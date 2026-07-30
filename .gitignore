@@ -1,4 +1,12 @@
+# Consumer-side generated profile — written by /worktree-calibrate into the TARGET
+# repo, never into this plugin repo.
+.claude/worktree-profile.json
+
+# Ephemeral state from the hygiene plugin used to build this one.
+.claude/.hygiene-*
+
 .DS_Store
+*.swp
 *.log
 tmp/
 .claude/settings.local.json

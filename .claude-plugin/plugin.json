@@ -1,0 +1,12 @@
+{
+  "name": "worktree",
+  "version": "0.1.0",
+  "description": "Makes a new git worktree actually runnable. Claude Code creates worktrees natively but leaves them unusable — no .env, no vendor/, no node_modules/, and pointing at the same port and database as every other session. This plugin closes both gaps and fits itself to the repo instead of assuming a stack: /worktree-calibrate inspects the repo once, proposes how dependencies install, what shell that must run inside, and what runtime state two sessions would collide on, then writes .claude/worktree-profile.json; from then on deterministic bash hooks read that profile to bootstrap each new worktree (copy gitignored config, hardlink or install dependencies inside the right toolchain shell) and isolate its runtime (a stable slug, a derived port, env overrides, a repo-owned seed script), with a teardown hook and /worktree-prune to clean up after. Model at calibrate time; plain bash at hook time.",
+  "author": {
+    "name": "Zairan Mir"
+  },
+  "homepage": "https://github.com/Mir-Zairan/worktree",
+  "repository": "https://github.com/Mir-Zairan/worktree",
+  "license": "MIT",
+  "keywords": ["worktree", "parallel-sessions", "bootstrap", "monorepo", "developer-experience"]
+}

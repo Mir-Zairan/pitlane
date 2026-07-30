@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "worktree",
+  "owner": {
+    "name": "Zairan Mir"
+  },
+  "description": "The Worktree plugin — makes parallel Claude Code sessions in one repository actually usable, by bootstrapping each new worktree and isolating its runtime from the others.",
+  "plugins": [
+    {
+      "name": "worktree",
+      "source": "./",
+      "description": "Bootstraps a new git worktree into a runnable checkout and isolates its runtime: copies gitignored config, installs or hardlinks dependencies inside the repo's own toolchain shell, and gives each worktree its own port, env overrides and seeded state. /worktree-calibrate fits all of it to your repo once; the hooks are deterministic bash from then on.",
+      "category": "workflow",
+      "keywords": ["worktree", "parallel-sessions", "bootstrap", "monorepo", "developer-experience"],
+      "license": "MIT"
+    }
+  ]
+}
