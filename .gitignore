@@ -2,8 +2,14 @@
 # repo, never into this plugin repo.
 .claude/worktree-profile.json
 
-# Ephemeral state from the hygiene plugin used to build this one.
+# Ephemeral and machine-local state from the hygiene plugin used to build this one.
+# Not all of it is dot-prefixed: the findings ledger, the generated profile and the
+# generated review agents are plain filenames, and the ledger is per-machine review
+# history that must not become a committed file in a public plugin repo.
 .claude/.hygiene-*
+.claude/hygiene-*
+.claude/agents/hygiene-*.md
+.claude/rules/hygiene-learned-*
 
 .DS_Store
 *.swp

@@ -8,7 +8,8 @@ it still points at the same database and the same port as every other session. T
 gap — and it fits itself to the repo instead of assuming a stack.
 
 **Status: in development.** Phase 1 is done — the plugin installs and is deliberately a no-op, and the
-hook contract is settled by measurement rather than guesswork. Bootstrapping itself starts in Phase 3.
+*creation* half of the hook contract is settled by measurement rather than guesswork. The teardown half
+(`WorktreeRemove`) is still unmeasured and is Phase 5's job. Bootstrapping itself starts in Phase 3.
 See [docs/03-roadmap.md](docs/03-roadmap.md).
 
 ## The idea in one paragraph

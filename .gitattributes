@@ -1,7 +1,11 @@
-# Shell scripts are executed via their shebang; a CRLF would make the kernel look
-# for "bash\r" and the hook would silently fail to run on Windows checkouts. That
-# failure mode is especially bad here: a WorktreeCreate hook that cannot execute
-# costs the user their session. Pin them (and the other text payloads) to LF
+# Normalise text by default, so extensionless files — LICENSE, .gitignore, and any
+# future hook script without a .sh suffix — don't follow the user's core.autocrlf.
+* text=auto
+
+# Shell scripts are executed via their shebang, so a CRLF checkout makes the kernel look
+# for "bash\r" and the script silently fails to run. That matters more here than usual:
+# these scripts are hooks, and this plugin's SessionStart hook runs on every session in
+# every repo where it's installed. Pin them (and the other text payloads) to LF
 # regardless of the user's autocrlf.
 *.sh    text eol=lf
 *.bash  text eol=lf

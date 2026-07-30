@@ -122,8 +122,9 @@ except Exception:
 #   object / array                                -> compact JSON, so a caller can test presence
 #
 # One invocation for N fields on purpose: this runs on the session-start path before the
-# UI renders, and a cold `python3 -c` is ~150-200ms. Reading a five-field profile with
-# five calls measured ~1s; one call is ~0.2s.
+# UI renders, and a cold `python3 -c` dominates the cost. Measured on the python3 backend,
+# 10 reps: reading the five profile fields with five separate calls is ~590ms; one call for
+# all five is ~120ms.
 #
 # Paths are passed as data (jq --args, python argv) and never interpolated into the
 # program text. The reference implementation in the source conversation built both the
