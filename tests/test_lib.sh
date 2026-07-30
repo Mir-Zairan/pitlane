@@ -74,9 +74,10 @@ cat >"$TMP/profile-v1.json" <<'JSON'
   "schemaVersion": 1,
   "shell": "nix develop --command",
   "copy": [],
-  "deps": [{"dir":"vendor","lock":"composer.lock","strategy":"hardlink"}],
+  "deps": [{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
+            "install":"composer install --no-interaction --no-progress --no-scripts"}],
   "runtime": {"slug":"{name}","port":{"var":"SERVER_PORT","base":3786,"span":200}},
-  "timeouts": {"bootstrapSeconds": 900, "seedSeconds": 120}
+  "timeouts": {"bootstrapSeconds": 420, "seedSeconds": 120}
 }
 JSON
 
@@ -229,7 +230,7 @@ worktree: two' "$err"
   # --- wt_read_file_field ---------------------------------------------------
   eq 'read_file_field scalar' 'nix develop --command' \
     "$(wt_read_file_field "$TMP/profile-v1.json" shell)"
-  eq 'read_file_field nested number' '900' \
+  eq 'read_file_field nested number' '420' \
     "$(wt_read_file_field "$TMP/profile-v1.json" timeouts.bootstrapSeconds)"
   eq 'read_file_field empty array is compact json' '[]' \
     "$(wt_read_file_field "$TMP/profile-v1.json" copy)"
@@ -360,12 +361,15 @@ worktree: two' "$err"
   wt_load_profile "$pdir/"
   eq 'load_profile normalises a trailing slash' "$target" "$PROFILE_PATH"
 
+  # deps[].lock is validated for existence relative to the root, so the fixture repo needs
+  # the lockfile its profile names. Absent, the profile is legitimately invalid.
+  : >"$pdir/composer.lock"
   cp "$TMP/profile-v1.json" "$target"
   wt_load_profile "$pdir"
   eq 'v1 profile -> present'       '1' "$PROFILE_PRESENT"
   eq 'v1 profile -> shell'         'nix develop --command' "$PROFILE_SHELL"
   eq 'v1 profile -> has runtime'   '1' "$PROFILE_HAS_RUNTIME"
-  eq 'v1 profile -> timeouts read' '900' "$PROFILE_BOOTSTRAP_TIMEOUT"
+  eq 'v1 profile -> timeouts read' '420' "$PROFILE_BOOTSTRAP_TIMEOUT"
   eq 'v1 profile -> seed timeout'  '120' "$PROFILE_SEED_TIMEOUT"
   eq 'v1 profile is silent' '' "$(wt_load_profile "$pdir" 2>&1 >/dev/null)"
 
@@ -571,15 +575,23 @@ worktree: two' "$err"
   rc_is 'records: one argument is a usage error' 1 "$(jr deps >/dev/null 2>&1; echo $?)"
   rc_is 'records: no arguments is a usage error' 1 "$(jr >/dev/null 2>&1; echo $?)"
 
-  # A newline inside a value is exactly why records are RS-delimited: `install` is a
-  # command string, where a line continuation is legal. Newline-delimited records would
-  # silently split this element in two and shift every column after it.
+  # A newline inside a value is why records are RS-delimited AND why desep folds CR/LF to a
+  # space. `install` is a command string where a line continuation is legal, and the bash
+  # side reads these with a LINE-delimited read — so a preserved newline would truncate the
+  # record and blank every field after it. In wt_validate_profile that measurably disabled
+  # the entire validator, so folding is the contract, not preservation.
   n=0
   while IFS=$US read -r -d "$RS" v; do
     n=$((n + 1))
-    eq 'records: a value containing a newline survives intact' "$(printf 'line1\nline2')" "$v"
+    eq 'records: a newline in a value is folded to a space' 'line1 line2' "$v"
   done < <(jr multiline install)
   eq 'records: a newline in a value does not split the record' 1 "$n"
+  eq 'records: a CR is folded too (a native-Windows python would emit CRLF)' 'a b' \
+    "$(printf '%s' '{"d":[{"v":"a\r\nb"}]}' | wt_json_records d v | tr -d "$RS")"
+  # And the same fold in wt_json_get, whose caller reads it with the same line-delimited
+  # read: one newline in an early value used to blank every field after it.
+  eq 'get: a newline cannot truncate the field list' "x y${US}kept" \
+    "$(printf '%s' '{"a":"x\ny","b":"kept"}' | wt_json_get a b)"
 
   # The loop idiom in the function's own docs must read every element, last included.
   n=0 seen=''
@@ -596,6 +608,371 @@ worktree: two' "$err"
   printf '\357\273\277%s' '{"deps":[{"dir":"vendor"}]}' >"$TMP/bom.json"
   eq 'records: a UTF-8 BOM is tolerated on both backends' "vendor${RS}" \
     "$(wt_json_records deps dir <"$TMP/bom.json")"
+
+  # --- wt_is_safe_relpath ---------------------------------------------------
+  # The shape check that runs BEFORE any existence check. Note it tests SEGMENTS, not
+  # substrings: a directory legitimately called `..cache` must be accepted, and a
+  # substring test would refuse it.
+  for good in vendor a/b node_modules .venv vendor/bundle ..cache foo..bar a/..b/c; do
+    wt_is_safe_relpath "$good"
+    rc_is "safe_relpath accepts $good" 0 $?
+  done
+  # SC2088: the tilde is DELIBERATELY unexpanded — a literal leading `~` arriving from a
+  # committed profile is one of the shapes being rejected, so expanding it here would test
+  # the wrong string entirely.
+  # shellcheck disable=SC2088
+  for bad in '' '.' '/abs' '/' '~/x' '~' '../up' 'a/../b' 'a/..' '../' '..'; do
+    wt_is_safe_relpath "$bad"
+    rc_is "safe_relpath rejects ${bad:-<empty>}" 1 $?
+  done
+
+  # --- wt_unknown_placeholders ----------------------------------------------
+  # Must agree with wt_expand about what a placeholder IS. wt_expand passes an unknown
+  # brace through verbatim so a shell snippet or an awk program survives, so those must
+  # NOT be reported — a wrong report becomes a wrong rejection, which downgrades a working
+  # repo to defaults.
+  # SC2016: single quotes are the point. These are profile VALUES containing shell and awk
+  # syntax that must survive placeholder scanning untouched; expanding them here would test
+  # this test's own environment instead of the scanner.
+  # shellcheck disable=SC2016
+  for known in 'demo_{slug}' '{name}' '{port}' '{worktree}/a' '{root}/b' 'no braces at all' \
+               '${FOO}/bin' '${HOME}' 'awk "{print $1}"' 'a{' '{' '{}' 'x${A}{slug}'; do
+    wt_unknown_placeholders "$known" >/dev/null
+    rc_is "placeholders: nothing to report in $known" 0 $?
+  done
+  got=$(wt_unknown_placeholders 'demo_{slugg}'); rc=$?
+  eq  'placeholders: a typo is reported' 'slugg' "$got"
+  rc_is 'placeholders: a typo returns 1' 1 "$rc"
+  got=$(wt_unknown_placeholders 'x{PORT}y'); rc=$?
+  eq  'placeholders: wrong case is reported' 'PORT' "$got"
+  rc_is 'placeholders: wrong case returns 1' 1 "$rc"
+  got=$(wt_unknown_placeholders '{a}-{slug}-{b}' | tr '\n' ',')
+  eq 'placeholders: several unknowns, knowns skipped' 'a,b,' "$got"
+  # A placeholder nested inside another brace. wt_expand leaves {slugg} literal here, so the
+  # scanner must report it — a scanner that skipped to the first `}` saw only the fragment
+  # `X{slugg` and reported nothing, missing the typo in exactly the inputs that mix a
+  # placeholder with shell or awk braces.
+  eq 'placeholders: a typo nested inside another brace is still found' 'slugg' \
+    "$(wt_unknown_placeholders 'demo_{X{slugg}')"
+  # shellcheck disable=SC2016  # a literal shell expansion is the input under test
+  eq 'placeholders: and inside a shell default-value expansion' 'slugg' \
+    "$(wt_unknown_placeholders '${VAR:-{slugg}}')"
+  # The scanner must agree with wt_expand about what actually expands.
+  WT_SLUG=realslug
+  eq 'placeholders: wt_expand leaves the reported token literal' 'demo_{X{slugg}' \
+    "$(wt_expand 'demo_{X{slugg}')"
+  eq 'placeholders: and substitutes the one the scanner stays quiet about' 'demo_realslug' \
+    "$(wt_expand 'demo_{slug}')"
+  unset WT_SLUG
+
+  # --- wt_validate_profile --------------------------------------------------
+  VR="$TMP/vrepo"
+  mkdir -p "$VR/.claude"
+  : >"$VR/composer.lock"
+  : >"$VR/pnpm-lock.yaml"
+  VCK=$(cksum <"$VR/composer.lock")
+  VP="$VR/.claude/worktree-profile.json"
+  vw() { printf '%s' "$1" >"$VP"; }
+  vv() { wt_validate_profile "$VP" "$VR" 2>/dev/null; }
+
+  vw '{"schemaVersion":1,"shell":"nix develop --command","shellArgs":"argv","copy":[],
+       "deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
+                "install":"composer install --no-scripts","verify":"test -r vendor/autoload.php",
+                "lockChecksum":"'"$VCK"'"}],
+       "timeouts":{"bootstrapSeconds":420,"seedSeconds":120}}'
+  eq 'validate: a good profile reports nothing' '' "$(vv)"
+  vv >/dev/null 2>&1
+  rc_is 'validate: a good profile returns 0' 0 $?
+
+  # Absence is valid everywhere it is meaningful: no deps, no runtime, no timeouts.
+  vw '{"schemaVersion":1}'
+  eq 'validate: a minimal profile is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[]}'
+  eq 'validate: an empty deps array is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{}}'
+  eq 'validate: an empty runtime block is valid (means touch nothing)' '' "$(vv)"
+
+  # schemaVersion is the one mandatory key.
+  vw '{"shell":"x"}'
+  contains 'validate: a missing schemaVersion is a violation' 'schemaVersion: missing' "$(vv)"
+  vw '{"schemaVersion":99}'
+  contains 'validate: an unknown schemaVersion names the version' '99 is not 1' "$(vv)"
+
+  # EVERY violation is reported, not just the first — a hand-broken profile is usually
+  # broken in several places and one-at-a-time reporting means a round trip per mistake.
+  vw '{"schemaVersion":99,"shellArgs":"shell",
+       "deps":[{"dir":"../../escape","lock":"nope.lock","strategy":"cache","install":"x"},
+               {"strategy":"hardlink"}],
+       "timeouts":{"bootstrapSeconds":0,"seedSeconds":"abc"},
+       "runtime":{"seed":"/etc/passwd"}}'
+  got=$(vv)
+  eq 'validate: reports all 9 violations in one pass' 9 "$(printf '%s\n' "$got" | grep -c .)"
+  contains 'validate: names the offending dep by index'   'deps[0].strategy:' "$got"
+  contains 'validate: indexes the SECOND dep as 1'        'deps[1].install:'  "$got"
+  contains 'validate: rejects a traversing dir'           'deps[0].dir:'      "$got"
+  contains 'validate: rejects a missing lockfile'         'deps[0].lock:'     "$got"
+  contains 'validate: rejects a bad shellArgs'            'shellArgs:'        "$got"
+  contains 'validate: rejects an absolute runtime.seed'   'runtime.seed:'     "$got"
+  vv >/dev/null 2>&1
+  rc_is 'validate: a broken profile returns 1' 1 $?
+
+  # THE SEVERITY BOUNDARY: a field with a safe per-field fallback WARNS; a field without
+  # one is FATAL. A bad timeout has a fallback (the default is substituted), so it must not
+  # discard an otherwise perfect profile — losing every dependency and the toolchain shell
+  # because one number is mistyped is the wrong-rejection failure.
+  vw '{"schemaVersion":1,"shell":"keep-me","timeouts":{"bootstrapSeconds":0,"seedSeconds":"abc"}}'
+  eq 'validate: a bad timeout is NOT a violation' '' "$(vv)"
+  err=$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)
+  contains 'validate: a bad bootstrap timeout warns instead' 'timeouts.bootstrapSeconds:' "$err"
+  contains 'validate: a bad seed timeout warns instead'      'timeouts.seedSeconds:'      "$err"
+  contains 'validate: and says the default will be used'     'default will be used'       "$err"
+  wt_load_profile "$VR" 2>/dev/null
+  eq 'load_profile: a bad timeout does not discard the profile' 1 "$PROFILE_PRESENT"
+  eq 'load_profile: the rest of the profile is still used' 'keep-me' "$PROFILE_SHELL"
+  eq 'load_profile: and the timeout falls back to the default' 600 "$PROFILE_BOOTSTRAP_TIMEOUT"
+  eq 'load_profile: both timeouts fall back' 600 "$PROFILE_SEED_TIMEOUT"
+
+  # Hostile paths, each rejected on SHAPE before the filesystem is consulted. These arrive
+  # in a committed file from other people's branches, and consumers act on them with
+  # `cp -al`, file writes and deletion.
+  # shellcheck disable=SC2088  # a literal `~` is one of the hostile shapes under test
+  for hp in '../../../etc/passwd' '/etc/passwd' 'a/../../../etc' '~/x'; do
+    vw '{"schemaVersion":1,"deps":[{"dir":"'"$hp"'","lock":"composer.lock","strategy":"hardlink","install":"x"}]}'
+    contains "validate: rejects dir $hp" 'must be a relative path inside the repository' "$(vv)"
+  done
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":"../../x"}}}'
+  contains 'validate: rejects a traversing runtime.env.file' 'runtime.env.file:' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"teardown":"../../rm"}}'
+  contains 'validate: rejects a traversing runtime.teardown' 'runtime.teardown:' "$(vv)"
+
+  # skip means the plugin does not act, so only the path SHAPE matters — no install, no
+  # lock, no existence requirement.
+  vw '{"schemaVersion":1,"deps":[{"strategy":"skip"}]}'
+  eq 'validate: skip needs neither install nor lock nor dir' '' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"strategy":"skip","dir":"../out"}]}'
+  contains 'validate: skip still rejects an escaping dir' 'deps[0].dir:' "$(vv)"
+
+  # store is a valid schema value nothing implements: warn, do not invalidate.
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"store","install":"x"}]}'
+  eq 'validate: store is not a violation' '' "$(vv)"
+  contains 'validate: store warns that no phase implements it' 'reserved schema value' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+
+  # Structural type errors on the containers themselves.
+  vw '{"schemaVersion":1,"deps":{"dir":"vendor"}}'
+  contains 'validate: deps must be an array' 'deps: must be an array' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":[]}'
+  contains 'validate: runtime must be an object' 'runtime: must be an object' "$(vv)"
+  vw '{"schemaVersion":1,"evidence":{"detectionVersion":"one"}}'
+  contains 'validate: evidence.detectionVersion must be numeric' 'evidence.detectionVersion:' "$(vv)"
+  vw '{"schemaVersion":1,"evidence":{"markers":"composer.lock"}}'
+  contains 'validate: evidence.markers must be an array' 'evidence.markers:' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip","lockChecksum":"not-a-cksum"}]}'
+  contains 'validate: a malformed lockChecksum is a violation' 'lockChecksum:' "$(vv)"
+
+  # The timeout SUM, which is what actually has to fit under the hook's own timeout. Each
+  # value alone is legal here; together they exceed it, so the platform would kill the hook
+  # before either internal guard fired.
+  vw '{"schemaVersion":1,"timeouts":{"bootstrapSeconds":600,"seedSeconds":600}}'
+  eq 'validate: an over-budget timeout SUM is a warning, not a violation' '' "$(vv)"
+  contains 'validate: warns that the timeout sum exceeds the hook timeout' 'over the 600s hook timeout' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+
+  # A named-but-absent repo-owned script is a warning: it may land in a later commit, and
+  # refusing the whole profile would take the dependency setup down with it.
+  vw '{"schemaVersion":1,"runtime":{"seed":".claude/worktree-seed.sh"}}'
+  eq 'validate: an absent seed script is not a violation' '' "$(vv)"
+  contains 'validate: warns about an absent seed script' 'will do nothing' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+
+  # File-level failures.
+  eq 'validate: an absent file is a violation' \
+    "profile: $TMP/nope.json is not a regular file" "$(wt_validate_profile "$TMP/nope.json" "$VR" 2>/dev/null)"
+  eq 'validate: no path at all is a violation' 'profile: no path given' \
+    "$(wt_validate_profile '' "$VR" 2>/dev/null)"
+  vw '{ not json'
+  contains 'validate: an unparseable profile is a violation' 'not parseable as a single JSON document' "$(vv)"
+  printf '%s' '{"schemaVersion":1} junk' >"$VP"
+  contains 'validate: a document with trailing junk is a violation' 'not parseable' "$(vv)"
+
+  # --- validation is wired into the loader, with NO PARTIAL TRUST -----------
+  vw '{"schemaVersion":1,"shell":"good","deps":[{"dir":"vendor","lock":"absent.lock","strategy":"hardlink","install":"x"}]}'
+  wt_load_profile "$VR" 2>/dev/null
+  eq 'load_profile: an invalid profile is not present at all' 0 "$PROFILE_PRESENT"
+  eq 'load_profile: and none of its values are trusted' '' "$PROFILE_SHELL"
+  err=$(wt_load_profile "$VR" 2>&1 >/dev/null)
+  contains 'load_profile: says why, and names the offending key' 'deps[0].lock' "$err"
+  contains 'load_profile: points at the fix' '/worktree-calibrate' "$err"
+  vw '{"schemaVersion":1,"shell":"good"}'
+  wt_load_profile "$VR" 2>/dev/null
+  eq 'load_profile: a valid profile is still loaded' 1 "$PROFILE_PRESENT"
+  eq 'load_profile: with its values' 'good' "$PROFILE_SHELL"
+  # The escape hatch exists for the calibrate skill, which validates with its own severity.
+  # NOT in a ( subshell ): eq's pass/fail counters would increment in the subshell and die
+  # with it, so a regression here would print FAIL and still exit 0. Mutation-confirmed.
+  vw '{"schemaVersion":1,"shell":"good","deps":[{"dir":"vendor","lock":"absent.lock","strategy":"hardlink","install":"x"}]}'
+  WT_SKIP_VALIDATION=1
+  wt_load_profile "$VR" 2>/dev/null
+  eq 'load_profile: WT_SKIP_VALIDATION bypasses validation' 1 "$PROFILE_PRESENT"
+  contains 'load_profile: and says the gate is off, so it cannot be silently disabled' \
+    'WT_SKIP_VALIDATION is set' "$(wt_load_profile "$VR" 2>&1 >/dev/null)"
+  unset WT_SKIP_VALIDATION
+  wt_load_profile "$VR" 2>/dev/null
+  eq 'load_profile: unsetting the bypass restores validation' 0 "$PROFILE_PRESENT"
+
+  # A dep with no `strategy` at all — the likeliest hand-edit mistake, and a whole rc-1
+  # branch that mutation showed was unexercised.
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock"}]}'
+  got=$(vv)
+  contains 'validate: a dep with no strategy is a violation' 'deps[0].strategy: missing' "$got"
+  contains 'validate: and the unknown-strategy arm renders ? not empty' 'strategy "?"' "$got"
+  vv >/dev/null 2>&1
+  rc_is 'validate: a strategy-less dep returns 1' 1 $?
+
+  # The placeholder CALL SITE, not just the helper: four fields are scanned and the message
+  # is reformatted from a newline list into one {a b} token. Mutation showed neutering the
+  # whole warning changed no assertion.
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+       "install":"seed demo_{slugg} --port {PORT}"}]}'
+  eq 'validate: a botched placeholder is a warning, not a violation' '' "$(vv)"
+  err=$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)
+  contains 'validate: the placeholder warning names the dep' 'deps[0]:' "$err"
+  contains 'validate: and lists every unknown token in one message' '{slugg PORT}' "$err"
+  # shellcheck disable=SC2016  # ${FOO} and awk's $1 are literal profile values under test
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+       "install":"install --prefix ${FOO} && awk \"{print $1}\""}]}'
+  eq 'validate: shell and awk braces are not reported as placeholders' '' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  # The runtime templates, which are the motivating example: a botched slug reaches a
+  # database name.
+  vw '{"schemaVersion":1,"runtime":{"slug":"{slugg}","env":{"vars":{"DB":"demo_{prot}"}}}}'
+  err=$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)
+  contains 'validate: runtime.slug is scanned for placeholders' 'slugg' "$err"
+  contains 'validate: runtime.env.vars values are scanned too' 'prot' "$err"
+
+  # copy[] is a bare-string array acted on by file operations — the same threat as
+  # deps[].dir, and it was completely unchecked.
+  vw '{"schemaVersion":1,"copy":["../../../.ssh/id_rsa"]}'
+  contains 'validate: a traversing copy entry is a violation' 'copy[0]:' "$(vv)"
+  vw '{"schemaVersion":1,"copy":[".env",".env.local"]}'
+  eq 'validate: ordinary copy entries are fine' '' "$(vv)"
+  vw '{"schemaVersion":1,"copy":[".env","/etc/shadow"]}'
+  contains 'validate: copy indexes the offending entry' 'copy[1]:' "$(vv)"
+  vw '{"schemaVersion":1,"copy":"env"}'
+  contains 'validate: copy must be an array' 'copy: must be an array' "$(vv)"
+
+  # A JSON *string* beginning with [ or { rendered as `[not-an-array`, which a
+  # leading-byte-only type test accepted.
+  vw '{"schemaVersion":1,"deps":"[not-an-array"}'
+  contains 'validate: a string that starts with [ is not an array' 'deps: must be an array' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":"{not-an-object"}'
+  contains 'validate: a string that starts with { is not an object' 'runtime: must be an object' "$(vv)"
+
+  # A non-empty deps array that yields no records must NOT be treated as empty: that is how
+  # a failed second interpreter invocation silently skipped every per-dep check while
+  # pronouncing the profile clean. It can only be reached by a reader failure, so the reader
+  # is stubbed in a CHILD shell (stubbing here would break every later assertion).
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip"}]}'
+  eq 'validate: a readable deps array validates normally' '' "$(vv)"
+  out=$(bash -c ". '$LIB'
+    wt_json_records() { return 0; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  contains 'validate: an unreadable deps array is a violation, not an empty one' \
+    'could not be read' "$out"
+  contains 'validate: and it returns non-zero rather than passing' '|rc=1' "$out"
+  # The hostile version: a dep that WOULD escape the worktree must not slip through when the
+  # records read fails.
+  vw '{"schemaVersion":1,"deps":[{"dir":"../../../../etc","lock":"/etc/passwd","strategy":"bogus"}]}'
+  out=$(bash -c ". '$LIB'
+    wt_json_records() { return 0; }
+    wt_validate_profile '$VP' '$VR' >/dev/null 2>&1
+    printf 'rc=%s' \$?" 2>/dev/null)
+  eq 'validate: an unreadable hostile deps array still fails validation' 'rc=1' "$out"
+
+  # One violation per line is a protocol both callers parse. A value containing a newline
+  # used to occupy two lines and could forge a line naming a key it does not own.
+  vw '{"schemaVersion":1,"deps":[{"dir":"../a\nschemaVersion: FORGED","lock":"composer.lock","strategy":"install","install":"x"}]}'
+  got=$(vv)
+  eq 'validate: a newline in a value cannot forge a second violation line' 1 \
+    "$(printf '%s\n' "$got" | grep -c .)"
+  contains 'validate: and the real violation is still reported' 'deps[0].dir:' "$got"
+
+  # The timeout SUM boundary, exactly at and one over.
+  vw '{"schemaVersion":1,"timeouts":{"bootstrapSeconds":480,"seedSeconds":120}}'
+  eq 'validate: a sum exactly at the hook timeout is silent' '' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  vw '{"schemaVersion":1,"timeouts":{"bootstrapSeconds":481,"seedSeconds":120}}'
+  contains 'validate: one second over the hook timeout warns' 'over the 600s hook timeout' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  # A leading zero is OCTAL to bash arithmetic: $((08 + 120)) is a fatal expansion error
+  # that kills a set -e caller, which a sourced library must never do.
+  vw '{"schemaVersion":1,"timeouts":{"bootstrapSeconds":"08","seedSeconds":120}}'
+  eq 'validate: a leading-zero timeout does not crash the arithmetic' '' "$(vv)"
+  out=$(bash -c "set -euo pipefail; . '$LIB'
+    wt_validate_profile '$VP' '$VR' >/dev/null 2>&1 || true; printf SURVIVED" 2>/dev/null)
+  eq 'validate: a leading-zero timeout does not kill a set -e caller' 'SURVIVED' "$out"
+
+  # No JSON backend: not the profile's fault and not fixable by editing it, so it must not
+  # look like a broken profile.
+  #
+  # Run in a CHILD SHELL, not by stubbing wt_has_json here. Stubbing then unsetting removes
+  # the real function, and re-sourcing does not restore it because lib.sh has a
+  # double-source guard — which silently broke every later assertion that reads JSON.
+  out=$(bash -c ". '$LIB'
+    wt_has_json() { return 1; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  eq 'validate: no JSON backend reports no violations, not a broken profile' '|rc=0' "$out"
+  err=$(bash -c ". '$LIB'
+    wt_has_json() { return 1; }
+    wt_validate_profile '$VP' '$VR' 2>&1 >/dev/null" 2>/dev/null)
+  contains 'validate: and says which tools are missing' 'jq nor python3' "$err"
+
+  # --- wt_profile_drifted ---------------------------------------------------
+  # No call site in this phase; Phase 3 owns wiring it. It must be a checksum and a string
+  # compare only — never a re-detection (ADR-002).
+  : >"$VR/composer.lock"
+  VCK=$(cksum <"$VR/composer.lock")
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","lockChecksum":"'"$VCK"'"}]}'
+  wt_profile_drifted "$VP" "$VR" >/dev/null 2>&1
+  rc_is 'drift: a matching checksum is clean' 0 $?
+  printf 'changed' >>"$VR/composer.lock"
+  got=$(wt_profile_drifted "$VP" "$VR" 2>/dev/null); rc=$?
+  rc_is 'drift: a changed lockfile is drift' 1 "$rc"
+  contains 'drift: names the lockfile that changed' 'composer.lock has changed' "$got"
+  rm -f "$VR/composer.lock"
+  got=$(wt_profile_drifted "$VP" "$VR" 2>/dev/null); rc=$?
+  rc_is 'drift: a vanished lockfile is drift' 1 "$rc"
+  contains 'drift: says the lockfile is gone' 'no longer exists' "$got"
+  : >"$VR/composer.lock"
+  # A profile with no recorded evidence simply cannot report drift, and must not pretend to.
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x"}]}'
+  wt_profile_drifted "$VP" "$VR" >/dev/null 2>&1
+  rc_is 'drift: no recorded checksum means nothing to report' 0 $?
+  wt_profile_drifted "$TMP/nope.json" "$VR" >/dev/null 2>&1
+  rc_is 'drift: an absent profile is not drift' 0 $?
+  wt_profile_drifted "$VP" '' >/dev/null 2>&1
+  rc_is 'drift: no root given is not drift' 0 $?
+
+  # drift is a PUBLIC entry point, so it re-checks the path shape rather than trusting that
+  # a caller validated first. Otherwise a lock outside the repo turns it into an
+  # existence-and-content oracle, and a lock naming a character device never returns.
+  vw '{"schemaVersion":1,"deps":[{"strategy":"skip","dir":"vendor","lock":"../../../../../../etc/passwd","lockChecksum":"0 0"}]}'
+  contains 'validate: a skip entry'"'"'s lock is shape-checked too' 'deps[0].lock:' "$(vv)"
+  got=$(wt_profile_drifted "$VP" "$VR" 2>/dev/null); rc=$?
+  rc_is 'drift: refuses a lock outside the repository' 1 "$rc"
+  contains 'drift: says it refused rather than reading it' 'refusing to check it' "$got"
+  ne 'drift: did not report a checksum for a path outside the repo' 'has changed' "$got"
+  # A non-regular file would make the read never return; -f rather than -e is what stops it.
+  if [ -e /dev/zero ]; then
+    ln -sf /dev/zero "$VR/zero.lock" 2>/dev/null || true
+    vw '{"schemaVersion":1,"deps":[{"strategy":"skip","dir":"vendor","lock":"zero.lock","lockChecksum":"0 0"}]}'
+    got=$(timeout 5 bash -c ". '$LIB'; wt_profile_drifted '$VP' '$VR'" 2>/dev/null); rc=$?
+    ne 'drift: a character-device lock does not hang the hook' 124 "$rc"
+    contains 'drift: and reports it as a vanished lockfile' 'no longer exists' "$got"
+    rm -f "$VR/zero.lock"
+  fi
 
   # --- caller safety --------------------------------------------------------
   # The caller runs `set -euo pipefail`; a library function returning non-zero, or
