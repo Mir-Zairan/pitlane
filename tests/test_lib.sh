@@ -145,6 +145,12 @@ run_suite() {
   eq 'wt_log writes nothing to stdout' '' "$out"
   err=$(wt_log "hello" 2>&1 >/dev/null)
   eq 'wt_log writes a prefixed line to stderr' 'worktree: hello' "$err"
+  err=$(wt_log "one
+two" 2>&1 >/dev/null)
+  eq 'wt_log prefixes EVERY line, not just the first' 'worktree: one
+worktree: two' "$err"
+  err=$(wt_log "" 2>&1 >/dev/null)
+  eq 'wt_log of an empty string is one bare prefix' 'worktree: ' "$err"
 
   # --- backend selection ----------------------------------------------------
   wt_has_json

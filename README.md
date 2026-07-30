@@ -7,7 +7,9 @@ make the new worktree *runnable*: a fresh checkout has no `.env`, no `vendor/`, 
 it still points at the same database and the same port as every other session. This plugin closes that
 gap — and it fits itself to the repo instead of assuming a stack.
 
-**Status: in development. Nothing is implemented yet — see [docs/03-roadmap.md](docs/03-roadmap.md).**
+**Status: in development.** Phase 1 is done — the plugin installs and is deliberately a no-op, and the
+hook contract is settled by measurement rather than guesswork. Bootstrapping itself starts in Phase 3.
+See [docs/03-roadmap.md](docs/03-roadmap.md).
 
 ## The idea in one paragraph
 

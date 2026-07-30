@@ -42,7 +42,16 @@ WT_US=$'\037'
 
 # Every informational message, warning and error goes to stderr, prefixed so the user
 # can tell which plugin is talking. stdout belongs to the worktree path alone.
-wt_log() { printf 'worktree: %s\n' "$*" >&2; }
+#
+# EVERY line is prefixed, not just the first: callers log captured command output
+# (`wt_log "$(git worktree add …)"`), and an unprefixed continuation line in a session's
+# startup noise reads like it came from Claude Code itself.
+wt_log() {
+  local line
+  while IFS= read -r line; do
+    printf 'worktree: %s\n' "$line" >&2
+  done <<<"$*"
+}
 
 # ---------------------------------------------------------------------------
 # git invocation
