@@ -31,10 +31,29 @@
 [ -n "${WT_LIB_SOURCED:-}" ] && return 0
 WT_LIB_SOURCED=1
 
-# Record separator for the multi-value readers below. US (\037) rather than TAB because
+# Field separator for the multi-value readers below. US (\037) rather than TAB because
 # TAB is IFS-whitespace: bash `read` collapses runs of it and drops empty fields, which
 # would shift every column as soon as one profile value is absent.
 WT_US=$'\037'
+
+# Record separator for wt_json_records. RS (\036) rather than newline, because a record
+# reader delimited by newlines silently shifts every subsequent column the moment one
+# value contains one — and `deps[].install` is a command string, where a line
+# continuation is entirely legal. A caller cannot detect that corruption.
+#
+# Choosing an exotic byte is NOT on its own a guarantee, and an earlier revision of this
+# comment wrongly claimed it was. JSON can encode  and  perfectly legally, and
+# the profile arrives from other people's branches, so a value carrying either would inject
+# a phantom field or end a record early — measured, on both backends. What actually makes
+# it impossible is that both readers STRIP these two bytes when rendering a value (`desep`
+# in wt_json_get and wt_json_records). The separator choice then only has to survive
+# ordinary text, which it does; the stripping handles the hostile case.
+#
+# SC2034: unused *within this file*. It is part of the public contract — every caller of
+# wt_json_records needs it for `read -d "$WT_RS"` — so it belongs here beside WT_US
+# rather than being re-declared by each consumer.
+# shellcheck disable=SC2034
+WT_RS=$'\036'
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -134,24 +153,33 @@ except Exception:
 # ensure_ascii=False so a non-ASCII object matches jq's output byte for byte.
 wt_json_get() {  # $@ = dotted paths
   [ "$#" -gt 0 ] || return 1
+  local _p
+  for _p in "$@"; do [ -n "$_p" ] || return 1; done
   if wt_use_jq; then
-    jq -rj --args '
+    jq -rj --args --slurp '
       def val:
         if . == null then ""
         elif type == "string" then .
         elif type == "boolean" or type == "number" then tostring
         else tojson end;
-      . as $doc
-      | [ $ARGS.positional[]
-          | . as $p
-          | (try ($doc | getpath($p | split("."))) catch null) | val ]
-      | join("")' "$@" 2>/dev/null
+      def desep: gsub("[]"; "");
+      if length != 1 then empty
+      else
+        .[0] as $doc
+        | [ $ARGS.positional[]
+            | . as $p
+            | (try ($doc | getpath($p | split("."))) catch null) | val | desep ]
+        | join("")
+      end' -- "$@" 2>/dev/null
   else
     python3 -c "${WT_PY_LF}"'import json,sys
 try:
     doc = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+
+def desep(s):
+    return s.replace("\x1f", "").replace("\x1e", "")
 
 def get(path):
     v = doc
@@ -167,15 +195,138 @@ def get(path):
     if v is False:
         return "false"
     if isinstance(v, str):
-        return v
+        return desep(v)
     if isinstance(v, int):
         return str(v)
     if isinstance(v, float):
         return repr(v)
-    return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    return desep(json.dumps(v, separators=(",", ":"), ensure_ascii=False))
 
 sys.stdout.write("\x1f".join(get(p) for p in sys.argv[1:]))' "$@" 2>/dev/null
   fi
+}
+
+# Read an ARRAY of objects in one backend invocation: $1 is the dotted path to the array,
+# every remaining argument is a dotted path WITHIN each element. Emits one record per
+# element, fields joined by WT_US, each record terminated by WT_RS.
+#
+# Why this exists rather than a loop over wt_json_get: wt_json_get cannot address array
+# elements at all. Measured on both backends — `deps.0.dir` returns the empty string,
+# because jq's getpath() rejects a string segment on an array (the error is caught and
+# becomes null) and the python branch guards with `isinstance(v, dict)`. Teaching it
+# numeric segments would mean editing the one function whose byte-for-byte agreement
+# across two backends is load-bearing, and whose behaviour 284 existing assertions pin.
+# A separate reader that does its own traversal leaves all of that untouched.
+#
+# It is also the only shape that keeps the cost right. deps[] has ~6 fields per element,
+# so a per-element or per-field call would be 6N cold interpreter starts on the
+# session-start path, where a cold python3 already dominates (measured: 5 fields cost
+# ~590ms as five calls and ~120ms as one).
+#
+# Value rendering is IDENTICAL to wt_json_get, deliberately duplicated rather than shared:
+#   missing / null / a non-object element / a non-object on the way down -> empty string
+#   true / false                                                        -> "true" / "false"
+#   object / array                                                      -> compact JSON
+#   an embedded US or RS byte                                           -> stripped, see WT_RS
+#
+# It carries the same three hardenings as wt_json_get, for the same measured reasons: `--`
+# so an option-like path stays data, `--slurp` plus a length check so trailing junk and
+# concatenated documents fail on jq exactly as they already did on python, and an empty
+# path argument rejected rather than silently meaning "the whole document" on jq.
+#
+# Iterate it like this — note the trailing WT_RS on every record, including the last,
+# which is what stops `read -d` dropping the final element:
+#
+#   while IFS=$WT_US read -r -d "$WT_RS" dir lock strategy; do
+#     ...
+#   done < <(wt_json_records deps dir lock strategy <"$profile")
+#
+# RETURN CONTRACT, and it matters: returns 1 only for a CALLER error — no arguments, or
+# no JSON backend on PATH. Returns 0 for every DATA outcome, including "the array is
+# absent", "it is not an array", and "the document does not parse at all", all of which
+# produce no records. That is deliberate: jq exits non-zero on a parse error while python
+# exits 0, so propagating the backend's status would make the two distinguishable, and
+# every caller would then behave differently depending on which tool the machine has.
+# The consequence for callers is explicit: ESTABLISH THAT THE DOCUMENT PARSES FIRST
+# (wt_load_profile and wt_validate_profile both read a scalar with wt_json_get before
+# they read records), because an empty record stream on its own cannot tell you whether
+# the profile has no dependencies or is corrupt.
+wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within each element
+  [ "$#" -ge 2 ] || return 1
+  wt_has_json || return 1
+  local _p
+  for _p in "$@"; do [ -n "$_p" ] || return 1; done
+  if wt_use_jq; then
+    jq -rj --args --slurp '
+      def val:
+        if . == null then ""
+        elif type == "string" then .
+        elif type == "boolean" or type == "number" then tostring
+        else tojson end;
+      def desep: gsub("[]"; "");
+      if length != 1 then empty
+      else
+        .[0] as $doc
+        | ($ARGS.positional[0] | split(".")) as $ap
+        | ($ARGS.positional[1:] | map(split("."))) as $fps
+        | (try ($doc | getpath($ap)) catch null) as $arr
+        | if ($arr | type) != "array" then empty
+          else
+            $arr[] as $el
+            | ([ $fps[] as $fp | (try ($el | getpath($fp)) catch null) | val | desep ]
+               | join("")) + ""
+          end
+      end' -- "$@" 2>/dev/null || true
+  else
+    python3 -c "${WT_PY_LF}"'import json,sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+# Absent and explicitly-null both render as the empty string, exactly as wt_json_get
+# does, so walk() returns None for a missing path rather than a distinct sentinel. A
+# sentinel would draw a distinction nothing here can observe — mutation-testing it
+# changed no assertion — and no field in the schema treats "" as meaningful.
+def desep(s):
+    return s.replace("\x1f", "").replace("\x1e", "")
+
+def walk(node, segs):
+    v = node
+    for seg in segs:
+        if isinstance(v, dict) and seg in v:
+            v = v[seg]
+        else:
+            return None
+    return v
+
+def val(v):
+    if v is None:
+        return ""
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, str):
+        return desep(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    return desep(json.dumps(v, separators=(",", ":"), ensure_ascii=False))
+
+arr = walk(doc, sys.argv[1].split("."))
+if not isinstance(arr, list):
+    sys.exit(0)
+# Split each field path ONCE, not once per element: deps[] has ~6 fields, so re-splitting
+# inside the loop is 6N string operations for no gain.
+fields = [f.split(".") for f in sys.argv[2:]]
+out = []
+for el in arr:
+    out.append("\x1f".join(val(walk(el, f)) for f in fields) + "\x1e")
+sys.stdout.write("".join(out))' "$@" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------

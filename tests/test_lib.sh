@@ -27,6 +27,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 pass=0 fail=0 backends_run=0
 US=$'\037'
+RS=$'\036'
 
 eq() {  # $1 = label, $2 = expected, $3 = actual
   if [ "$2" = "$3" ]; then
@@ -447,6 +448,155 @@ worktree: two' "$err"
   contains 'directory at the profile path warns' 'not a regular file' "$err"
   rmdir "$target"
 
+  # --- wt_json_records ------------------------------------------------------
+  # The array reader. Everything here is asserted on BOTH backends, because this is a
+  # second implementation of wt_json_get's value rendering and the two have already
+  # genuinely diverged twice in this library's history (non-ASCII escaping, and a
+  # UTF-8 BOM). Byte-for-byte agreement is the property under test, not "it works".
+  recs='{"deps":[
+      {"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"composer install"},
+      {"dir":"node_modules","lock":"pnpm-lock.yaml","strategy":"install"}],
+    "empty":[],"notarr":{"a":1},"scalar":"str",
+    "types":[{"n":5,"neg":-2,"flt":1.5,"t":true,"f":false,"o":{"x":1},"arr":[1,2],"nul":null}],
+    "deep":{"inner":[{"dir":"a"},{"dir":"b"}]},
+    "seps":[{"v":"a\u001fb","w":"keep"},{"v":"c\u001ed","w":"also"}],
+    "nested":[{"p":{"var":"SERVER_PORT"}}],
+    "nonobj":["hello",42,null],
+    "multiline":[{"install":"line1\nline2"}],
+    "unicode":[{"v":"café — über"}],
+    "tricky":[{"v":"a b  c"},{"v":""},{"v":"--flag=x"}]}'
+  jr() { printf '%s' "$recs" | wt_json_records "$@"; }
+
+  # The whole point: one record per element, US between fields, RS after EVERY record
+  # including the last. A missing optional field is an EMPTY field, not a dropped one —
+  # dropping it would shift every later column, which is the defect this separator
+  # choice exists to prevent.
+  eq 'records: two elements, missing optional field kept as empty' \
+    "vendor${US}composer.lock${US}hardlink${US}composer install${RS}node_modules${US}pnpm-lock.yaml${US}install${US}${RS}" \
+    "$(jr deps dir lock strategy install)"
+
+  # Data conditions all produce no records and rc 0. rc must NOT depend on the backend:
+  # jq exits non-zero on a parse error while python exits 0, so the function normalises.
+  eq 'records: empty array -> nothing' '' "$(jr empty a)"
+  rc_is 'records: empty array -> rc 0' 0 "$(jr empty a >/dev/null; echo $?)"
+  eq 'records: path is an object, not an array -> nothing' '' "$(jr notarr a)"
+  rc_is 'records: not-an-array -> rc 0' 0 "$(jr notarr a >/dev/null; echo $?)"
+  eq 'records: absent path -> nothing' '' "$(jr nope a)"
+  rc_is 'records: absent path -> rc 0' 0 "$(jr nope a >/dev/null; echo $?)"
+  eq 'records: path is a scalar -> nothing' '' "$(jr scalar a)"
+  eq 'records: unparseable document -> nothing' '' \
+    "$(printf 'not json at all' | wt_json_records deps dir)"
+  rc_is 'records: unparseable document -> rc 0, same on both backends' 0 \
+    "$(printf 'not json at all' | wt_json_records deps dir >/dev/null; echo $?)"
+
+  # Value rendering must match wt_json_get exactly, including python's True/False trap.
+  eq 'records: scalar rendering matches wt_json_get' \
+    "5${US}-2${US}1.5${US}true${US}false${US}{\"x\":1}${US}[1,2]${US}${RS}" \
+    "$(jr types n neg flt t f o arr nul)"
+
+  # The DOTTED array path — half of the documented traversal, and previously untested:
+  # a mutation replacing the split with a single top-level lookup passed every assertion.
+  eq 'records: a dotted path to the array itself' "a${RS}b${RS}" \
+    "$(jr deep.inner dir)"
+
+  # An option-like path must be DATA, not a jq option. Measured before the `--` was added:
+  # jq returned nothing while python returned a record, so the same committed profile gave
+  # two teammates different dependency lists.
+  eq 'records: an option-like path is data, not an option' "${RS}${RS}" "$(jr deps -i)"
+  eq 'get: an option-like path is data, not an option' 'x' \
+    "$(printf '%s' '{"-i":"x"}' | wt_json_get -i)"
+
+  # An empty path argument is a caller error, not "the whole document": jq's split(".") on
+  # "" yields [], and getpath([]) returns the document, where python returned "".
+  rc_is 'records: an empty field path is rejected' 1 "$(jr deps '' >/dev/null 2>&1; echo $?)"
+  rc_is 'records: an empty array path is rejected' 1 "$(jr '' dir >/dev/null 2>&1; echo $?)"
+  rc_is 'get: an empty path is rejected' 1 \
+    "$(printf '%s' '{}' | wt_json_get '' >/dev/null 2>&1; echo $?)"
+
+  # A valid document followed by junk, and two concatenated documents. jq reads stdin as a
+  # STREAM, so both parsed happily there while python's json.load raised — one teammate got
+  # a working profile from bytes that gave another teammate none.
+  eq 'records: a document with trailing junk yields nothing' '' \
+    "$(printf '%s' '{"deps":[{"dir":"v"}]} junk' | wt_json_records deps dir)"
+  eq 'get: a document with trailing junk yields nothing' '' \
+    "$(printf '%s' '{"a":"1"} junk' | wt_json_get a)"
+  eq 'records: two concatenated documents yield nothing' '' \
+    "$(printf '%s' '{"deps":[{"dir":"v"}]}{"deps":[{"dir":"w"}]}' | wt_json_records deps dir)"
+  eq 'get: two concatenated documents yield nothing' '' \
+    "$(printf '%s' '{"a":"1"}{"a":"2"}' | wt_json_get a)"
+
+  # A value carrying the separators themselves. JSON encodes \u001f/\u001e legally and the
+  # profile arrives on colleagues' branches, so without stripping this injects a phantom
+  # field and shifts `w` into the wrong variable — undetectable by any caller.
+  eq 'records: an embedded US in a value cannot inject a field' \
+    "ab${US}keep${RS}cd${US}also${RS}" "$(jr seps v w)"
+  n=0 cols=''
+  while IFS=$US read -r -d "$RS" sv sw; do
+    n=$((n + 1))
+    cols="${cols}[${sv}|${sw}]"
+  done < <(jr seps v w)
+  eq 'records: separator-bearing values still yield exactly two records' 2 "$n"
+  eq 'records: the second field stays in its own column' '[ab|keep][cd|also]' "$cols"
+  eq 'get: an embedded US in a value cannot shift a column' "ab${US}keep" \
+    "$(printf '%s' '{"a":"a\u001fb","b":"keep"}' | wt_json_get a b)"
+
+  # Whitespace runs, an empty value and a leading-dash value, read through the documented
+  # loop: IFS=$US must not collapse spaces the way IFS-whitespace would.
+  eq 'records: whitespace runs, empty and dash-leading values survive' \
+    "a b  c${RS}${RS}--flag=x${RS}" "$(jr tricky v)"
+  n=0 tvals=''
+  while IFS=$US read -r -d "$RS" tv; do
+    n=$((n + 1))
+    tvals="${tvals}<${tv}>"
+  done < <(jr tricky v)
+  eq 'records: an element whose only field is empty is still a record' 3 "$n"
+  eq 'records: IFS=US does not collapse a run of spaces' '<a b  c><><--flag=x>' "$tvals"
+
+  # No JSON backend at all must be a CALLER error, so a toolless machine can never be
+  # mistaken for a repo with no dependencies. `command -v` and `printf` are builtins, so an
+  # empty PATH is safe here. Mutation-confirmed: relaxing this guard to `return 0` left
+  # every other assertion passing.
+  rc_is 'records: no JSON backend is a caller error, not an empty array' 1 \
+    "$(printf '%s' '{"d":[{"i":"x"}]}' | (
+         wt_has_json() { return 1; }
+         wt_json_records d i >/dev/null 2>&1; echo $?) )"
+  eq 'records: dotted path inside an element' "SERVER_PORT${RS}" "$(jr nested p.var)"
+  eq 'records: non-object elements yield empty fields, not errors' \
+    "${RS}${RS}${RS}" "$(jr nonobj a)"
+  eq 'records: non-ASCII is not escaped (a proven divergence point)' \
+    "café — über${RS}" "$(jr unicode v)"
+
+  # rc 1 is reserved for CALLER errors, so a machine with no backend cannot be mistaken
+  # for a repo with no dependencies.
+  rc_is 'records: one argument is a usage error' 1 "$(jr deps >/dev/null 2>&1; echo $?)"
+  rc_is 'records: no arguments is a usage error' 1 "$(jr >/dev/null 2>&1; echo $?)"
+
+  # A newline inside a value is exactly why records are RS-delimited: `install` is a
+  # command string, where a line continuation is legal. Newline-delimited records would
+  # silently split this element in two and shift every column after it.
+  n=0
+  while IFS=$US read -r -d "$RS" v; do
+    n=$((n + 1))
+    eq 'records: a value containing a newline survives intact' "$(printf 'line1\nline2')" "$v"
+  done < <(jr multiline install)
+  eq 'records: a newline in a value does not split the record' 1 "$n"
+
+  # The loop idiom in the function's own docs must read every element, last included.
+  n=0 seen=''
+  while IFS=$US read -r -d "$RS" rdir rlock; do
+    n=$((n + 1))
+    seen="$seen$rdir:$rlock "
+  done < <(jr deps dir lock)
+  eq 'records: the documented read loop sees the final element' 2 "$n"
+  eq 'records: the read loop splits fields correctly on every element' \
+    'vendor:composer.lock node_modules:pnpm-lock.yaml ' "$seen"
+
+  # A UTF-8 BOM is the other proven divergence point: jq accepts it, so python must too,
+  # or one teammate gets dependencies and another gets none from the same committed file.
+  printf '\357\273\277%s' '{"deps":[{"dir":"vendor"}]}' >"$TMP/bom.json"
+  eq 'records: a UTF-8 BOM is tolerated on both backends' "vendor${RS}" \
+    "$(wt_json_records deps dir <"$TMP/bom.json")"
+
   # --- caller safety --------------------------------------------------------
   # The caller runs `set -euo pipefail`; a library function returning non-zero, or
   # referencing an unset variable, must not take the session down. ADR-003.
@@ -457,6 +607,9 @@ worktree: two' "$err"
     wt_load_profile /nonexistent >/dev/null
     wt_slugify '' >/dev/null
     wt_expand '{name}' >/dev/null
+    printf '%s' '{\"deps\":[]}' | wt_json_records deps dir >/dev/null
+    printf '%s' 'broken' | wt_json_records deps dir >/dev/null
+    wt_json_records >/dev/null 2>&1 || true
     . '$LIB'
     printf SURVIVED" 2>/dev/null)
   eq 'the library never kills a caller under set -euo pipefail' 'SURVIVED' "$out"
