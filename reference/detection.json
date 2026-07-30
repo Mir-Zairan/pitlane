@@ -1,0 +1,419 @@
+{
+  "_comment": [
+    "GROUND TRUTH for calibration's mechanical detection. /worktree-calibrate does not carry this",
+    "knowledge in its prose and docs/02-architecture.md does not carry a second copy — both defer",
+    "here, because one table restated in three places is a doc-rot generator. hooks/scripts/detect.sh",
+    "reads this file; the skill narrates what detect.sh returns.",
+    "",
+    "HOOKS DO NOT READ THIS FILE. Detection happens once, at calibrate time, with a human present",
+    "(ADR-002). By the time a hook runs, every answer derived from here is already in the target",
+    "repo's committed .claude/worktree-profile.json.",
+    "",
+    "To add an ecosystem: add an entry to `deps` (or a `variant` to an existing one). That is the",
+    "whole change — no edit to detect.sh, no edit to the skill.",
+    "",
+    "MATCHING IS FIRST-MATCH-WINS IN ARRAY ORDER. `shells` is ordered by precedence on purpose:",
+    "flake.nix beats shell.nix beats .envrc beats .devcontainer beats the null catch-all. `deps`",
+    "entries are independent of each other (a repo can match composer.lock AND pnpm-lock.yaml), but a",
+    "single entry's `variants` are first-match-wins and fall through to the entry's own defaults, and",
+    "see `sameDirPolicy` for what happens when two entries claim one directory.",
+    "",
+    "`reason` strings are DATA, not decoration. They are what the developer is shown when calibration",
+    "proposes a value, so they must state the why in one line a developer can disagree with. Improvised",
+    "reasons would differ run to run; these do not."
+  ],
+
+  "detectionVersion": 1,
+
+  "_comment_sameDirPolicy": [
+    "Several markers can resolve to the same `dir` — a repo mid-migration with both pnpm-lock.yaml and",
+    "package-lock.json, or both bun.lock and bun.lockb, all claim node_modules. Two profile entries for",
+    "one directory is not a cosmetic problem: their strategies conflict (one hardlinks a tree the other",
+    "then reinstalls) and bootstrap does the work twice.",
+    "So: at most ONE entry per `dir`. Ties are broken by array order — the first matching entry wins —",
+    "and calibration must SAY which markers it dropped and why, never drop one silently. A repo with two",
+    "live lockfiles for one directory is usually a mistake the developer wants to know about."
+  ],
+  "sameDirPolicy": { "maxEntriesPerDir": 1, "tieBreak": "array-order", "announceDropped": true },
+
+  "deps": [
+    {
+      "markers": ["composer.lock"],
+      "dir": "vendor",
+      "strategy": "hardlink",
+      "install": "composer install --no-interaction --no-progress",
+      "verify": "test -r vendor/autoload.php",
+      "reason": "composer materialises real bytes per project, so a hardlink copy is near-instant and costs almost no disk (ADR-004)",
+      "hazards": ["composer-post-install"]
+    },
+    {
+      "markers": ["pnpm-lock.yaml"],
+      "dir": "node_modules",
+      "strategy": "install",
+      "install": "pnpm install --frozen-lockfile",
+      "reason": "pnpm already content-addresses packages in a global store and hardlinks them in, so the tree is mostly not real disk and sharing it is unsafe — node_modules/.modules.yaml records the project it was installed for (ADR-005)",
+      "hazards": ["npm-postinstall"]
+    },
+    {
+      "markers": ["package-lock.json"],
+      "dir": "node_modules",
+      "strategy": "hardlink",
+      "install": "npm ci",
+      "reason": "npm materialises real bytes per project, so hardlinking beats reinstalling (ADR-004)",
+      "hazards": ["npm-postinstall"]
+    },
+    {
+      "markers": ["yarn.lock"],
+      "dir": "node_modules",
+      "strategy": "hardlink",
+      "install": "yarn install --frozen-lockfile",
+      "reason": "classic yarn materialises real bytes per project, so hardlinking beats reinstalling (ADR-004)",
+      "hazards": ["npm-postinstall"],
+      "variants": [
+        {
+          "when": { "exists": ".yarnrc.yml" },
+          "dir": ".yarn/cache",
+          "strategy": "install",
+          "install": "yarn install --immutable",
+          "reason": "Yarn Berry keeps its own zip cache and, under Plug'n'Play, has no node_modules to share at all — so install rather than hardlink, and --frozen-lockfile is the deprecated spelling of --immutable (ADR-005)"
+        }
+      ]
+    },
+    {
+      "markers": ["bun.lock", "bun.lockb"],
+      "dir": "node_modules",
+      "strategy": "install",
+      "install": "bun install --frozen-lockfile",
+      "reason": "bun installs from its own global cache, so a fresh install is cheap and sharing the tree buys nothing (ADR-005). bun.lockb is the pre-1.2 binary lockfile; newer repos use the text bun.lock — one entry covers both, since a repo mid-migration must not get two",
+      "hazards": ["npm-postinstall"]
+    },
+    {
+      "markers": ["uv.lock"],
+      "dir": ".venv",
+      "strategy": "install",
+      "install": "uv sync --frozen",
+      "reason": "uv hardlinks from its own global cache and a sync is seconds, so installing is cheaper and safer than sharing a venv whose scripts hard-code their own absolute paths (ADR-005)"
+    },
+    {
+      "markers": ["poetry.lock"],
+      "dir": ".venv",
+      "strategy": "hardlink",
+      "install": "poetry install",
+      "reason": "poetry materialises real bytes into the project venv, so hardlinking beats reinstalling (ADR-004) — but ONLY when the venv is in-project; see requiresDir",
+      "requiresDir": true,
+      "fallbackStrategy": "install",
+      "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and there is nothing in the repo to hardlink. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
+    },
+    {
+      "markers": ["Pipfile.lock"],
+      "dir": ".venv",
+      "strategy": "hardlink",
+      "install": "pipenv sync",
+      "reason": "pipenv materialises real bytes into the project venv, so hardlinking beats reinstalling (ADR-004) — but ONLY when the venv is in-project; see requiresDir",
+      "requiresDir": true,
+      "fallbackStrategy": "install",
+      "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so proposing hardlink unconditionally would name a directory that is not there."
+    },
+    {
+      "markers": ["Gemfile.lock"],
+      "dir": "vendor/bundle",
+      "strategy": "hardlink",
+      "install": "bundle install",
+      "reason": "a vendored bundle is real bytes per project, so hardlinking beats reinstalling (ADR-004) — but ONLY when bundler is configured to vendor; see requiresDir",
+      "requiresDir": true,
+      "fallbackStrategy": "install",
+      "notes": "vendor/bundle exists only when bundler is configured with a `path` (check .bundle/config). Otherwise gems are installed into the system/rbenv gem home and there is nothing per-project to copy.",
+      "hazards": ["ruby-postinstall"]
+    },
+    {
+      "markers": ["mix.lock"],
+      "dir": "deps",
+      "strategy": "hardlink",
+      "install": "mix deps.get",
+      "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching (ADR-004)"
+    },
+    {
+      "markers": ["Cargo.lock"],
+      "dir": null,
+      "strategy": "skip",
+      "install": "cargo fetch",
+      "reason": "crate sources are already shared through CARGO_HOME, and target/ is build output that a stale hardlink actively corrupts for incremental builds — so there is nothing per-project worth copying (ADR-004)",
+      "notes": "dir is null rather than \"target\" on purpose: `install` is documented as the command that populates `dir`, and `cargo fetch` populates CARGO_HOME, not target/. Nothing here is managed, so naming a directory would be a claim the entry does not honour."
+    },
+    {
+      "markers": ["go.sum"],
+      "dir": null,
+      "strategy": "skip",
+      "install": "go mod download",
+      "reason": "go has no per-project dependency directory at all — GOMODCACHE is already shared between every checkout on the machine, so there is nothing for a worktree to copy (ADR-004)"
+    }
+  ],
+
+  "shells": [
+    {
+      "marker": "flake.nix",
+      "shell": "nix develop --command",
+      "shellArgs": "argv",
+      "reason": "hooks launch from the host shell, where this project's toolchain is not on PATH; a flake means `nix develop` is the way in"
+    },
+    {
+      "marker": "shell.nix",
+      "shell": "nix-shell --run",
+      "shellArgs": "string",
+      "reason": "a non-flake nix project enters through nix-shell, which takes the command as ONE STRING rather than as argv"
+    },
+    {
+      "marker": ".envrc",
+      "shell": "direnv exec .",
+      "shellArgs": "argv",
+      "reason": "direnv already encodes how to enter this project's environment, and `direnv exec .` reproduces it non-interactively"
+    },
+    {
+      "marker": ".devcontainer",
+      "shell": "",
+      "shellArgs": "argv",
+      "warn": "this repo's toolchain is defined by a devcontainer, but a hook runs on the HOST. Installs will use whatever host tooling exists, which may be the wrong version or absent entirely. Set `shell` by hand (for example to a `docker compose run --rm <service>` wrapper) if host installs are wrong.",
+      "reason": "a devcontainer describes a container the hook is not running inside, so there is no correct non-interactive wrapper to infer"
+    },
+    {
+      "marker": null,
+      "shell": "",
+      "shellArgs": "argv",
+      "reason": "no toolchain marker found, so commands run on the host shell as-is — which is correct for a repo whose tooling is simply installed globally"
+    }
+  ],
+
+  "shellProbe": {
+    "_comment": [
+      "After proposing a shell, calibration runs ONE bounded version check per detected tool. Seconds,",
+      "no side effects, no database, no install. This catches the largest real class of 'the profile",
+      "looks right and is wrong': a wrong wrapper, or a toolchain absent from the host.",
+      "",
+      "`versionArgs` is per tool because there is no universal spelling. `go --version` does not exist —",
+      "it exits non-zero with a usage error — so hard-coding `--version` would report 'toolchain absent'",
+      "for every healthy Go repo, which is precisely the false positive the probe exists to avoid.",
+      "",
+      "Full prove-by-installing is deliberately NOT done here: it costs minutes, and an install that",
+      "migrates the shared database exits 0, so the dangerous variant is exactly the one that passes."
+    ],
+    "timeoutSeconds": 60,
+    "tools": [
+      { "marker": "composer.lock", "tool": "composer", "versionArgs": "--version" },
+      { "marker": "pnpm-lock.yaml", "tool": "pnpm", "versionArgs": "--version" },
+      { "marker": "package-lock.json", "tool": "npm", "versionArgs": "--version" },
+      { "marker": "yarn.lock", "tool": "yarn", "versionArgs": "--version" },
+      { "marker": "bun.lock", "tool": "bun", "versionArgs": "--version" },
+      { "marker": "bun.lockb", "tool": "bun", "versionArgs": "--version" },
+      { "marker": "uv.lock", "tool": "uv", "versionArgs": "--version" },
+      { "marker": "poetry.lock", "tool": "poetry", "versionArgs": "--version" },
+      { "marker": "Pipfile.lock", "tool": "pipenv", "versionArgs": "--version" },
+      { "marker": "Gemfile.lock", "tool": "bundle", "versionArgs": "--version" },
+      { "marker": "mix.lock", "tool": "mix", "versionArgs": "--version" },
+      { "marker": "Cargo.lock", "tool": "cargo", "versionArgs": "--version" },
+      { "marker": "go.sum", "tool": "go", "versionArgs": "version" }
+    ]
+  },
+
+  "hazards": [
+    {
+      "id": "composer-post-install",
+      "manifest": "composer.json",
+      "probe": "scripts.post-install-cmd",
+      "action": "neutralise",
+      "neutralise": "--no-scripts",
+      "reason": "composer runs post-install-cmd on every `composer install`. In the repo this design was drawn from, that chain reaches a database migration — so bootstrapping a worktree would migrate the SHARED development database that every other worktree and the main checkout also point at.",
+      "corroboration": "CI is usually already guarding this; if the repo's workflows pass --no-scripts, say so — it is independent confirmation, not a guess."
+    },
+    {
+      "id": "npm-postinstall",
+      "manifest": "package.json",
+      "probe": "scripts.postinstall",
+      "action": "note",
+      "reason": "a postinstall that builds assets is real work a runnable worktree genuinely needs, so keep it — but it is usually the single largest part of bootstrap time, and the developer should know that is where the wait comes from.",
+      "corroboration": null
+    },
+    {
+      "id": "ruby-postinstall",
+      "manifest": "Rakefile",
+      "probe": null,
+      "action": "note",
+      "reason": "bundler itself runs no post-install hook, but many Rails repos wrap `bundle install` in a setup task that also loads the schema. If the install command comes from such a task rather than from bundler directly, check what else it does.",
+      "corroboration": null
+    }
+  ],
+
+  "escalations": [
+    {
+      "id": "migration",
+      "action": "refuse-and-ask",
+      "caseInsensitive": true,
+      "pattern": "migrat|doctrine:|schema:update|schema-update|schema:load|schema.?load|db:migrate|db:update|db:reset|db:fresh|db:wipe|db:setup|db:seed|db:import|artisan migrate|rake db:|alembic|prisma (migrate|db push)|drizzle-kit (push|migrate)|atlas schema apply|flyway|liquibase|tenants:run-command|(mysql|psql|mariadb)[^|]*<",
+      "resolveIndirection": {
+        "_comment": [
+          "MATCH THE WHOLE CHAIN, NOT THE FIRST LINK. The probe returns a script's immediate value, and in",
+          "real repos that value is almost always a reference to somewhere else. The reference repo is the",
+          "worked example and it defeats a naive one-level match twice over:",
+          "  post-install-cmd -> [\"@db\", ...]          the pattern sees only \"@db\"",
+          "  @db              -> [..., \"@db:migrate\"]  one more hop to the match",
+          "  @db:migrate      -> acme\\Composer\\Scripts::dbMigrate   camelCase, hence caseInsensitive",
+          "So follow these forms until they bottom out, and match the pattern against every level."
+        ],
+        "forms": [
+          "@name — another script in the same manifest",
+          "npm run <name> / pnpm run <name> / yarn <name> — another script in package.json",
+          "make <target> / just <recipe> — a Makefile or justfile target",
+          "bin/console <cmd>, php artisan <cmd>, rake <task>, mix <task> — a framework command",
+          "Fully\\Qualified\\Class::method — a code callback; read the method if it is in the repo",
+          "a path to a script file in the repo — read it"
+        ],
+        "maxDepth": 5,
+        "unresolvedAction": "refuse-and-ask",
+        "unresolvedReason": "A chain that cannot be followed is not evidence of safety. If the script resolves to code this detection cannot read, say exactly what was found and how far the trail went, then ASK — do not fall back to `note`."
+      },
+      "reason": "An install that migrates is the one failure mode with no recovery: it runs against the SHARED development database. Never neutralise this silently. State exactly which script was found and what it calls, then ASK — the developer may know it is safe, or may need a different command entirely."
+    }
+  ],
+
+  "corroboration": {
+    "_comment": [
+      "Where this repo may have ALREADY answered the same question, in an artifact that has been",
+      "tested. Read these to CORROBORATE a proposal, and cite the file when you do — a hazard flag",
+      "backed by 'your own CI already passes --no-scripts' is far more convincing than a rule.",
+      "",
+      "NEVER IMPORT THE FLAGS VERBATIM. This was checked against the reference repo and it matters:",
+      "its workflows run `composer install --no-progress --prefer-dist --optimize-autoloader --no-dev",
+      "--classmap-authoritative --no-scripts` and `pnpm install --frozen-lockfile --filter assets`.",
+      "Imported as-is, a development worktree would get NO dev dependencies (no phpunit, no phpstan)",
+      "and only one package of a four-package workspace. CI optimises for a throwaway machine running",
+      "one job; a worktree is a development environment. Take the CORROBORATION, drop the flags.",
+      "",
+      "STRIPPING IS NOT UNCONDITIONAL. A flag that SUPPRESSES SOMETHING DANGEROUS must be kept, not",
+      "stripped — see keepFlags. Removing such a flag would turn 'this repo's CI deliberately disabled",
+      "dependency lifecycle scripts' into 'a hook now runs them unattended at session start'."
+    ],
+    "sources": [
+      ".github/workflows",
+      ".gitlab-ci.yml",
+      "Makefile",
+      "justfile",
+      "Taskfile.yml",
+      "docker-compose.yml",
+      "docker-compose.yaml",
+      "compose.yml",
+      "compose.yaml",
+      ".devcontainer/devcontainer.json"
+    ],
+    "keepFlags": {
+      "_comment": "Safety flags. Finding one of these in CI is corroboration to KEEP it in the proposed command, never to remove it. `--ignore-scripts` and `--no-scripts` suppress arbitrary dependency- or repo-authored lifecycle code; that is exactly what a hook running unattended before the UI renders must not execute.",
+      "flags": ["--ignore-scripts", "--no-scripts", "--frozen-lockfile", "--immutable", "--locked"]
+    },
+    "stripFlags": [
+      "--no-dev",
+      "--production",
+      "--omit=dev",
+      "--only=production",
+      "--no-optional",
+      "--classmap-authoritative",
+      "--optimize-autoloader",
+      "--prefer-dist",
+      "-w",
+      "--workspace-root"
+    ],
+    "stripFlagsWithValue": {
+      "_comment": "These take a value, so strip the flag AND its argument — and handle the `--flag=value` form too. NOTE `-w` is deliberately NOT here: for npm it is short for --workspace and takes a value, but for pnpm it is --workspace-root and is a BOOLEAN. Treating it as valued would swallow the next real flag, turning `pnpm install -w --frozen-lockfile` into `pnpm install` — a non-frozen install that can rewrite the lockfile. It is in stripFlags instead, which is safe for both.",
+      "flags": ["--filter", "--workspace"]
+    },
+    "neverFrom": {
+      "shell": "CI has no nix and no direnv — it installs the toolchain itself. A shell wrapper taken from CI would be wrong on a developer machine, and wrong in a way that only shows up as 'command not found' inside a hook."
+    }
+  },
+
+  "configCandidates": {
+    "_comment": [
+      "Gitignored config a fresh checkout is missing and cannot regenerate. These become a proposed",
+      ".worktreeinclude, NOT profile `copy` entries — .worktreeinclude stays authoritative (ADR-007),",
+      "it is native behaviour that keeps working if this plugin is uninstalled, and repos already",
+      "using it get taken over transparently.",
+      "",
+      "A candidate only counts if it is ACTUALLY GITIGNORED. Native .worktreeinclude copying applies",
+      "the gitignored-only rule, so listing a tracked file there does nothing, and listing a file",
+      "that does not exist is noise. Confirm with `git check-ignore` before proposing."
+    ],
+    "globs": [
+      ".env",
+      ".env.local",
+      ".env.*.local",
+      ".env.development",
+      ".env.development.local",
+      ".envrc",
+      ".envrc.local",
+      "*.local.php",
+      "*.local.yaml",
+      "*.local.yml",
+      "config/local.php",
+      "docker-compose.override.yml",
+      "docker-compose.override.yaml"
+    ],
+    "neverPropose": {
+      "_comment": "Credentials, keys and machine state. Secrets belong in a copied .env, never in the committed profile (ADR-008) — and several of these are actively harmful to duplicate: a second worktree writing a copied SQLite file or terraform state corrupts the original. Registry-credential files are here as a class: auth.json (composer), .npmrc (npm), .netrc, .git-credentials all carry tokens, so none of them is proposed.",
+      "globs": [
+        "*.pem",
+        "*.key",
+        "*.crt",
+        "*.p12",
+        "*.pfx",
+        "*.keystore",
+        "id_rsa*",
+        "id_ed25519*",
+        "id_ecdsa*",
+        "id_dsa*",
+        "auth.json",
+        ".npmrc",
+        ".netrc",
+        ".pgpass",
+        ".my.cnf",
+        ".git-credentials",
+        "*service-account*.json",
+        "*credentials*.json",
+        "terraform.tfstate",
+        "terraform.tfstate.backup",
+        "*.sqlite",
+        "*.sqlite3",
+        "*.db"
+      ]
+    }
+  },
+
+  "runtimeHints": {
+    "_comment": [
+      "WHERE TO LOOK FOR HINTS ONLY. Layer 3 is never inferred (ADR-006): nothing in a repo states",
+      "that an env var selects a tenant database. Everything found here is offered as a HINT next to",
+      "an AskUserQuestion, never as a pre-filled default, and 'no runtime isolation' is always an",
+      "offered outcome. A `runtime` block the developer did not explicitly confirm must not be written.",
+      "",
+      "These are search locations and patterns, deliberately NOT rules that conclude anything."
+    ],
+    "portSources": [
+      "docker-compose.yml",
+      "docker-compose.yaml",
+      "compose.yml",
+      "compose.yaml",
+      ".env",
+      ".env.local",
+      "Makefile",
+      "justfile",
+      "vite.config.js",
+      "vite.config.ts",
+      "webpack.config.js",
+      "package.json"
+    ],
+    "portVarPattern": "(SERVER_PORT|APP_PORT|HTTP_PORT|PORT|DEV_PORT|VITE_PORT|WEB_PORT)",
+    "dbVarPattern": "(DATABASE_URL|DATABASE_NAME|DB_DATABASE|DB_NAME|MYSQL_DATABASE|POSTGRES_DB|INSTALLATION_NAME|TENANT|SCHEMA)",
+    "serviceSources": [
+      "docker-compose.yml",
+      "docker-compose.yaml",
+      "compose.yml",
+      "compose.yaml"
+    ]
+  }
+}

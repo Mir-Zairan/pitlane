@@ -1,0 +1,203 @@
+{
+  "_comment": [
+    "TEMPLATE for the per-repo profile. /worktree-calibrate fills this in by examining the repo, asking",
+    "about anything it must not guess, and writing the result to <target-repo>/.claude/worktree-profile.json.",
+    "It is COMMITTED to the target repo (ADR-008) so a teammate who installs the plugin gets a working",
+    "setup with no calibration run of their own.",
+    "",
+    "NO SECRETS IN HERE, EVER. A database password for a seed step is read from the environment or from",
+    "the copied .env — never written into a committed file (ADR-008).",
+    "",
+    "Annotation is by `_comment` keys, NOT by `//` comments. docs/02-architecture.md sketches this schema",
+    "as jsonc for readability, but a real profile has to be parsed by jq and by python3, and neither",
+    "accepts comments. Every `_comment` key is ignored by the validator wherever it appears.",
+    "",
+    "Omit any optional block entirely rather than filling it with nulls. Absence is meaningful: no",
+    "`runtime` block means TOUCH NOTHING (ADR-006), which is a valid and deliberately offered outcome.",
+    "",
+    "EVERY PATH FIELD IS CONTAINED, AND THAT IS AN ENFORCED INVARIANT, NOT A CONVENTION.",
+    "`deps[].dir`, `deps[].lock`, `copy[]`, `runtime.env.file`, `runtime.seed` and `runtime.teardown`",
+    "are all relative to the repo root and must resolve INSIDE it. Absolute paths, any `..` component,",
+    "and empty or `.` values are rejected by validation before anything acts on them.",
+    "This is not defensive tidiness: because the profile is committed, it arrives with any branch anyone",
+    "pushes, and consumers act on these fields with `cp -al`, file writes and teardown deletion. A `dir`",
+    "of `../../..` would put those operations on the main checkout or the home directory — damage",
+    "strictly outside the worktree, which is the one boundary this design has to hold."
+  ],
+
+  "schemaVersion": 1,
+
+  "_comment_shell": [
+    "How to enter the project's toolchain. Hooks launch from the host shell, where the project's",
+    "PHP/Node/Python is usually not on PATH. Empty string means run on the host as-is.",
+    "Detected from flake.nix / shell.nix / .envrc / .devcontainer — see reference/detection.json.",
+    "Examples: \"\" | \"nix develop --command\" | \"nix-shell --run\" | \"direnv exec .\" |",
+    "\"docker compose run --rm app\""
+  ],
+  "shell": "nix develop --command",
+
+  "_comment_shellArgs": [
+    "NOT YET HONOURED — owner: Phase 3. Phase 3's run_in_shell() currently derives the calling",
+    "convention by matching the `shell` string against a known list, so a profile setting this today is",
+    "ignored. Phase 3 must either read it or drop it from this schema; an inert documented field is",
+    "worse than no field.",
+    "",
+    "How the wrapper in `shell` takes the command it wraps:",
+    "  \"argv\"   — the command follows as separate arguments: `nix develop --command composer install`",
+    "  \"string\" — the command must be ONE argument: `nix-shell --run \"composer install\"`",
+    "Getting it wrong is not a graceful failure. `nix-shell --run composer install` treats `install`",
+    "as a nix file to load, and `nix develop --command \"composer install\"` looks for a binary literally",
+    "named \"composer install\".",
+    "",
+    "It is recorded rather than re-derived because string-matching only works for wrappers already on",
+    "the list. A hand-written `shell` — `docker compose run --rm app`, an `sh -c` wrapper, a repo's own",
+    "`./dev` script — has no entry to match, so a consumer that infers has to guess exactly where",
+    "guessing is ungraceful. Optional; defaults to \"argv\", correct for everything except",
+    "`nix-shell --run` and `sh -c`-shaped wrappers."
+  ],
+  "shellArgs": "argv",
+
+  "_comment_copy": [
+    "Extra gitignored files to copy in. MERGED with .worktreeinclude, which stays authoritative",
+    "(ADR-007). Usually empty, and calibration prefers writing a .worktreeinclude to filling this in:",
+    ".worktreeinclude is native behaviour that keeps working if this plugin is uninstalled.",
+    "Same .gitignore syntax, and the same gitignored-only rule — a tracked file listed here is skipped."
+  ],
+  "copy": [],
+
+  "_comment_deps": [
+    "One entry per dependency directory the repo needs before it can run. At most one per `dir` — see",
+    "detection.json's sameDirPolicy for what happens when two lockfiles claim the same directory.",
+    "",
+    "Note the detection side lists `markers` (plural, because one rule can cover both `bun.lock` and",
+    "`bun.lockb`) while a profile entry records the single `lock` that was actually found. Detection",
+    "matches on any marker; the profile names the one in this repo.",
+    "  dir           where the dependencies land, relative to the repo root. null means this ecosystem",
+    "                has no per-project directory (Go), so there is nothing to copy or hardlink.",
+    "  lock          the lockfile whose content decides whether a copy is still valid.",
+    "  strategy      install | hardlink | store | skip",
+    "                  install  — run the install command in the new worktree. Correct for any package",
+    "                             manager with its own global content-addressable store (pnpm, bun, uv,",
+    "                             Yarn Berry): the tree is mostly not real disk and sharing it is unsafe",
+    "                             (ADR-005).",
+    "                  hardlink — `cp -al` from the main checkout. Correct where the manager materialises",
+    "                             real bytes per project (composer vendor/, npm/classic-yarn node_modules,",
+    "                             a poetry/pipenv .venv). Near-instant, almost no disk (ADR-004).",
+    "                  store    — the lockfile-keyed shared store. RESERVED: it is a valid schema value",
+    "                             but calibration never proposes it, and no phase has built it yet.",
+    "                  skip     — the plugin does not touch this directory at all. Correct where the",
+    "                             artefacts are build output backed by an already-shared cache",
+    "                             (Cargo target/ + CARGO_HOME, GOMODCACHE). `install` is still recorded",
+    "                             so a developer can see what would populate it, but bootstrap won't run it.",
+    "  install       the command that populates `dir`, run inside `shell`.",
+    "  verify        optional, cheap sanity check. Must not mutate anything.",
+    "  lockChecksum  `cksum` output for `lock` AS OF CALIBRATION. Evidence, not configuration — see",
+    "                _comment_evidence. Deliberately stored per-dep rather than in an evidence map keyed",
+    "                by filename: the JSON reader addresses fields by dotted path, so a key like",
+    "                \"composer.lock\" would be unreachable (measured — it splits on the dot)."
+  ],
+  "deps": [
+    {
+      "dir": "vendor",
+      "lock": "composer.lock",
+      "strategy": "hardlink",
+      "install": "composer install --no-interaction --no-progress --no-scripts",
+      "verify": "composer validate --no-check-all --quiet",
+      "lockChecksum": "1234567890 397"
+    },
+    {
+      "dir": "node_modules",
+      "lock": "pnpm-lock.yaml",
+      "strategy": "install",
+      "install": "pnpm install --frozen-lockfile",
+      "lockChecksum": "987654321 41233"
+    }
+  ],
+
+  "_comment_runtime": [
+    "OMIT THIS WHOLE BLOCK to leave runtime alone. Nothing in here is ever inferred (ADR-006): nothing",
+    "in a repository states that an env var selects a tenant database, and guessing corrupts data that",
+    "is shared with colleagues. Calibration proposes candidates as hints and the developer confirms;",
+    "\"no runtime isolation\" is a valid, offered outcome.",
+    "",
+    "  slug      NOT YET HONOURED — owner: Phase 4. Phase 1's bootstrap always derives the slug with",
+    "            wt_slugify(name); a profile setting this today is silently ignored. Phase 4 must either",
+    "            implement it or drop it from the schema — an inert documented field is worse than no",
+    "            field. If it IS implemented, the result must be re-run through wt_slugify before use:",
+    "            the value below is a TEMPLATE, so a profile could set it to \"{name}\" and hand raw",
+    "            branch text to something that trusts {slug} to be [a-z0-9_]. The template ships",
+    "            \"{slug}\" for that reason — the identity mapping — not \"{name}\".",
+    "  port      derived as base + (crc32(slug) % span), so it is stable for a given worktree name.",
+    "            Collisions are possible and acceptable; teardown must never kill a port it did not",
+    "            allocate.",
+    "  env       overrides written INTO the worktree, as a file the app already loads.",
+    "  seed      repo-owned escape hatch. Calibration scaffolds a COMMENTED STUB and never invents its",
+    "            contents — a database-cloning command is the target repo's business, not this plugin's.",
+    "  teardown  repo-owned, same rule.",
+    "",
+    "Placeholders: {name} the worktree name as given, {slug} the sanitised name, {port} the derived",
+    "port, {worktree} the absolute worktree path, {root} the main checkout.",
+    "SUBSTITUTION IS NOT QUOTING. {slug} and {port} are constrained by construction; {name}, {worktree}",
+    "and {root} are raw text that can come from a colleague's branch name, so a consumer putting one in",
+    "command position must quote it itself."
+  ],
+  "runtime": {
+    "slug": "{slug}",
+    "port": { "var": "SERVER_PORT", "base": 3786, "span": 200 },
+    "env": {
+      "file": ".env.worktree.local",
+      "vars": { "INSTALLATION_NAME": "demo_{slug}" }
+    },
+    "seed": ".claude/worktree-seed.sh",
+    "teardown": ".claude/worktree-teardown.sh"
+  },
+
+  "_comment_timeouts": [
+    "Bounds on the WORK, in seconds.",
+    "",
+    "THE RULE IS bootstrapSeconds + seedSeconds < the hook's own timeout in hooks/hooks.json (600s),",
+    "not each one separately. Both run inside the SAME SessionStart hook invocation, and the platform's",
+    "timer starts first. Setting each to 600 — which the earlier draft of this template did — means the",
+    "hook is killed at 600s before either internal `timeout` guard ever fires, so the warn-and-continue",
+    "path that ADR-003 depends on never runs and the user loses exactly what ADR-003 promises they",
+    "cannot lose.",
+    "",
+    "A value of 0 is rejected, not honoured: to `timeout` it means no timeout at all, which would turn",
+    "the one guard against a hanging bootstrap into an unbounded hang on the session-start path.",
+    "",
+    "The values below leave 60s of headroom under 600s. Raise hooks.json's timeout first if a repo",
+    "genuinely needs more."
+  ],
+  "timeouts": { "bootstrapSeconds": 420, "seedSeconds": 120 },
+
+  "_comment_evidence": [
+    "WHAT THIS PROFILE WAS DERIVED FROM. Written by calibration, never edited by hand.",
+    "",
+    "READER NOT YET WIRED — owner: Phase 3. Phase 2 ships this block and the comparison helper in",
+    "lib.sh; Phase 3 owns the call site in bootstrap.sh that actually emits the warning. Until then the",
+    "block is written and validated but nothing reports on it. It is listed as a Phase 3 task so it",
+    "cannot quietly become an inert field.",
+    "",
+    "It exists so that cheap deterministic shell can notice the profile has drifted from the checkout",
+    "in front of it and say so, instead of applying stale advice in silence.",
+    "",
+    "The comparison is a string compare and a checksum, nothing more — no re-detection, no judgement,",
+    "no model. That is what keeps it legal inside a hook (ADR-002), and it warns without ever blocking",
+    "(ADR-003).",
+    "",
+    "  detectionVersion  reference/detection.json's version at calibration time. A newer shipped table",
+    "                    means re-calibrating might propose better answers.",
+    "  markers           the dependency markers found, sorted. A repo that has since gained",
+    "                    pnpm-lock.yaml has an ecosystem this profile knows nothing about.",
+    "  shellMarker       which file produced `shell` (\"flake.nix\", \"\" if none). A repo that has since",
+    "                    gained a flake.nix is now running installs on the wrong toolchain.",
+    "",
+    "Per-lockfile content lives in deps[].lockChecksum, not here — see _comment_deps.",
+    "This whole block is OPTIONAL: a profile without it is valid and simply cannot report drift."
+  ],
+  "evidence": {
+    "detectionVersion": 1,
+    "markers": ["composer.lock", "pnpm-lock.yaml"],
+    "shellMarker": "flake.nix"
+  }
+}
