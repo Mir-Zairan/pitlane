@@ -172,6 +172,11 @@ Three properties of that matching are load-bearing:
   `chainMaxDepth`) and match at every level. **Running out of hops counts as unfollowable**, or a repo
   need only nest its migration one level deeper than the budget to be reported as a fully-followed,
   migration-free chain.
+- **A script name containing a dot cannot be followed at all.** The plugin addresses JSON values by
+  dotted path, so `scripts.some.name` is unreachable and a reference to it is treated as an
+  unfollowable trail. This fails *safe* — it reports `unreadable` and asks — but it is a false alarm
+  rather than a real finding, so a repo that names its scripts `db.migrate` rather than `db:migrate`
+  will be asked about every install. Colons and dashes are followed normally; only dots are affected.
 - **An unfollowable chain is reported, but not as a match.** A trail that runs into code this cannot
   read is not evidence of safety — and it is not evidence of danger either. It gets its own
   `unreadable` label with action `confirm`, because nearly every real composer chain ends in a code
