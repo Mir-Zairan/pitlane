@@ -49,6 +49,10 @@
 #   hint             port|db|service <name> <where it was seen>
 #   warn             <message>
 #
+# WT_SKIP_PROBES=1 skips the toolchain version probes. They are the only part of detection
+# whose answer depends on the host rather than on the repository, so they are also the only
+# part a test cannot assert deterministically.
+#
 # Exit status: 0 whenever it produced a proposal, 1 only if it could not run at all — no
 # such directory, no detection table, no JSON backend. An unusual repository is never a
 # failure; it legitimately yields a proposal with no deps.
@@ -588,7 +592,15 @@ probe_tool() {  # $1 = tool, $2 = version arguments
   esac
 }
 
+# WT_SKIP_PROBES exists for the test suite and for a re-run on a repo whose toolchain is
+# known good. It is the one part of detection whose result depends on the HOST rather than on
+# the repository, so it is also the one part that cannot be asserted deterministically.
+if [ -n "${WT_SKIP_PROBES:-}" ]; then
+  emit warn "toolchain probes skipped (WT_SKIP_PROBES is set) — the shell wrapper is unverified"
+fi
+
 while IFS=$WT_US read -r -d "$WT_RS" p_marker p_tool p_args; do
+  [ -n "${WT_SKIP_PROBES:-}" ] && break
   [ -n "$p_marker" ] && [ -n "$p_tool" ] || continue
   claimed "$MATCHED_MARKERS" "$p_marker" || continue
   if out=$(probe_tool "$p_tool" "$p_args"); then
