@@ -55,8 +55,14 @@ may claim a given `dir`**. A repo mid-migration with both `pnpm-lock.yaml` and `
 would otherwise get two `node_modules` entries with contradicting strategies, so bootstrap would
 hardlink a tree and then reinstall over it. Array order breaks the tie, and calibration must **say
 which marker it dropped** — two live lockfiles for one directory is usually a mistake the developer
-wants told about. Entries with a `variants` list (only `yarn.lock` today) are first-match-wins and
-fall through to the entry's own defaults.
+wants told about.
+
+Matching is **first-match-wins per marker**. A rule may carry a `when` guard, and the guarded rule sits
+*before* the rule it refines: the Yarn Berry rule is guarded on `.yarnrc.yml`, so a Berry repo takes it
+and a classic repo falls through to the next rule naming `yarn.lock`. The table is flat for a reason —
+an earlier revision nested guarded rules inside a `variants` array on their parent, which reads well but
+cannot be consumed, because the plugin's JSON layer addresses values by dotted path and cannot index
+into an array. Ordering plus a guard expresses the same thing with no nesting.
 
 ### Caveats worth stating out loud
 
@@ -135,12 +141,18 @@ This is where a plausible profile does real damage. The hazard is not that an in
 that it **succeeds** and has side effects on state shared with every other worktree and with the main
 checkout.
 
-| Hazard | Probe | Action |
+| Hazard | Probes | Action |
 |---|---|---|
-| composer `post-install-cmd` | `scripts.post-install-cmd` in `composer.json` | **Neutralise** — append `--no-scripts` to the proposed command |
-| npm/pnpm/yarn `postinstall` | `scripts.postinstall` in `package.json` | **Note** — keep it, but tell the developer this is where bootstrap time goes |
+| composer lifecycle scripts | `pre-install-cmd`, `post-install-cmd`, `post-autoload-dump`, `post-package-install`, `post-package-update` in `composer.json` | **Neutralise** — append `--no-scripts` |
+| npm/pnpm/yarn lifecycle scripts | `preinstall`, `install`, `postinstall`, `prepare` in `package.json` | **Note** — keep it, but tell the developer this is where bootstrap time goes |
 | Rails setup-task wrapper | `Rakefile` present | **Note** — bundler has no post-install hook, but a `setup` task often loads the schema; check what the install command actually wraps |
-| Anything that runs migrations | the escalation pattern, over the **whole resolved chain** | **Refuse and ask** — never neutralise silently |
+| A rule matched over the resolved chain | the escalation pattern | **`escalate` / refuse and ask** — it *will* migrate |
+| The chain could not be followed | an unfollowable leaf, or the hop budget ran out | **`unreadable` / confirm** — it *might* |
+
+**Probing one key is not enough.** `composer install` fires more than `post-install-cmd`, and a
+framework repo conventionally hangs its migration off `post-autoload-dump` — so a single-key probe
+reported such a repo as clean and proposed a plain `composer install`. Every key above is probed and
+each resolved chain is judged separately.
 
 ### The escalation rule, and why one level of matching is not enough
 
@@ -150,43 +162,49 @@ Any hazard whose script text matches the migration pattern in `detection.json` �
 `mysql … < dump.sql` — **escalates**. Calibration must not quietly append a flag. It must state which
 script it found and what that script calls, then **ask**.
 
-Two properties of that matching are load-bearing, and the worked example below is what proves it:
+Three properties of that matching are load-bearing:
 
 - **Matching is case-insensitive.** Real script targets are camelCase (`dbMigrate`), and a lowercase
   pattern misses them.
 - **Match the whole resolved chain, not the first link.** A probe returns a script's *immediate* value,
   and in real repos that value is almost always a reference somewhere else — `@name`, `npm run x`,
   `make x`, `bin/console x`, a `Class::method` callback, a path to a script. Follow each form (up to
-  `maxDepth`) and match at every level.
-- **An unresolvable chain escalates too.** A trail that runs into code this detection cannot read is
-  not evidence of safety. Say what was found and how far the trail went, then ask — do **not** fall
-  back to `note`.
+  `chainMaxDepth`) and match at every level. **Running out of hops counts as unfollowable**, or a repo
+  need only nest its migration one level deeper than the budget to be reported as a fully-followed,
+  migration-free chain.
+- **An unfollowable chain is reported, but not as a match.** A trail that runs into code this cannot
+  read is not evidence of safety — and it is not evidence of danger either. It gets its own
+  `unreadable` label with action `confirm`, because nearly every real composer chain ends in a code
+  callback: reporting all of them as "a migration was found" would fire on almost every repository,
+  and an alarm that always fires is one developers learn to click through. Both reach the developer;
+  only `escalate` claims to have found something.
 
-This is the one failure mode with no recovery, because it runs against the *shared* development
-database.
+A real match is the one failure mode with no recovery, because it runs against the *shared*
+development database.
 
-### The worked example, verified — and it defeats a naive matcher
+### The worked example that proves it
 
-`/home/alice/acme-app` is the repo this design was drawn from. Its `composer.json` really does chain
-into a migration:
+The repository this design was drawn from — recorded as the reference repo in
+[00-context](../docs/00-context.md#the-reference-repo), which is where measurements name their
+subject — chains into a migration like this:
 
 ```
-post-install-cmd  ->  @duckdb:install-lib, @cache:clear, @db, @translation:warm-up, @assets:install
+post-install-cmd  ->  @install-lib, @cache:clear, @db, @warm-up, @assets:install
 @db               ->  @db:prepare-config, @db:update-functions, @db:migrate, @db:update-views
-@db:migrate       ->  acme\Composer\Scripts::dbMigrate
+@db:migrate       ->  Vendor\Pkg\Scripts::dbMigrate
 ```
 
-So a plain `composer install` in a fresh worktree would migrate the shared MySQL and rewrite its views
-and functions — while another session is using it. This is bug 4 of the source conversation's scripts
-([00-context](../docs/00-context.md#the-source-conversation)), confirmed in the real repo rather than
-assumed.
+A plain `composer install` in a fresh worktree therefore migrates the shared database and rewrites
+its views and functions, while another session is using it. This is bug 4 of the source
+conversation's scripts ([00-context](../docs/00-context.md#the-source-conversation)) — confirmed
+against a real repository rather than assumed.
 
-Now read that chain against a one-level, case-sensitive matcher, because this is the *reason* for both
-rules above: the probe returns `["@duckdb:install-lib", "@cache:clear", "@db", …]`. Nothing there
-matches `db:migrate` — the string is just `@db`. Follow it one hop and `@db:migrate` matches. Follow it
-one more and the target is `dbMigrate`, which a lowercase `migrat` misses. **A naive matcher reports
-this repo — the very repo the hazard rule was written from — as clean.** That is why the chain is
-resolved and the match is case-insensitive.
+Now read that chain against a one-level, case-sensitive matcher, because this is the *reason* for
+every rule above: the probe returns `["@install-lib","@cache:clear","@db",…]`. Nothing there matches
+`db:migrate` — the string is just `@db`. Follow it one hop and `@db:migrate` matches. Follow it one
+more and the target is `dbMigrate`, which a lowercase `migrat` misses. **A naive matcher reports the
+very repository the hazard rule was written from as clean.** Hence: every lifecycle key, the whole
+chain, case-insensitively, with an unfollowable trail reported rather than assumed safe.
 
 ## Corroboration: cite it, never import it
 
@@ -195,17 +213,17 @@ workflow, a `Makefile` target, a compose file, a devcontainer — read it and **
 proposing. "Your own CI already passes `--no-scripts`" is independent confirmation and far more
 convincing than a rule from a table.
 
-**Never import the flags verbatim.** This was checked against the reference repo, and the difference is
-not academic. Its workflows run:
+**Never import the flags verbatim,** and the difference is not academic. A real workflow line looks
+like this:
 
 ```
 composer install --no-progress --prefer-dist --optimize-autoloader --no-dev --classmap-authoritative --no-scripts
-pnpm install --frozen-lockfile --filter assets
+pnpm install --frozen-lockfile --filter <one-package>
 ```
 
-Imported as-is, a development worktree would get **no dev dependencies** — no phpunit, no phpstan — and
-**one package of a four-package workspace**. CI optimises for a throwaway machine running one job; a
-worktree is a development environment. So:
+Imported as-is, a development worktree would get **no dev dependencies** — so no test runner and no
+static analyser — and **one package of a multi-package workspace**. CI optimises for a throwaway
+machine running one job; a worktree is a development environment. So:
 
 - Strip production/CI-only flags: `--no-dev`, `--production`, `--omit=dev`, `--only=production`,
   `--no-optional`, `--classmap-authoritative`, `--optimize-autoloader`, `--prefer-dist`.

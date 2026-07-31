@@ -320,27 +320,38 @@
     {
       "id": "composer-post-install",
       "manifest": "composer.json",
-      "probe": "scripts.post-install-cmd",
       "action": "neutralise",
       "neutralise": "--no-scripts",
-      "reason": "composer runs post-install-cmd on every `composer install`. In the repo this design was drawn from, that chain reaches a database migration — so bootstrapping a worktree would migrate the SHARED development database that every other worktree and the main checkout also point at.",
-      "corroboration": "CI is usually already guarding this; if the repo's workflows pass --no-scripts, say so — it is independent confirmation, not a guess."
+      "reason": "composer runs these on every `composer install`, not just post-install-cmd. A framework repo conventionally hangs its migration off post-autoload-dump, so probing one key reported such a repo as clean — and bootstrapping a worktree would then migrate the SHARED development database that every other worktree and the main checkout also point at.",
+      "corroboration": "CI is usually already guarding this; if the repo's workflows pass --no-scripts, say so — it is independent confirmation, not a guess.",
+      "probes": [
+        "scripts.pre-install-cmd",
+        "scripts.post-install-cmd",
+        "scripts.post-autoload-dump",
+        "scripts.post-package-install",
+        "scripts.post-package-update"
+      ]
     },
     {
       "id": "npm-postinstall",
       "manifest": "package.json",
-      "probe": "scripts.postinstall",
       "action": "note",
       "reason": "a postinstall that builds assets is real work a runnable worktree genuinely needs, so keep it — but it is usually the single largest part of bootstrap time, and the developer should know that is where the wait comes from.",
-      "corroboration": null
+      "corroboration": null,
+      "probes": [
+        "scripts.preinstall",
+        "scripts.install",
+        "scripts.postinstall",
+        "scripts.prepare"
+      ]
     },
     {
       "id": "ruby-postinstall",
       "manifest": "Rakefile",
-      "probe": null,
       "action": "note",
       "reason": "bundler itself runs no post-install hook, but many Rails repos wrap `bundle install` in a setup task that also loads the schema. If the install command comes from such a task rather than from bundler directly, check what else it does.",
-      "corroboration": null
+      "corroboration": null,
+      "probes": []
     }
   ],
   "escalations": [
@@ -357,7 +368,15 @@
           "  post-install-cmd -> [\"@db\", ...]          the pattern sees only \"@db\"",
           "  @db              -> [..., \"@db:migrate\"]  one more hop to the match",
           "  @db:migrate      -> acme\\Composer\\Scripts::dbMigrate   camelCase, hence caseInsensitive",
-          "So follow these forms until they bottom out, and match the pattern against every level."
+          "So follow these forms until they bottom out, and match the pattern against every level.",
+          "",
+          "A MATCH AND AN UNREADABLE TRAIL ARE DIFFERENT FINDINGS, reported under different labels.",
+          "Nearly every real composer post-install chain ends in a code callback, so treating every",
+          "unfollowable trail as 'a migration was found' would fire on almost every repository and the",
+          "alarm would stop meaning anything — the developer learns to click through it, which is worse",
+          "than not having it. A pattern match emits `escalate` (this WILL migrate; refuse and ask). An",
+          "unfollowable trail emits `unreadable` (this MIGHT; confirm). Both reach the developer; only one",
+          "claims to have found something."
         ],
         "forms": [
           "@name — another script in the same manifest",
@@ -367,9 +386,9 @@
           "Fully\\Qualified\\Class::method — a code callback; read the method if it is in the repo",
           "a path to a script file in the repo — read it"
         ],
-        "maxDepth": 5,
-        "unresolvedAction": "refuse-and-ask",
-        "unresolvedReason": "A chain that cannot be followed is not evidence of safety. If the script resolves to code this detection cannot read, say exactly what was found and how far the trail went, then ASK — do not fall back to `note`."
+        "unresolvedAction": "confirm",
+        "unresolvedReason": "This install runs a script whose trail could not be followed to the end, so it is UNKNOWN rather than known-dangerous — do not present it as a migration that was found. Say which script it was and how far the trail went, and ask the developer to confirm it does not touch shared state. Most such chains end in ordinary cache or asset work and are fine; the point is that nobody can tell from the repository alone, and the cost of being wrong is a colleague's data.",
+        "unresolvedLeafPattern": "::|\\.(sh|php|js|mjs|cjs|rb|py)([[:space:]\"']|$)|bin/"
       },
       "reason": "An install that migrates is the one failure mode with no recovery: it runs against the SHARED development database. Never neutralise this silently. State exactly which script was found and what it calls, then ASK — the developer may know it is safe, or may need a different command entirely."
     }
@@ -380,16 +399,14 @@
       "tested. Read these to CORROBORATE a proposal, and cite the file when you do — a hazard flag",
       "backed by 'your own CI already passes --no-scripts' is far more convincing than a rule.",
       "",
-      "NEVER IMPORT THE FLAGS VERBATIM. This was checked against the reference repo and it matters:",
-      "its workflows run `composer install --no-progress --prefer-dist --optimize-autoloader --no-dev",
-      "--classmap-authoritative --no-scripts` and `pnpm install --frozen-lockfile --filter assets`.",
-      "Imported as-is, a development worktree would get NO dev dependencies (no phpunit, no phpstan)",
-      "and only one package of a four-package workspace. CI optimises for a throwaway machine running",
-      "one job; a worktree is a development environment. Take the CORROBORATION, drop the flags.",
+      "NEVER IMPORT THE FLAGS VERBATIM. CI optimises for a throwaway machine running one job; a",
+      "worktree is a development environment. Production flags (--no-dev, --omit=dev) would leave it",
+      "with no dev dependencies and so no test runner, and scoping flags (--filter) would install one",
+      "package of a workspace. The worked example this was checked against is in docs/00-context.md.",
+      "Take the CORROBORATION, drop the flags.",
       "",
       "STRIPPING IS NOT UNCONDITIONAL. A flag that SUPPRESSES SOMETHING DANGEROUS must be kept, not",
-      "stripped — see keepFlags. Removing such a flag would turn 'this repo's CI deliberately disabled",
-      "dependency lifecycle scripts' into 'a hook now runs them unattended at session start'."
+      "stripped — see keepFlags."
     ],
     "sources": [
       ".github/workflows",
@@ -498,7 +515,9 @@
       "an AskUserQuestion, never as a pre-filled default, and 'no runtime isolation' is always an",
       "offered outcome. A `runtime` block the developer did not explicitly confirm must not be written.",
       "",
-      "These are search locations and patterns, deliberately NOT rules that conclude anything."
+      "These are search locations and generic patterns, deliberately NOT rules that conclude anything —",
+      "and deliberately not any one project's variable names. A repo whose tenant selector is spelled",
+      "something this pattern misses is exactly why the developer is ASKED rather than told."
     ],
     "portSources": [
       "docker-compose.yml",
@@ -515,12 +534,20 @@
       "package.json"
     ],
     "portVarPattern": "(SERVER_PORT|APP_PORT|HTTP_PORT|PORT|DEV_PORT|VITE_PORT|WEB_PORT)",
-    "dbVarPattern": "(DATABASE_URL|DATABASE_NAME|DB_DATABASE|DB_NAME|MYSQL_DATABASE|POSTGRES_DB|INSTALLATION_NAME|TENANT|SCHEMA)",
+    "dbVarPattern": "(DATABASE_URL|DATABASE_NAME|DB_DATABASE|DB_NAME|MYSQL_DATABASE|POSTGRES_DB|TENANT|SCHEMA)",
     "serviceSources": [
       "docker-compose.yml",
       "docker-compose.yaml",
       "compose.yml",
       "compose.yaml"
     ]
-  }
+  },
+  "chainMaxDepth": 5,
+  "_comment_chainMaxDepth": [
+    "How many hops of script indirection to follow before giving up. Top-level ON PURPOSE: it used to",
+    "live at escalations[0].resolveIndirection.maxDepth, which the plugin's JSON layer cannot address",
+    "because it cannot index into an array — so it read as empty and the hardcoded fallback always won,",
+    "meaning tuning it here changed nothing. Running out of budget now counts as an unfollowable trail",
+    "and escalates, rather than being reported as a fully-followed clean chain."
+  ]
 }

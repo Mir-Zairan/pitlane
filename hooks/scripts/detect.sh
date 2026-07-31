@@ -42,7 +42,8 @@
 #   dropped          <marker> <dir> <why it was not used>
 #   hazard           <n> <id> <action> <flag> <why>
 #   hazardChain      <n> <the resolved script chain>
-#   escalate         <n> <id> <action> <why this needs a human>
+#   escalate         <n> <id> <action> <why this needs a human>   (a rule MATCHED: it will)
+#   unreadable       <n> <id> <action> <why this needs a human>   (trail unfollowable: it might)
 #   corroborate      <n> <file> <what it independently confirms>
 #   config           <repo-relative path>
 #   hint             port|db|service <name> <where it was seen>
@@ -107,7 +108,7 @@ json_array_items() {  # $1 = compact JSON array
   case $raw in
     '' | '[]' | 'null') return 0 ;;
     '['*']') ;;
-    *) warn "expected a JSON array from the detection table, got: $raw"; return 1 ;;
+    *) wt_log "expected a JSON array from the detection table, got: $raw"; return 1 ;;
   esac
   raw=${raw#[}
   raw=${raw%]}
@@ -122,7 +123,9 @@ json_array_items() {  # $1 = compact JSON array
     case $item in
       '') continue ;;
       *[\\\"]*)
-        warn "refusing a detection-table array item containing a quote or backslash: $item"
+        # wt_log, NOT warn: warn writes a record to STDOUT, which is this function's item
+        # stream, so a refused item became an item for every caller.
+        wt_log "refusing a detection-table array item containing a quote or backslash: $item"
         continue
         ;;
     esac
@@ -220,11 +223,20 @@ manifest_value() {  # $1 = manifest path, $2 = dotted key
 # clean. This follows `@name` and `npm|pnpm|yarn run <name>` references within the same
 # manifest, which are the forms that are mechanically resolvable, and flags anything else as
 # unresolved rather than treating it as safe.
+# RESULTS COME BACK IN GLOBALS, NOT ON STDOUT, and that is the whole point of the shape.
+# An earlier version printed the chain and let the caller capture it with `$( )`. Command
+# substitution runs in a SUBSHELL, so every CHAIN_UNRESOLVED=1 it set was discarded and the
+# caller always read the initial 0 — which made the "a trail we cannot follow is not evidence
+# of safety" escalation dead code. A migration hidden behind a code callback was therefore
+# neutralised silently, with no human asked, which is the one decision the table says must
+# never be made silently.
+CHAIN_TEXT=''
 CHAIN_UNRESOLVED=0
-resolve_chain() {  # $1 = manifest path, $2 = dotted key
-  local manifest=$1 key=$2 depth=0 maxdepth text pending next seen='' ref
+resolve_chain() {  # $1 = manifest path, $2 = dotted key; sets CHAIN_TEXT, CHAIN_UNRESOLVED
+  local manifest=$1 key=$2 depth=0 maxdepth text pending next seen='' ref resolved leafpat
+  CHAIN_TEXT=''
   CHAIN_UNRESOLVED=0
-  maxdepth=$(wt_json_get escalations.0.resolveIndirection.maxDepth <"$WT_DETECTION_JSON" 2>/dev/null) || maxdepth=''
+  maxdepth=$(wt_json_get chainMaxDepth <"$WT_DETECTION_JSON" 2>/dev/null) || maxdepth=''
   wt_is_seconds "$maxdepth" || maxdepth=5
 
   pending=$(manifest_value "$manifest" "$key")
@@ -256,36 +268,64 @@ resolve_chain() {  # $1 = manifest path, $2 = dotted key
     pending=$next
   done
 
-  # A leaf that is a code callback or a script path is a trail we cannot follow.
-  if printf '%s' "$text" | grep -qE '::|\.sh|\.php|\.js|bin/' 2>/dev/null; then
+  # Running out of depth budget is ALSO an unfollowable trail. Without this, a repository only
+  # had to nest its migration one hop deeper than the budget to be reported as a
+  # fully-followed, migration-free chain — and the emitted hazardChain record then asserted a
+  # completeness the resolver never achieved.
+  if [ -n "$pending" ]; then
+    CHAIN_UNRESOLVED=1
+    text="$text -> (unfollowed after $maxdepth hops: $pending)"
+  fi
+
+  # A leaf that is a code callback or a script path is a trail we cannot follow. The pattern
+  # is anchored so `\.js` does not also swallow `.json` — `cp config.json.dist config.json`
+  # is not an unfollowable trail.
+  leafpat=$(wt_json_get escalations.0.resolveIndirection.unresolvedLeafPattern <"$WT_DETECTION_JSON" 2>/dev/null) || leafpat=''
+  [ -n "$leafpat" ] || leafpat='::|\.(sh|php|js|mjs|cjs|rb|py)([[:space:]"'"'"']|$)|bin/'
+  if printf '%s' "$text" | grep -qE "$leafpat" 2>/dev/null; then
     CHAIN_UNRESOLVED=1
   fi
 
-  printf '%s' "$text"
+  CHAIN_TEXT=$text
+  return 0
 }
 
 # Judge the resolved chain against every escalation rule.
 check_escalations() {  # $1 = dep index, $2 = hazard id, $3 = chain text
-  local n=$1 hid=$2 chain=$3 e_id e_action e_pat e_ci e_why e_unres e_unwhy matched=0
+  local n=$1 hid=$2 chain=$3 e_id e_action e_pat e_ci e_why e_unres e_unwhy
+  local fb_id='' fb_action='' fb_why='' matched
+  # EVERY pattern is tested before the unresolved fallback is used. Returning on the first
+  # rule that merely carries an unresolvedAction would report that rule's id and reason for a
+  # chain that actually matched a LATER rule's pattern — the wrong reason for the right alarm.
   while IFS=$WT_US read -r -d "$WT_RS" e_id e_action e_pat e_ci e_why e_unres e_unwhy; do
-    [ -n "$e_pat" ] || continue
-    if [ "$e_ci" = true ]; then
-      printf '%s' "$chain" | grep -qiE "$e_pat" 2>/dev/null && matched=1
-    else
-      printf '%s' "$chain" | grep -qE "$e_pat" 2>/dev/null && matched=1
+    matched=0
+    if [ -n "$e_pat" ]; then
+      if [ "$e_ci" = true ]; then
+        printf '%s' "$chain" | grep -qiE "$e_pat" 2>/dev/null && matched=1
+      else
+        printf '%s' "$chain" | grep -qE "$e_pat" 2>/dev/null && matched=1
+      fi
     fi
     if [ "$matched" = 1 ]; then
       emit escalate "$n" "$e_id" "${e_action:-refuse-and-ask}" "$e_why"
       return 0
     fi
-    # A trail that cannot be followed is not evidence of safety.
-    if [ "$CHAIN_UNRESOLVED" = 1 ] && [ -n "$e_unres" ]; then
-      emit escalate "$n" "$e_id" "$e_unres" "$e_unwhy"
-      return 0
+    if [ -z "$fb_id" ] && [ -n "$e_unres" ]; then
+      fb_id=$e_id; fb_action=$e_unres; fb_why=$e_unwhy
     fi
   done < <(wt_json_records escalations id action pattern caseInsensitive reason \
            resolveIndirection.unresolvedAction resolveIndirection.unresolvedReason \
            <"$WT_DETECTION_JSON")
+
+  # A trail that cannot be followed is not evidence of safety — but it is not evidence of
+  # DANGER either, and reporting it under the same label as a real pattern match would be a
+  # false claim. Almost every composer post-install chain ends in a code callback, so that
+  # conflation would fire on nearly every repository and the alarm would stop meaning
+  # anything. Different label, different action: the developer still gets asked, but is told
+  # honestly which of the two they are looking at.
+  if [ "$CHAIN_UNRESOLVED" = 1 ] && [ -n "$fb_id" ]; then
+    emit unreadable "$n" "$fb_id" "$fb_action" "$fb_why"
+  fi
   return 0
 }
 
@@ -313,7 +353,8 @@ corroborate() {  # $1 = dep index, $2 = the proposed install command
 
   while IFS= read -r src; do
     [ -n "$src" ] || continue
-    for f in $(corroborate_candidates "$src"); do
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
       rel=${f#"$ROOT"/}
       fileflags=$(tool_flags_in "$tool" "$rel") || continue
       total=$((total + 1))
@@ -330,7 +371,7 @@ corroborate() {  # $1 = dep index, $2 = the proposed install command
         fi
         cited=$((cited + 1))
       fi
-    done
+    done < <(corroborate_candidates "$src")
   done < <(json_array_items "$(wt_json_get corroboration.sources <"$WT_DETECTION_JSON")")
 
   if [ "$total" -gt "$cited" ]; then
@@ -347,10 +388,30 @@ corroborate() {  # $1 = dep index, $2 = the proposed install command
 
 # The files a corroboration source expands to. A directory (.github/workflows) is searched
 # one level down; anything else is taken literally.
+# One path per line, so the caller can read them with `read -r` — an unquoted command
+# substitution word-split them, so a workflow named `a b.yml` became two bogus paths and one
+# literally named `*` re-expanded its own directory.
+#
+# Symlinks are refused rather than followed. A repo with `.github/workflows` symlinked outside
+# the checkout would otherwise have files from outside cited as this repository's own CI
+# evidence — corroboration that looks like the repo agreeing with itself when it does not.
 corroborate_candidates() {  # $1 = source entry
-  local src=$1 f
+  local src=$1 f real
+  if [ -L "$ROOT/$src" ]; then
+    wt_log "ignoring the corroboration source $src because it is a symlink"
+    return 0
+  fi
   if [ -d "$ROOT/$src" ]; then
-    for f in "$ROOT/$src"/*; do [ -f "$f" ] && printf '%s\n' "$f"; done
+    real=$(cd "$ROOT/$src" && pwd -P) || return 0
+    case $real/ in
+      "$ROOT"/*) ;;
+      *) wt_log "ignoring the corroboration source $src because it resolves outside the repository"; return 0 ;;
+    esac
+    for f in "$ROOT/$src"/*; do
+      [ -f "$f" ] || continue
+      [ -L "$f" ] && continue
+      printf '%s\n' "$f"
+    done
   elif [ -f "$ROOT/$src" ]; then
     printf '%s\n' "$ROOT/$src"
   fi
@@ -433,23 +494,36 @@ while IFS=$WT_US read -r -d "$WT_RS" \
   # Hazards are applied to the install command BEFORE it is emitted, so what the developer
   # sees proposed is what would actually run.
   install=$d_install
+  hit=0
   while IFS= read -r hid; do
     [ -n "$hid" ] || continue
-    h_manifest='' h_probe='' h_action='' h_flag='' h_why=''
-    while IFS=$WT_US read -r -d "$WT_RS" x_id x_manifest x_probe x_action x_flag x_why; do
+    h_manifest='' h_probes='' h_action='' h_flag='' h_why=''
+    while IFS=$WT_US read -r -d "$WT_RS" x_id x_manifest x_probes x_action x_flag x_why; do
       [ "$x_id" = "$hid" ] || continue
-      h_manifest=$x_manifest; h_probe=$x_probe; h_action=$x_action
+      h_manifest=$x_manifest; h_probes=$x_probes; h_action=$x_action
       h_flag=$x_flag; h_why=$x_why
       break
-    done < <(wt_json_records hazards id manifest probe action neutralise reason <"$WT_DETECTION_JSON")
+    done < <(wt_json_records hazards id manifest probes action neutralise reason <"$WT_DETECTION_JSON")
     [ -n "$h_action" ] || continue
     [ -n "$h_manifest" ] && [ ! -e "$ROOT/$h_manifest" ] && continue
 
-    chain=''
-    if [ -n "$h_probe" ]; then
+    # EVERY probe key, not one. `composer install` fires pre-install-cmd,
+    # post-install-cmd, post-autoload-dump and the post-package-* hooks, and a framework repo
+    # conventionally hangs its migration off post-autoload-dump — so probing a single key
+    # reported such a repo as clean and proposed a plain install that would migrate the
+    # shared database.
+    hit=0
+    if [ -n "$h_probes" ]; then
       [ -n "$h_manifest" ] || continue
-      chain=$(resolve_chain "$ROOT/$h_manifest" "$h_probe") || chain=''
-      [ -n "$chain" ] || continue
+      while IFS= read -r pkey; do
+        [ -n "$pkey" ] || continue
+        resolve_chain "$ROOT/$h_manifest" "$pkey" || continue
+        [ -n "$CHAIN_TEXT" ] || continue
+        hit=1
+        emit hazardChain "$N" "$pkey: $CHAIN_TEXT"
+        check_escalations "$N" "$hid" "$CHAIN_TEXT"
+      done < <(json_array_items "$h_probes")
+      [ "$hit" = 1 ] || continue
     fi
 
     case $h_action in
@@ -464,10 +538,6 @@ while IFS=$WT_US read -r -d "$WT_RS" \
         ;;
       *) emit hazard "$N" "$hid" "$h_action" "$h_flag" "$h_why" ;;
     esac
-    if [ -n "$chain" ]; then
-      emit hazardChain "$N" "$chain"
-      check_escalations "$N" "$hid" "$chain"
-    fi
   done < <(json_array_items "$d_hazards")
 
   emit dep "$N" "$d_dir" "$marker" "$strategy" "$install" "$d_verify"
@@ -497,7 +567,11 @@ fi
 probe_tool() {  # $1 = tool, $2 = version arguments
   local tool=$1 args=$2
   if [ -z "$SHELL_CMD" ]; then
-    ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" "$tool" "$args" ) 2>&1
+    # </dev/null so the probed command cannot read the caller's stdin. Measured: the probe
+    # loop reads its records from a process substitution on stdin, so a tool that reads stdin
+    # — a wrapper prompting to trust a substituter, for instance — swallowed the remaining
+    # probe records and later tools vanished from the output with no warning at all.
+    ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" "$tool" "$args" ) </dev/null 2>&1
     return
   fi
   case $SHELL_ARGS in
@@ -505,11 +579,11 @@ probe_tool() {  # $1 = tool, $2 = version arguments
       # nix-shell --run takes ONE argument. `nix-shell --run composer --version` would read
       # `--version` as another nix flag.
       # shellcheck disable=SC2086  # the wrapper is several words, split on purpose
-      ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" $SHELL_CMD "$tool $args" ) 2>&1
+      ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" $SHELL_CMD "$tool $args" ) </dev/null 2>&1
       ;;
     *)
       # shellcheck disable=SC2086  # same
-      ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" $SHELL_CMD "$tool" "$args" ) 2>&1
+      ( cd "$ROOT" && timeout "$PROBE_TIMEOUT" $SHELL_CMD "$tool" "$args" ) </dev/null 2>&1
       ;;
   esac
 }
