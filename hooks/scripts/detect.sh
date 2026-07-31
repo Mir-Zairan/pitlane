@@ -178,6 +178,7 @@ PROBE_TIMEOUT=$(wt_json_get shellProbe.timeoutSeconds <"$WT_DETECTION_JSON") || 
 wt_is_seconds "$PROBE_TIMEOUT" || PROBE_TIMEOUT=60
 
 NEVER_GLOBS=$(wt_json_get configCandidates.neverPropose.globs <"$WT_DETECTION_JSON") || NEVER_GLOBS=''
+NEVER_HINT=$(wt_json_get runtimeHints.neverHintPattern <"$WT_DETECTION_JSON") || NEVER_HINT=''
 
 # ---------------------------------------------------------------------------
 # The toolchain shell
@@ -284,7 +285,7 @@ resolve_chain() {  # $1 = manifest path, $2 = dotted key; sets CHAIN_TEXT, CHAIN
   # A leaf that is a code callback or a script path is a trail we cannot follow. The pattern
   # is anchored so `\.js` does not also swallow `.json` — `cp config.json.dist config.json`
   # is not an unfollowable trail.
-  leafpat=$(wt_json_get escalations.0.resolveIndirection.unresolvedLeafPattern <"$WT_DETECTION_JSON" 2>/dev/null) || leafpat=''
+  leafpat=$(wt_json_get unresolvedLeafPattern <"$WT_DETECTION_JSON" 2>/dev/null) || leafpat=''
   [ -n "$leafpat" ] || leafpat='::|\.(sh|php|js|mjs|cjs|rb|py)([[:space:]"'"'"']|$)|bin/'
   if printf '%s' "$text" | grep -qE "$leafpat" 2>/dev/null; then
     CHAIN_UNRESOLVED=1
@@ -498,7 +499,6 @@ while IFS=$WT_US read -r -d "$WT_RS" \
   # Hazards are applied to the install command BEFORE it is emitted, so what the developer
   # sees proposed is what would actually run.
   install=$d_install
-  hit=0
   while IFS= read -r hid; do
     [ -n "$hid" ] || continue
     h_manifest='' h_probes='' h_action='' h_flag='' h_why=''
@@ -516,18 +516,24 @@ while IFS=$WT_US read -r -d "$WT_RS" \
     # conventionally hangs its migration off post-autoload-dump — so probing a single key
     # reported such a repo as clean and proposed a plain install that would migrate the
     # shared database.
-    hit=0
-    if [ -n "$h_probes" ]; then
+    # An EMPTY probes list means "this hazard needs no probing" — its mere manifest being
+    # present is the finding, which is how a Rakefile-based rule works. Requiring a probe hit
+    # unconditionally dropped such a rule entirely, so it was unreachable and the developer was
+    # never told the install command may wrap a schema load.
+    hit=0 probed=0
+    while IFS= read -r pkey; do
+      [ -n "$pkey" ] || continue
+      probed=1
       [ -n "$h_manifest" ] || continue
-      while IFS= read -r pkey; do
-        [ -n "$pkey" ] || continue
-        resolve_chain "$ROOT/$h_manifest" "$pkey" || continue
-        [ -n "$CHAIN_TEXT" ] || continue
-        hit=1
-        emit hazardChain "$N" "$pkey: $CHAIN_TEXT"
-        check_escalations "$N" "$hid" "$CHAIN_TEXT"
-      done < <(json_array_items "$h_probes")
-      [ "$hit" = 1 ] || continue
+      resolve_chain "$ROOT/$h_manifest" "$pkey" || continue
+      [ -n "$CHAIN_TEXT" ] || continue
+      hit=1
+      emit hazardChain "$N" "$pkey: $CHAIN_TEXT"
+      check_escalations "$N" "$hid" "$CHAIN_TEXT"
+    done < <(json_array_items "$h_probes")
+    if [ "$probed" = 1 ] && [ "$hit" = 0 ]; then
+      # Keys were probed and none of them exist in this manifest: nothing to report.
+      continue
     fi
 
     case $h_action in
@@ -667,6 +673,13 @@ scan_hints() {  # $1 = kind, $2 = ERE, $3 = dotted path to the source list
     [ -f "$ROOT/$f" ] || continue
     while IFS= read -r name; do
       [ -n "$name" ] || continue
+      # A credential-shaped NAME is never offered as a runtime candidate. Found by running
+      # this against a real repository, where the tenancy family matched a variable called
+      # ACCOUNTING_CREDENTIAL_KEY: the name itself is not a leak, but a hint is a suggestion,
+      # and suggesting that one invites a secret into a committed profile (ADR-008).
+      if [ -n "$NEVER_HINT" ] && printf '%s' "$name" | grep -qE "$NEVER_HINT" 2>/dev/null; then
+        continue
+      fi
       emit hint "$kind" "$name" "$f"
     done < <(grep -ohE "$pat" "$ROOT/$f" 2>/dev/null | sort -u)
   done < <(json_array_items "$(wt_json_get "$listpath" <"$WT_DETECTION_JSON")")

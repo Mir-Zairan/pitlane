@@ -983,8 +983,14 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence
   return 0
 }
 
-# Report how the profile's recorded evidence differs from the checkout in front of it, one
-# line per difference, returning 1 if anything drifted.
+# Report how the profile's recorded LOCKFILE CHECKSUMS differ from the checkout in front of it,
+# one line per difference, returning 1 if anything drifted.
+#
+# Scope, stated precisely because the field is called `evidence` and it would be easy to assume
+# more: this reads `deps[].lockChecksum` ONLY. `evidence.markers`, `evidence.shellMarker` and
+# `evidence.detectionVersion` are written and validated by Phase 2 but have no reader yet —
+# comparing them is a named Phase 3 task, because each catches a different kind of drift a
+# checksum cannot (a new ecosystem, a toolchain that appeared, a newer detection table).
 #
 # NO CALL SITE IN THIS PHASE — deliberately. Phase 2 ships the evidence block, this
 # comparator and its tests; docs/phases/phase-3-bootstrap.md owns wiring it into

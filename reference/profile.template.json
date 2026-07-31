@@ -90,7 +90,10 @@
     "                             (Cargo target/ + CARGO_HOME, GOMODCACHE). `install` is still recorded",
     "                             so a developer can see what would populate it, but bootstrap won't run it.",
     "  install       the command that populates `dir`, run inside `shell`.",
-    "  verify        optional, cheap sanity check. Must not mutate anything.",
+    "  verify        optional, cheap sanity check. Must not mutate anything, and must actually READ",
+    "                the installed tree: `composer validate` only checks composer.json/composer.lock",
+    "                consistency, so it passes identically on a worktree with no vendor/ at all — a",
+    "                check that cannot fail in the one case bootstrap needs it to.",
     "  lockChecksum  `cksum` output for `lock` AS OF CALIBRATION. Evidence, not configuration — see",
     "                _comment_evidence. Deliberately stored per-dep rather than in an evidence map keyed",
     "                by filename: the JSON reader addresses fields by dotted path, so a key like",
@@ -102,7 +105,7 @@
       "lock": "composer.lock",
       "strategy": "hardlink",
       "install": "composer install --no-interaction --no-progress --no-scripts",
-      "verify": "composer validate --no-check-all --quiet",
+      "verify": "test -r vendor/autoload.php",
       "lockChecksum": "1234567890 397"
     },
     {

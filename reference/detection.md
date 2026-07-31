@@ -35,8 +35,8 @@ project, `skip` where the artefacts are build output that a shared cache already
 | `composer.lock` | `vendor` | hardlink | `composer install --no-interaction --no-progress` |
 | `pnpm-lock.yaml` | `node_modules` | install | `pnpm install --frozen-lockfile` |
 | `package-lock.json` | `node_modules` | hardlink | `npm ci` |
-| `yarn.lock` | `node_modules` | hardlink | `yarn install --frozen-lockfile` |
 | `yarn.lock` + `.yarnrc.yml` | `.yarn/cache` | install | `yarn install --immutable` |
+| `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` |
 | `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` |
 | `uv.lock` | `.venv` | install | `uv sync --frozen` |
 | `poetry.lock` | `.venv` | hardlink¹ | `poetry install` |
@@ -285,8 +285,14 @@ Secrets belong in a copied `.env`, never in the committed profile
 ## Layer 3: hints, never conclusions
 
 `detection.json`'s `runtimeHints` block lists **where to look** and **what shape to look for** — port
-variables in compose files and `.env`, database-ish variable names, service names. It deliberately
-contains no rule that concludes anything.
+variables in compose files and `.env`, database-ish and tenancy-ish variable names, service names. It
+deliberately contains no rule that concludes anything.
+
+The tenancy family (`INSTALLATION*`, `TENANT*`, `SITE*`, `CLIENT*`, `ORG*`, `ACCOUNT*`, `WORKSPACE*`,
+`SCHEMA*`) is a naming **convention**, not a list of variables seen in some particular repository —
+that distinction is the difference between a general engine and one carrying another project's
+identity. A repo whose selector is spelled something the family misses is exactly why the developer is
+asked rather than told: the pattern saves typing, it does not reach a conclusion.
 
 Everything found there is offered as a **hint beside a question**, never as a pre-filled default. A
 `runtime` block the developer did not explicitly confirm must not be written, and **"no runtime

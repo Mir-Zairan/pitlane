@@ -82,11 +82,14 @@ commit_all() { git -C "$1" add -A >/dev/null 2>&1; git -C "$1" commit -qm more >
 # All output, tabs turned into a separator that is easy to assert on.
 det() { bash "$DETECT" "$1" 2>/dev/null | tr '\t' '|'; }
 
-# One field of one record: $2 = label, $3 = field number (1-based).
-field() { printf '%s\n' "$1" | grep "^$2|" | head -1 | cut -d'|' -f"$3"; }
+# One field of one record: $2 = label, $3 = field number (1-based), $4 = which record (default 1).
+# The index is explicit because several fixtures emit more than one record per label, and a
+# helper that silently took the first would let an assertion read dep 0 while appearing to
+# assert about dep 1.
+field() { printf '%s\n' "$1" | grep "^$2|" | sed -n "${4:-1}p" | cut -d'|' -f"$3"; }
 
 run_suite() {
-  local out r
+  local out r first
 
   # --- a plain npm application -------------------------------------------------
   r=$(mkrepo npmapp package.json package-lock.json .env)
@@ -171,8 +174,11 @@ run_suite() {
   r=$(mkrepo bareshell uv.lock)
   out=$(det "$r")
   eq 'shell: nothing matched -> the host shell' '' "$(field "$out" shell 2)"
-  eq 'shell: which is the catch-all rule, not a fallthrough' '' "$(field "$out" shellMarker 2)"
-  has 'shell: and it still states a reason' 'shellReason|no toolchain marker found' "$out"
+  # The empty marker alone proves nothing — it is also the initial value, so it would match if
+  # the rules loop had yielded no records at all. The catch-all's REASON is the discriminator.
+  has 'shell: reached via the catch-all rule, not a silent fallthrough' \
+    'shellReason|no toolchain marker found' "$out"
+  eq 'shell: and shellArgs still defaults to argv' 'argv' "$(field "$out" shellArgs 2)"
 
   # --- post-install hazards ----------------------------------------------------
   # The failure mode with no recovery: an install that succeeds and migrates the SHARED
@@ -239,24 +245,36 @@ run_suite() {
   # --- gitignored config -------------------------------------------------------
   # Only ACTUALLY gitignored files count: native .worktreeinclude copying applies the
   # gitignored-only rule, so a tracked file listed there does nothing.
+  # `.env.local` is a candidate glob AND is committed here, so it exercises the check-ignore
+  # gate in its negative direction — the direction ADR-007 depends on, since a tracked file
+  # listed in .worktreeinclude is a silent no-op. An earlier fixture used a name no glob
+  # matched, so the gate was never reached at all.
   r=$(mkrepo cfg uv.lock .env .env.local)
-  printf 'tracked-not-ignored\n' >"$r/.env.tracked"
-  printf '.env\n.env.local\n' >"$r/.gitignore"
+  printf '.env\n' >"$r/.gitignore"
   git -C "$r" add -A >/dev/null 2>&1
   git -C "$r" commit -qm cfg >/dev/null 2>&1
   out=$(det "$r")
-  has 'config: a gitignored .env is proposed'       'config|.env' "$out"
-  hasnt 'config: a TRACKED file is not proposed'    'config|.env.tracked' "$out"
-  # Credentials and machine state are never proposed, even when gitignored.
-  r=$(mkrepo creds uv.lock .env id_rsa auth.json app.sqlite)
-  printf '.env\nid_rsa\nauth.json\napp.sqlite\n' >"$r/.gitignore"
+  has 'config: a gitignored candidate is proposed' 'config|.env' "$out"
+  hasnt 'config: a TRACKED candidate is not proposed, even though a glob matches it' \
+    'config|.env.local' "$out"
+  # Credentials are never proposed, even when gitignored AND matching a candidate glob.
+  #
+  # Two things make this fixture fiddly, and both are the reason the earlier version of it was
+  # vacuous. First, the name must match a configCandidates GLOB or the neverPropose filter is
+  # never reached — `id_rsa` alone matches nothing, so it passed for the wrong reason.
+  # `*.local.yml` IS a candidate glob, so `id_rsa.local.yml` matches both lists and genuinely
+  # exercises the filter. Second, the files must stay UNTRACKED: `git check-ignore` does not
+  # report a tracked file as ignored, so committing them would make every candidate vanish for
+  # an unrelated reason.
+  r=$(mkrepo creds uv.lock)
+  printf 'ok.local.yml\nid_rsa.local.yml\n' >"$r/.gitignore"
   git -C "$r" add -A >/dev/null 2>&1
-  git -C "$r" commit -qm creds >/dev/null 2>&1
+  git -C "$r" commit -qm ignore >/dev/null 2>&1
+  : >"$r/ok.local.yml"
+  : >"$r/id_rsa.local.yml"
   out=$(det "$r")
-  has   'config: an ordinary .env is still proposed' 'config|.env' "$out"
-  hasnt 'config: an SSH private key is never proposed' 'config|id_rsa' "$out"
-  hasnt 'config: registry credentials are never proposed' 'config|auth.json' "$out"
-  hasnt 'config: a database file is never proposed' 'config|app.sqlite' "$out"
+  has   'config: an ordinary gitignored local config file is proposed' 'config|ok.local.yml' "$out"
+  hasnt 'config: an SSH-key-shaped name is refused by neverPropose' 'config|id_rsa.local.yml' "$out"
 
   # --- layer 3 is hints only ---------------------------------------------------
   # Nothing here may conclude anything (ADR-006). A wrong guess does not break a worktree; it
@@ -315,8 +333,9 @@ run_suite() {
   printf '{"scripts":{"post-install-cmd":["@db"],"db":"doctrine:migrations:migrate"}}' >"$r/composer.json"
   printf '{"scripts":{"postinstall":"vite build"}}' >"$r/package.json"
   commit_all "$r"
-  eq 'idempotent: two consecutive runs are byte-identical' "$(det "$r")" "$(det "$r")"
-  eq 'idempotent: and a third agrees with the first' "$(det "$r")" "$(det "$r")"
+  first=$(det "$r")
+  eq 'idempotent: a second run is byte-identical to the first' "$first" "$(det "$r")"
+  eq 'idempotent: and so is a third'                          "$first" "$(det "$r")"
   # And it is a real proposal, not an empty one that trivially matches itself.
   out=$(det "$r")
   eq 'idempotent: on a repo with two ecosystems' 2 "$(printf '%s\n' "$out" | grep -c '^dep|')"

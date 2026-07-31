@@ -387,8 +387,7 @@
           "a path to a script file in the repo — read it"
         ],
         "unresolvedAction": "confirm",
-        "unresolvedReason": "This install runs a script whose trail could not be followed to the end, so it is UNKNOWN rather than known-dangerous — do not present it as a migration that was found. Say which script it was and how far the trail went, and ask the developer to confirm it does not touch shared state. Most such chains end in ordinary cache or asset work and are fine; the point is that nobody can tell from the repository alone, and the cost of being wrong is a colleague's data.",
-        "unresolvedLeafPattern": "::|\\.(sh|php|js|mjs|cjs|rb|py)([[:space:]\"']|$)|bin/"
+        "unresolvedReason": "This install runs a script whose trail could not be followed to the end, so it is UNKNOWN rather than known-dangerous — do not present it as a migration that was found. Say which script it was and how far the trail went, and ask the developer to confirm it does not touch shared state. Most such chains end in ordinary cache or asset work and are fine; the point is that nobody can tell from the repository alone, and the cost of being wrong is a colleague's data."
       },
       "reason": "An install that migrates is the one failure mode with no recovery: it runs against the SHARED development database. Never neutralise this silently. State exactly which script was found and what it calls, then ASK — the developer may know it is safe, or may need a different command entirely."
     }
@@ -517,7 +516,22 @@
       "",
       "These are search locations and generic patterns, deliberately NOT rules that conclude anything —",
       "and deliberately not any one project's variable names. A repo whose tenant selector is spelled",
-      "something this pattern misses is exactly why the developer is ASKED rather than told."
+      "something this pattern misses is exactly why the developer is ASKED rather than told.",
+      "",
+      "The tenancy family — INSTALLATION/TENANT/SITE/CLIENT/ORG/ACCOUNT/WORKSPACE/SCHEMA plus a suffix —",
+      "is there because a multi-tenant app's collidable state is usually keyed on one of them, and that is",
+      "a naming CONVENTION rather than any one project's variable. It is deliberately a family and not a",
+      "list of names seen in a particular repository: matching a convention keeps the engine general, while",
+      "matching a name would put one repo's identity into a table shipped to everyone.",
+      "",
+      "And it is still only a HINT. A repo whose selector is spelled something this family misses is",
+      "precisely why the developer is asked rather than told — the pattern's job is to save typing, never",
+      "to reach a conclusion.",
+      "",
+      "neverHintPattern drops credential-shaped variable NAMES from the hint list. Found by running this",
+      "against a real repository: the tenancy family matched ACCOUNTING_CREDENTIAL_KEY, and offering that",
+      "as a runtime candidate invites the one thing ADR-008 forbids — a secret in a committed profile. The",
+      "name alone is not a leak, but a hint is a suggestion, and this is not a variable to suggest."
     ],
     "portSources": [
       "docker-compose.yml",
@@ -534,13 +548,14 @@
       "package.json"
     ],
     "portVarPattern": "(SERVER_PORT|APP_PORT|HTTP_PORT|PORT|DEV_PORT|VITE_PORT|WEB_PORT)",
-    "dbVarPattern": "(DATABASE_URL|DATABASE_NAME|DB_DATABASE|DB_NAME|MYSQL_DATABASE|POSTGRES_DB|TENANT|SCHEMA)",
+    "dbVarPattern": "(DATABASE_URL|DATABASE_NAME|DB_DATABASE|DB_NAME|MYSQL_DATABASE|POSTGRES_DB|PGDATABASE|REDIS_URL|CACHE_URL|(INSTALLATION|TENANT|SITE|CLIENT|ORG|ACCOUNT|WORKSPACE|SCHEMA)[A-Z0-9_]*)",
     "serviceSources": [
       "docker-compose.yml",
       "docker-compose.yaml",
       "compose.yml",
       "compose.yaml"
-    ]
+    ],
+    "neverHintPattern": "(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SALT|CERT|DSN_PASS|AUTH)"
   },
   "chainMaxDepth": 5,
   "_comment_chainMaxDepth": [
@@ -549,5 +564,13 @@
     "because it cannot index into an array — so it read as empty and the hardcoded fallback always won,",
     "meaning tuning it here changed nothing. Running out of budget now counts as an unfollowable trail",
     "and escalates, rather than being reported as a fully-followed clean chain."
+  ],
+  "unresolvedLeafPattern": "::|\\.(sh|php|js|mjs|cjs|rb|py)([[:space:]\"']|$)|bin/",
+  "_comment_unresolvedLeafPattern": [
+    "A chain leaf matching this is a trail detection cannot follow — a code callback, a script file.",
+    "Top-level for the same reason as chainMaxDepth: it briefly lived inside escalations[0], an ARRAY",
+    "element, which the dotted-path JSON layer cannot address. It read as empty and the hardcoded",
+    "fallback in detect.sh always won, so editing it here changed nothing and the two copies could",
+    "diverge silently. Anything tunable must live where the reader can actually reach it."
   ]
 }
