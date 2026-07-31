@@ -136,8 +136,12 @@ SUB="$SUPER/sub"
 run_suite() {
   # Fresh shell state each time: lib.sh has a double-source guard.
   unset WT_LIB_SOURCED WT_INPUT_READ HOOK_INPUT
+  # SC1091: shellcheck only follows a sourced file with -x, and the gate lints each changed
+  # file alone. SC2034/SC2329: WT_SLUG, WT_SKIP_VALIDATION and the stubbed wt_has_json are
+  # read by lib.sh, not by this file — they are inputs to the code under test.
   # shellcheck source-path=SCRIPTDIR/../hooks/scripts
   # shellcheck source=lib.sh
+  # shellcheck disable=SC1091,SC2034,SC2329
   . "$LIB"
 
   local out err got
@@ -562,6 +566,7 @@ worktree: two' "$err"
   # every other assertion passing.
   rc_is 'records: no JSON backend is a caller error, not an empty array' 1 \
     "$(printf '%s' '{"d":[{"i":"x"}]}' | (
+         # shellcheck disable=SC2329  # invoked inside the child-shell string below
          wt_has_json() { return 1; }
          wt_json_records d i >/dev/null 2>&1; echo $?) )"
   eq 'records: dotted path inside an element' "SERVER_PORT${RS}" "$(jr nested p.var)"
@@ -658,6 +663,7 @@ worktree: two' "$err"
   eq 'placeholders: and inside a shell default-value expansion' 'slugg' \
     "$(wt_unknown_placeholders '${VAR:-{slugg}}')"
   # The scanner must agree with wt_expand about what actually expands.
+  # shellcheck disable=SC2034  # read by wt_expand inside lib.sh, not by this file
   WT_SLUG=realslug
   eq 'placeholders: wt_expand leaves the reported token literal' 'demo_{X{slugg}' \
     "$(wt_expand 'demo_{X{slugg}')"
@@ -811,6 +817,7 @@ worktree: two' "$err"
   # NOT in a ( subshell ): eq's pass/fail counters would increment in the subshell and die
   # with it, so a regression here would print FAIL and still exit 0. Mutation-confirmed.
   vw '{"schemaVersion":1,"shell":"good","deps":[{"dir":"vendor","lock":"absent.lock","strategy":"hardlink","install":"x"}]}'
+  # shellcheck disable=SC2034  # read by wt_load_profile inside lib.sh, not by this file
   WT_SKIP_VALIDATION=1
   wt_load_profile "$VR" 2>/dev/null
   eq 'load_profile: WT_SKIP_VALIDATION bypasses validation' 1 "$PROFILE_PRESENT"

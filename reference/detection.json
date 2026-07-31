@@ -9,22 +9,30 @@
     "(ADR-002). By the time a hook runs, every answer derived from here is already in the target",
     "repo's committed .claude/worktree-profile.json.",
     "",
-    "To add an ecosystem: add an entry to `deps` (or a `variant` to an existing one). That is the",
-    "whole change — no edit to detect.sh, no edit to the skill.",
+    "To add an ecosystem: add an entry to `deps`. That is the whole change — no edit to detect.sh,",
+    "no edit to the skill.",
     "",
-    "MATCHING IS FIRST-MATCH-WINS IN ARRAY ORDER. `shells` is ordered by precedence on purpose:",
-    "flake.nix beats shell.nix beats .envrc beats .devcontainer beats the null catch-all. `deps`",
-    "entries are independent of each other (a repo can match composer.lock AND pnpm-lock.yaml), but a",
-    "single entry's `variants` are first-match-wins and fall through to the entry's own defaults, and",
-    "see `sameDirPolicy` for what happens when two entries claim one directory.",
+    "MATCHING IS FIRST-MATCH-WINS IN ARRAY ORDER, PER MARKER. Each `deps` entry lists the `markers`",
+    "that trigger it; the first entry whose marker exists AND whose optional `when` guard holds",
+    "claims that marker, and later entries listing the same marker are skipped. That is how the two",
+    "yarn rules coexist: the Yarn Berry rule is guarded on .yarnrc.yml and sits BEFORE the classic",
+    "one, so a Berry repo takes it and a classic repo falls through. `shells` is ordered by",
+    "precedence the same way, ending in a marker:null catch-all so matching always terminates.",
+    "",
+    "FLAT BY DESIGN. An earlier revision nested these guarded rules inside a `variants` array on",
+    "their parent entry, which reads well but cannot be consumed: the plugin's JSON layer addresses",
+    "values by dotted path and cannot index into an array, so reading an object inside an array",
+    "element would have meant a third JSON parser in a codebase whose two existing ones have already",
+    "diverged twice. Ordering plus a `when` guard expresses the same thing with no nesting.",
     "",
     "`reason` strings are DATA, not decoration. They are what the developer is shown when calibration",
     "proposes a value, so they must state the why in one line a developer can disagree with. Improvised",
-    "reasons would differ run to run; these do not."
+    "reasons would differ run to run; these do not.",
+    "",
+    "NO TAB CHARACTERS ANYWHERE IN THIS FILE'S VALUES. detect.sh emits tab-separated records, and it",
+    "strips tabs defensively, but a tab here would be a silent field split at the source."
   ],
-
   "detectionVersion": 1,
-
   "_comment_sameDirPolicy": [
     "Several markers can resolve to the same `dir` — a repo mid-migration with both pnpm-lock.yaml and",
     "package-lock.json, or both bun.lock and bun.lockb, all claim node_modules. Two profile entries for",
@@ -34,68 +42,99 @@
     "and calibration must SAY which markers it dropped and why, never drop one silently. A repo with two",
     "live lockfiles for one directory is usually a mistake the developer wants to know about."
   ],
-  "sameDirPolicy": { "maxEntriesPerDir": 1, "tieBreak": "array-order", "announceDropped": true },
-
+  "sameDirPolicy": {
+    "maxEntriesPerDir": 1,
+    "tieBreak": "array-order",
+    "announceDropped": true
+  },
   "deps": [
     {
-      "markers": ["composer.lock"],
+      "markers": [
+        "composer.lock"
+      ],
       "dir": "vendor",
       "strategy": "hardlink",
       "install": "composer install --no-interaction --no-progress",
       "verify": "test -r vendor/autoload.php",
       "reason": "composer materialises real bytes per project, so a hardlink copy is near-instant and costs almost no disk (ADR-004)",
-      "hazards": ["composer-post-install"]
+      "hazards": [
+        "composer-post-install"
+      ]
     },
     {
-      "markers": ["pnpm-lock.yaml"],
+      "markers": [
+        "pnpm-lock.yaml"
+      ],
       "dir": "node_modules",
       "strategy": "install",
       "install": "pnpm install --frozen-lockfile",
       "reason": "pnpm already content-addresses packages in a global store and hardlinks them in, so the tree is mostly not real disk and sharing it is unsafe — node_modules/.modules.yaml records the project it was installed for (ADR-005)",
-      "hazards": ["npm-postinstall"]
+      "hazards": [
+        "npm-postinstall"
+      ]
     },
     {
-      "markers": ["package-lock.json"],
+      "markers": [
+        "package-lock.json"
+      ],
       "dir": "node_modules",
       "strategy": "hardlink",
       "install": "npm ci",
       "reason": "npm materialises real bytes per project, so hardlinking beats reinstalling (ADR-004)",
-      "hazards": ["npm-postinstall"]
+      "hazards": [
+        "npm-postinstall"
+      ]
     },
     {
-      "markers": ["yarn.lock"],
+      "markers": [
+        "yarn.lock"
+      ],
+      "dir": ".yarn/cache",
+      "strategy": "install",
+      "install": "yarn install --immutable",
+      "reason": "Yarn Berry keeps its own zip cache and, under Plug'n'Play, has no node_modules to share at all — so install rather than hardlink, and --frozen-lockfile is the deprecated spelling of --immutable (ADR-005)",
+      "when": {
+        "exists": ".yarnrc.yml"
+      }
+    },
+    {
+      "markers": [
+        "yarn.lock"
+      ],
       "dir": "node_modules",
       "strategy": "hardlink",
       "install": "yarn install --frozen-lockfile",
       "reason": "classic yarn materialises real bytes per project, so hardlinking beats reinstalling (ADR-004)",
-      "hazards": ["npm-postinstall"],
-      "variants": [
-        {
-          "when": { "exists": ".yarnrc.yml" },
-          "dir": ".yarn/cache",
-          "strategy": "install",
-          "install": "yarn install --immutable",
-          "reason": "Yarn Berry keeps its own zip cache and, under Plug'n'Play, has no node_modules to share at all — so install rather than hardlink, and --frozen-lockfile is the deprecated spelling of --immutable (ADR-005)"
-        }
+      "hazards": [
+        "npm-postinstall"
       ]
     },
     {
-      "markers": ["bun.lock", "bun.lockb"],
+      "markers": [
+        "bun.lock",
+        "bun.lockb"
+      ],
       "dir": "node_modules",
       "strategy": "install",
       "install": "bun install --frozen-lockfile",
       "reason": "bun installs from its own global cache, so a fresh install is cheap and sharing the tree buys nothing (ADR-005). bun.lockb is the pre-1.2 binary lockfile; newer repos use the text bun.lock — one entry covers both, since a repo mid-migration must not get two",
-      "hazards": ["npm-postinstall"]
+      "hazards": [
+        "npm-postinstall"
+      ]
     },
     {
-      "markers": ["uv.lock"],
+      "markers": [
+        "uv.lock"
+      ],
       "dir": ".venv",
       "strategy": "install",
       "install": "uv sync --frozen",
       "reason": "uv hardlinks from its own global cache and a sync is seconds, so installing is cheaper and safer than sharing a venv whose scripts hard-code their own absolute paths (ADR-005)"
     },
     {
-      "markers": ["poetry.lock"],
+      "markers": [
+        "poetry.lock"
+      ],
       "dir": ".venv",
       "strategy": "hardlink",
       "install": "poetry install",
@@ -105,7 +144,9 @@
       "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and there is nothing in the repo to hardlink. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
     },
     {
-      "markers": ["Pipfile.lock"],
+      "markers": [
+        "Pipfile.lock"
+      ],
       "dir": ".venv",
       "strategy": "hardlink",
       "install": "pipenv sync",
@@ -115,7 +156,9 @@
       "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so proposing hardlink unconditionally would name a directory that is not there."
     },
     {
-      "markers": ["Gemfile.lock"],
+      "markers": [
+        "Gemfile.lock"
+      ],
       "dir": "vendor/bundle",
       "strategy": "hardlink",
       "install": "bundle install",
@@ -123,17 +166,23 @@
       "requiresDir": true,
       "fallbackStrategy": "install",
       "notes": "vendor/bundle exists only when bundler is configured with a `path` (check .bundle/config). Otherwise gems are installed into the system/rbenv gem home and there is nothing per-project to copy.",
-      "hazards": ["ruby-postinstall"]
+      "hazards": [
+        "ruby-postinstall"
+      ]
     },
     {
-      "markers": ["mix.lock"],
+      "markers": [
+        "mix.lock"
+      ],
       "dir": "deps",
       "strategy": "hardlink",
       "install": "mix deps.get",
       "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching (ADR-004)"
     },
     {
-      "markers": ["Cargo.lock"],
+      "markers": [
+        "Cargo.lock"
+      ],
       "dir": null,
       "strategy": "skip",
       "install": "cargo fetch",
@@ -141,14 +190,15 @@
       "notes": "dir is null rather than \"target\" on purpose: `install` is documented as the command that populates `dir`, and `cargo fetch` populates CARGO_HOME, not target/. Nothing here is managed, so naming a directory would be a claim the entry does not honour."
     },
     {
-      "markers": ["go.sum"],
+      "markers": [
+        "go.sum"
+      ],
       "dir": null,
       "strategy": "skip",
       "install": "go mod download",
       "reason": "go has no per-project dependency directory at all — GOMODCACHE is already shared between every checkout on the machine, so there is nothing for a worktree to copy (ADR-004)"
     }
   ],
-
   "shells": [
     {
       "marker": "flake.nix",
@@ -182,7 +232,6 @@
       "reason": "no toolchain marker found, so commands run on the host shell as-is — which is correct for a repo whose tooling is simply installed globally"
     }
   ],
-
   "shellProbe": {
     "_comment": [
       "After proposing a shell, calibration runs ONE bounded version check per detected tool. Seconds,",
@@ -194,26 +243,79 @@
       "for every healthy Go repo, which is precisely the false positive the probe exists to avoid.",
       "",
       "Full prove-by-installing is deliberately NOT done here: it costs minutes, and an install that",
-      "migrates the shared database exits 0, so the dangerous variant is exactly the one that passes."
+      "TIMEOUT IS 180s because a COLD nix flake evaluation measured over 60s on the reference repo,",
+      "which made an earlier 60s budget report a false 'the wrapper is wrong for this repo'. A timeout",
+      "is reported as INCONCLUSIVE, never as a failure — the two mean different things to a developer."
     ],
-    "timeoutSeconds": 60,
+    "timeoutSeconds": 180,
     "tools": [
-      { "marker": "composer.lock", "tool": "composer", "versionArgs": "--version" },
-      { "marker": "pnpm-lock.yaml", "tool": "pnpm", "versionArgs": "--version" },
-      { "marker": "package-lock.json", "tool": "npm", "versionArgs": "--version" },
-      { "marker": "yarn.lock", "tool": "yarn", "versionArgs": "--version" },
-      { "marker": "bun.lock", "tool": "bun", "versionArgs": "--version" },
-      { "marker": "bun.lockb", "tool": "bun", "versionArgs": "--version" },
-      { "marker": "uv.lock", "tool": "uv", "versionArgs": "--version" },
-      { "marker": "poetry.lock", "tool": "poetry", "versionArgs": "--version" },
-      { "marker": "Pipfile.lock", "tool": "pipenv", "versionArgs": "--version" },
-      { "marker": "Gemfile.lock", "tool": "bundle", "versionArgs": "--version" },
-      { "marker": "mix.lock", "tool": "mix", "versionArgs": "--version" },
-      { "marker": "Cargo.lock", "tool": "cargo", "versionArgs": "--version" },
-      { "marker": "go.sum", "tool": "go", "versionArgs": "version" }
+      {
+        "marker": "composer.lock",
+        "tool": "composer",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "pnpm-lock.yaml",
+        "tool": "pnpm",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "package-lock.json",
+        "tool": "npm",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "yarn.lock",
+        "tool": "yarn",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "bun.lock",
+        "tool": "bun",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "bun.lockb",
+        "tool": "bun",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "uv.lock",
+        "tool": "uv",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "poetry.lock",
+        "tool": "poetry",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "Pipfile.lock",
+        "tool": "pipenv",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "Gemfile.lock",
+        "tool": "bundle",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "mix.lock",
+        "tool": "mix",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "Cargo.lock",
+        "tool": "cargo",
+        "versionArgs": "--version"
+      },
+      {
+        "marker": "go.sum",
+        "tool": "go",
+        "versionArgs": "version"
+      }
     ]
   },
-
   "hazards": [
     {
       "id": "composer-post-install",
@@ -241,7 +343,6 @@
       "corroboration": null
     }
   ],
-
   "escalations": [
     {
       "id": "migration",
@@ -273,7 +374,6 @@
       "reason": "An install that migrates is the one failure mode with no recovery: it runs against the SHARED development database. Never neutralise this silently. State exactly which script was found and what it calls, then ASK — the developer may know it is safe, or may need a different command entirely."
     }
   ],
-
   "corroboration": {
     "_comment": [
       "Where this repo may have ALREADY answered the same question, in an artifact that has been",
@@ -305,7 +405,13 @@
     ],
     "keepFlags": {
       "_comment": "Safety flags. Finding one of these in CI is corroboration to KEEP it in the proposed command, never to remove it. `--ignore-scripts` and `--no-scripts` suppress arbitrary dependency- or repo-authored lifecycle code; that is exactly what a hook running unattended before the UI renders must not execute.",
-      "flags": ["--ignore-scripts", "--no-scripts", "--frozen-lockfile", "--immutable", "--locked"]
+      "flags": [
+        "--ignore-scripts",
+        "--no-scripts",
+        "--frozen-lockfile",
+        "--immutable",
+        "--locked"
+      ]
     },
     "stripFlags": [
       "--no-dev",
@@ -321,13 +427,15 @@
     ],
     "stripFlagsWithValue": {
       "_comment": "These take a value, so strip the flag AND its argument — and handle the `--flag=value` form too. NOTE `-w` is deliberately NOT here: for npm it is short for --workspace and takes a value, but for pnpm it is --workspace-root and is a BOOLEAN. Treating it as valued would swallow the next real flag, turning `pnpm install -w --frozen-lockfile` into `pnpm install` — a non-frozen install that can rewrite the lockfile. It is in stripFlags instead, which is safe for both.",
-      "flags": ["--filter", "--workspace"]
+      "flags": [
+        "--filter",
+        "--workspace"
+      ]
     },
     "neverFrom": {
       "shell": "CI has no nix and no direnv — it installs the toolchain itself. A shell wrapper taken from CI would be wrong on a developer machine, and wrong in a way that only shows up as 'command not found' inside a hook."
     }
   },
-
   "configCandidates": {
     "_comment": [
       "Gitignored config a fresh checkout is missing and cannot regenerate. These become a proposed",
@@ -383,7 +491,6 @@
       ]
     }
   },
-
   "runtimeHints": {
     "_comment": [
       "WHERE TO LOOK FOR HINTS ONLY. Layer 3 is never inferred (ADR-006): nothing in a repo states",

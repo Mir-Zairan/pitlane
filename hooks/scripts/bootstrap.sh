@@ -23,8 +23,12 @@
 # which is strictly worse than a worktree missing its dependencies.
 set -uo pipefail
 
+# SC1091: shellcheck only FOLLOWS a sourced file when invoked with -x, and the pre-commit
+# gate lints each changed file on its own. The two directives below still tell it where
+# lib.sh is for anyone running `shellcheck -x`.
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib.sh
+# shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 wt_read_input

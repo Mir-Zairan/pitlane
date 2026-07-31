@@ -28,6 +28,15 @@ Documents that lie are worse than no documents. If reality disagrees with a doc,
 
 ## Conventions
 
+- **The engine is general; no repo's identity belongs in it.** Phases 1–5 and 7 build a plugin for any
+  repository. Naming *ecosystems* is fine and necessary — `composer`, `pnpm`, `uv`, `flake.nix` are what
+  the detection tables are made of. Naming a particular *repository* is not: no local paths, no
+  project-specific env vars, database names, ports or ticket prefixes in requirements, tasks or
+  acceptance criteria. When a concrete example genuinely helps, invent a neutral one (`alice/fix-99`) or
+  point at the worked example in `docs/00-context.md` and say it is an example.
+  Two deliberate exceptions: **Phase 6** is the named-repo validation phase, and `00-context.md`'s
+  "reference repo" section plus the evidence cited in ADRs — those record what was actually measured,
+  and measurements name their subject.
 - **Hooks are deterministic shell.** No model calls, no network, no interactive prompts inside a hook.
   Anything that needs judgement happens in `/worktree-calibrate` and is written to the profile.
 - **A hook must never cost the user their session.** On any internal failure, warn on stderr, still emit
