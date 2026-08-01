@@ -390,11 +390,27 @@ wt_copy_paths() {  # $1 = main checkout, $2 = worktree
 
 # The whole config step: `.worktreeinclude` (only where native did not already do it) merged with
 # the profile's copy[], through one copier.
+# Drop the runtime override file from a NUL-separated path stream. See wt_copy_config for why.
+wt_drop_env_override() {
+  local p
+  while IFS= read -r -d '' p; do
+    [ "$p" = "${PROFILE_RT_ENVFILE:-}" ] && continue
+    printf '%s\0' "$p"
+  done
+}
+
+# THE OVERRIDE FILE IS NEVER COPIED IN, however it is listed. `copy[]` and `.worktreeinclude` both
+# draw from the gitignored files of the main checkout, which is the same set `runtime.env.file` must
+# belong to — so a profile naming `.env` in both (plausible for an app that loads only `.env`) would
+# have the copier place the main checkout's file first, layer 3 then find no marker line in it,
+# record the worktree as developer-managed FOREVER, and refuse both the overrides and the seed. The
+# worktree would run on the shared database while the plugin blamed the developer for a file it had
+# put there itself. Skipping it here breaks that chain at the only point where the two lists meet.
 wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .worktreeinclude
   local root=${1%/} worktree=${2%/} own_include=${3:-0} rec body
 
   {
-    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root"
+    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root" | wt_drop_env_override
     # copy[] comes out of the scan wt_load_profile already made — group 2 — so honouring it costs
     # no interpreter start at all. PROFILE_RAW is empty unless the profile validated, so an
     # unusable profile contributes nothing here rather than contributing half its list.
@@ -405,7 +421,9 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
           *) continue ;;
         esac
         body=${rec#*"$WT_US"}
-        [ -n "$body" ] && printf '%s\0' "$body"
+        [ -n "$body" ] || continue
+        [ "$body" = "${PROFILE_RT_ENVFILE:-}" ] && continue
+        printf '%s\0' "$body"
       done < <(printf '%s' "$PROFILE_RAW")
     fi
   } | wt_copy_paths "$root" "$worktree"
@@ -1695,9 +1713,14 @@ wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 
     skip=0
     if [ -n "$WT_SIBLINGS" ]; then
       while IFS=$WT_US read -r -d "$WT_RS" sslug sport; do
-        # A sibling on the SAME slug is not a collision — it is this worktree seen through a stale
-        # record, and stepping around it would move a port that is rightfully ours.
-        [ "$sport" = "$cand" ] && [ "$sslug" != "$slug" ] && { skip=1; break; }
+        # NO SAME-SLUG EXEMPTION. An earlier version skipped a sibling sharing our slug, on the
+        # theory that it was this worktree seen through a stale record — but self is already
+        # excluded by path and a dead worktree by the liveness test, so the only thing that
+        # exemption could ever match is a DIFFERENT LIVE worktree whose name slugifies the same.
+        # That is the collision, not an exception to it: both would derive the same database name
+        # too, which wt_runtime_handoff warns about separately because moving the port does not
+        # fix it.
+        if [ "$sport" = "$cand" ]; then skip=1; break; fi
       done <<EOF
 $WT_SIBLINGS
 EOF
@@ -1992,6 +2015,8 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
 
 # Run the seed. Sets WT_SEED_STATUS to one of: done, failed, timeout, skipped, refused, none.
 wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env state $7=seed rel $8=deadline
+  # $6 carries the env file's DISPOSITION, which is `ours`, `theirs`, or — when the profile asked
+  # for a file this session could not write — `unwritten`.
   local root=${1%/} worktree=${2%/} slug=${3-} port=${4-} envrel=${5-} envstate=${6-}
   local rel=${7-} deadline=${8-} abs esc cksum prev prevck prevslug left secs full rc started elapsed
   local sibslug sibport
@@ -2053,6 +2078,17 @@ wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env sta
   # the app will never read, and in the worst case does it to a name someone else is using.
   if [ "$envstate" = theirs ]; then
     wt_log "  runtime: not seeding — $envrel is managed by you, so this worktree is pointed somewhere the seed's WT_SLUG=$slug does not describe. Delete that file to hand it back."
+    WT_SEED_STATUS=refused
+    return 0
+  fi
+  # THE SAME CONDITION ARRIVED AT A DIFFERENT WAY. If the profile asked for an override file and
+  # this session could not write it — the path was not gitignored, a parent was a symlink, the disk
+  # was full — then the app in this worktree is still reading whatever it read before, usually the
+  # shared database. Seeding would then create a database named after WT_SLUG that nothing points
+  # at, while the session quietly works against the shared one. Refusal 1 exists for exactly this
+  # state; it just could not see it until the outcome was passed in.
+  if [ "$envstate" = unwritten ]; then
+    wt_log "  runtime: not seeding — $envrel could not be written, so this worktree is not pointed at anything named $slug yet"
     WT_SEED_STATUS=refused
     return 0
   fi
@@ -2212,7 +2248,7 @@ WT_NO_RUNTIME_MARKER='.claude/worktree-no-runtime'
 
 wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
-  local slug tpl envrel envstate port psrc oldslug oldseed oldcksum
+  local slug tpl envrel envstate oldenv recenv port psrc oldslug oldseed oldcksum sslug sport
 
   [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
 
@@ -2287,6 +2323,10 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
   # --- the env override file -------------------------------------------------------------------
   envrel=${PROFILE_RT_ENVFILE:-}
   envstate=$(wt_runtime_state_get "$worktree" envstate) || envstate=''
+  # A CHANGED `runtime.env.file` makes the recorded disposition meaningless: it described a
+  # different file. Carrying `ours` across would claim we wrote a file we have never touched.
+  oldenv=$(wt_runtime_state_get "$worktree" envfile) || oldenv=''
+  [ "$oldenv" = "$envrel" ] || envstate=''
   if [ -n "$envrel" ]; then
     wt_runtime_env_write "$worktree" "$envrel" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}"
     case $WT_ENV_WROTE in
@@ -2301,10 +2341,34 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
         fi
         envstate=theirs
         ;;
-      *) envstate=${envstate:-} ;;
+      # The profile asked for a file and we could not write it — a state of its own, because the
+      # seed must refuse on it just as it refuses on a developer-managed file.
+      *) envstate=unwritten ;;
     esac
-    wt_runtime_state_set "$worktree" "$slug" "$port" "$psrc" "$envrel" "$envstate" \
+    # `unwritten` is this session's outcome, not a durable fact about the file — recording it
+    # would make a later successful write look like a change of ownership. Only `ours`/`theirs`
+    # persist.
+    case $envstate in
+      ours | theirs) recenv=$envstate ;;
+      *) recenv='' ;;
+    esac
+    wt_runtime_state_set "$worktree" "$slug" "$port" "$psrc" "$envrel" "$recenv" \
       "${oldseed:-none}" "$oldcksum" || true
+  fi
+
+  # ANOTHER LIVE WORKTREE ON THIS SLUG affects the DATABASE, not just the port — both derive the
+  # same `demo_{slug}`, and stepping the port forward does not fix that. The seed refuses outright,
+  # but a profile with `env.vars` and no seed has nothing to refuse, so the warning belongs here
+  # where every profile shape reaches it.
+  if [ -n "${WT_SIBLINGS-}" ]; then
+    while IFS=$WT_US read -r -d "$WT_RS" sslug sport; do
+      if [ "$sslug" = "$slug" ]; then
+        wt_log "runtime: another live worktree already uses the name \"$slug\", so both would point at the same database. Rename this worktree, or give runtime.slug a template that distinguishes them."
+        break
+      fi
+    done <<EOF
+${WT_SIBLINGS-}
+EOF
   fi
 
   # --- the seed ----------------------------------------------------------------------------------

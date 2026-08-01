@@ -21,7 +21,9 @@
 #   Working directory   the worktree, not the main checkout.
 #   Shell               whatever your profile's `shell` says, so your project's toolchain is on
 #                       PATH exactly as it is for the install commands.
-#   Environment         WT_NAME      the worktree name as given, e.g. alice/fix-99
+#   Environment         WT_NAME      the worktree name, e.g. alice/fix-99 or alice-fix-99
+#                                    depending on how the worktree was created — do not key
+#                                    anything on it; that is what WT_SLUG is for
 #                       WT_SLUG      that name sanitised to [a-z0-9_], e.g. alice_fix_99.
 #                                    THIS is what to name things after — never WT_NAME, which is
 #                                    raw branch text and can contain anything.
@@ -29,7 +31,9 @@
 #                                    does not configure one
 #                       WT_PATH      absolute path of the worktree
 #                       WT_ROOT      absolute path of the main checkout
-#                       WT_ENV_FILE  the override file the plugin wrote, relative to WT_PATH
+#                       WT_ENV_FILE  the override file the profile NAMES, relative to WT_PATH.
+#                                    EMPTY when the profile has no `runtime.env`, and the file may
+#                                    not exist if the plugin could not write it — guard both.
 #   Time limit          `timeouts.seedSeconds`, or whatever is LEFT of the bootstrap budget if
 #                       that is less. Overrun is not a crash — the script is stopped and the
 #                       session continues.
@@ -65,8 +69,9 @@
 # 3. NO CREDENTIALS IN HERE. This file is committed. Read them from the environment or from the
 #    `.env` the plugin copied into the worktree — which is exactly why it copies it.
 #
-# 4. IT IS SAFE TO RUN TWICE. A hook can be interrupted, and the plugin retries a seed it could not
-#    confirm finished.
+# 4. IT IS SAFE TO RUN TWICE. A hook can be interrupted before the outcome is recorded, and the
+#    next session then runs this again. (It is not retried after a failure it DID record, until
+#    this file changes — so do not rely on "it will just try again next time".)
 
 # SC2317/SC2329/SC2034: everything below the sentinel is deliberately UNREACHABLE until a developer
 # deletes that line, and target_exists() is deliberately uncalled-looking for the same reason. That
@@ -114,8 +119,13 @@ SOURCE="${WORKTREE_SEED_SOURCE:-demo_template}"
 #   Docker volume:  docker volume inspect "${TARGET}" >/dev/null 2>&1
 #
 target_exists() {
-  echo "worktree-seed: replace target_exists() with a real check" >&2
-  return 1
+  # FAILS CLOSED, and that matters more than it looks. Returning "no, it does not exist" would mean
+  # that a copy of this file in which section 2 was replaced but this check was not goes straight
+  # on to clone OVER whatever is already there. This is the only defence against a database made by
+  # a colleague, by hand, or by a worktree of the same name that was torn down — the plugin's own
+  # check can only see live sibling worktrees. So an unreplaced check stops the script instead.
+  echo "worktree-seed: target_exists() has not been replaced — refusing to touch ${TARGET}" >&2
+  exit 1
 }
 
 if target_exists; then
@@ -133,10 +143,23 @@ fi
 #   SQLite:         cp "var/${SOURCE}.sqlite" "var/${TARGET}.sqlite"
 #
 # If your app needs migrations run afterwards, run them HERE, against ${TARGET} — not against
-# whatever the ambient environment points at. Sourcing the override file the plugin just wrote is
-# usually the simplest way to be sure:
+# whatever the ambient environment points at.
 #
-#   set -a; . "${WT_PATH}/${WT_ENV_FILE}"; set +a
+# READING THE OVERRIDE FILE: do not `source` it. The plugin writes values VERBATIM and unquoted —
+# dotenv dialects disagree about quoting, so the profile author's own text is used as-is — and a
+# value may legitimately contain `{worktree}`, which expands to a path containing the branch name.
+# Sourcing turns `DOC_ROOT=/wt/x;whatever` into two commands, run unattended at session start. Read
+# it without evaluating instead:
+#
+#   if [ -n "${WT_ENV_FILE:-}" ] && [ -f "${WT_PATH}/${WT_ENV_FILE}" ]; then
+#     while IFS='=' read -r k v; do
+#       case $k in ''|'#'*) continue ;; esac
+#       export "$k=$v"
+#     done < "${WT_PATH}/${WT_ENV_FILE}"
+#   fi
+#
+# Note both guards: WT_ENV_FILE is the path your profile NAMES, so it is empty when the profile has
+# a seed and no `runtime.env`, and the file may not exist if the plugin could not write it.
 #
 echo "worktree-seed: replace this section with the clone your database needs" >&2
 exit 1

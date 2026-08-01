@@ -745,6 +745,91 @@ lacks 'and the summary does not claim it wrote one' 'env=tracked.env' "$errRF"
 contains 'while still reporting the slug it settled on' 'runtime: slug=rf' "$errRF"
 eq 'and no such file was created' 0 "$([ -e "$WRF/tracked.env" ] && echo 1 || echo 0)"
 
+# AN UNWRITABLE OVERRIDE FILE MUST ALSO STOP THE SEED. The seed's first refusal is "the app is not
+# pointed where WT_SLUG describes" — and a write that was REFUSED leaves exactly that state, with
+# the app still reading the shared database. Seeding then creates a database nothing points at,
+# which is the failure the refusal exists for arrived at by a different route.
+RU=$TMP/rtunwritable
+make_rt_repo "$RU" ',
+    "seed": ".claude/worktree-seed.sh"'
+python3 - "$RU/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["env"]["file"] = "tracked.env"     # deliberately NOT gitignored, so the write refuses
+json.dump(d, open(f, "w"))
+PYJ
+mkdir -p "$RU/.claude"
+# shellcheck disable=SC2016  # $WT_PATH must reach the seed script, not be expanded here.
+printf '#!/usr/bin/env bash\nprintf ran > "$WT_PATH/seeded.txt"\n' > "$RU/.claude/worktree-seed.sh"
+chmod +x "$RU/.claude/worktree-seed.sh"
+git -C "$RU" add -A; git -C "$RU" commit -qm unwritable
+WU=$RU/.claude/worktrees/u1
+git -C "$RU" worktree add -q "$WU" -b worktree-u1 2>/dev/null
+start_hook "$WU" >/dev/null; errU=$(cat "$TMP/err")
+eq 'a refused env write stops the seed' 0 "$([ -e "$WU/seeded.txt" ] && echo 1 || echo 0)"
+contains 'and says the worktree is not pointed anywhere yet' 'not pointed at anything named' "$errU"
+eq 'and the session still survives' 'ok' "$(cat "$WU/vendor/marker" 2>/dev/null)"
+
+# THE OVERRIDE FILE IS NEVER COPIED IN, however it is listed. copy[] and .worktreeinclude draw from
+# the same gitignored set the override file must belong to, so a profile naming one path in both
+# would have the copier place the main checkout's version first — layer 3 then finds no marker,
+# records the worktree developer-managed FOREVER, and refuses both the overrides and the seed,
+# blaming the developer for a file the plugin put there itself.
+RO=$TMP/rtoverlap
+make_rt_repo "$RO"
+python3 - "$RO/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["copy"] = [".env.worktree.local"]             # the same path runtime.env.file names
+json.dump(d, open(f, "w"))
+PYJ
+printf 'INSTALLATION_NAME=the_main_checkout_one\n' > "$RO/.env.worktree.local"
+git -C "$RO" add -A; git -C "$RO" commit -qm overlap
+WO=$RO/.claude/worktrees/o1
+git -C "$RO" worktree add -q "$WO" -b worktree-o1 2>/dev/null
+start_hook "$WO" >/dev/null
+eq 'the main checkout version is NOT copied over the override file' 'demo_o1' \
+  "$(envval "$WO" INSTALLATION_NAME)"
+eq 'and the worktree is isolated rather than reading the shared value' 0 \
+  "$(grep -c 'the_main_checkout_one' "$WO/.env.worktree.local" | tr -d ' ')"
+
+# ...and the same for .worktreeinclude, which is the OTHER list drawing from the same gitignored
+# set. It is only honoured on the WorktreeCreate path, so this exercises that branch.
+printf '.env.worktree.local\n' > "$RO/.worktreeinclude"
+git -C "$RO" add -A; git -C "$RO" commit -qm wtinclude
+outWC=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"o2\",\"cwd\":\"$RO\"}" "$RO")
+eq 'WorktreeCreate still prints the worktree path' "$RO/.claude/worktrees/o2" "$outWC"
+eq 'and .worktreeinclude did NOT copy the main checkout version over the override file' 0 \
+  "$(grep -c 'the_main_checkout_one' "$RO/.claude/worktrees/o2/.env.worktree.local" 2>/dev/null | tr -d ' ')"
+eq 'while the worktree got its own isolated value' 'demo_o2' \
+  "$(envval "$RO/.claude/worktrees/o2" INSTALLATION_NAME)"
+
+# A CHANGED runtime.env.file makes the recorded disposition meaningless — it described a different
+# file. Carrying `theirs` across would suppress the once-only notice for the NEW file, so a
+# developer who is now managing a second file would never be told the plugin has stopped writing it.
+RV=$TMP/rtchangedenv
+make_rt_repo "$RV"
+git -C "$RV" worktree add -q "$RV/.claude/worktrees/v1" -b worktree-v1 2>/dev/null
+WV=$RV/.claude/worktrees/v1
+start_hook "$WV" >/dev/null
+printf 'MINE=1\n' > "$WV/.env.worktree.local"          # take ownership of the first file
+start_hook "$WV" >/dev/null                              # ...and be told once
+printf '.env.other.local\n' >> "$WV/.gitignore"
+python3 - "$WV/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["env"]["file"] = ".env.other.local"
+json.dump(d, open(f, "w"))
+PYJ
+printf 'ALSO_MINE=1\n' > "$WV/.env.other.local"          # and of the new one
+start_hook "$WV" >/dev/null; errV=$(cat "$TMP/err")
+contains 'a NEW developer-managed override file is announced on its own terms' \
+  '.env.other.local is yours' "$errV"
+eq 'and it is left alone' 'ALSO_MINE=1' "$(cat "$WV/.env.other.local")"
+
 # ACCEPTANCE: every runtime failure path still yields a session. A seed that fails, and one that
 # hangs past its budget.
 RS=$TMP/rtseed

@@ -1789,11 +1789,16 @@ wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
 eq 'two claimed candidates are both stepped over' "$c3" "$WT_PORT"
 git -C "$PREPO" worktree remove --force "$PG" 2>/dev/null
 
-# A sibling holding the same port under the SAME slug is not a collision.
+# A LIVE SIBLING ON THE SAME SLUG IS A REAL COLLISION, not an exemption. An earlier version
+# skipped it, reasoning that it must be this worktree seen through a stale record — but self is
+# excluded BY PATH and a dead worktree by the liveness check, so the only thing that exemption
+# could ever match is a different live worktree whose name slugifies the same. Stepping the port
+# forward is right; it is the DATABASE the two would still share, which wt_runtime_handoff warns
+# about separately because no port move can fix it.
 rm -f "$(wt_state_path "$PA")"
 wt_runtime_state_set "$PB" alpha_slug "$want" derived .e ours none ''
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
-eq 'a same-slug sibling does not push us off our own port' "$want" "$WT_PORT"
+ne 'a live sibling on the same slug is stepped over like any other' "$want" "$WT_PORT"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
 # A span of 1 with the single port already claimed: every candidate is taken, so it keeps the

@@ -1346,6 +1346,19 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         printf 'runtime.env.file: "%s" must be a relative path inside the repository\n' "$envfile"
         bad=1
       fi
+      # THE OVERRIDE FILE MUST NOT ALSO BE A COPIED FILE. Both lists draw from the same gitignored
+      # set, so naming one path in both means the copier places the main checkout's version first
+      # and layer 3 then reads it as developer-managed forever — the worktree runs on the shared
+      # database while the plugin blames the developer. The engine now skips it in the copier, so
+      # this is a warning rather than a violation, but the profile still says something it does not
+      # mean and the author should know.
+      if [ -n "$envfile" ] && [ -n "$copy" ]; then
+        case $copy in
+          *"\"$envfile\""*)
+            wt_log "runtime.env.file names $envfile, which copy[] also lists — the plugin writes that file, so it will not be copied in as well; remove it from copy[]"
+            ;;
+        esac
+      fi
       # The runtime templates are where a botched placeholder does the most damage, and they
       # are the docstring's own motivating example: `demo_{slugg}` reaching a database name
       # writes the literal text `demo_{slugg}` instead of isolating anything. env.vars is
