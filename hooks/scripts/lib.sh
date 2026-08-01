@@ -609,6 +609,11 @@ wt_main_root() {  # $1 = directory (default: $PWD)
 # Slugs and placeholders
 # ---------------------------------------------------------------------------
 
+# The longest slug wt_slugify will return. See the LENGTH IS CAPPED paragraph below for why 40 and
+# not something rounder: it is a database identifier limit (63/64) minus the room a repo's own
+# naming spends before the slug begins.
+WT_SLUG_MAX=40
+
 # A worktree name reduced to something safe to embed in a database name, an env var
 # value or a filename: lowercased, every run of characters outside [a-z0-9_] collapsed
 # to a single _, and leading/trailing _ trimmed.
@@ -620,14 +625,49 @@ wt_main_root() {  # $1 = directory (default: $PWD)
 # where it is a fatal expansion error that would take the whole hook down. LC_ALL=C keeps
 # the ranges ASCII, so a non-ASCII name degrades to _ instead of depending on collation.
 #
-# The slug keys a database name and a port derived as base + crc32(slug) % span, so it
+# The slug keys a database name and a port derived as base + cksum(slug) % span, so it
 # must be stable for a given name and — just as important — DISTINCT for distinct names.
 # A name made only of separators (or entirely non-ASCII, e.g. a colleague's branch in
 # Japanese) would otherwise slug to the empty string, and every such worktree would land
 # on one shared database and one shared port. Those fall back to a checksum of the raw
 # name instead: still deterministic across runs and machines, but still distinct.
+#
+# LENGTH IS CAPPED, and the cap is not cosmetic. A slug keys a database name, and identifiers have
+# limits — PostgreSQL 63 bytes, MySQL 64 — which the repo's own shaping eats into before the slug
+# even arrives (`demo_{slug}_test` spends 11 characters before the first character of the slug).
+# 40 leaves room for that.
+#
+# THE TRUNCATION MUST NOT COLLIDE, which is the whole difficulty. Chopping at 40 makes any two
+# branch names agreeing on their first 40 characters — `feature/checkout-rewrite-part-one` and
+# `-part-two`, which is exactly how people name long branches — slug to ONE string, and therefore
+# to one database and one port. That is the half-isolation bug in its purest form: both worktrees
+# look isolated and share their state. So an over-long slug keeps a 29-character prefix and spends
+# the rest on a checksum of the WHOLE sanitised string, which differs wherever the names differ.
+#
+# 11 characters are reserved for that suffix, not 9: `cksum`'s first field is up to 4294967295,
+# which is ten digits, plus the `_`.
+#
+# The checksum is taken of the SANITISED string rather than the raw name, so that two names which
+# already mean the same slug keep meaning the same slug — `Fix-99` and `fix_99` must not diverge
+# only because they happen to be long.
+#
+# The prefix is re-trimmed of a trailing `_` before the suffix is joined on, which keeps this
+# function IDEMPOTENT: without it a prefix ending in `_` would produce `__`, and re-slugifying the
+# result would collapse that and return something different. Idempotence matters because the slug
+# round-trips through the profile's `runtime.slug` template, which Phase 4 re-slugifies on the way
+# out.
+#
+# LC_ALL=C TWICE, because the two spellings cover different processes and neither covers both.
+# `local LC_ALL=C` makes bash's OWN bracket ranges C-collated — `[!a-z0-9_]` is locale-collated and
+# can otherwise mean different sets on two machines. It does NOT reach `tr`: a bash `local` has no
+# export attribute unless the name was already exported, and LC_ALL is normally unset, so without
+# the command prefix the case fold runs under the ambient LANG (measured: inside such a function
+# `env` shows no LC_ALL at all). That matters because glibc's Turkish locale does not fold `I` to
+# `i`, so one branch name would slug two ways on two laptops — and the slug names a database.
+# (The collapse loop already makes the byte-vs-character difference invisible: a two-byte `é`
+# becomes `__` under C and `_` under UTF-8, and both collapse to `_`.)
 wt_slugify() {  # $1 = worktree name
-  local s ck
+  local LC_ALL=C s ck
   s=$(printf '%s' "${1-}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   s=${s//[!a-z0-9_]/_}
   while [ "${s//__/_}" != "$s" ]; do s=${s//__/_}; done
@@ -637,7 +677,101 @@ wt_slugify() {  # $1 = worktree name
     ck=$(printf '%s' "${1-}" | cksum) || return 1
     s="wt_${ck%% *}"
   fi
+  if [ "${#s}" -gt "$WT_SLUG_MAX" ]; then
+    ck=$(printf '%s' "$s" | cksum) || return 1
+    ck=${ck%% *}
+    s=${s:0:$((WT_SLUG_MAX - 11))}
+    s=${s%_}
+    s="${s}_${ck}"
+  fi
   printf '%s' "$s"
+}
+
+# True if $1 is safe to use as the NAME of an environment variable: a leading letter or underscore,
+# then letters, digits and underscores, within a sane length.
+#
+# This is the gate wt_json_kv deliberately does not apply. A key out of `runtime.env.vars` becomes
+# the left-hand side of a `KEY=value` line in a file the application loads, and that profile is
+# committed (ADR-008) so the key arrives with anyone's branch. Without a shape check, a key of
+# `A=1` writes a line that sets a DIFFERENT variable than the profile appears to name, and a key
+# containing a space or an `=` produces a line most dotenv parsers read as something else entirely
+# — neither of which the value-side quoting can defend against, because the damage is done before
+# the `=` this writer adds.
+#
+# LC_ALL=C for the same reason wt_slugify has it: a locale-collated bracket range would accept a
+# different set of characters on a colleague's machine, and a committed profile is read on both.
+wt_is_safe_envkey() {  # $1 = candidate
+  local LC_ALL=C k=${1-}
+  case $k in
+    '' | [!A-Za-z_]*) return 1 ;;
+    *[!A-Za-z0-9_]*) return 1 ;;
+  esac
+  [ "${#k}" -le 128 ]
+}
+
+# The port a slug derives to: base + (cksum(slug) % span).
+#
+# `cksum` rather than an interpreter, because this runs on the session-start path and a cold
+# python3 costs more than every other part of layer 3 put together — and because `cksum` is
+# already what wt_slugify's own fallback trusts for the same property.
+#
+# NOTE, and it is worth being exact because the docs used to say otherwise: POSIX `cksum` is NOT
+# zlib's CRC-32. They disagree (`printf hello | cksum` gives 3287646509 where zlib.crc32 gives
+# 907060870). Nothing here needs to match another tool's crc32 — the requirement is only that the
+# value is the same on every machine that opens the worktree, which `cksum` being POSIX-specified
+# gives. Do not "fix" this to a different checksum later: every existing worktree would move to a
+# different port, and a developer's bookmarked URL is the thing this determinism exists to protect.
+#
+# Returns 1 rather than a wrong number when the range is unusable, so a caller cannot mistake a
+# malformed profile for a derived port. `%` is applied before the addition, so the 32-bit checksum
+# never has to fit anywhere narrower than bash's own arithmetic.
+#
+# THE RANGE IS BOUNDED TO REAL PORTS, not merely to "positive integers". A digits-only check passes
+# a `base` of nineteen digits, which then wraps bash's own arithmetic and prints a negative number
+# with a success code — a committed profile with a typo would hand a caller a "port" that no socket
+# can ever be bound to, and the caller would write it into the app's environment. Refusing here is
+# the whole reason this function reports failure at all.
+wt_derive_port() {  # $1 = slug, $2 = base, $3 = span
+  local slug=${1-} base=${2-} span=${3-} ck
+  wt_is_posint "$base" || return 1
+  wt_is_posint "$span" || return 1
+  [ "$((10#$base))" -ge "$WT_PORT_MIN" ] || return 1
+  [ "$((10#$span))" -le "$WT_PORT_MAX" ] || return 1
+  [ "$((10#$base + 10#$span - 1))" -le "$WT_PORT_MAX" ] || return 1
+  ck=$(printf '%s' "$slug" | cksum) || return 1
+  ck=${ck%% *}
+  printf '%s' $((10#$base + (10#$ck % 10#$span)))
+}
+
+# How many ports wt_port_candidates will offer before giving up. A span is allowed to be tens of
+# thousands wide, and emitting one line per port would spend more time building the list than the
+# whole rest of the bootstrap; the number of worktrees that could actually be contending is small.
+# Beyond this the caller keeps the derived port and warns, which is safe — a port collision costs
+# one bind error, never data.
+WT_PORT_PROBE_MAX=64
+
+# The range a derived port must fall inside. 1024 because a hook cannot bind a privileged port and
+# a profile naming one is a mistake worth reporting, not honouring; 65535 because that is where
+# ports stop.
+WT_PORT_MIN=1024
+WT_PORT_MAX=65535
+
+# The ports to try, in order, one per line: the derived one first, then forward within the span,
+# wrapping at its end so the whole span is reachable from anywhere inside it.
+#
+# PURE — no I/O, no knowledge of what is taken. Deciding that is the caller's job, and keeping the
+# two apart is what makes the sequence exhaustively testable without a single fixture.
+wt_port_candidates() {  # $1 = slug, $2 = base, $3 = span, $4 = max (default WT_PORT_PROBE_MAX)
+  local slug=${1-} base=${2-} span=${3-} max=${4:-$WT_PORT_PROBE_MAX} first i n
+  first=$(wt_derive_port "$slug" "$base" "$span") || return 1
+  wt_is_posint "$max" || max=$WT_PORT_PROBE_MAX
+  n=$((10#$span))
+  [ "$n" -le "$((10#$max))" ] || n=$((10#$max))
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    printf '%s\n' $(( 10#$base + ((first - 10#$base + i) % 10#$span) ))
+    i=$((i + 1))
+  done
 }
 
 # Substitute the profile placeholders in $1 from the WT_* environment:
@@ -819,6 +953,17 @@ WT_HOOK_TIMEOUT=600
 # says a user must never lose a session. Anything non-numeric makes `timeout` exit 125,
 # which a consumer would misread as "the bootstrap failed".
 wt_is_seconds() {  # $1 = candidate
+  wt_is_posint "${1-}"
+}
+
+# True if $1 is a positive whole number — the actual test, with no unit attached to its name.
+#
+# wt_is_seconds is a one-line alias for it rather than a second copy. The two callers want the
+# identical check for unrelated quantities (a timeout, and a port's base and span), and a numeric
+# validator that exists twice is the shape this codebase has already had to un-duplicate twice —
+# once for the JSON value renderer, once for the drift comparator. Reading `wt_is_seconds "$base"`
+# at a port call site would also be a small lie in the source.
+wt_is_posint() {  # $1 = candidate
   local n=${1-}
   case $n in
     '' | *[!0-9]*) return 1 ;;

@@ -40,6 +40,30 @@ eq() {  # $1 = label, $2 = expected, $3 = actual
 
 rc_is() { eq "$1" "$2" "$3"; }  # $1 = label, $2 = expected rc, $3 = actual rc
 
+# A derived port must land in [base, base+span). Asserted as a RANGE rather than against a
+# hardcoded number on purpose: pinning the exact port would pin `cksum`'s output, and the
+# properties that matter are determinism (asserted separately, by comparing two calls) and
+# containment. A test that hardcoded 3912 would fail on any machine whose cksum differed while
+# telling you nothing about whether the derivation was still correct.
+in_range() {  # $1 = label, $2 = base, $3 = span, $4 = actual
+  if [ "$4" -ge "$2" ] && [ "$4" -lt $(($2 + $3)) ] 2>/dev/null; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL [%s] %s\n      %s is not in [%s, %s)\n' \
+      "$BACKEND" "$1" "$4" "$2" $(($2 + $3)) >&2
+  fi
+}
+
+lacks() {  # $1 = label, $2 = needle that must NOT appear, $3 = haystack
+  case $3 in
+    *"$2"*) fail=$((fail + 1))
+            printf 'FAIL [%s] %s\n      must not contain: %q\n      actual: %q\n' \
+              "$BACKEND" "$1" "$2" "$3" >&2 ;;
+    *) pass=$((pass + 1)) ;;
+  esac
+}
+
 ne() {  # $1 = label, $2, $3 = values that must differ
   if [ "$2" != "$3" ]; then
     pass=$((pass + 1))
@@ -304,6 +328,238 @@ worktree: two' "$err"
   ne 'two non-ascii names must not collide' "$s_ja" "$s_ko"
   ne '"///" and "-" must not collide' "$s_slash" "$s_dash"
   eq 'slugify fallback is deterministic' "$s_empty" "$(wt_slugify '')"
+
+  # --- wt_slugify: the length cap --------------------------------------------
+  # A slug names a database, and identifiers have limits. What the cap must NOT do is make two
+  # long names collide: that is the half-isolation bug — both worktrees look isolated and share
+  # one database — so these assertions are about DISTINCTNESS first and length second.
+  long_a='feature/checkout-rewrite-the-long-descriptive-part-one'
+  long_b='feature/checkout-rewrite-the-long-descriptive-part-two'
+  sa=$(wt_slugify "$long_a"); sb=$(wt_slugify "$long_b")
+  capped_ok=0
+  { [ "${#sa}" -le "$WT_SLUG_MAX" ] && [ "${#sa}" -gt 20 ]; } || capped_ok=1
+  rc_is 'slugify caps at WT_SLUG_MAX without collapsing to nothing' 0 "$capped_ok"
+  ne 'two long names agreeing on their first 40 chars still differ' "$sa" "$sb"
+  # The prefix really is shared — proving the divergence above comes from the checksum suffix and
+  # not from the names happening to differ early.
+  eq 'the capped prefix of both IS identical, so the suffix is what separates them' \
+    "${sa:0:29}" "${sb:0:29}"
+  eq 'a capped slug is still legal [a-z0-9_]' '' "$(printf '%s' "$sa" | tr -d 'a-z0-9_')"
+  lacks 'a capped slug has no doubled underscore' '__' "$sa"
+  case $sa in *_) sa_tail=1 ;; *) sa_tail=0 ;; esac
+  rc_is 'a capped slug does not end in _' 0 "$sa_tail"
+  # IDEMPOTENCE SURVIVES THE CAP. Phase 4 round-trips a slug through runtime.slug and re-slugifies
+  # the result, so a capped slug that changed on a second pass would derive a different database
+  # on the very next session.
+  eq 'slugify is idempotent on a capped slug' "$sa" "$(wt_slugify "$sa")"
+  eq 'slugify is stable across calls for a capped slug' "$sa" "$(wt_slugify "$long_a")"
+  # THE CHILD PROCESS'S LOCALE, pinned by MECHANISM rather than by outcome.
+  #
+  # The slug names a database, so it has to be byte-identical on every machine — and the case fold
+  # is the locale-sensitive step (glibc's Turkish locale does not fold `I` to `i`). The outcome
+  # cannot be asserted directly: reproducing the divergence needs a Turkish locale, and most
+  # machines including this one do not have one installed, so an outcome test would silently
+  # degrade to asserting nothing.
+  #
+  # What actually broke is observable without any locale at all. `local LC_ALL=C` sets the variable
+  # for BASH but does not export it, so the `tr` child ran under the ambient LANG. Shadowing `tr`
+  # with a stub that records the LC_ALL it was handed pins exactly that, on any machine.
+  mkdir -p "$TMP/lcbin"
+  real_tr=$(command -v tr)
+  {
+    printf '#!/usr/bin/env bash\n'
+    # SC2016: ${LC_ALL-UNSET} must stay LITERAL. It is the generated stub that expands it, at the
+    # moment the stub runs as tr's replacement — expanding it here would bake in this shell's
+    # locale and the assertion would pin nothing.
+    # shellcheck disable=SC2016
+    printf 'printf %%s "${LC_ALL-UNSET}" >"%s/lcbin/seen"\n' "$TMP"
+    printf 'exec %s "$@"\n' "$real_tr"
+  } >"$TMP/lcbin/tr"
+  chmod +x "$TMP/lcbin/tr"
+  rm -f "$TMP/lcbin/seen"
+  ( PATH="$TMP/lcbin:$PATH"
+    unset LC_ALL
+    export LANG=en_US.utf8
+    wt_slugify 'ABC-Def' >/dev/null )
+  eq 'slugify folds case in the C locale even when LC_ALL is unset in the environment' \
+    'C' "$(cat "$TMP/lcbin/seen" 2>/dev/null)"
+
+  # THE BOUNDARY. Exactly WT_SLUG_MAX must pass through untouched and one more must cap, which is
+  # what separates `-gt` from `-ge` in the guard; neither is pinned by the long names above.
+  n40=$(printf 'a%.0s' $(seq 1 "$WT_SLUG_MAX"))
+  n41=$(printf 'a%.0s' $(seq 1 $((WT_SLUG_MAX + 1))))
+  eq 'a name of exactly WT_SLUG_MAX passes through uncapped' "$n40" "$(wt_slugify "$n40")"
+  ne 'a name one character longer is capped' "$n41" "$(wt_slugify "$n41")"
+  capped_ok=0
+  [ "${#-}" -ge 0 ] && [ "$(printf '%s' "$(wt_slugify "$n41")" | wc -c)" -le "$WT_SLUG_MAX" ] || capped_ok=1
+  rc_is 'and the capped result is within the cap' 0 "$capped_ok"
+
+  # THE CHECKSUM IS OF THE SANITISED STRING, NOT THE RAW NAME. Two spellings that already mean one
+  # slug must keep meaning one slug — otherwise `Feature/Long-Thing` and `feature_long_thing` name
+  # the same database while short but two different ones once they cross the cap, which is a
+  # collision that appears only for long names and would be found in production.
+  eq 'a long name and its already-sanitised spelling cap to the SAME slug' \
+    "$(wt_slugify 'feature/checkout-rewrite-the-long-descriptive-part-one')" \
+    "$(wt_slugify 'FEATURE/Checkout--Rewrite/The-Long-Descriptive-Part-One')"
+
+  # An 80-character name and one that is pure punctuation-plus-length both stay legal.
+  s80=$(wt_slugify 'aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffgggggggggghhhhhhhhhh')
+  capped_ok=0
+  [ "${#s80}" -le "$WT_SLUG_MAX" ] || capped_ok=1
+  rc_is 'an 80-char name caps' 0 "$capped_ok"
+  eq 'an 80-char name stays legal' '' "$(printf '%s' "$s80" | tr -d 'a-z0-9_')"
+  # A name whose 29-char prefix ENDS in an underscore is the case that would produce `__` and
+  # break idempotence if the prefix were not re-trimmed before the suffix is joined on.
+  s_us=$(wt_slugify 'abcdefghijklmnopqrstuvwxyzab/cdefghijklmnopqrstuvwxyz')
+  lacks 'a prefix ending in _ does not produce __' '__' "$s_us"
+  case $s_us in *_) us_tail=1 ;; *) us_tail=0 ;; esac
+  rc_is 'nor does the underscore-prefix one' 0 "$us_tail"
+  eq 'that slug is idempotent too' "$s_us" "$(wt_slugify "$s_us")"
+  # A short name is untouched by any of this.
+  eq 'a short name is unaffected by the cap' 'colleague_qt_999' "$(wt_slugify 'colleague/QT-999')"
+
+  # --- wt_is_posint / wt_is_seconds -------------------------------------------
+  # One implementation, two names. wt_is_seconds is an alias, so these pin that it stayed one.
+  for good in 1 7 42 65535 0000001; do
+    wt_is_posint "$good"; rc_is "is_posint accepts $good" 0 $?
+    wt_is_seconds "$good"; rc_is "is_seconds still accepts $good" 0 $?
+  done
+  for bad in '' 0 000 -1 1.5 ' 1' '1 ' abc 1a; do
+    wt_is_posint "$bad"; rc_is "is_posint rejects '$bad'" 1 $?
+    wt_is_seconds "$bad"; rc_is "is_seconds still rejects '$bad'" 1 $?
+  done
+
+  # --- wt_is_safe_envkey ------------------------------------------------------
+  # The gate wt_json_kv deliberately leaves to its consumer. A key becomes the left-hand side of a
+  # KEY=value line, so the shapes that must be refused are the ones that would write a line naming
+  # a DIFFERENT variable than the profile appears to name.
+  for good in A A_B _leading FOO123 INSTALLATION_NAME a; do
+    wt_is_safe_envkey "$good"; rc_is "safe_envkey accepts $good" 0 $?
+  done
+  # SC2016: the `$` in 'A$B' is a LITERAL dollar, which is one of the shapes being refused --
+  # expanding it here would test a different string than the one that must be rejected.
+  # shellcheck disable=SC2016
+  for bad in '' '1LEADING' 'A B' 'A=B' 'A-B' 'export FOO' 'A.B' 'A;B' 'A$B' 'Aé' '#A'; do
+    wt_is_safe_envkey "$bad"; rc_is "safe_envkey rejects '$bad'" 1 $?
+  done
+  # NEWLINES AND FRIENDS, which are the point of the gate rather than an edge of it: a key of
+  # $'FOO\nDATABASE_URL' writes TWO lines into the env file, the second setting a variable the
+  # profile never names. wt_json_kv folds CR/LF to a space, so this is defence in depth for a key
+  # that reached the writer another way — a hand-built pair, or a future reader that does not fold.
+  for bad in $'A\nB' $'A\tB' $'A\rB' $'A\n' $'\nA'; do
+    # rc CAPTURED FIRST. A command substitution in the label argument runs before `$?` is read and
+    # resets it, so `rc_is ... $?` would silently assert printf's status instead of the function's.
+    wt_is_safe_envkey "$bad"; envkey_rc=$?
+    envkey_label=$(printf '%q' "$bad")
+    rc_is "safe_envkey rejects a key containing a control character ($envkey_label)" 1 "$envkey_rc"
+  done
+  # A key long enough to be a mistake rather than a name.
+  wt_is_safe_envkey "$(printf 'A%.0s' $(seq 1 129))"
+  rc_is 'safe_envkey rejects a 129-character key' 1 $?
+  wt_is_safe_envkey "$(printf 'A%.0s' $(seq 1 128))"
+  rc_is 'safe_envkey accepts a 128-character key' 0 $?
+
+  # --- wt_derive_port ---------------------------------------------------------
+  # Pure arithmetic over cksum. The properties that matter: deterministic, inside the range, and
+  # the same on any machine — a developer bookmarks this port.
+  eq 'derive_port is deterministic' "$(wt_derive_port demo_x 3786 200)" \
+    "$(wt_derive_port demo_x 3786 200)"
+  p1=$(wt_derive_port demo_x 3786 200)
+  in_range 'derive_port lands inside [base, base+span)' 3786 200 "$p1"
+  in_range 'derive_port with span 1 lands on base itself' 3786 1 \
+    "$(wt_derive_port anything 3786 1)"
+  eq 'derive_port with span 1 IS base' 3786 "$(wt_derive_port anything 3786 1)"
+  # Distinctness is the property isolation depends on. Not guaranteed for every pair — a hash can
+  # collide — so this pins that a realistic set of worktree names spreads out rather than piling up.
+  ports=''
+  for n in alice_fix_99 bob_fix_99 carol_hotfix main demo_test feature_a feature_b release_1; do
+    ports="$ports$(wt_derive_port "$n" 3786 200)
+"
+  done
+  eq 'eight realistic slugs derive eight distinct ports' 8 \
+    "$(printf '%s' "$ports" | sort -u | grep -c .)"
+  # A slug that differs by one character must not land on the same port by construction.
+  ne 'two slugs differing in one character derive different ports' \
+    "$(wt_derive_port demo_alice_fix_99 3786 200)" \
+    "$(wt_derive_port demo_alice_fix_98 3786 200)"
+  # Malformed range: return 1 and print nothing, so a caller cannot read a broken profile as a port.
+  for bad_base in '' 0 abc -5 1.5; do
+    rc_is "derive_port rejects base '$bad_base'" 1 \
+      "$(wt_derive_port s "$bad_base" 200 >/dev/null 2>&1; echo $?)"
+  done
+  for bad_span in '' 0 abc -5; do
+    rc_is "derive_port rejects span '$bad_span'" 1 \
+      "$(wt_derive_port s 3786 "$bad_span" >/dev/null 2>&1; echo $?)"
+  done
+  eq 'derive_port prints nothing when it refuses' '' "$(wt_derive_port s 0 0 2>/dev/null)"
+  # A leading zero must be read as base 10, not octal — `08` is a fatal arithmetic error otherwise,
+  # and a fatal expansion error in a sourced library takes the whole hook down (ADR-003).
+  eq 'derive_port reads a zero-padded base as decimal, not octal' \
+    "$(wt_derive_port s 3786 200)" "$(wt_derive_port s 03786 200)"
+
+  # --- wt_port_candidates -----------------------------------------------------
+  # The probe order, kept pure and separate from any notion of what is taken.
+  cands=$(wt_port_candidates demo_x 3786 200)
+  eq 'the first candidate IS the derived port' "$(wt_derive_port demo_x 3786 200)" \
+    "$(printf '%s' "$cands" | head -1)"
+  eq 'candidates are capped at WT_PORT_PROBE_MAX, not the whole span' "$WT_PORT_PROBE_MAX" \
+    "$(printf '%s\n' "$cands" | grep -c .)"
+  eq 'every candidate is distinct' "$WT_PORT_PROBE_MAX" \
+    "$(printf '%s\n' "$cands" | sort -u | grep -c .)"
+  # WRAPPING. A derived port near the top of the span must still reach the bottom of it, or the
+  # worktrees that hash high would have far fewer places to go than the ones that hash low.
+  small=$(wt_port_candidates demo_x 3786 5)
+  eq 'a span smaller than the cap yields exactly span candidates' 5 \
+    "$(printf '%s\n' "$small" | grep -c .)"
+  eq 'and they are the whole span, in wrapped order' '3786 3787 3788 3789 3790' \
+    "$(printf '%s\n' "$small" | sort -n | tr '\n' ' ' | sed 's/ $//')"
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    in_range 'every candidate stays inside the span' 3786 5 "$c"
+  done <<EOF
+$small
+EOF
+  # CONTAINMENT ON THE DEFAULT LIST TOO. Only the 5-wide list was range-checked, and dropping the
+  # `% span` from the emit line left every span-200 assertion passing while candidates ran off the
+  # end of the profile's range onto ports it never asked for.
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    in_range 'every default candidate stays inside the span' 3786 200 "$c"
+  done <<EOF
+$cands
+EOF
+  # The wrap assertions above are only meaningful if the derived port is not base itself — pin that
+  # the fixture actually exercises wrapping rather than passing by luck.
+  ne 'the span-5 fixture really does wrap (its first candidate is not base)' 3786 \
+    "$(wt_derive_port demo_x 3786 5)"
+  eq 'candidates come back in wrapped ORDER, not merely as the right set' \
+    "$(f=$(wt_derive_port demo_x 3786 5); i=0
+       while [ "$i" -lt 5 ]; do printf '%s ' $((3786 + ((f - 3786 + i) % 5))); i=$((i + 1)); done)" \
+    "$(printf '%s\n' "$small" | tr '\n' ' ')"
+
+  # The `max` parameter and its fallback had no caller at all: with the fallback removed, a
+  # malformed max made the loop condition error out and the function print NOTHING while exiting 0,
+  # which a caller reads as "no ports available" rather than as a bug.
+  eq 'an explicit max caps the list' 7 \
+    "$(wt_port_candidates demo_x 3786 200 7 | grep -c .)"
+  eq 'a malformed max falls back to WT_PORT_PROBE_MAX rather than emitting nothing' \
+    "$WT_PORT_PROBE_MAX" "$(wt_port_candidates demo_x 3786 200 abc | grep -c .)"
+
+  rc_is 'port_candidates refuses a malformed span, as derive_port does' 1 \
+    "$(wt_port_candidates s 3786 0 >/dev/null 2>&1; echo $?)"
+
+  # THE PORT RANGE IS BOUNDED, not merely positive. A digits-only check passed a nineteen-digit
+  # base, which wrapped bash's arithmetic and returned a negative "port" with a success code.
+  for bad_base in 1 1023 99999 12345678901234567890; do
+    rc_is "derive_port refuses base $bad_base as outside the port range" 1 \
+      "$(wt_derive_port s "$bad_base" 200 >/dev/null 2>&1; echo $?)"
+  done
+  rc_is 'derive_port refuses a span that would run past 65535' 1 \
+    "$(wt_derive_port s 65000 1000 >/dev/null 2>&1; echo $?)"
+  rc_is 'derive_port accepts a range that ends exactly at 65535' 0 \
+    "$(wt_derive_port s 65336 200 >/dev/null 2>&1; echo $?)"
+  rc_is 'derive_port accepts the lowest allowed base' 0 \
+    "$(wt_derive_port s 1024 200 >/dev/null 2>&1; echo $?)"
 
   # --- wt_expand ------------------------------------------------------------
   # shellcheck disable=SC2034  # read by wt_expand in the sourced lib
