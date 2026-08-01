@@ -23,6 +23,12 @@ trap 'rm -rf "$TMP"' EXIT
 . "$BLIB"
 
 pass=0 fail=0
+US_=$WT_US
+RS_=$WT_RS
+# SC2034: PROFILE_RAW, PROFILE_SHELL and PROFILE_SHELLARGS are read by the SOURCED
+# engine, never by this file, so shellcheck cannot see the use.
+# shellcheck disable=SC2034
+PROFILE_RAW=''
 
 eq() {  # $1 = label, $2 = expected, $3 = actual
   if [ "$2" = "$3" ]; then
@@ -303,6 +309,263 @@ ln -sf "$(command -v printf)" "$TMP/nobin/printf" 2>/dev/null
 err=$(PATH=$TMP/nobin wt_run_in_shell 'printf ok' "$TMP/run" 10 2>&1 >/dev/null)
 contains 'with no timeout binary it says so' 'without a time limit' "$err"
 contains '...and still runs the command' 'ok' "$err"
+
+# ---------------------------------------------------------------------------
+# Config copying
+# ---------------------------------------------------------------------------
+# These need a REAL git repository: the whole point is that the gitignore semantics are git's
+# rather than a matcher of ours, so a fake would test the fake.
+
+# The ignore semantics under test must come from the FIXTURE only. A developer's global
+# core.excludesFile, or a system /etc/gitconfig, would otherwise inject ignore rules into this
+# scratch repo and make the suite machine-dependent.
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+unset XDG_CONFIG_HOME
+
+REPO=$TMP/cfgrepo
+WT=$TMP/cfgwt
+mkdir -p "$REPO" "$WT"
+git init -q "$REPO"
+git -C "$REPO" config user.email t@example.com
+git -C "$REPO" config user.name t
+
+printf '%s\n' '.env' 'secrets/' 'nested/deep/' '*.local' '*.hidden' > "$REPO/.gitignore"
+printf '%s\n' '.env' 'secrets/**' 'nested/deep/**' 'tracked.txt' 'config.local' 'key.pem' \
+  'mode.local' '*.local' > "$REPO/.worktreeinclude"
+printf 'ENVVAL\n' > "$REPO/.env"
+chmod 600 "$REPO/.env"
+mkdir -p "$REPO/secrets" "$REPO/nested/deep"
+printf 'KEY\n' > "$REPO/secrets/key.pem"
+printf 'DEEP\n' > "$REPO/nested/deep/thing.txt"
+printf 'LOCAL\n' > "$REPO/config.local"
+printf 'TRACKED\n' > "$REPO/tracked.txt"
+printf 'UNLISTED\n' > "$REPO/unlisted.hidden"
+# A file whose name is a SUBSTRING of an ignored path (secrets/key.pem). It is UNTRACKED and NOT
+# gitignored, so .worktreeinclude selects it as a candidate and check-ignore must then reject it.
+# Tracked would not exercise this: `git ls-files -o` drops tracked files before the ignore check
+# ever sees them.
+printf 'DECOY\n' > "$REPO/key.pem"
+# 666 rather than 600 for the mode check: 600 survives `cp` without -p, because the umask only
+# clears bits that are already clear, so an assertion on it cannot fail. 666 & ~022 is 644.
+# Names that justify the NUL-delimited plumbing: a space, a non-ASCII character, and a newline.
+printf 'SPACED\n' > "$REPO/my conf.local"
+printf 'UNICODE\n' > "$REPO/café.local"
+printf 'NEWLINE\n' > "$REPO/$(printf 'two\nlines').local"
+printf 'MODE\n' > "$REPO/mode.local"
+chmod 666 "$REPO/mode.local"
+touch -t 200001020304.05 "$REPO/mode.local"
+git -C "$REPO" add .gitignore .worktreeinclude tracked.txt
+git -C "$REPO" commit -qm init
+
+PROFILE_RAW=''
+wt_copy_config "$REPO" "$WT" 1 2>/dev/null
+
+eq 'worktreeinclude: a gitignored file it names is copied' 'ENVVAL' "$(cat "$WT/.env" 2>/dev/null)"
+eq 'worktreeinclude: a gitignored file in a named directory is copied' 'KEY' \
+  "$(cat "$WT/secrets/key.pem" 2>/dev/null)"
+eq 'worktreeinclude: parent directories are created as needed' 'DEEP' \
+  "$(cat "$WT/nested/deep/thing.txt" 2>/dev/null)"
+eq 'worktreeinclude: a glob pattern matches' 'LOCAL' "$(cat "$WT/config.local" 2>/dev/null)"
+# ADR-007's other half: matching is not enough, it must ALSO be gitignored.
+eq 'worktreeinclude: a TRACKED file it names is NOT copied' '' \
+  "$(cat "$WT/tracked.txt" 2>/dev/null)"
+# ...and being gitignored is not enough either, it must be named.
+eq 'a gitignored file it does NOT name is not copied' '' \
+  "$(cat "$WT/unlisted.hidden" 2>/dev/null)"
+eq 'the file mode is preserved, which matters for a 600 .env' '600' \
+  "$(stat -c '%a' "$WT/.env" 2>/dev/null || stat -f '%Lp' "$WT/.env" 2>/dev/null)"
+# The assertion above documents the intent but cannot FAIL: 600 survives a plain `cp`, since the
+# umask only clears bits that are already clear. 666 is the mode that actually distinguishes
+# `cp -p` from `cp`, and mtime distinguishes it regardless of umask.
+eq 'a mode the umask would otherwise strip is preserved too' '666' \
+  "$(stat -c '%a' "$WT/mode.local" 2>/dev/null || stat -f '%Lp' "$WT/mode.local" 2>/dev/null)"
+eq 'and the modification time is preserved, not reset to now' \
+  "$(stat -c '%Y' "$REPO/mode.local" 2>/dev/null || stat -f '%m' "$REPO/mode.local" 2>/dev/null)" \
+  "$(stat -c '%Y' "$WT/mode.local" 2>/dev/null || stat -f '%m' "$WT/mode.local" 2>/dev/null)"
+# EXACT ignore matching. `key.pem` is tracked and therefore not ignored, but it is a substring of
+# the ignored `secrets/key.pem`; a substring test would copy a file git never said was ignored.
+eq 'a candidate that is merely a SUBSTRING of an ignored path is not copied' '' \
+  "$(cat "$WT/key.pem" 2>/dev/null)"
+# The NUL-delimited plumbing exists for these; a line-delimited reader would split the last one
+# into two bogus paths and copy neither.
+eq 'a filename containing a space is copied' 'SPACED' "$(cat "$WT/my conf.local" 2>/dev/null)"
+eq 'a non-ASCII filename is copied' 'UNICODE' "$(cat "$WT/café.local" 2>/dev/null)"
+eq 'a filename containing a newline is copied' 'NEWLINE' \
+  "$(cat "$WT/$(printf 'two\nlines').local" 2>/dev/null)"
+
+# Never overwrite: the worktree's own edit is the developer's.
+printf 'MINE\n' > "$WT/.env"
+wt_copy_config "$REPO" "$WT" 1 2>/dev/null
+eq 'a file already in the worktree is never overwritten' 'MINE' "$(cat "$WT/.env")"
+
+# Self-healing, which is the thing native cannot do: .worktreeinclude runs only at creation, so a
+# worktree that loses a config file only gets it back because this runs on every entry.
+rm -f "$WT/.env"
+wt_copy_config "$REPO" "$WT" 1 2>/dev/null
+eq 'a config file deleted from the worktree is restored on the next entry' 'ENVVAL' \
+  "$(cat "$WT/.env" 2>/dev/null)"
+
+# On the SessionStart path native already did .worktreeinclude, so the plugin must not redo it.
+WT2=$TMP/cfgwt2
+mkdir -p "$WT2"
+PROFILE_RAW=''
+wt_copy_config "$REPO" "$WT2" 0 2>/dev/null
+eq 'with own_include off, .worktreeinclude is left to native and nothing is copied' '' \
+  "$(cat "$WT2/.env" 2>/dev/null)"
+
+# The profile's copy[] is honoured on that path instead, straight out of the scan the load made.
+PROFILE_RAW="0${US_}${RS_}2${US_}.env${RS_}2${US_}unlisted.hidden${RS_}"
+wt_copy_config "$REPO" "$WT2" 0 2>/dev/null
+eq 'copy[] is honoured with no second interpreter start' 'ENVVAL' "$(cat "$WT2/.env" 2>/dev/null)"
+eq 'copy[] can name a gitignored file .worktreeinclude does not' 'UNLISTED' \
+  "$(cat "$WT2/unlisted.hidden" 2>/dev/null)"
+
+# copy[] obeys the same gitignored-only rule.
+WT3=$TMP/cfgwt3; mkdir -p "$WT3"
+PROFILE_RAW="0${US_}${RS_}2${US_}tracked.txt${RS_}"
+err=$(wt_copy_config "$REPO" "$WT3" 0 2>&1)
+eq 'a tracked file in copy[] is not copied' '' "$(cat "$WT3/tracked.txt" 2>/dev/null)"
+contains '...and the developer is told why' 'not gitignored' "$err"
+
+# Path containment. The profile arrives with anyone's branch and this step writes files.
+WT4=$TMP/cfgwt4; mkdir -p "$WT4"
+printf 'SECRET\n' > "$TMP/outside.txt"
+PROFILE_RAW="0${US_}${RS_}2${US_}../outside.txt${RS_}2${US_}/etc/hostname${RS_}"
+err=$(wt_copy_config "$REPO" "$WT4" 0 2>&1)
+eq 'a traversing copy[] entry writes nothing' '' "$(find "$WT4" -type f 2>/dev/null)"
+contains '...and is refused by shape, before anything is resolved' 'refusing to copy' "$err"
+
+# An unusable profile contributes NO copy entries, rather than half of them.
+WT5=$TMP/cfgwt5; mkdir -p "$WT5"
+PROFILE_RAW=''
+wt_copy_config "$REPO" "$WT5" 0 2>/dev/null
+eq 'with no loaded profile, copy[] contributes nothing' '' "$(find "$WT5" -type f 2>/dev/null)"
+
+# A symlink is refused: reproducing it would point the worktree's config at the main checkout,
+# so an edit in one worktree would show up in another.
+ln -s "$REPO/.env" "$REPO/linked.local"
+WT6=$TMP/cfgwt6; mkdir -p "$WT6"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}linked.local${RS_}"
+err=$(wt_copy_config "$REPO" "$WT6" 0 2>&1)
+eq 'a symlinked config file is not copied' '' "$(find "$WT6" -type f -o -type l 2>/dev/null)"
+contains '...and the reason names the shared-state risk' 'share state between worktrees' "$err"
+
+# A symlinked PARENT directory must not be followed. This is the threat Claude Code refuses
+# worktree creation over, and the leaf check alone does not see it: `mkdir -p` and `cp` would
+# both follow `conf/` and write the file wherever it points — here, outside the worktree.
+WT7=$TMP/cfgwt7; mkdir -p "$WT7" "$TMP/elsewhere"
+mkdir -p "$REPO/conf"
+printf 'INNER\n' > "$REPO/conf/app.local"
+ln -s "$TMP/elsewhere" "$WT7/conf"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}conf/app.local${RS_}"
+err=$(wt_copy_config "$REPO" "$WT7" 0 2>&1)
+eq 'a symlinked parent directory in the worktree is not followed' '' \
+  "$(cat "$TMP/elsewhere/app.local" 2>/dev/null)"
+contains '...and the reason says so' 'parent directories is a symlink' "$err"
+
+# The same on the SOURCE side: a symlinked parent in the main checkout would read from outside it.
+WT8=$TMP/cfgwt8; mkdir -p "$WT8"
+ln -s "$TMP/elsewhere" "$REPO/linkdir"
+printf 'OUTSIDE\n' > "$TMP/elsewhere/secret.local"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}linkdir/secret.local${RS_}"
+wt_copy_config "$REPO" "$WT8" 0 2>/dev/null
+eq 'a symlinked parent directory in the checkout is not followed either' '' \
+  "$(cat "$WT8/linkdir/secret.local" 2>/dev/null)"
+rm -f "$REPO/linkdir"
+
+# A DANGLING symlink in the worktree is still the worktree's own state. `-e` is false for one, so
+# without the `-L` half of the guard `cp` would write THROUGH the link, creating the file it
+# points at — outside the worktree.
+WT9=$TMP/cfgwt9; mkdir -p "$WT9"
+ln -s "$TMP/elsewhere/notyet" "$WT9/.env"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}.env${RS_}"
+wt_copy_config "$REPO" "$WT9" 0 2>/dev/null
+eq 'a dangling symlink in the worktree is left alone, not written through' 'yes' \
+  "$([ -L "$WT9/.env" ] && echo yes)"
+eq '...and the file it points at is not created' '' \
+  "$(cat "$TMP/elsewhere/notyet" 2>/dev/null)"
+
+# A directory whose tree contains a symlink is refused whole, or `cp -Rp` would reproduce the
+# link and reintroduce exactly the shared state the leaf refusal prevents.
+WT10=$TMP/cfgwt10; mkdir -p "$WT10"
+mkdir -p "$REPO/bundle"
+printf 'PLAIN\n' > "$REPO/bundle/plain.txt"
+ln -s "$TMP/elsewhere" "$REPO/bundle/link"
+printf 'bundle/\n' >> "$REPO/.gitignore"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}bundle${RS_}"
+err=$(wt_copy_config "$REPO" "$WT10" 0 2>&1)
+eq 'a directory containing a symlink is not copied at all' '' \
+  "$(cat "$WT10/bundle/plain.txt" 2>/dev/null)"
+contains '...and the reason names the shared-state risk' 'contains a symlink' "$err"
+
+# A repository with NO .worktreeinclude is the ordinary case; it must be silent, not a git error.
+NOINC=$TMP/noinc; mkdir -p "$NOINC"
+git init -q "$NOINC"
+git -C "$NOINC" config user.email t@example.com
+git -C "$NOINC" config user.name t
+printf '*.local\n' > "$NOINC/.gitignore"
+printf 'X\n' > "$NOINC/only.local"
+git -C "$NOINC" add .gitignore
+git -C "$NOINC" commit -qm init
+WT11=$TMP/cfgwt11; mkdir -p "$WT11"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}only.local${RS_}"
+err=$(wt_copy_config "$NOINC" "$WT11" 1 2>&1)
+eq 'a repo with no .worktreeinclude still gets its copy[] entries' 'X' \
+  "$(cat "$WT11/only.local" 2>/dev/null)"
+eq '...and produces no git error' '' "$(printf '%s' "$err" | grep -i 'fatal\|error' || true)"
+
+# A traversal whose destination is observable, so removing the shape check makes this FAIL rather
+# than merely stop logging. `sub/../escaped.local` resolves to a real gitignored file.
+WT12=$TMP/cfgwt12; mkdir -p "$WT12"
+printf 'ESCAPED\n' > "$REPO/escaped.local"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}sub/../escaped.local${RS_}"
+wt_copy_config "$REPO" "$WT12" 0 2>/dev/null
+eq 'a copy[] entry containing a .. segment copies nothing, even when it resolves inside' '' \
+  "$(find "$WT12" -type f 2>/dev/null)"
+
+# An empty copy[] element is ignored rather than treated as the repository root.
+WT13=$TMP/cfgwt13; mkdir -p "$WT13"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}${RS_}"
+wt_copy_config "$REPO" "$WT13" 0 2>/dev/null
+eq 'an empty copy[] entry copies nothing' '' "$(find "$WT13" -mindepth 1 2>/dev/null)"
+
+# ORDERING: the candidate list is built before any copy happens, so a copy[] naming both a file
+# and the directory containing it must not `cp -Rp` into a directory an earlier entry just
+# created. Without the re-existence test this produces pack/pack.
+WT14=$TMP/cfgwt14; mkdir -p "$WT14"
+mkdir -p "$REPO/pack"
+printf 'A\n' > "$REPO/pack/a.txt"
+printf 'pack/\n' >> "$REPO/.gitignore"
+# shellcheck disable=SC2034
+PROFILE_RAW="0${US_}${RS_}2${US_}pack/a.txt${RS_}2${US_}pack${RS_}"
+wt_copy_config "$REPO" "$WT14" 0 2>/dev/null
+eq 'the file inside the named directory is copied' 'A' "$(cat "$WT14/pack/a.txt" 2>/dev/null)"
+eq 'and the directory entry does not nest a second copy inside it' '' \
+  "$(find "$WT14" -type d -name pack -path '*/pack/pack' 2>/dev/null)"
+
+# A check-ignore that FAILS outright (git absent, corrupt index, not a work tree) must not read as
+# "nothing is ignored" — that would blame every path with the wrong reason, and a later change
+# that inverted the default would silently copy files git never approved.
+WT15=$TMP/cfgwt15; mkdir -p "$WT15"
+out=$(
+  # shellcheck disable=SC2034
+  PROFILE_RAW="0${US_}${RS_}2${US_}.env${RS_}"
+  wt_git() { return 128; }
+  wt_copy_config "$REPO" "$WT15" 0 2>&1
+)
+contains 'a failing check-ignore is reported as a failure, not as nothing-ignored' \
+  'could not ask git which paths are gitignored' "$out"
+eq '...and nothing is copied on that run' '' "$(find "$WT15" -type f 2>/dev/null)"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

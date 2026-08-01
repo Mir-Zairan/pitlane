@@ -188,3 +188,219 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   fi
   return $rc
 }
+
+# ---------------------------------------------------------------------------
+# Config copying
+# ---------------------------------------------------------------------------
+#
+# TWO SOURCES, ONE RULE. `.worktreeinclude` is authoritative and stays native wherever native
+# creation runs (ADR-007); the profile's `copy[]` is a supplement native knows nothing about.
+# Both end up in the same copier so they cannot drift apart in what they consider safe.
+#
+# THE RULE, from ADR-007: a path is copied only if it MATCHES and is ALSO gitignored. Verified on
+# git 2.34 while building this: `git ls-files -o -i --exclude-from=F` uses ONLY F as its ignore
+# source — the flags are not unioned with .gitignore — so matching and being-gitignored really are
+# two questions, and the second needs its own `git check-ignore` pass. A tracked file listed in
+# `.worktreeinclude` is therefore skipped, which is native's behaviour too.
+#
+# COPY-IF-MISSING, NEVER OVERWRITE. A worktree's own edited `.env` is the developer's, and this
+# runs on EVERY entry rather than only at creation — which is the one thing native cannot do, and
+# is what lets a worktree that lost a config file heal itself on the next session.
+
+# Emit, NUL-separated, the paths `.worktreeinclude` selects: untracked files matching its patterns.
+# The gitignored half of the rule is applied later, by the copier, in one batched call.
+#
+# Only for the WorktreeCreate path. Registering that hook disables native `.worktreeinclude`
+# handling, so the plugin owes the behaviour there; on SessionStart native has already done it and
+# repeating it could only ever disagree with what it did.
+wt_worktreeinclude_paths() {  # $1 = main checkout
+  local root=${1%/}
+  [ -f "$root/.worktreeinclude" ] || return 0
+  # -z because a path may contain a newline, and this feeds a NUL-delimited reader.
+  wt_git "$root" ls-files -z -o -i --exclude-from="$root/.worktreeinclude" 2>/dev/null || true
+}
+
+# True if any PARENT component of the relative path $2, resolved under $1, is a symlink.
+#
+# THE LEAF CHECK IS NOT ENOUGH, and this is the same class of threat Claude Code refuses worktree
+# creation over. For a path like `config/app.env`, testing only `config/app.env` misses a
+# committed symlinked `config/` — and then `mkdir -p` and `cp` both FOLLOW it, writing the file
+# wherever it points: another worktree, the main checkout's .git, or the home directory. The mode
+# is preserved too, so a committed source file with the executable bit becomes an executable file
+# outside the repository. A branch is untrusted input and this is a file write, so every
+# component is checked, not just the last.
+wt_has_symlinked_parent() {  # $1 = base directory, $2 = relative path
+  local base=${1%/} rel=${2-} acc='' seg rest
+  rest=${rel%/*}
+  [ "$rest" = "$rel" ] && return 1      # no parent components at all
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
+    [ -n "$seg" ] || continue
+    acc="${acc:+$acc/}$seg"
+    [ -L "$base/$acc" ] && return 0
+  done
+  return 1
+}
+
+# Copy NUL-separated repo-relative paths, read from stdin, from $1 into $2.
+#
+# ORDER OF THE CHECKS IS A PERFORMANCE DECISION, not just correctness. The cheap local tests —
+# path shape, and "is it already in the worktree" — run FIRST, and only what is still missing is
+# batched into a single `git check-ignore`. On the re-entry path, where everything is already
+# present, that is N stats and ZERO subprocesses, which is what "well under a second" needs.
+wt_copy_paths() {  # $1 = main checkout, $2 = worktree
+  local root=${1%/} worktree=${2%/} p q n=0 present=0 copied=0 cand=() ignored=() is_ignored
+  local dest src parent irc ictmp
+
+  while IFS= read -r -d '' p; do
+    [ -n "$p" ] || continue
+    n=$((n + 1))
+    # The profile and .worktreeinclude both arrive with anyone's branch, and what follows is a
+    # file write: refuse the shape before resolving anything (see wt_is_safe_relpath).
+    if ! wt_is_safe_relpath "$p"; then
+      wt_log "refusing to copy \"$p\": not a relative path inside the repository"
+      continue
+    fi
+    # Already there — including as a directory, a symlink, or an empty file. Never overwrite.
+    # `-e` is false for a DANGLING symlink, so `-L` is tested too: a broken link is still the
+    # worktree's own state and replacing it would be an overwrite.
+    if [ -e "$worktree/$p" ] || [ -L "$worktree/$p" ]; then
+      present=$((present + 1))
+      continue
+    fi
+    [ -e "$root/$p" ] || continue
+    cand[${#cand[@]}]=$p
+  done
+
+  # Report only what was actually already there. Counting refusals here too produced a summary
+  # that contradicted the warnings printed immediately above it.
+  if [ "${#cand[@]}" -eq 0 ]; then
+    [ "$present" -eq 0 ] || wt_log "config: nothing to copy, $present path(s) already present"
+    return 0
+  fi
+
+  # ONE call for every candidate. check-ignore answers the "and is gitignored" half of ADR-007's
+  # rule, using the repository's real ignore rules rather than a hand-rolled matcher.
+  #
+  # The result is read into an array and compared EXACTLY. Two traps here, both avoided
+  # deliberately: command substitution silently DISCARDS NUL bytes, so `$(... -z ...)` would
+  # return the paths run together with no separator at all; and a substring test against such a
+  # blob would then match `a` inside `bar/a.txt` and copy a file git never said was ignored.
+  ignored=()
+  irc=0
+  # A real temp file rather than a process substitution: the status of the command inside `< <(…)`
+  # is not the loop's status, and this needs check-ignore's OWN exit code. mktemp honours TMPDIR,
+  # so nothing is written into the worktree or the checkout.
+  ictmp=$(mktemp 2>/dev/null) || ictmp=''
+  if [ -z "$ictmp" ]; then
+    wt_log "could not create a temporary file to check gitignore status — copying nothing this run"
+    return 0
+  fi
+  printf '%s\0' "${cand[@]}" | wt_git "$root" check-ignore -z --stdin >"$ictmp" 2>/dev/null
+  irc=$?
+  # git exits 0 when at least one path is ignored and 1 when none are; ANYTHING else is a real
+  # failure (git absent, a corrupt index, not a work tree). Without this, such a failure looks
+  # exactly like "nothing is ignored", and every path would be refused with the wrong reason.
+  case $irc in
+    0 | 1)
+      while IFS= read -r -d '' q; do
+        ignored[${#ignored[@]}]=$q
+      done <"$ictmp"
+      ;;
+    *)
+      rm -f "$ictmp"
+      wt_log "could not ask git which paths are gitignored (it exited $irc) — copying nothing this run"
+      return 0
+      ;;
+  esac
+  rm -f "$ictmp"
+
+  for p in "${cand[@]}"; do
+    is_ignored=0
+    for q in ${ignored[@]+"${ignored[@]}"}; do
+      if [ "$q" = "$p" ]; then is_ignored=1; break; fi
+    done
+    case $is_ignored in
+      1) ;;
+      *)
+        # A tracked or otherwise non-ignored file. Native skips these, so this does too — but say
+        # so, because a developer who listed one is expecting it to appear.
+        wt_log "not copying \"$p\": it is not gitignored, and only gitignored files are copied"
+        continue
+        ;;
+    esac
+    src=$root/$p
+    dest=$worktree/$p
+    # Re-test presence: the candidate list was built before ANY copy happened, so an earlier
+    # entry in this same run may have created this path. Without this, a copy[] naming a
+    # directory whose child was copied first would `cp -Rp` INTO the existing directory and
+    # produce nested/nested.
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      continue
+    fi
+    if wt_has_symlinked_parent "$worktree" "$p" || wt_has_symlinked_parent "$root" "$p"; then
+      wt_log "not copying \"$p\": one of its parent directories is a symlink, which would write outside the worktree"
+      continue
+    fi
+    # A symlink is REFUSED rather than reproduced. Copying the link would leave the worktree's
+    # config pointing at a path outside it — usually the main checkout's own file — so edits in
+    # one worktree would appear in another, which is the exact isolation this plugin exists to
+    # provide. Copying what it points AT would silently turn a link into a file. Neither is
+    # obviously right, so it is the developer's call.
+    if [ -L "$src" ]; then
+      wt_log "not copying \"$p\": it is a symlink, and copying it would share state between worktrees"
+      continue
+    fi
+    # `${dest%/*}` rather than `$(dirname ...)`: this runs per file on a hook that blocks session
+    # start, and a subshell plus an exec is a real cost for a value parameter expansion already
+    # has. The `-d` test skips the mkdir entirely in the common case.
+    parent=${dest%/*}
+    if [ "$parent" != "$dest" ] && [ ! -d "$parent" ]; then
+      mkdir -p "$parent" 2>/dev/null || {
+        wt_log "could not create a parent directory for \"$p\" — skipping it"
+        continue
+      }
+    fi
+    # -p preserves the mode, which matters for a private key or a 600 .env.
+    if [ -d "$src" ]; then
+      # `cp -Rp` reproduces symlinks INSIDE the tree verbatim, which would smuggle past the leaf
+      # refusal above the very thing it exists to stop. Refuse the whole directory rather than
+      # copy some of it.
+      if [ -n "$(find "$src" -type l -print -quit 2>/dev/null)" ]; then
+        wt_log "not copying the directory \"$p\": it contains a symlink, which would share state between worktrees"
+        continue
+      fi
+      cp -Rp "$src" "$dest" 2>/dev/null || { wt_log "could not copy the directory \"$p\""; continue; }
+    else
+      cp -p "$src" "$dest" 2>/dev/null || { wt_log "could not copy \"$p\""; continue; }
+    fi
+    copied=$((copied + 1))
+  done
+
+  [ "$copied" -eq 0 ] || wt_log "config: copied $copied file(s) the worktree was missing"
+  return 0
+}
+
+# The whole config step: `.worktreeinclude` (only where native did not already do it) merged with
+# the profile's copy[], through one copier.
+wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .worktreeinclude
+  local root=${1%/} worktree=${2%/} own_include=${3:-0} rec body
+
+  {
+    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root"
+    # copy[] comes out of the scan wt_load_profile already made — group 2 — so honouring it costs
+    # no interpreter start at all. PROFILE_RAW is empty unless the profile validated, so an
+    # unusable profile contributes nothing here rather than contributing half its list.
+    if [ -n "${PROFILE_RAW:-}" ]; then
+      while IFS= read -r -d "$WT_RS" rec; do
+        case $rec in
+          2"$WT_US"*) ;;
+          *) continue ;;
+        esac
+        body=${rec#*"$WT_US"}
+        [ -n "$body" ] && printf '%s\0' "$body"
+      done < <(printf '%s' "$PROFILE_RAW")
+    fi
+  } | wt_copy_paths "$root" "$worktree"
+}
