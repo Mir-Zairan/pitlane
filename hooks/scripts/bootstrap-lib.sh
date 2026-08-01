@@ -404,3 +404,277 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
     fi
   } | wt_copy_paths "$root" "$worktree"
 }
+
+# ---------------------------------------------------------------------------
+# Locking
+# ---------------------------------------------------------------------------
+#
+# WHAT IS SHARED, AND THEREFORE WHAT IS LOCKED. Two worktrees bootstrapping at once contend over
+# two things: the main checkout's dependency directory, which is the hardlink SOURCE, and the
+# package manager's own cache. Both are keyed by the dependency, so the lock is too. This is the
+# race the source conversation's scripts got wrong — its completeness marker was checked outside
+# any lock, so two worktrees on one lockfile both installed into the same place.
+#
+# The lock files live in the MAIN checkout, because that is the only directory every worktree of
+# a repository can agree on. They are empty and are never removed: an unlink would race with the
+# next acquirer opening the same path, and an empty file per dependency is not worth that.
+#
+# ON FAILURE TO ACQUIRE, PROCEED UNLOCKED WITH A WARNING. That is ADR-003 applied to locking
+# itself: a session that hangs waiting for another worktree's 90-second install is exactly the
+# cost the user must never pay. It is an HONEST weakening — the race becomes rarer, not
+# impossible — and the alternative, blocking, is worse for the failure it prevents.
+#
+# WHAT THIS DOES NOT PROTECT, stated plainly because a lock invites over-trust:
+#   * a developer running `composer install` BY HAND in the main checkout while a worktree
+#     hardlinks from it. Nothing here can take a lock on that, and no hook can.
+#   * two DIFFERENT dependency directories that happen to share one external cache outside the
+#     repository. The lock is per directory, so it cannot serialise those.
+
+# Seconds to wait for a lock before giving up and proceeding unlocked. Short on purpose: long
+# enough that two worktrees started together serialise properly, short enough that nobody waits.
+WT_LOCK_WAIT=10
+
+# Where a dependency's lock file lives. The directory name is slugified because it may contain
+# `/` — `assets/node_modules` is a real case. Two different directories CAN slug to one name,
+# which costs a little concurrency and no correctness: the worst outcome is that two unrelated
+# installs serialise. A dir that slugifies to nothing at all still gets a usable name.
+#
+# It goes in the repository's SHARED git directory, not the working tree. Shared is the
+# requirement — every worktree of this repo must agree on the same file, and `--git-common-dir`
+# is the same for all of them — and being outside the checkout means these never appear as
+# untracked entries in the main checkout's `git status`, in a repo whose .gitignore knows nothing
+# about this plugin. A layout git cannot report falls back to `.claude/worktree-locks/`.
+wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
+  local root=${1%/} slug common
+  slug=$(wt_slugify "${2-}") || slug=dep
+  [ -n "$slug" ] || slug=dep
+  common=$(wt_git "$root" rev-parse --git-common-dir 2>/dev/null) || common=''
+  if [ -n "$common" ]; then
+    case $common in
+      /*) ;;
+      *) common=$root/$common ;;
+    esac
+    if [ -d "$common" ]; then
+      printf '%s/worktree-locks/%s.lock' "${common%/}" "$slug"
+      return 0
+    fi
+  fi
+  printf '%s/.claude/worktree-locks/%s.lock' "$root" "$slug"
+}
+
+# Acquire the lock at $1 on file descriptor $3, waiting at most $2 seconds.
+#   0 = held, 1 = not held (caller proceeds unlocked), 2 = could not even try.
+#
+# The fd is a parameter and applied with `eval` because bash 3.2 — the portability floor — has no
+# automatic descriptor allocation (`exec {fd}>` is 4.1+), and the engine nests two locks.
+wt_lock_acquire() {  # $1 = lock path, $2 = wait seconds, $3 = fd number
+  local lock=${1-} secs=${2-} fd=${3-} dir base rel
+  # Descriptors 0, 1 and 2 are refused as well as non-numeric ones: `exec 1>"$lock"` would
+  # redirect the hook's STDOUT — the channel carrying the worktree path — into the lock file.
+  case $fd in '' | *[!0-9]* | 0 | 1 | 2) return 2 ;; esac
+  [ -n "$lock" ] || return 2
+  wt_is_seconds "$secs" || secs=$WT_LOCK_WAIT
+
+  if ! command -v flock >/dev/null 2>&1; then
+    # Stock macOS has no flock(1). Say so ONCE per run and carry on: an unserialised install is a
+    # risk, refusing to install is a certainty. A mkdir-with-a-TTL substitute was considered and
+    # rejected — a TTL is a guess, and one too short lets a second worktree barge into a running
+    # install, which is silent corruption rather than a warning.
+    if [ -z "${WT_FLOCK_WARNED:-}" ]; then
+      WT_FLOCK_WARNED=1
+      wt_log "flock is not on PATH — dependency work will not be serialised against other worktrees"
+    fi
+    return 1
+  fi
+
+  dir=${lock%/*}
+  # THE OPEN BELOW TRUNCATES. `exec 9>path` is create-or-truncate, so if the lock path or any
+  # component of it is a symlink, whatever it points at is zeroed on session start — and these
+  # paths are fixed and their names guessable (`vendor`, `node_modules`). This is the same hole
+  # wt_copy_paths defends against, and it has to be closed here too rather than assumed away
+  # because the path is "ours": the directories it sits under can be committed by anyone.
+  if [ -L "$lock" ]; then
+    wt_log "refusing to use the lock file $lock: it is a symlink, and opening it would truncate whatever it points at"
+    return 2
+  fi
+  base=${dir%/*}
+  rel=${lock##*/}
+  if [ -n "$base" ] && [ "$base" != "$dir" ] && wt_has_symlinked_parent "$base" "${dir##*/}/$rel"; then
+    wt_log "refusing to use the lock file $lock: one of its parent directories is a symlink"
+    return 2
+  fi
+  [ "$dir" = "$lock" ] || [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 2
+  eval "exec $fd>\"\$lock\"" 2>/dev/null || return 2
+  if flock -w "$secs" "$fd" 2>/dev/null; then
+    return 0
+  fi
+  wt_lock_release "$fd"
+  return 1
+}
+
+wt_lock_release() {  # $1 = fd number
+  case ${1-} in '' | *[!0-9]*) return 0 ;; esac
+  eval "exec $1>&-" 2>/dev/null || true
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Per-worktree bootstrap state
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS: re-entering an already-bootstrapped worktree must cost milliseconds. Without a
+# record, "is this done" can only be guessed from the directory's contents, and a directory that
+# exists is not the same as an install that FINISHED — the difference being exactly the case a
+# timeout produces.
+#
+# NOT JSON, deliberately. Reading JSON costs a cold interpreter start, on the one path whose
+# entire purpose is to be fast. This is US/RS-delimited text read with bash's own `read`, which
+# costs no process at all. The same separators as the JSON layer, for the same reason: a command
+# string may contain anything except these, which the readers strip.
+#
+# WHERE IT LIVES: the worktree's own private git directory, `<root>/.git/worktrees/<name>`. The
+# phase document says "inside the worktree — it dies with the worktree", and this satisfies that
+# (git removes it with the worktree) while avoiding what a file in the checkout would cost: an
+# untracked entry in every `git status`, in a repo whose .gitignore knows nothing about us, which
+# a developer could commit by accident. A checkout that cannot report a private git dir falls
+# back to the worktree's own .claude/.
+#
+# STATUS IS WRITTEN BEFORE THE WORK, NOT AFTER. An entry goes to `doing` before the install starts
+# and only becomes `done` once the command AND its verify have succeeded. That is what separates
+# "installed" from "killed halfway by the timeout", which a populated directory cannot tell you —
+# and the phase's own acceptance list requires a hung install to leave a usable session.
+#
+# NO PARTIAL TRUST, the same rule the profile has: unreadable, wrong version, unparseable, or an
+# entry left at `doing` all mean THE SAME THING — not done, do it again. Redoing safe work is
+# cheap; skipping real work leaves a worktree that looks finished and is not.
+
+# Bumped when the RECORD FORMAT changes, which is the only thing that can make an existing file
+# unreadable. Deliberately not the plugin's own version: a new release does not invalidate a
+# correct install, and reading plugin.json would cost the interpreter start this file exists to
+# avoid — so every worktree on the machine would pay a full reinstall on the day of an upgrade.
+WT_STATE_VERSION=1
+
+wt_state_path() {  # $1 = worktree
+  local wt=${1%/} gitdir
+  gitdir=$(wt_git "$wt" rev-parse --git-dir 2>/dev/null) || gitdir=''
+  if [ -n "$gitdir" ]; then
+    case $gitdir in
+      /*) ;;
+      *) gitdir=$wt/$gitdir ;;
+    esac
+    if [ -d "$gitdir" ]; then
+      printf '%s/worktree-bootstrap-state' "${gitdir%/}"
+      return 0
+    fi
+  fi
+  printf '%s/.claude/worktree-bootstrap-state' "$wt"
+}
+
+# Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
+# entries, and a partial write is the one thing a reader must never see.
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-}
+  local file tmp rec kind rdir rest kept='' hdrok=0
+
+  file=$(wt_state_path "$wt")
+  [ -n "$file" ] || return 1
+  local parent=${file%/*}
+  [ "$parent" = "$file" ] || [ -d "$parent" ] || mkdir -p "$parent" 2>/dev/null || return 1
+
+  # Existing records are carried over ONLY if the file is one this format can read. Without the
+  # header check, the first write after a WT_STATE_VERSION bump would copy every stale record
+  # into a file freshly stamped with the NEW version — laundering exactly the records the reader
+  # had correctly refused to trust, so a dependency never installed under the new format would
+  # then read as done. Same rule as the profile: wrong version means ignore the file whole.
+  if [ -r "$file" ]; then
+    hdrok=0
+    while IFS= read -r -d "$WT_RS" rec; do
+      kind=${rec%%"$WT_US"*}
+      rest=${rec#*"$WT_US"}
+      case $kind in
+        wtstate)
+          [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || { kept=''; break; }
+          hdrok=1
+          ;;
+        dep)
+          [ "$hdrok" = 1 ] || { kept=''; break; }   # records before any header: not our file
+          rdir=${rest%%"$WT_US"*}
+          [ "$rdir" = "$dir" ] && continue          # replaced below
+          kept="$kept$rec$WT_RS"
+          ;;
+      esac
+    done <"$file"
+  fi
+
+  tmp=$(mktemp "${parent}/.wtstate.XXXXXX" 2>/dev/null) || return 1
+  {
+    printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
+    printf '%s' "$kept"
+    printf 'dep%s%s%s%s%s%s%s%s%s%s%s' \
+      "$WT_US" "$dir" "$WT_US" "$strategy" "$WT_US" "$lck" \
+      "$WT_US" "$ick" "$WT_US" "$status" "$WT_RS"
+  } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  # Atomic: a reader sees the old file or the new one, never a half-written one.
+  mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# True when this dependency is recorded as finished AND the evidence still matches.
+#
+# The lock checksum compared is the WORKTREE's own lockfile, not the main checkout's and not the
+# profile's calibration-time value: they answer different questions, and a worktree on its own
+# branch can legitimately differ from both. The install command is fingerprinted too, so editing
+# it in the profile re-runs the dependency rather than trusting a tree built by the old one.
+wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy
+  local wt=${1%/} dir=${2-} lck=${3-} ick=${4-} want=${5-}
+  local file rec kind rest ver rdir rstrategy rlck rick rstatus seen=0
+
+  file=$(wt_state_path "$wt")
+  [ -r "$file" ] || return 1
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    case $kind in
+      wtstate)
+        ver=${rest%%"$WT_US"*}
+        # A file written by a different format is not partially trusted, it is ignored whole.
+        [ "$ver" = "$WT_STATE_VERSION" ] || return 1
+        seen=1
+        ;;
+      dep)
+        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus <<<"$rest" || true
+        [ "$rdir" = "$dir" ] || continue
+        # Quoted: bare `done` is the loop keyword to the parser.
+        [ "$rstatus" = "done" ] || return 1   # `doing` means killed mid-write: redo it
+        [ "$rlck" = "$lck" ] || return 1
+        [ "$rick" = "$ick" ] || return 1
+        # The recorded STRATEGY is compared too, not merely stored. Flipping a dependency from
+        # hardlink to install in the profile changes neither the lockfile nor the install command,
+        # so without this the worktree would keep a tree built the way the developer just
+        # abandoned and report itself up to date. A caller passing no strategy skips the check.
+        [ -z "$want" ] || [ "$rstrategy" = "$want" ] || return 1
+        [ "$seen" = 1 ] || return 1           # a dep record before any header: not our file
+        return 0
+        ;;
+    esac
+  done <"$file"
+  return 1
+}
+
+# `cksum` of a string, for fingerprinting an install command. Empty for empty input, so a missing
+# command never compares equal to a present one by accident.
+wt_cksum_string() {  # $1 = text
+  local out
+  [ -n "${1-}" ] || { printf ''; return 0; }
+  out=$(printf '%s' "$1" | cksum 2>/dev/null) || { printf ''; return 1; }
+  printf '%s' "$out"
+}
+
+# `cksum` of a file, or empty when it is absent or unreadable.
+wt_cksum_file() {  # $1 = path
+  local out
+  [ -f "${1-}" ] && [ -r "$1" ] || { printf ''; return 0; }
+  out=$(cksum <"$1" 2>/dev/null) || { printf ''; return 1; }
+  printf '%s' "$out"
+}

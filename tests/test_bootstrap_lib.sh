@@ -39,6 +39,15 @@ eq() {  # $1 = label, $2 = expected, $3 = actual
   fi
 }
 
+ne() {  # $1 = label, $2, $3 = values that must differ
+  if [ "$2" != "$3" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL %s\n      both were: %q\n' "$1" "$2" >&2
+  fi
+}
+
 contains() {  # $1 = label, $2 = needle, $3 = haystack
   case $3 in
     *"$2"*) pass=$((pass + 1)) ;;
@@ -560,12 +569,301 @@ WT15=$TMP/cfgwt15; mkdir -p "$WT15"
 out=$(
   # shellcheck disable=SC2034
   PROFILE_RAW="0${US_}${RS_}2${US_}.env${RS_}"
+  # SC2329: invoked indirectly, by the engine this suite sources.
+  # shellcheck disable=SC2329
   wt_git() { return 128; }
   wt_copy_config "$REPO" "$WT15" 0 2>&1
 )
 contains 'a failing check-ignore is reported as a failure, not as nothing-ignored' \
   'could not ask git which paths are gitignored' "$out"
 eq '...and nothing is copied on that run' '' "$(find "$WT15" -type f 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# Locking
+# ---------------------------------------------------------------------------
+
+LKROOT=$TMP/lkroot
+mkdir -p "$LKROOT"
+git init -q "$LKROOT"
+git -C "$LKROOT" config user.email t@example.com
+git -C "$LKROOT" config user.name t
+
+# Locks live in the SHARED git directory: every worktree of the repo must agree on the same file,
+# and being outside the checkout keeps them out of `git status`.
+eq 'a lock path is in the shared git dir, keyed on the dependency' \
+  "$LKROOT/.git/worktree-locks/vendor.lock" "$(wt_lock_path "$LKROOT" vendor)"
+eq 'a dependency dir containing a slash is slugified into one filename' \
+  "$LKROOT/.git/worktree-locks/assets_node_modules.lock" \
+  "$(wt_lock_path "$LKROOT" assets/node_modules)"
+# A directory outside a git repository still gets a usable path rather than nothing.
+eq 'outside a repository it falls back to .claude/worktree-locks' \
+  "$TMP/plain/.claude/worktree-locks/vendor.lock" "$(wt_lock_path "$TMP/plain" vendor)"
+
+# Hostile dependency directories arrive in a committed profile. Whatever they are, the lock path
+# must stay one file inside the locks directory — never escape it, never be empty.
+for bad in '' '..' '/etc/passwd' '../../x' 'a/../../b' 'ünïcode' '///'; do
+  lp=$(wt_lock_path "$LKROOT" "$bad")
+  case $lp in
+    "$LKROOT/.git/worktree-locks/"*) pass=$((pass+1)) ;;
+    *) fail=$((fail+1)); printf 'FAIL lock path escaped for %q: %q\n' "$bad" "$lp" >&2 ;;
+  esac
+  tail_part=${lp#"$LKROOT/.git/worktree-locks/"}
+  case $tail_part in
+    */*) fail=$((fail+1)); printf 'FAIL lock name has a separator for %q: %q\n' "$bad" "$tail_part" >&2 ;;
+    '') fail=$((fail+1)); printf 'FAIL lock name empty for %q\n' "$bad" >&2 ;;
+    *) pass=$((pass+1)) ;;
+  esac
+done
+ne 'two different dependency dirs get different locks' \
+  "$(wt_lock_path "$LKROOT" vendor)" "$(wt_lock_path "$LKROOT" node_modules)"
+
+if command -v flock >/dev/null 2>&1; then
+  LK=$(wt_lock_path "$LKROOT" vendor)
+  wt_lock_acquire "$LK" 5 9
+  eq 'a free lock is acquired' 0 $?
+  # A SECOND holder must not get it while the first has it. Taken from a child process, because
+  # flock is per open-file-description and a second acquire in this same shell would succeed.
+  rc=$(flock -w 1 "$LK" -c true >/dev/null 2>&1; echo $?)
+  ne 'a held lock genuinely excludes another process' 0 "$rc"
+  wt_lock_release 9
+  rc=$(flock -w 1 "$LK" -c true >/dev/null 2>&1; echo $?)
+  eq 'and releasing it lets the next one in' 0 "$rc"
+
+  # The ADR-003 behaviour: contention must never stall a session. Hold the lock from a child,
+  # then confirm the acquire gives up quickly and reports "not held" rather than waiting.
+  # A readiness marker rather than a bare sleep: on a loaded machine the holder may not have the
+  # lock yet, the parent would acquire it, and the two assertions below would fail for reasons
+  # that have nothing to do with the code. A flaky suite trains people to ignore red.
+  rm -f "$LKROOT/held"
+  ( flock 9; : >"$LKROOT/held"; sleep 3 ) 9>"$LK" &
+  holder=$!
+  waitn=0
+  while [ ! -f "$LKROOT/held" ] && [ "$waitn" -lt 100 ]; do
+    sleep 0.05
+    waitn=$((waitn + 1))
+  done
+  eq 'the test holder actually took the lock before we tried' yes \
+    "$([ -f "$LKROOT/held" ] && echo yes)"
+  start=$(date +%s)
+  wt_lock_acquire "$LK" 1 8
+  rc=$?
+  waited=$(( $(date +%s) - start ))
+  eq 'a contended lock reports not-held rather than blocking' 1 "$rc"
+  eq '...and gives up within its wait, so a session never stalls behind another worktree' yes \
+    "$([ "$waited" -le 2 ] && echo yes)"
+  wt_lock_release 8
+  wait "$holder" 2>/dev/null
+else
+  printf 'WARNING: flock absent — lock exclusion NOT verified\n' >&2
+fi
+
+# The fd guard runs before the flock probe, so it holds on any host.
+rc=$(wt_lock_acquire "$LKROOT/x.lock" 1 notanumber >/dev/null 2>&1; echo $?)
+eq 'a non-numeric fd is refused rather than eval-ed' 2 "$rc"
+# 0, 1 and 2 must be refused too: `exec 1>lock` would redirect the hook's stdout — the channel
+# carrying the worktree path — into the lock file.
+for badfd in 0 1 2; do
+  rc=$(wt_lock_acquire "$LKROOT/x.lock" 1 "$badfd" >/dev/null 2>&1; echo $?)
+  eq "fd $badfd is refused, so the protocol channel cannot be clobbered" 2 "$rc"
+done
+
+if command -v flock >/dev/null 2>&1; then
+  # An unusable lock path is "could not even try", distinct from "not held". Only meaningful
+  # where flock exists — without it the probe short-circuits and returns 1 first.
+  rc=$(wt_lock_acquire /proc/nonexistent/x.lock 1 7 >/dev/null 2>&1; echo $?)
+  eq 'an unusable lock path is reported as could-not-try, not as acquired' 2 "$rc"
+
+  # A symlinked lock path must be refused, not opened: `exec 9>` TRUNCATES, so opening it would
+  # zero whatever it points at.
+  printf 'PRECIOUS\n' > "$TMP/precious.txt"
+  mkdir -p "$LKROOT/.git/worktree-locks"
+  ln -sf "$TMP/precious.txt" "$LKROOT/.git/worktree-locks/evil.lock"
+  rc=$(wt_lock_acquire "$LKROOT/.git/worktree-locks/evil.lock" 1 7 >/dev/null 2>&1; echo $?)
+  eq 'a symlinked lock file is refused rather than opened' 2 "$rc"
+  eq '...and the file it pointed at is untouched' 'PRECIOUS' "$(cat "$TMP/precious.txt")"
+  # The same for a symlinked parent directory.
+  ln -sf "$TMP/elsewhere" "$LKROOT/.git/linkdir"
+  mkdir -p "$TMP/elsewhere"
+  printf 'ALSO\n' > "$TMP/elsewhere/p.lock"
+  rc=$(wt_lock_acquire "$LKROOT/.git/linkdir/p.lock" 1 7 >/dev/null 2>&1; echo $?)
+  eq 'a lock under a symlinked directory is refused' 2 "$rc"
+  eq '...and that file is untouched too' 'ALSO' "$(cat "$TMP/elsewhere/p.lock")"
+fi
+
+# No flock on PATH: warn once and proceed unlocked, never refuse to work.
+out=$(
+  # SC2123: clobbering PATH is the point — this simulates a host with no flock(1).
+  # shellcheck disable=SC2123
+  PATH=/nonexistent
+  unset WT_FLOCK_WARNED
+  wt_lock_acquire "$LKROOT/y.lock" 1 6 2>&1
+  printf '|rc=%s' $?
+)
+contains 'with no flock binary the user is told' 'not be serialised' "$out"
+contains '...and the caller is told to proceed unlocked, not that it failed' '|rc=1' "$out"
+# "Say so ONCE per run" is the contract; a warning on every dependency would bury the real output.
+out=$(
+  # shellcheck disable=SC2123
+  PATH=/nonexistent
+  unset WT_FLOCK_WARNED
+  wt_lock_acquire "$LKROOT/y.lock" 1 6 2>&1
+  wt_lock_acquire "$LKROOT/z.lock" 1 6 2>&1
+)
+eq 'the missing-flock warning is printed once per run, not once per dependency' 1 \
+  "$(printf '%s\n' "$out" | grep -c 'not be serialised')"
+# A non-numeric wait falls back to the default instead of erroring.
+rc=$(wt_lock_acquire "$LKROOT/w.lock" abc 7 >/dev/null 2>&1; echo $?)
+case $rc in 0|1) pass=$((pass+1)) ;; *) fail=$((fail+1)); printf 'FAIL non-numeric wait: rc=%s\n' "$rc" >&2 ;; esac
+wt_lock_release 7
+
+# ---------------------------------------------------------------------------
+# Per-worktree bootstrap state
+# ---------------------------------------------------------------------------
+
+SREPO=$TMP/srepo
+git init -q "$SREPO"
+git -C "$SREPO" config user.email t@example.com
+git -C "$SREPO" config user.name t
+printf 'x\n' > "$SREPO/f.txt"
+git -C "$SREPO" add f.txt
+git -C "$SREPO" commit -qm init
+SWT=$SREPO/.claude/worktrees/one
+git -C "$SREPO" worktree add -q "$SWT" -b wt-one 2>/dev/null
+
+# It lives in the worktree's private git directory, so it never shows up in `git status` and a
+# developer cannot commit it by accident.
+sp=$(wt_state_path "$SWT")
+case $sp in
+  *"/.git/worktrees/one/worktree-bootstrap-state") pass=$((pass+1)) ;;
+  *) fail=$((fail+1)); printf 'FAIL state path is not in the private git dir: %q\n' "$sp" >&2 ;;
+esac
+eq 'and the worktree checkout itself stays clean' '' \
+  "$(git -C "$SWT" status --porcelain 2>/dev/null)"
+
+wt_state_is_done "$SWT" vendor L1 I1 hardlink
+eq 'an unbootstrapped worktree reports not done' 1 $?
+
+wt_state_set "$SWT" vendor hardlink L1 I1 doing
+eq 'writing an in-progress record succeeds' 0 $?
+wt_state_is_done "$SWT" vendor L1 I1 hardlink
+eq 'an entry left at "doing" is NOT done — that is a timeout kill, not a finished install' 1 $?
+
+wt_state_set "$SWT" vendor hardlink L1 I1 "done"
+wt_state_is_done "$SWT" vendor L1 I1 hardlink
+eq 'a completed entry with matching evidence is done' 0 $?
+wt_state_is_done "$SWT" vendor L2 I1 hardlink
+eq 'a changed lockfile makes it not done' 1 $?
+wt_state_is_done "$SWT" vendor L1 I2 hardlink
+eq 'a changed install command makes it not done' 1 $?
+wt_state_is_done "$SWT" node_modules L1 I1 install
+eq 'a different dependency is not covered by this one' 1 $?
+
+# Several dependencies coexist, and rewriting one leaves the others intact.
+wt_state_set "$SWT" node_modules install L9 I9 "done"
+wt_state_is_done "$SWT" vendor L1 I1 hardlink
+eq 'writing a second dependency does not disturb the first' 0 $?
+wt_state_is_done "$SWT" node_modules L9 I9 install
+eq 'and the second is recorded too' 0 $?
+wt_state_set "$SWT" vendor hardlink L3 I3 "done"
+wt_state_is_done "$SWT" node_modules L9 I9 install
+eq 'rewriting the first still leaves the second intact' 0 $?
+eq 'a dependency is stored once, not appended to' 1 \
+  "$(tr "$RS_" '\n' < "$(wt_state_path "$SWT")" | grep -c '^dep.*vendor' )"
+
+# No partial trust: anything unreadable, truncated or from another format means "not done".
+printf 'garbage' > "$(wt_state_path "$SWT")"
+wt_state_is_done "$SWT" vendor L3 I3 hardlink
+eq 'an unparseable state file means not done' 1 $?
+printf 'wtstate%s99%sdep%svendor%shardlink%sL3%sI3%sdone%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_state_is_done "$SWT" vendor L3 I3 hardlink
+eq 'a state file from a different format version means not done' 1 $?
+printf 'dep%svendor%shardlink%sL3%sI3%sdone%s' "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" \
+  > "$(wt_state_path "$SWT")"
+wt_state_is_done "$SWT" vendor L3 I3 hardlink
+eq 'a record with no header means not done' 1 $?
+rm -f "$(wt_state_path "$SWT")"
+wt_state_is_done "$SWT" vendor L3 I3 hardlink
+eq 'a missing state file means not done' 1 $?
+
+# Atomicity has a limit worth stating: a `cp`-then-`rm` write produces the same CONTENT, so only
+# a racing reader could observe the difference and such a test is inherently flaky. What IS
+# deterministic is the precondition atomicity depends on — the temp file must be created in the
+# SAME directory as the target, or `mv` crosses a filesystem and stops being a rename — and that
+# no temp file survives a write.
+wt_state_set "$SWT" vendor hardlink L4 I4 "done"
+eq 'a state write leaves no temporary file behind' 0 \
+  "$(find "$(dirname "$(wt_state_path "$SWT")")" -maxdepth 1 -name '.wtstate.*' 2>/dev/null | wc -l | tr -d ' ')"
+eq 'and the state file itself is intact afterwards' 0 \
+  "$(wt_state_is_done "$SWT" vendor L4 I4 hardlink; echo $?)"
+
+# The recorded STRATEGY is evidence too. Flipping hardlink -> install in the profile changes
+# neither the lockfile nor the install command, so without comparing it the worktree would keep a
+# tree built the way the developer just abandoned and call itself up to date.
+wt_state_set "$SWT" vendor hardlink L5 I5 "done"
+wt_state_is_done "$SWT" vendor L5 I5 hardlink
+eq 'a matching strategy is done' 0 $?
+wt_state_is_done "$SWT" vendor L5 I5 install
+eq 'the SAME evidence under a different strategy is NOT done' 1 $?
+wt_state_is_done "$SWT" vendor L5 I5
+eq 'a caller that passes no strategy skips that check' 0 $?
+
+# A file from a different format version must not be LAUNDERED by an unrelated write: without a
+# header check in the writer, the first write after a version bump restamps every stale record as
+# current, and the reader then trusts records it had correctly refused.
+printf 'wtstate%s99%sdep%snode_modules%sinstall%sL9%sI9%sdone%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_state_set "$SWT" vendor hardlink L7 I7 "done"
+wt_state_is_done "$SWT" node_modules L9 I9 install
+eq 'a foreign-version record is discarded by the next write, not promoted' 1 $?
+wt_state_is_done "$SWT" vendor L7 I7 hardlink
+eq '...while the record just written is trusted' 0 $?
+
+# Same for a file with no header at all.
+printf 'dep%snode_modules%sinstall%sL9%sI9%sdone%s' \
+  "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_state_set "$SWT" vendor hardlink L8 I8 "done"
+wt_state_is_done "$SWT" node_modules L9 I9 install
+eq 'a headerless record is discarded by the next write too' 1 $?
+
+# The non-git fallback location, and a write that cannot succeed.
+PLAINWT=$TMP/plainwt; mkdir -p "$PLAINWT"
+case "$(wt_state_path "$PLAINWT")" in
+  "$PLAINWT/.claude/worktree-bootstrap-state") pass=$((pass+1)) ;;
+  *) fail=$((fail+1)); printf 'FAIL non-git state path: %q\n' "$(wt_state_path "$PLAINWT")" >&2 ;;
+esac
+wt_state_set "$PLAINWT" vendor install LA IA "done"
+eq 'state round-trips outside a git repository too' 0 \
+  "$(wt_state_is_done "$PLAINWT" vendor LA IA install; echo $?)"
+
+if [ "$(id -u)" != 0 ]; then
+  ROWT=$TMP/rowt; mkdir -p "$ROWT/.claude"
+  chmod 500 "$ROWT/.claude"
+  wt_state_set "$ROWT" vendor install LB IB "done"
+  eq 'an unwritable state directory is a returned failure, not a crash' 1 $?
+  eq '...and the dependency then reads as not done, so the work is redone' 1 \
+    "$(wt_state_is_done "$ROWT" vendor LB IB install; echo $?)"
+  chmod 700 "$ROWT/.claude"
+fi
+
+# Checksums
+eq 'the checksum of a string is stable' "$(wt_cksum_string 'composer install')" \
+  "$(wt_cksum_string 'composer install')"
+ne 'and differs when the command differs' "$(wt_cksum_string 'composer install')" \
+  "$(wt_cksum_string 'composer install --no-scripts')"
+eq 'an empty command has an empty checksum, never matching a present one' '' \
+  "$(wt_cksum_string '')"
+eq 'a missing file has an empty checksum' '' "$(wt_cksum_file "$TMP/nosuchlock")"
+eq 'a file checksum is stable' "$(wt_cksum_file "$SREPO/f.txt")" "$(wt_cksum_file "$SREPO/f.txt")"
+printf 'y\n' > "$TMP/other.txt"
+ne 'and differs when the contents differ' "$(wt_cksum_file "$SREPO/f.txt")" \
+  "$(wt_cksum_file "$TMP/other.txt")"
+if [ "$(id -u)" != 0 ]; then
+  printf 'z\n' > "$TMP/unreadable.txt"; chmod 000 "$TMP/unreadable.txt"
+  eq 'an unreadable file has an empty checksum rather than a spurious match' '' \
+    "$(wt_cksum_file "$TMP/unreadable.txt")"
+  chmod 600 "$TMP/unreadable.txt"
+fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]
