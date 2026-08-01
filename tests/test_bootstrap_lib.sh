@@ -26,6 +26,7 @@ pass=0 fail=0
 US_=$WT_US
 RS_=$WT_RS
 NL_=$WT_NL
+CR_=$WT_CR
 # SC2034: PROFILE_RAW, PROFILE_SHELL and PROFILE_SHELLARGS are read by the SOURCED
 # engine, never by this file, so shellcheck cannot see the use.
 # shellcheck disable=SC2034
@@ -60,7 +61,7 @@ contains() {  # $1 = label, $2 = needle, $3 = haystack
 # A derived port must land in [base, base+span). Asserted as a RANGE rather than against a literal:
 # pinning the number would pin `cksum`'s output on this machine while saying nothing about whether
 # the derivation is still correct.
-noflock_port=''; c=''; cp=''
+noflock_port=''; c=''; cp=''; kv=''; bad=''; before=''
 in_range_b() {  # $1 = label, $2 = base, $3 = span, $4 = actual
   if [ -n "$4" ] && [ "$4" -ge "$2" ] && [ "$4" -lt $(($2 + $3)) ] 2>/dev/null; then
     pass=$((pass + 1))
@@ -1878,6 +1879,319 @@ contains 'and the warning says the port was left alone' 'leaving the port as it 
      wt_port_in_use() { return 0; }
      wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>&1 >/dev/null)"
 rm -f "$(wt_state_path "$PA")"
+
+# ---------------------------------------------------------------------------
+# Layer 3 — the env override file
+# ---------------------------------------------------------------------------
+EREPO=$TMP/erepo
+mkdir -p "$EREPO"
+git init -q "$EREPO"
+git -C "$EREPO" config user.email t@example.com
+git -C "$EREPO" config user.name t
+printf '.env.worktree.local\nignored/\n' >"$EREPO/.gitignore"
+: >"$EREPO/f"
+git -C "$EREPO" add -A; git -C "$EREPO" commit -qm init
+git -C "$EREPO" worktree add -q "$EREPO/.claude/worktrees/ew" -b ew 2>/dev/null
+EW=$EREPO/.claude/worktrees/ew
+EF=.env.worktree.local
+
+# A pairs stream shaped exactly like group 3 of a profile scan.
+mk_pairs() {  # $@ = KEY=VALUE
+  local kv
+  for kv in "$@"; do printf '3%s%s%s%s%s' "$US_" "${kv%%=*}" "$US_" "${kv#*=}" "$RS_"; done
+}
+
+WT_NAME=alice/fix-99
+WT_SLUG=alice_fix_99
+WT_PATH=$EW
+WT_ROOT=$EREPO
+WT_PORT=3812
+export WT_NAME WT_SLUG WT_PATH WT_ROOT WT_PORT
+
+# --- wt_runtime_env_state ---
+eq 'an absent override file is absent' 'absent' "$(wt_runtime_env_state "$EW" "$EF")"
+
+# --- writing it ---
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}' 'APP_ENV=dev')"
+eq 'writing the override file reports written' 'written' "$WT_ENV_WROTE"
+eq 'the port line is written from the profile-named variable' 'SERVER_PORT=3812' \
+  "$(grep '^SERVER_PORT=' "$EW/$EF")"
+eq 'a {slug} placeholder is expanded in a value' 'INSTALLATION_NAME=demo_alice_fix_99' \
+  "$(grep '^INSTALLATION_NAME=' "$EW/$EF")"
+eq 'a literal value is written as-is' 'APP_ENV=dev' "$(grep '^APP_ENV=' "$EW/$EF")"
+eq 'the file now reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
+# These files hold database names and, in a repo that puts one there, a connection string.
+# `stat` differs between GNU and BSD, so both spellings are tried.
+eq 'and it is not world-readable' '600' \
+  "$(stat -c '%a' "$EW/$EF" 2>/dev/null || stat -f '%Lp' "$EW/$EF" 2>/dev/null)"
+eq 'no temporary file is left beside it' 0 \
+  "$(find "$EW" -maxdepth 1 -name '.wtenv.*' 2>/dev/null | wc -l | tr -d ' ')"
+# The whole file, so nothing unexpected is in it and the marker really is first.
+eq 'the marker is the FIRST line, which is what the ownership check reads' "$WT_ENV_MARKER" \
+  "$(head -1 "$EW/$EF")"
+
+# REWRITING keeps values in sync when the profile changes.
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+eq 'a rewrite updates the port' 'SERVER_PORT=3999' "$(grep '^SERVER_PORT=' "$EW/$EF")"
+eq 'and drops a variable the profile no longer names' 0 \
+  "$(grep -c '^APP_ENV=' "$EW/$EF" | tr -d ' ')"
+
+# A DEVELOPER-EDITED FILE IS NEVER TOUCHED. Editing it is the supported way to point a worktree at
+# a shared database, a colleague's, or a restored snapshot — so losing those edits on the next
+# session would destroy the one escape hatch the design offers.
+printf 'INSTALLATION_NAME=someone_elses_db\n' >"$EW/$EF"
+eq 'a file without the marker reads as theirs' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+eq 'and is reported as developer-managed' 'developer' "$WT_ENV_WROTE"
+eq 'and is left byte for byte alone' 'INSTALLATION_NAME=someone_elses_db' "$(cat "$EW/$EF")"
+# Deleting the file hands ownership back, which is how a developer undoes that.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+eq 'deleting the file hands ownership back to the plugin' 'written' "$WT_ENV_WROTE"
+
+# An EMPTY existing file is not ours either — it has no marker, so the same rule applies.
+: >"$EW/$EF"
+eq 'an empty existing file reads as theirs' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
+rm -f "$EW/$EF"
+
+# THE MARKER IS PREFIX-MATCHED, so a future version can extend that line without every file
+# written by this one suddenly freezing itself as developer-managed.
+printf '%s (v2)\nX=1\n' "$WT_ENV_MARKER" >"$EW/$EF"
+eq 'a marker line with something appended is still ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
+rm -f "$EW/$EF"
+
+# NOT GITIGNORED — refused, because an override file that shows up as an untracked change gets
+# committed by accident, and then every teammate's worktree points at one database.
+wt_runtime_env_write "$EW" tracked.env SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq 'a path that is not gitignored is refused' 'skipped' "$WT_ENV_WROTE"
+eq 'and nothing is written there' 0 "$([ -e "$EW/tracked.env" ] && echo 1 || echo 0)"
+contains 'and it says why' 'not gitignored' \
+  "$(wt_runtime_env_write "$EW" tracked.env SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
+
+# THE WORKTREE'S OWN .gitignore GOVERNS, not the main checkout's — a branch can legitimately differ,
+# and asking the wrong one would refuse a path the app actually loads.
+printf 'branch-only.env\n' >>"$EW/.gitignore"
+wt_runtime_env_write "$EW" branch-only.env SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq "a path ignored only by the WORKTREE's .gitignore is accepted" 'written' "$WT_ENV_WROTE"
+git -C "$EW" checkout -q -- .gitignore 2>/dev/null || printf '.env.worktree.local\nignored/\n' >"$EW/.gitignore"
+rm -f "$EW/branch-only.env"
+
+# SYMLINKS, at the leaf and at a parent. runtime.env.file comes from a committed profile, so it
+# arrives with anyone's branch, and a write through a link lands outside the worktree entirely.
+OUTSIDE=$TMP/outside-target
+: >"$OUTSIDE"
+ln -sf "$OUTSIDE" "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq 'a symlinked override path is refused' 'skipped' "$WT_ENV_WROTE"
+eq 'and the file it pointed at is untouched' 0 "$(wc -c <"$OUTSIDE" | tr -d ' ')"
+rm -f "$EW/$EF"
+mkdir -p "$TMP/outside-dir"
+ln -sfn "$TMP/outside-dir" "$EW/ignored"
+wt_runtime_env_write "$EW" ignored/x.env SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq 'a symlinked PARENT directory is refused too' 'skipped' "$WT_ENV_WROTE"
+eq 'and nothing is written through it' 0 \
+  "$(find "$TMP/outside-dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+# The refusal must come from OUR guard, named as such. git happens to refuse this path too
+# ("pathspec is beyond a symbolic link", rc 128), so without pinning the message the two guards
+# overlap and removing ours would look harmless.
+contains 'and the refusal is ours, naming the symlinked parent' 'parent directories is a symlink' \
+  "$(wt_runtime_env_write "$EW" ignored/x.env SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
+rm -f "$EW/ignored"
+
+# A git THAT CANNOT ANSWER is a refusal, not permission. exit 0 means ignored and 1 means not;
+# anything else (no git, a corrupt index, a path beyond a symlink) must not be read as a yes —
+# that is how an override file ends up tracked and committed for the whole team.
+eq 'a git that fails an unexpected way means the file is not written' 'skipped' \
+  "$(rm -f "$EW/$EF"
+     # shellcheck disable=SC2329
+     wt_git() { return 128; }
+     wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+     printf '%s' "$WT_ENV_WROTE")"
+eq 'and nothing is left on disk' 0 "$([ -e "$EW/$EF" ] && echo 1 || echo 0)"
+contains 'and it reports the exit code rather than guessing' 'could not ask git' \
+  "$(# shellcheck disable=SC2329
+     wt_git() { return 128; }
+     wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
+
+# A path escaping the worktree is refused on shape alone, before anything is resolved.
+for bad in ../escape.env /abs.env '' .; do
+  wt_runtime_env_write "$EW" "$bad" SERVER_PORT 3812 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+  eq "an unsafe env path (${bad:-<empty>}) is refused" 'skipped' "$WT_ENV_WROTE"
+done
+eq 'and nothing escaped the worktree' 0 "$([ -e "$TMP/escape.env" ] && echo 1 || echo 0)"
+
+# A BAD KEY IS SKIPPED, NOT FATAL — the other variables are still worth writing. Re-checked here
+# rather than trusted from validation, because this is a public entry point and WT_SKIP_VALIDATION
+# can bypass the validator entirely.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'GOOD=1' 'BAD KEY=2' 'ALSO_GOOD=3')"
+eq 'a malformed key does not stop the file being written' 'written' "$WT_ENV_WROTE"
+eq 'the good keys are there' 2 \
+  "$(grep -c -e '^GOOD=' -e '^ALSO_GOOD=' "$EW/$EF" | tr -d ' ')"
+eq 'and the malformed one is not' 0 "$(grep -c 'BAD KEY' "$EW/$EF" | tr -d ' ')"
+contains 'and it says which key it skipped' 'BAD KEY' \
+  "$(rm -f "$EW/$EF"; wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'BAD KEY=2')" 2>&1)"
+
+# No port variable and no vars: the file is still written, with just the marker, so its presence
+# still means "this worktree is managed" rather than looking absent.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' ''
+eq 'a file with nothing to put in it is still written' 'written' "$WT_ENV_WROTE"
+eq 'and reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
+eq 'and contains no KEY=VALUE lines' 0 \
+  "$(grep -c -v '^#' "$EW/$EF" | tr -d ' ')"
+
+# EVERY ENVIRONMENT, not just the default one. `vars` is a plain map, so isolating development and
+# test at once is a matter of the engine writing all of it faithfully — the acceptance criterion
+# that says two worktrees must not destroy each other's TEST runs either.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 \
+  "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}' 'TEST_INSTALLATION_NAME=demo_{slug}_test' 'CI_INSTALLATION_NAME=demo_{slug}_ci')"
+eq 'the development database is isolated' 'INSTALLATION_NAME=demo_alice_fix_99' \
+  "$(grep '^INSTALLATION_NAME=' "$EW/$EF")"
+eq 'the test database is isolated too' 'TEST_INSTALLATION_NAME=demo_alice_fix_99_test' \
+  "$(grep '^TEST_INSTALLATION_NAME=' "$EW/$EF")"
+eq 'and so is CI' 'CI_INSTALLATION_NAME=demo_alice_fix_99_ci' \
+  "$(grep '^CI_INSTALLATION_NAME=' "$EW/$EF")"
+
+# {port} resolves from the exported WT_PORT, which is what makes a URL in a value work.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'APP_URL=http://localhost:{port}/')"
+eq 'a {port} placeholder resolves from the allocated port' 'APP_URL=http://localhost:3812/' \
+  "$(grep '^APP_URL=' "$EW/$EF")"
+
+# A value carrying a newline cannot forge a second line. The JSON layer folds these, so this is the
+# backstop for a pairs stream built any other way.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(printf '3%sA%sx%sFORGED=1%s' "$US_" "$US_" "$NL_" "$RS_")"
+eq 'a newline in a value cannot forge a second assignment' 0 \
+  "$(grep -c '^FORGED=' "$EW/$EF" | tr -d ' ')"
+
+# THE PORT VARIABLE IS A KEY TOO, and was written unchecked at first while the vars keys beside it
+# were guarded. It lands on the left of a `KEY=value` line exactly as they do, validation only
+# WARNS about it, and WT_SKIP_VALIDATION removes even that.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" 'A=1' 3812 "$(mk_pairs 'GOOD=1')"
+eq 'a malformed port var does not stop the file being written' 'written' "$WT_ENV_WROTE"
+eq 'and no forged assignment reaches the file' 0 "$(grep -c '^A=1=' "$EW/$EF" | tr -d ' ')"
+eq 'and the legitimate variables are still there' 'GOOD=1' "$(grep '^GOOD=' "$EW/$EF")"
+contains 'and it says the port line was skipped' 'skipping the port line' \
+  "$(rm -f "$EW/$EF"; wt_runtime_env_write "$EW" "$EF" 'A=1' 3812 '' 2>&1)"
+eq 'and the summary does not claim a port it did not write' 0 \
+  "$(rm -f "$EW/$EF"; wt_runtime_env_write "$EW" "$EF" 'A=1' 3812 '' 2>&1 | grep -c 'A=1=3812' | tr -d ' ')"
+# A port VAR with no port value must not be announced either.
+rm -f "$EW/$EF"
+lacks 'a port var with no derived port is not announced' '(SERVER_PORT=)' \
+  "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT '' "$(mk_pairs 'A=1')" 2>&1)"
+eq 'and no bare port line is written' 0 "$(grep -c '^SERVER_PORT' "$EW/$EF" | tr -d ' ')"
+
+# A CR forges a line as readily as an LF, and only the LF sibling was pinned.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(printf '3%sA%sx%sFORGEDCR=1%s' "$US_" "$US_" "$CR_" "$RS_")"
+# ANCHORED: folding leaves the text on the SAME line (`A=x FORGEDCR=1`), which is the point —
+# what must not exist is a second ASSIGNMENT, so the pattern has to be anchored to a line start.
+eq 'a carriage return in a value cannot forge a second assignment' 0 \
+  "$(grep -c '^FORGEDCR=' "$EW/$EF" | tr -d ' ')"
+eq 'and the folded value stays on the one line it belongs to' 'A=x FORGEDCR=1' \
+  "$(grep '^A=' "$EW/$EF")"
+
+# --- wt_runtime_env_state: the arms that only another guard was covering ---
+# This is a public accessor whose answer is RECORDED as envstate, so each arm has to hold on its
+# own rather than be saved by the write-side symlink check.
+rm -f "$EW/$EF"
+printf '%s\nX=1\n' "$WT_ENV_MARKER" >"$TMP/marker-bearing"
+ln -sf "$TMP/marker-bearing" "$EW/$EF"
+eq 'a symlink pointing at a marker-bearing file is THEIRS, not ours' 'theirs' \
+  "$(wt_runtime_env_state "$EW" "$EF")"
+rm -f "$EW/$EF"
+ln -sf "$TMP/does-not-exist-at-all" "$EW/$EF"
+eq 'a dangling symlink is theirs, not absent' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
+rm -f "$EW/$EF"
+mkdir -p "$EW/$EF"
+eq 'the path existing as a directory is theirs' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
+rmdir "$EW/$EF"
+if [ "$(id -u)" != 0 ]; then
+  printf '%s\n' "$WT_ENV_MARKER" >"$EW/$EF"
+  chmod 000 "$EW/$EF"
+  eq 'an unreadable file is theirs — we cannot prove we wrote it' 'theirs' \
+    "$(wt_runtime_env_state "$EW" "$EF")"
+  chmod 600 "$EW/$EF"
+fi
+rm -f "$EW/$EF"
+
+# The marker's CONTRACT, independent of its exact text: it must be a comment, so that a dotenv
+# reader ignores it rather than choking on the first line of every file this writes.
+case $WT_ENV_MARKER in
+  '#'*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL the env marker is not a comment line: %q\n' "$WT_ENV_MARKER" >&2 ;;
+esac
+
+# --- the failure paths, which decide whether a failed write leaves debris ---
+# A leaked .wtenv.* is not gitignored, so it shows up as an untracked change — the precise harm the
+# gitignore guard exists to prevent.
+rm -f "$EW/$EF"
+eq 'a mktemp that fails is reported, not ignored' 'skipped' \
+  "$(# shellcheck disable=SC2329
+     mktemp() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+     printf '%s' "$WT_ENV_WROTE")"
+contains 'and it says so' 'could not create a temporary file' \
+  "$(# shellcheck disable=SC2329
+     mktemp() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" 2>&1)"
+eq 'a failed mv leaves no temporary file behind' 0 \
+  "$(# shellcheck disable=SC2329
+     mv() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+     find "$EW" -maxdepth 1 -name '.wtenv.*' 2>/dev/null | wc -l | tr -d ' ')"
+contains 'and a failed mv is reported rather than claimed as success' 'could not put' \
+  "$(# shellcheck disable=SC2329
+     mv() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" 2>&1)"
+# A FAILED WRITE MUST NOT BE PROMOTED. The shadow below fails WITHOUT writing anything, so a
+# version that ignores the status would move an empty file into place and report success — and if
+# the lost line were the marker, every later session would read the file as developer-owned and
+# never touch it again. Asserting only "no temp left behind" misses that entirely, because the
+# unchecked path cleans up after itself by succeeding.
+rm -f "$EW/$EF"
+eq 'a failed write is reported, not promoted' 'skipped' \
+  "$(# shellcheck disable=SC2329
+     printf() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+     command printf '%s' "$WT_ENV_WROTE")"
+eq 'and no override file is left in place after it' 0 \
+  "$([ -e "$EW/$EF" ] && echo 1 || echo 0)"
+eq 'and no temporary file is left behind either' 0 \
+  "$(# shellcheck disable=SC2329
+     printf() { return 1; }
+     wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
+     find "$EW" -maxdepth 1 -name '.wtenv.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+# The unsafe-path refusal must be OURS, named as such: git also refuses some of these paths, so
+# without pinning the message the shape guard could be deleted unnoticed.
+for bad in ../escape.env /abs.env; do
+  contains "the refusal for $bad is the shape guard, not git" 'not a relative path inside the worktree' \
+    "$(wt_runtime_env_write "$EW" "$bad" P 1 "$(mk_pairs 'A=1')" 2>&1)"
+done
+contains 'and a trailing slash is refused as a directory' 'names a directory' \
+  "$(wt_runtime_env_write "$EW" 'ignored/' P 1 "$(mk_pairs 'A=1')" 2>&1)"
+eq 'nothing escaped into the worktrees directory' 0 \
+  "$([ -e "$EREPO/.claude/worktrees/escape.env" ] && echo 1 || echo 0)"
+
+# THE ACCEPTANCE CRITERION IN FULL: a hand-edited file survives a re-bootstrap AND is not
+# re-announced. The once-ness lives in the caller's state record, so what this function owes is
+# SILENCE — a wt_log added here would make every session warn, and nothing pinned that.
+rm -f "$EW/$EF"
+printf 'INSTALLATION_NAME=colleagues_db\n' >"$EW/$EF"
+before=$(cat "$EW/$EF")
+eq 'the developer path says nothing itself' '' \
+  "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq 'a second consecutive run still reports developer-managed' 'developer' "$WT_ENV_WROTE"
+eq 'and the file is byte-identical after both runs' "$before" "$(cat "$EW/$EF")"
+
+rm -f "$EW/$EF"
+unset WT_PORT
 
 # ---------------------------------------------------------------------------
 # The Phase 4 hand-off

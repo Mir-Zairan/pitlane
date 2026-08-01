@@ -1717,6 +1717,218 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Layer 3 — the env override file
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS WRITES IS DOTENV, `KEY=value` a line at a time, and deliberately nothing cleverer. A
+# renderer that could also produce YAML or PHP config would have to know that target format's
+# nesting and typing conventions — is a boolean quoted, is a key dotted or nested — which is
+# exactly the repo-specific judgement ADR-006 forbids inferring and which calibration never
+# gathered. A repo that needs another format already has the escape hatch: `runtime.seed` receives
+# WT_ENV_FILE and every derived value, and can translate.
+#
+# VALUES ARE NOT QUOTED. dotenv dialects disagree about quoting — some strip quotes, some keep them
+# literally — so the profile author's own text is written verbatim and the author owns it, the same
+# trust boundary `deps[].install` already has. What is NOT left to the author is the KEY: it is
+# shape-checked, because a key of `A=1` writes a line setting a variable the profile never names,
+# and no care on the value side can defend against damage done before the `=`.
+
+# The first line of every file this writes. Its presence is the whole ownership protocol.
+WT_ENV_MARKER='# managed by the worktree plugin — delete this line to take ownership of this file'
+
+# Who owns the override file at $1/$2: `absent`, `ours`, or `theirs`.
+#
+# THE MARKER IS MATCHED AS A PREFIX so a later version can append to that line — a version stamp,
+# say — without every previously written file suddenly reading as developer-owned and freezing
+# itself. An existing file with no first line at all counts as `theirs`: it is not one we wrote, and
+# the rule for anything we did not write is the same.
+#
+# Read with a plain `read` and no subprocess: this runs on the session-start path, and the answer is
+# one line of one small file.
+wt_runtime_env_state() {  # $1 = worktree, $2 = relative path
+  local worktree=${1%/} rel=${2-} f line
+  f=$worktree/$rel
+  # A dangling symlink is not `absent` — something is there, and it is not ours.
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    printf 'absent'
+    return 0
+  fi
+  if [ -L "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    printf 'theirs'
+    return 0
+  fi
+  line=''
+  IFS= read -r line <"$f" 2>/dev/null || line=''
+  case $line in
+    "$WT_ENV_MARKER"*) printf 'ours' ;;
+    *) printf 'theirs' ;;
+  esac
+  return 0
+}
+
+# Write the override file. Sets WT_ENV_WROTE to `written`, `developer`, or `skipped`.
+#
+# NEVER OVERWRITES A FILE THIS PLUGIN DID NOT WRITE. Editing that file is the SUPPORTED way to point
+# a worktree somewhere else — a shared database, a colleague's, a restored snapshot — so a
+# developer-managed file is left exactly as it is. The caller records that in the state file so the
+# warning is said once rather than on every session, which is the difference between a useful
+# notice and one people learn to scroll past.
+#
+# It refuses rather than follows a symlink, at the leaf and at every parent. `runtime.env.file`
+# comes out of a committed profile, so it arrives with anyone's branch, and the write below would
+# otherwise land wherever the link points — another worktree, the main checkout, a home directory.
+# The leaf check alone is not enough: `mkdir -p` and a redirect both follow a symlinked PARENT.
+#
+# It refuses a path that is not gitignored, and asks git rather than matching patterns itself. An
+# override file that shows up as an untracked change is a bug — a developer commits it by accident
+# and every teammate's worktree then points at one database. The question is asked IN THE WORKTREE,
+# because that is the .gitignore that governs the file and a branch can legitimately differ.
+wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream
+  local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-}
+  local dest tmp parent state rec body key val out n=0 irc
+
+  # SC2034: WT_ENV_WROTE is this function's result — the caller records it in the state file so
+  # the developer-managed warning is said once rather than on every session.
+  # shellcheck disable=SC2034
+  WT_ENV_WROTE=skipped
+  [ -n "$rel" ] || return 0
+  # A TRAILING SLASH names a directory, and `mv` into one moves the temp file INSIDE it under its
+  # own random name — reporting success while creating no override file at all, so the next session
+  # finds it absent and does it again, accumulating debris. wt_is_safe_relpath accepts the shape,
+  # so it has to be caught here.
+  case $rel in
+    */) wt_log "  runtime: refusing to write \"$rel\" — it names a directory, not a file"; return 0 ;;
+  esac
+  if ! wt_is_safe_relpath "$rel"; then
+    wt_log "  runtime: refusing to write \"$rel\" — not a relative path inside the worktree"
+    return 0
+  fi
+
+  dest=$worktree/$rel
+  if [ -L "$dest" ]; then
+    wt_log "  runtime: refusing to write $rel — it is a symlink, and writing through it would land outside the worktree"
+    return 0
+  fi
+  if wt_has_symlinked_parent "$worktree" "$rel"; then
+    wt_log "  runtime: refusing to write $rel — one of its parent directories is a symlink"
+    return 0
+  fi
+
+  state=$(wt_runtime_env_state "$worktree" "$rel")
+  if [ "$state" = theirs ]; then
+    # SILENT HERE, deliberately. The caller says this once, from the state record — saying it from
+    # inside a function that runs every session is how a useful notice becomes noise people scroll
+    # past, and this is the escape hatch the design most wants a developer to keep trusting.
+    # shellcheck disable=SC2034
+    WT_ENV_WROTE=developer
+    return 0
+  fi
+
+  # GITIGNORED OR NOTHING. Asked before the write, and a git that cannot answer is treated as a
+  # refusal rather than as a yes: exit 0 means ignored, 1 means not, anything else is a real
+  # failure (no git, a corrupt index, a path beyond a symlink) that must not be read as permission.
+  wt_git "$worktree" check-ignore -q -- "$rel" >/dev/null 2>&1
+  irc=$?
+  case $irc in
+    0) ;;
+    1)
+      wt_log "  runtime: refusing to write $rel — it is not gitignored, and an override file that shows up as an untracked change gets committed by accident"
+      return 0
+      ;;
+    *)
+      wt_log "  runtime: could not ask git whether $rel is ignored (it exited $irc) — not writing it"
+      return 0
+      ;;
+  esac
+
+  parent=${dest%/*}
+  if [ "$parent" != "$dest" ] && [ ! -d "$parent" ]; then
+    mkdir -p "$parent" 2>/dev/null || {
+      wt_log "  runtime: could not create a parent directory for $rel — not writing it"
+      return 0
+    }
+  fi
+
+  # THE CONTENT IS BUILT FIRST, IN MEMORY, AND WRITTEN BY ONE COMMAND. The obvious shape —
+  # `{ printf; printf; while ...; } >"$tmp" || cleanup` — cannot detect a failed write: a brace
+  # group reports the status of its LAST command, which here is the loop, so a printf that failed
+  # on a full disk was invisible and the truncated file was promoted into place anyway. Worse, if
+  # the line lost was the MARKER, every later session reads the file as developer-owned and never
+  # touches it again. Building the text first makes the write one checkable command, and shrinks
+  # the window in which a killed hook can leave a temp file behind to almost nothing.
+  out=$WT_ENV_MARKER$WT_NL
+  out=$out"# Regenerated on every session while the line above is present. worktree=${WT_NAME-} slug=${WT_SLUG-}$WT_NL"
+
+  # THE PORT VARIABLE IS SHAPE-CHECKED LIKE ANY OTHER KEY, and it was not at first. It becomes the
+  # left-hand side of a `KEY=value` line exactly as an env.vars key does, and it is only WARNED
+  # about by validation (which WT_SKIP_VALIDATION removes entirely), so a committed profile naming
+  # `"var": "A=1"` would emit `A=1=3812` — setting a variable the profile never names, which is
+  # precisely the damage checking the other keys exists to prevent.
+  if [ -n "$pvar" ] && [ -n "$port" ]; then
+    if wt_is_safe_envkey "$pvar"; then
+      out=$out"$pvar=$port$WT_NL"
+    else
+      wt_log "  runtime: skipping the port line — \"$pvar\" is not a legal environment variable name"
+      pvar=''
+    fi
+  else
+    pvar=''
+  fi
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    # Group 3 of the profile scan is runtime.env.vars.
+    case $rec in
+      3"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    key=${body%%"$WT_US"*}
+    val=${body#*"$WT_US"}
+    # Re-checked here rather than trusted from validation: this is a public entry point, and the
+    # validator can be bypassed with WT_SKIP_VALIDATION. A bad key is skipped, not fatal — the
+    # other variables are still worth writing.
+    if ! wt_is_safe_envkey "$key"; then
+      wt_log "  runtime: skipping \"$key\" — not a legal environment variable name"
+      continue
+    fi
+    # A NEWLINE IN A VALUE WOULD FORGE A SECOND ASSIGNMENT, naming a variable the profile does not
+    # — the same damage as a bad key, arriving from the other side of the `=`. dotenv is
+    # line-oriented, so the writer folds line breaks rather than trusting its input not to have
+    # any. The JSON layer folds these already; this is the backstop for a stream built another way.
+    val=$(wt_expand "$val")
+    val=${val//"$WT_CR"/ }
+    val=${val//"$WT_NL"/ }
+    out=$out"$key=$val$WT_NL"
+    n=$((n + 1))
+  done < <(printf '%s' "$pairs")
+
+  # Atomic, and in the same directory so `mv` is a rename rather than a copy. A half-written
+  # override file is worse than none: the app reads it and points at half a configuration.
+  tmp=$(mktemp "${parent}/.wtenv.XXXXXX" 2>/dev/null) || {
+    wt_log "  runtime: could not create a temporary file beside $rel — not writing it"
+    return 0
+  }
+  # 0600 before anything is in it. These files hold the names of databases and, in a repo that puts
+  # one there, a connection string.
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! printf '%s' "$out" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    wt_log "  runtime: could not write $rel"
+    return 0
+  fi
+
+  if mv -f "$tmp" "$dest" 2>/dev/null; then
+    # shellcheck disable=SC2034
+    WT_ENV_WROTE=written
+    wt_log "  runtime: wrote $rel${pvar:+ ($pvar=$port)}, $n variable(s)"
+  else
+    rm -f "$tmp"
+    wt_log "  runtime: could not put $rel in place"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # The hand-off to Phase 4
 # ---------------------------------------------------------------------------
 #
