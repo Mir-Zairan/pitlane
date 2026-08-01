@@ -599,45 +599,87 @@ wt_state_path() {  # $1 = worktree
   printf '%s' "$WT_STATE_PATH_IS"
 }
 
-# Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
-# entries, and a partial write is the one thing a reader must never see.
-wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status
-  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-}
-  local file tmp rec kind rdir rest kept='' hdrok=0 when
+# Join fields into a record body, stripping the bytes the record format cannot carry.
+#
+# THE FORMAT CANNOT REPRESENT ITS OWN SEPARATORS, so the writer must not pretend otherwise. A US in
+# any field forges an extra field and an RS ends the record early; both readers here are
+# line-delimited, so a newline truncates the record and blanks EVERY FIELD AFTER IT. That is not a
+# cosmetic loss — `seedstatus` and `seedcksum` are late fields, so a stray byte in the slug would
+# blank the seed marker and re-run a database clone on every single session, silently.
+#
+# It mirrors the JSON layer's `desep` exactly (strip US and RS, fold CR and LF to a space) because
+# most of these values arrive THROUGH that layer, and a second sanitiser with different rules would
+# be a second thing to keep true. This one is the backstop for the values that do not: a caller
+# building a record by hand, and a slug or path that reached us another way.
+#
+# Sets WT_STATE_REC rather than printing, deliberately: this runs per field on the session-start
+# path, and a command substitution per field is a fork per field for work that parameter expansion
+# already does for free.
+wt_state_join() {  # $@ = field values; sets WT_STATE_REC
+  local f v out='' first=1
+  for f in "$@"; do
+    v=$f
+    v=${v//"$WT_US"/}
+    v=${v//"$WT_RS"/}
+    v=${v//"$WT_CR"/ }
+    v=${v//"$WT_NL"/ }
+    if [ "$first" = 1 ]; then
+      out=$v
+      first=0
+    else
+      out="$out$WT_US$v"
+    fi
+  done
+  WT_STATE_REC=$out
+}
 
-  # Recorded but never compared: it answers "when did this last happen" for a developer looking at
-  # a worktree that seems stale, and gives Phase 5 something to age entries by. It is deliberately
-  # NOT part of the freshness decision — a timestamp cannot tell you whether a tree is correct, and
-  # comparing one would make re-entry depend on the clock.
-  when=$(date +%s 2>/dev/null) || when=0
+# Rewrite the state file, replacing one record and carrying every other through untouched.
+#
+# THE ONE MERGE IMPLEMENTATION, and it is one because the second copy of it had already drifted
+# before it was a day old: the copy's own replaced-kind arm was missing the headerless guard the
+# original applies to every other arm, so the two writers disagreed about the no-partial-trust
+# rule on identical bytes. A merge loop that exists twice is the shape this codebase has now
+# un-duplicated three times (the JSON value renderer, the drift comparator, this).
+#
+# $2 names the kind being replaced and $3 narrows that to a single record by its FIRST field —
+# `dep` records are per directory, so only the matching one goes, while `rt` is a single slot and
+# passes an empty $3 to replace whichever one is there.
+#
+# The rules it enforces for every caller at once:
+#   * a header of an unrecognised WT_STATE_VERSION discards the whole file rather than merging
+#     with it — otherwise the next write restamps stale records as current and the reader trusts
+#     records it had correctly refused;
+#   * a record appearing BEFORE any header means the file is not ours, same outcome;
+#   * a kind this build does not know is preserved verbatim, never parsed and never dropped. That
+#     arm is why layer 2 and layer 3 can share one file at all.
+#
+# Atomic: temp file in the SAME directory (so `mv` is a rename and not a copy), then `mv -f`.
+wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first field or empty, $4 = the replacement record
+  local wt=${1%/} kind=${2-} key=${3-} newrec=${4-}
+  local file tmp rec rkind rest kept='' hdrok=0 parent
 
   file=$(wt_state_path "$wt")
   [ -n "$file" ] || return 1
-  local parent=${file%/*}
+  parent=${file%/*}
   [ "$parent" = "$file" ] || [ -d "$parent" ] || mkdir -p "$parent" 2>/dev/null || return 1
 
-  # Existing records are carried over ONLY if the file is one this format can read. Without the
-  # header check, the first write after a WT_STATE_VERSION bump would copy every stale record
-  # into a file freshly stamped with the NEW version — laundering exactly the records the reader
-  # had correctly refused to trust, so a dependency never installed under the new format would
-  # then read as done. Same rule as the profile: wrong version means ignore the file whole.
   if [ -r "$file" ]; then
-    hdrok=0
     while IFS= read -r -d "$WT_RS" rec; do
-      kind=${rec%%"$WT_US"*}
+      rkind=${rec%%"$WT_US"*}
       rest=${rec#*"$WT_US"}
-      case $kind in
-        wtstate)
-          [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || { kept=''; break; }
-          hdrok=1
-          ;;
-        dep)
-          [ "$hdrok" = 1 ] || { kept=''; break; }   # records before any header: not our file
-          rdir=${rest%%"$WT_US"*}
-          [ "$rdir" = "$dir" ] && continue          # replaced below
-          kept="$kept$rec$WT_RS"
-          ;;
-      esac
+      if [ "$rkind" = wtstate ]; then
+        [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || { kept=''; break; }
+        hdrok=1
+        continue
+      fi
+      # EVERY non-header record is subject to the same headerless rule, including the kind being
+      # replaced. Exempting that one is precisely the divergence this function exists to prevent.
+      [ "$hdrok" = 1 ] || { kept=''; break; }
+      if [ "$rkind" = "$kind" ]; then
+        [ -z "$key" ] && continue                      # single-slot kind: this one is replaced
+        [ "${rest%%"$WT_US"*}" = "$key" ] && continue  # keyed kind: only the match is replaced
+      fi
+      kept="$kept$rec$WT_RS"
     done <"$file"
   fi
 
@@ -645,13 +687,29 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   {
     printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
     printf '%s' "$kept"
-    printf 'dep%s%s%s%s%s%s%s%s%s%s%s%s%s' \
-      "$WT_US" "$dir" "$WT_US" "$strategy" "$WT_US" "$lck" \
-      "$WT_US" "$ick" "$WT_US" "$status" "$WT_US" "$when" "$WT_RS"
+    printf '%s%s' "$newrec" "$WT_RS"
   } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  # Atomic: a reader sees the old file or the new one, never a half-written one.
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
   return 0
+}
+
+# Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
+# entries, and a partial write is the one thing a reader must never see.
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} when rec
+
+  # Recorded but never compared: it answers "when did this last happen" for a developer looking at
+  # a worktree that seems stale, and gives Phase 5 something to age entries by. It is deliberately
+  # NOT part of the freshness decision — a timestamp cannot tell you whether a tree is correct, and
+  # comparing one would make re-entry depend on the clock.
+  when=$(date +%s 2>/dev/null) || when=0
+
+  wt_state_join dep "$dir" "$strategy" "$lck" "$ick" "$status" "$when"
+  rec=$WT_STATE_REC
+  # The KEY is cleaned the same way the field was, or a `dir` carrying a stripped byte would never
+  # match the record it just wrote and would append a duplicate on every session.
+  wt_state_join "$dir"
+  wt_state_rewrite "$wt" dep "$WT_STATE_REC" "$rec"
 }
 
 # True when this dependency is recorded as finished AND the evidence still matches.
@@ -693,6 +751,117 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
         # abandoned and report itself up to date. A caller passing no strategy skips the check.
         [ -z "$want" ] || [ "$rstrategy" = "$want" ] || return 1
         [ "$seen" = 1 ] || return 1           # a dep record before any header: not our file
+        return 0
+        ;;
+    esac
+  done <"$file"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Per-worktree RUNTIME state — layer 3's half of the same file
+# ---------------------------------------------------------------------------
+#
+# ONE record, kind `rt`, in the SAME state file the dependency records live in. One file rather
+# than two because it is one worktree's state, it dies with the worktree the same way, and Phase 5
+# then has one place to look rather than two that can disagree about whether a worktree was ever
+# set up. The two writers each recognise their own kind and carry every other kind through
+# verbatim, so neither needs to understand the other's fields.
+#
+# Field order, after the kind:
+#   1 slug         the FINAL slug, after runtime.slug was expanded and re-slugified. What the
+#                  database is actually named after, not the template it came from.
+#   2 port         the allocated port, or empty when none was derived
+#   3 portsource   `derived` or `probed` — whether the port is the one the slug hashes to, or one
+#                  found by stepping past a sibling's claim. Phase 5 wants to know which.
+#   4 envfile      the override file's path relative to THE WORKTREE, resolving as
+#                  <worktree>/<envfile> — stated exactly because the consumer of this field
+#                  deletes it, and `wt_copy_paths` already uses "repo-relative" for paths resolved
+#                  against the MAIN CHECKOUT. Recorded so teardown removes the file by name rather
+#                  than by re-expanding a template that may have changed underneath it.
+#   5 envstate     `ours` or `theirs` — whether this plugin wrote that file or a developer owns it.
+#                  Recorded so the warning fires ONCE rather than on every session.
+#   6 seedstatus   `none` | `done` | `failed` | `timeout` | `skipped`
+#   7 seedcksum    cksum of the seed SCRIPT'S CONTENT at the last attempt, which is what lets an
+#                  edited script retry automatically while an unedited failing one does not re-pay
+#                  its timeout every session
+#   8 when         epoch seconds, recorded and never compared (see wt_state_set)
+#
+# WHAT THIS RECORD CANNOT DO, stated rather than left for Phase 5 to discover. It is a single
+# slot describing the CURRENT allocation, so it cannot describe a superseded one. `runtime.slug`
+# and `runtime.env.file` are profile templates, and ADR-008 lets a worktree's own committed profile
+# win — so editing either on a branch re-points a live worktree, and the previous slug's database
+# becomes referenced by nothing: the only record of it was overwritten. Teardown would then not
+# remove it and `/worktree-prune` would not find it.
+#
+# Deliberately NOT solved here. Reclaiming an orphaned database needs the inverse of a repo-owned
+# seed script, which only the repo knows how to write, and unreferenced-state sweeping is
+# explicitly Phase 5's `/worktree-prune`. It is recorded in the Phase 4 handoff so that phase
+# inherits a named problem rather than a surprise.
+#
+# WT_STATE_VERSION IS NOT BUMPED. A new record KIND is not a change an older parser misreads: the
+# readers already skip kinds they do not know, and the writer now carries them through. Bumping
+# would force every worktree on the machine to reinstall its dependencies on the day of an
+# upgrade, which is a real cost for no correctness gain.
+
+# Write (or replace) this worktree's `rt` record, carrying every other record through untouched.
+# Mirrors wt_state_set exactly, including the atomic temp-then-rename and the no-partial-trust
+# header rule — a file whose version we do not recognise is not merged with, it is replaced.
+wt_runtime_state_set() {  # $1 = worktree, $2 = slug, $3 = port, $4 = portsource, $5 = envfile, $6 = envstate, $7 = seedstatus, $8 = seedcksum
+  local wt=${1%/} slug=${2-} port=${3-} psrc=${4-} envfile=${5-} envstate=${6-}
+  local sstatus=${7-} scksum=${8-} when rec
+
+  when=$(date +%s 2>/dev/null) || when=0
+
+  # An empty key: `rt` is a single slot, so whichever record is there is the one replaced.
+  wt_state_join rt "$slug" "$port" "$psrc" "$envfile" "$envstate" "$sstatus" "$scksum" "$when"
+  wt_state_rewrite "$wt" rt '' "$WT_STATE_REC"
+}
+
+# Read one field of this worktree's `rt` record, by NAME. Prints nothing and returns 1 when there
+# is no usable record.
+#
+# A named accessor rather than "go and parse the state file" is the contract Phase 5 consumes: its
+# teardown must not re-derive a slug or re-expand an env path to find out what this phase created,
+# because a profile edited in between would send it looking in the wrong place — or, worse, let it
+# delete something it never made.
+#
+# STATUS, and the two failures are deliberately DIFFERENT numbers:
+#   0  the field was read; its value is on stdout (possibly empty, which is a legitimate value)
+#   1  there is no usable record — no file, a foreign format version, or layer 3 has not run here
+#   2  the FIELD NAME is not one this record has, which is a bug in the caller
+# They were both 1 in the first draft, which made `v=$(... seedstatuss) || v=none` turn a typo into
+# a silent default — the caller cannot tell "not set up yet" from "you asked for nothing".
+wt_runtime_state_get() {  # $1 = worktree, $2 = field name
+  local wt=${1%/} want=${2-} file rec kind rest seen=0
+  local rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen
+
+  file=$(wt_state_path "$wt")
+  [ -r "$file" ] || return 1
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    case $kind in
+      wtstate)
+        [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
+        seen=1
+        ;;
+      rt)
+        [ "$seen" = 1 ] || return 1       # a record before any header: not our file
+        IFS=$WT_US read -r rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen \
+          <<<"$rest" || true
+        case $want in
+          slug)       printf '%s' "$rslug" ;;
+          port)       printf '%s' "$rport" ;;
+          portsource) printf '%s' "$rpsrc" ;;
+          envfile)    printf '%s' "$renvfile" ;;
+          envstate)   printf '%s' "$renvstate" ;;
+          seedstatus) printf '%s' "$rsstatus" ;;
+          seedcksum)  printf '%s' "$rscksum" ;;
+          when)       printf '%s' "$rwhen" ;;
+          *)          return 2 ;;          # a CALLER error, and distinct from "no record" (1)
+        esac
         return 0
         ;;
     esac

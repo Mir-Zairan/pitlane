@@ -25,6 +25,7 @@ trap 'rm -rf "$TMP"' EXIT
 pass=0 fail=0
 US_=$WT_US
 RS_=$WT_RS
+NL_=$WT_NL
 # SC2034: PROFILE_RAW, PROFILE_SHELL and PROFILE_SHELLARGS are read by the SOURCED
 # engine, never by this file, so shellcheck cannot see the use.
 # shellcheck disable=SC2034
@@ -844,6 +845,162 @@ printf 'dep%snode_modules%sinstall%sL9%sI9%sdone%s' \
 wt_state_set "$SWT" vendor hardlink L8 I8 "done"
 wt_state_is_done "$SWT" node_modules L9 I9 install
 eq 'a headerless record is discarded by the next write too' 1 $?
+
+# ---------------------------------------------------------------------------
+# The runtime (`rt`) record — layer 3's half of the same file
+# ---------------------------------------------------------------------------
+#
+# THE TWO WRITERS MUST NOT ERASE EACH OTHER, and this is the defect that made a shared file look
+# unusable: wt_state_set's carry-over recognised `wtstate` and `dep` only, with no default arm, so
+# any other kind was silently dropped by the next dependency write. Since a dependency write
+# happens on nearly every session, an `rt` record would have survived for about one session —
+# taking the seed's already-done marker with it and re-seeding forever. Both directions are
+# asserted, because only one of them was ever broken and a future edit could break the other.
+rm -f "$(wt_state_path "$SWT")"
+wt_state_set "$SWT" vendor hardlink LR IR "done"
+wt_runtime_state_set "$SWT" demo_one 3812 derived .env.worktree.local ours "done" SC1
+eq 'writing a runtime record succeeds' 0 $?
+eq 'the dependency record survives a runtime write' 0 \
+  "$(wt_state_is_done "$SWT" vendor LR IR hardlink; echo $?)"
+wt_state_set "$SWT" node_modules install LN IN "done"
+eq 'and the runtime record survives a dependency write' 'demo_one' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+eq '...including its seed status, which is what stops the seed re-running forever' 'done' \
+  "$(wt_runtime_state_get "$SWT" seedstatus)"
+
+# Every field round-trips, by NAME. Phase 5 consumes these rather than re-deriving a slug or
+# re-expanding an env path, because a profile edited in between would send it looking elsewhere.
+eq 'rt field: slug'       'demo_one'             "$(wt_runtime_state_get "$SWT" slug)"
+eq 'rt field: port'       '3812'                 "$(wt_runtime_state_get "$SWT" port)"
+eq 'rt field: portsource' 'derived'              "$(wt_runtime_state_get "$SWT" portsource)"
+eq 'rt field: envfile'    '.env.worktree.local'  "$(wt_runtime_state_get "$SWT" envfile)"
+eq 'rt field: envstate'   'ours'                 "$(wt_runtime_state_get "$SWT" envstate)"
+eq 'rt field: seedcksum'  'SC1'                  "$(wt_runtime_state_get "$SWT" seedcksum)"
+ne 'rt field: when is recorded' '' "$(wt_runtime_state_get "$SWT" when)"
+# THE TWO FAILURES ARE DIFFERENT NUMBERS. Both were 1 at first, which made
+# `v=$(... seedstatuss) || v=none` turn a field-name TYPO into a silent default — the caller could
+# not tell "layer 3 has not run here" from "you asked for a field that does not exist".
+wt_runtime_state_get "$SWT" nosuchfield >/dev/null 2>&1
+eq 'an unknown rt field name is a caller error (2)' 2 $?
+eq 'and it prints nothing' '' "$(wt_runtime_state_get "$SWT" nosuchfield 2>/dev/null)"
+wt_runtime_state_get "$TMP/nowhere-at-all" slug >/dev/null 2>&1
+eq 'while a missing record is a different failure (1)' 1 $?
+
+# One record, replaced rather than appended: a second allocation must not leave the first behind
+# for a reader to find.
+wt_runtime_state_set "$SWT" demo_one 3813 probed .env.worktree.local ours failed SC2
+eq 'a runtime record is stored once, not appended to' 1 \
+  "$(tr "$RS_" '\n' < "$(wt_state_path "$SWT")" | grep -c '^rt')"
+eq 'and the replacement wins' '3813' "$(wt_runtime_state_get "$SWT" port)"
+eq 'the dependency records are still there after both runtime writes' 0 \
+  "$(wt_state_is_done "$SWT" node_modules LN IN install; echo $?)"
+
+# No partial trust, exactly as for the dependency records.
+printf 'garbage' > "$(wt_state_path "$SWT")"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'an unparseable state file yields no runtime record' 1 $?
+printf 'wtstate%s99%srt%sdemo%s3812%sderived%s.e%sours%sdone%sSC%s1%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" \
+  > "$(wt_state_path "$SWT")"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'a runtime record from another format version is not trusted' 1 $?
+printf 'rt%sdemo%s3812%sderived%s.e%sours%sdone%sSC%s1%s' \
+  "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'a runtime record before any header is not trusted' 1 $?
+rm -f "$(wt_state_path "$SWT")"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'a missing state file yields no runtime record' 1 $?
+
+# ...and a foreign-version file is not LAUNDERED by a runtime write either, which is the same
+# trap wt_state_set has: restamping stale records as current makes the reader trust records it
+# had correctly refused.
+printf 'wtstate%s99%sdep%snode_modules%sinstall%sLZ%sIZ%sdone%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" demo_two 3900 derived .e ours none ''
+eq 'a foreign-version dep record is discarded by a runtime write, not promoted' 1 \
+  "$(wt_state_is_done "$SWT" node_modules LZ IZ install; echo $?)"
+eq '...while the runtime record just written is trusted' 'demo_two' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+
+# Empty fields are legal and must round-trip as empty rather than shifting their neighbours — the
+# ordinary state before a port is allocated or a seed has ever run.
+rm -f "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" demo_three '' '' '' '' none ''
+eq 'an empty port round-trips as empty' '' "$(wt_runtime_state_get "$SWT" port)"
+eq 'and the fields after it are not shifted' 'none' "$(wt_runtime_state_get "$SWT" seedstatus)"
+eq 'and the slug before it is intact' 'demo_three' "$(wt_runtime_state_get "$SWT" slug)"
+eq 'an empty envfile round-trips as empty'   '' "$(wt_runtime_state_get "$SWT" envfile)"
+eq 'an empty envstate round-trips as empty'  '' "$(wt_runtime_state_get "$SWT" envstate)"
+eq 'an empty seedcksum round-trips as empty' '' "$(wt_runtime_state_get "$SWT" seedcksum)"
+
+# A VALID, CURRENT file that simply has no rt record yet — the ordinary state before layer 3 has
+# ever run in this worktree. Distinct from every corruption case above and easy to get wrong.
+rm -f "$(wt_state_path "$SWT")"
+wt_state_set "$SWT" vendor hardlink LQ IQ "done"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'a valid file with dep records but no rt record yields no runtime record' 1 $?
+
+# A dep record positioned AFTER an rt record must still be readable: once layer 3 has run, that is
+# the ordinary file layout, so the dependency reader has to skip a leading rt rather than stop at it.
+rm -f "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" demo_five 3902 derived .e ours none ''
+wt_state_set "$SWT" vendor hardlink LP IP "done"
+eq 'a dep record after an rt record is still found' 0 \
+  "$(wt_state_is_done "$SWT" vendor LP IP hardlink; echo $?)"
+eq 'and wt_state_status skips the rt record too' 'done' "$(wt_state_status "$SWT" vendor)"
+
+# THE HEADERLESS GUARD, from BOTH directions. Neither was pinned: the only headerless test planted
+# a dep record and hit the dep arm's own guard, so the shared rule could be deleted and the suite
+# would stay green while a headerless file's records were laundered into a header-stamped one.
+printf 'rt%sdemo_ghost%s3999%sderived%s.e%sours%sdone%sSCX%s1%s' \
+  "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_state_set "$SWT" vendor hardlink LG IG "done"
+wt_runtime_state_get "$SWT" slug >/dev/null 2>&1
+eq 'a headerless rt record is discarded by a dependency write, not promoted' 1 $?
+printf 'dep%snode_modules%sinstall%sLG2%sIG2%sdone%s1%s' \
+  "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" demo_six 3903 derived .e ours none ''
+eq 'a headerless dep record is discarded by a runtime write, not promoted' 1 \
+  "$(wt_state_is_done "$SWT" node_modules LG2 IG2 install; echo $?)"
+eq '...while the runtime record just written is trusted' 'demo_six' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+
+# HOSTILE FIELD VALUES. A slug is derived from a worktree name and an envfile from a profile
+# template, and the record is US/RS-delimited and read with a line-based `read` — so a value
+# carrying any of those bytes would truncate the record and blank every field after it, silently.
+# The seed status is one of those later fields, so the seed would re-run every session.
+rm -f "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" "a${US_}b" "3904" derived "x${RS_}y" ours "done" SCZ
+eq 'a separator in an early field does not blank the fields after it' 'done' \
+  "$(wt_runtime_state_get "$SWT" seedstatus)"
+eq 'and the checksum after that survives too' 'SCZ' "$(wt_runtime_state_get "$SWT" seedcksum)"
+eq 'the separator itself is stripped from the value that carried it' 'ab' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+eq 'and an RS in a later field is stripped too, not treated as a record end' 'xy' \
+  "$(wt_runtime_state_get "$SWT" envfile)"
+rm -f "$(wt_state_path "$SWT")"
+wt_runtime_state_set "$SWT" "a${NL_}b" 3905 derived .e ours "done" SCY
+eq 'a newline in an early field does not blank the fields after it' 'done' \
+  "$(wt_runtime_state_get "$SWT" seedstatus)"
+eq 'and the newline is folded to a space, matching the JSON layer' 'a b' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+rm -f "$(wt_state_path "$SWT")"
+# SC2016: the `$(x)` is LITERAL and is the point — a slug that reached the state file carrying
+# shell syntax must be stored and returned as text, never evaluated. Expanding it here would test
+# a different string than the one under test.
+# shellcheck disable=SC2016
+wt_runtime_state_set "$SWT" 'a;b$(x)' 3906 derived '.env-üñî' ours "done" SCW
+# shellcheck disable=SC2016
+eq 'shell metacharacters in a slug round-trip verbatim' 'a;b$(x)' \
+  "$(wt_runtime_state_get "$SWT" slug)"
+eq 'and a non-ASCII env path round-trips verbatim' '.env-üñî' \
+  "$(wt_runtime_state_get "$SWT" envfile)"
+
+wt_runtime_state_set "$SWT" demo_four 3901 derived .e ours "done" SC9
+eq 'a runtime write leaves no temporary file behind' 0 \
+  "$(find "$(dirname "$(wt_state_path "$SWT")")" -maxdepth 1 -name '.wtstate.*' 2>/dev/null | wc -l | tr -d ' ')"
+rm -f "$(wt_state_path "$SWT")"
 
 # The non-git fallback location, and a write that cannot succeed.
 PLAINWT=$TMP/plainwt; mkdir -p "$PLAINWT"
