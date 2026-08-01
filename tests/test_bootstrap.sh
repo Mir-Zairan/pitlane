@@ -329,5 +329,166 @@ eq 'and the two worktrees were installed by DIFFERENT processes, so both really 
 lacks 'and neither reported a corrupt or interleaved install' 'interrupted' \
   "$(cat "$TMP/err.a" "$TMP/err.b" 2>/dev/null)"
 
+# ---------------------------------------------------------------------------
+# Acceptance: a real ecosystem, end to end
+# ---------------------------------------------------------------------------
+# The phase's acceptance asks for a scratch pnpm repo and a scratch composer repo to come up with
+# config and dependencies present and no manual steps.
+#
+# pnpm is exercised FOR REAL when it is on PATH — a dependency-free package still produces a
+# lockfile and a node_modules, which is enough to prove the whole path (profile -> shell wrapper ->
+# install -> verify -> state) against a genuine package manager rather than a stand-in.
+#
+# composer is NOT installed on every machine this runs on, so its repo is composer-SHAPED: the
+# same vendor/ + composer.lock + hardlink strategy, driven by a stand-in command. That proves the
+# engine's behaviour, not composer's. A real composer run against a 397 MB vendor/ is Phase 6's
+# job, and the handoff says so rather than implying this covered it.
+
+if command -v pnpm >/dev/null 2>&1; then
+  RP=$TMP/pnpmrepo
+  mkdir -p "$RP/.claude"
+  git init -q "$RP"
+  git -C "$RP" config user.email t@example.com
+  git -C "$RP" config user.name t
+  printf '{"name":"scratch","version":"1.0.0","private":true}\n' > "$RP/package.json"
+  printf 'node_modules/\n.env\n.claude/worktrees/\n' > "$RP/.gitignore"
+  printf '.env\n' > "$RP/.worktreeinclude"
+  printf 'APP_ENV=local\n' > "$RP/.env"
+  ( cd "$RP" && pnpm install --lockfile-only >/dev/null 2>&1 )
+  if [ -f "$RP/pnpm-lock.yaml" ]; then
+    cat > "$RP/.claude/worktree-profile.json" <<'JSON'
+{
+  "schemaVersion": 1,
+  "shell": "",
+  "shellArgs": "argv",
+  "copy": [],
+  "deps": [
+    { "dir": "node_modules", "lock": "pnpm-lock.yaml", "strategy": "install",
+      "install": "pnpm install --frozen-lockfile", "verify": "test -d node_modules" }
+  ],
+  "timeouts": { "bootstrapSeconds": 120, "seedSeconds": 30 }
+}
+JSON
+    git -C "$RP" add -A
+    git -C "$RP" commit -qm init
+    WP=$RP/.claude/worktrees/pn
+    git -C "$RP" worktree add -q "$WP" -b worktree-pn 2>/dev/null
+
+    out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WP\"}" "$WP")
+    err=$(cat "$TMP/err")
+    eq 'pnpm: the session start writes nothing to stdout' '' "$out"
+    eq 'pnpm: node_modules really is installed by a real pnpm' yes \
+      "$([ -d "$WP/node_modules" ] && echo yes)"
+    # ADR-005: pnpm has its own content-addressable store, so it must be installed, never shared.
+    lacks 'pnpm: and it was installed, not hardlinked from the main checkout' 'hardlinked' "$err"
+    eq 'pnpm: the worktree is usable with no manual steps' yes \
+      "$([ -d "$WP/node_modules" ] && [ -f "$WP/package.json" ] && echo yes)"
+
+    # Idempotence against a real package manager, asserted by OBSERVATION rather than by a clock:
+    # a wall-clock budget both flakes on a loaded machine and is weak here, since a wrongly
+    # re-run `pnpm install` on a dependency-free project finishes in well under a second anyway.
+    # An untouched node_modules is the thing that actually proves pnpm was not run.
+    before=$(find "$WP/node_modules" -maxdepth 1 -newer "$WP/package.json" 2>/dev/null | wc -l)
+    marker=$WP/node_modules/.wt-untouched
+    : > "$marker"
+    run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WP\"}" "$WP" >/dev/null
+    contains 'pnpm: re-entry is a no-op' 'already up to date' "$(cat "$TMP/err")"
+    eq 'pnpm: and node_modules was not rewritten' yes "$([ -e "$marker" ] && echo yes)"
+    eq 'pnpm: nor was the tree otherwise disturbed' "$before" \
+      "$(find "$WP/node_modules" -maxdepth 1 -newer "$WP/package.json" 2>/dev/null | grep -vc '.wt-untouched$')"
+  else
+    printf 'WARNING: pnpm could not produce a lockfile offline — real-pnpm path NOT verified\n' >&2
+    fail=$((fail + 1))
+  fi
+else
+  # A skipped acceptance criterion is not a pass. Same rule as the cross-backend guard in
+  # tests/test_lib.sh: a suite whose whole point is proving something must not report success
+  # having quietly not proved it.
+  if [ -n "${WT_TEST_ALLOW_MISSING_PNPM:-}" ]; then
+    printf 'WARNING: pnpm absent — the real-ecosystem acceptance was NOT verified\n' >&2
+  else
+    printf 'FAIL: pnpm is not on PATH, so the real-ecosystem acceptance is untested.\n' >&2
+    printf '      Run: nix shell nixpkgs#pnpm -c tests/test_bootstrap.sh\n' >&2
+    printf '      Or set WT_TEST_ALLOW_MISSING_PNPM=1 to accept a run without it.\n' >&2
+    fail=$((fail + 1))
+  fi
+fi
+
+# composer-SHAPED: vendor/ hardlinked from the main checkout when the lockfiles agree, which is
+# the case ADR-004 exists for and the one a real composer repo hits.
+# NOTE ON THE HARNESS, because it changes what can be asserted: this creates worktrees with plain
+# `git worktree add`, which does NOT do Claude Code's native `.worktreeinclude` copying. So on the
+# SessionStart path a .worktreeinclude file legitimately never arrives here, and asserting it
+# would be asserting the harness rather than the hook. The profile's copy[] is what the hook
+# genuinely owes on that path, so that is what is checked. The WorktreeCreate case above, where
+# the hook DOES own .worktreeinclude, asserts the other half.
+RC=$TMP/composerish
+make_repo "$RC" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor && printf installed > vendor/autoload.php","verify":"test -r vendor/autoload.php"}' '".env"'
+mkdir -p "$RC/vendor/pkg"
+printf 'REALBYTES\n' > "$RC/vendor/autoload.php"
+printf 'x\n' > "$RC/vendor/pkg/big.php"
+WC=$RC/.claude/worktrees/cm
+git -C "$RC" worktree add -q "$WC" -b worktree-cm 2>/dev/null
+
+out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WC\"}" "$WC")
+err=$(cat "$TMP/err")
+eq 'composer-shaped: vendor/ is present in the worktree' 'REALBYTES' \
+  "$(cat "$WC/vendor/autoload.php" 2>/dev/null)"
+contains 'composer-shaped: and it was hardlinked rather than installed' 'hardlinked' "$err"
+eq 'composer-shaped: the session start writes nothing to stdout' '' "$out"
+src_ino=$(stat -c '%i' "$RC/vendor/pkg/big.php" 2>/dev/null || stat -f '%i' "$RC/vendor/pkg/big.php" 2>/dev/null)
+# Guard against the comparison passing because BOTH sides are empty on a host with neither stat.
+eq 'composer-shaped: the source inode is readable, so the next assertion means something' yes \
+  "$([ -n "$src_ino" ] && echo yes)"
+eq 'composer-shaped: the tree really shares inodes, so a big vendor costs no disk' "$src_ino" \
+  "$(stat -c '%i' "$WC/vendor/pkg/big.php" 2>/dev/null || stat -f '%i' "$WC/vendor/pkg/big.php" 2>/dev/null)"
+eq 'composer-shaped: the profile copy[] config came across, so the worktree is runnable' 'SECRET=1' \
+  "$(cat "$WC/.env" 2>/dev/null)"
+
+# --- an unsupported or cross-filesystem hardlink --------------------------------------------
+# A second filesystem cannot be arranged inside one repository, so the failure is injected where
+# the engine actually observes it: `cp -al` returning non-zero. That is exactly what a
+# cross-device link or a filesystem without hardlinks produces.
+RX=$TMP/nohardlink
+make_repo "$RX" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor && printf fellback > vendor/m"}'
+mkdir -p "$RX/vendor/pkg"; printf 'src\n' > "$RX/vendor/pkg/f"
+WX=$RX/.claude/worktrees/nx
+git -C "$RX" worktree add -q "$WX" -b worktree-nx 2>/dev/null
+
+mkdir -p "$TMP/stub"
+REAL_CP=$(command -v cp)
+cat > "$TMP/stub/cp" <<STUB
+#!/bin/sh
+# Fail a hardlink copy the way a cross-device link really does: PARTWAY, having already created
+# the destination and some of its contents. Exiting before touching anything would make the
+# debris-cleanup assertion below unfalsifiable — and that branch is load-bearing, because a
+# leftover destination makes the NEXT run report "already present" and freeze a partial tree.
+case " \$* " in
+  *" -al "*)
+    for d; do :; done
+    mkdir -p "\$d/pkg" 2>/dev/null
+    : > "\$d/pkg/partial" 2>/dev/null
+    echo "cp: cannot create hard link: Invalid cross-device link" >&2
+    exit 1
+    ;;
+esac
+exec "$REAL_CP" "\$@"
+STUB
+chmod +x "$TMP/stub/cp"
+out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WX\"}" \
+       | PATH="$TMP/stub:$PATH" bash "$HOOK" 2>"$TMP/err" )
+err=$(cat "$TMP/err")
+eq 'a hardlink that cannot be made does not fail the session' '' "$out"
+contains '...it says the link was not possible' 'could not hardlink' "$err"
+eq '...and installs instead, so the worktree still works' 'fellback' "$(cat "$WX/vendor/m" 2>/dev/null)"
+eq '...having first cleared the debris the failed copy left' '' \
+  "$([ -e "$WX/vendor/pkg/partial" ] && echo debris)"
+# And the state that debris would otherwise poison: a second run must not decide the leftover
+# directory is a finished dependency.
+out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WX\"}" \
+       | bash "$HOOK" 2>"$TMP/err" )
+contains '...and the next run sees a finished dependency, not a frozen partial one' \
+  'already up to date' "$(cat "$TMP/err")"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]
