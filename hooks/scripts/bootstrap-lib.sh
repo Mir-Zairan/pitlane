@@ -1160,10 +1160,10 @@ else
   WT_DETECTION_JSON_DEFAULT=${WT_BLIB_DIR:+$WT_BLIB_DIR/reference/detection.json}
 fi
 
-wt_report_drift() {  # $1 = checkout to inspect, $2 = detectionVersion, $3 = markers, $4 = shellMarker
-  local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-}
+wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = shellMarker, $5 = profile path (only needed when no profile is loaded)
+  local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-} profile=${5-}
   local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT}
-  local raw rec body curdet m rdir gained='' lost='' curshell='' seen=''
+  local raw rec body curdet m rdir gained='' lost='' curshell='' seen='' problems
   local lock cksum now n=0
 
   # THE LOCKFILE CHECKSUMS FIRST, and OUTSIDE every guard below. They live in deps[], not in
@@ -1172,9 +1172,19 @@ wt_report_drift() {  # $1 = checkout to inspect, $2 = detectionVersion, $3 = mar
   # install where the table cannot be found) silently got no drift warning at all, leaving the one
   # comparator Phase 2 actually shipped unwired for exactly those profiles.
   #
-  # Read from PROFILE_RAW rather than by calling wt_profile_drifted, which would re-read the file:
-  # this runs on the path the phase just cut from four interpreter starts to one.
-  if [ -n "${PROFILE_RAW:-}" ]; then
+  # TWO ROUTES TO ONE ANSWER, and the reason is measured rather than stylistic. With a profile
+  # loaded, the checksums are already in PROFILE_RAW, so comparing them here costs nothing —
+  # calling lib.sh's wt_profile_drifted would re-read the file and spend an interpreter start on
+  # the very path this phase cut from four to one. Without one (a caller checking a profile it is
+  # not about to use), that function is the only way to get them, and it is delegated to rather
+  # than reimplemented. tests/test_bootstrap_lib.sh asserts the two agree on the same profile,
+  # because two routes to one answer is exactly the shape that drifts apart.
+  if [ -z "${PROFILE_RAW:-}" ] && [ -n "$profile" ]; then
+    problems=$(wt_profile_drifted "$profile" "$tree") || {
+      wt_log "$problems"
+      wt_log "run /worktree-calibrate if the dependency set really changed"
+    }
+  elif [ -n "${PROFILE_RAW:-}" ]; then
     while IFS= read -r -d "$WT_RS" rec; do
       case $rec in
         1"$WT_US"*) ;;

@@ -1366,6 +1366,36 @@ PROFILE_RAW=$(printf '0%s%s1%svendor%sgone.lock%sinstall%sx%s%s9 9%s' \
 contains 'a lockfile that has disappeared is reported' 'no longer exists' \
   "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
 
+# WITHOUT a loaded profile there is nothing in PROFILE_RAW, so the checksums come from lib.sh's
+# file-based comparator instead. Both routes must reach the same verdict on the same profile, or
+# a hook and the calibrate skill would disagree about whether a repo has drifted.
+cat > "$DRTREE/p-stale.json" <<JSON
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+ "install":"x","lockChecksum":"1 1"}]}
+JSON
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+out=$(wt_report_drift "$DRTREE" '' '' '' "$DRTREE/p-stale.json" 2>&1)
+contains 'with no loaded profile the checksums are still compared, via the file' \
+  'has changed since calibration' "$out"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "1 1")
+out2=$(wt_report_drift "$DRTREE" '' '' '' 2>&1)
+eq 'and both routes agree that this profile has drifted' \
+  "$(printf '%s' "$out" | grep -c 'changed since calibration')" \
+  "$(printf '%s' "$out2" | grep -c 'changed since calibration')"
+cat > "$DRTREE/p-fresh.json" <<JSON
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+ "install":"x","lockChecksum":"$CK"}]}
+JSON
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+eq 'and both agree when it has NOT drifted: the file route is silent' '' \
+  "$(wt_report_drift "$DRTREE" '' '' '' "$DRTREE/p-fresh.json" 2>&1)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$CK")
+eq '...as is the loaded-profile route' '' "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
+
 # With everything matching and no evidence, it says nothing at all.
 # shellcheck disable=SC2034
 PROFILE_RAW=$(raw_with "$CK")

@@ -156,7 +156,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # and nothing would notice if the two drifted apart.
   if [ "$(wt_budget_left "$deadline")" -gt 0 ]; then
     wt_report_drift "$worktree" \
-      "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}"
+      "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}" "$PROFILE_PATH"
   fi
 
   wt_bootstrap_deps "$root" "$worktree" "$deadline"
