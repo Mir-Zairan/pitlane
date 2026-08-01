@@ -209,7 +209,9 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
   profile has drifted.
 - `evidence` — `detectionVersion` from the detector, `markers` as the sorted list of lockfiles it
   matched, `shellMarker` as the file that produced the wrapper.
-- `runtime.port` — `var`, `base` and `span`; the port is derived as `base + (crc32(slug) % span)`, so
+- `runtime.port` — `var`, `base` and `span`; the port is derived as `base + (cksum(slug) % span)`
+  using POSIX `cksum` (not zlib CRC-32 — they disagree), and `base`/`span` must fit inside
+  1024..65535, so
   `span` decides how much room there is before two worktrees collide.
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
