@@ -341,8 +341,13 @@ git -C "$REPO" config user.email t@example.com
 git -C "$REPO" config user.name t
 
 printf '%s\n' '.env' 'secrets/' 'nested/deep/' '*.local' '*.hidden' > "$REPO/.gitignore"
-printf '%s\n' '.env' 'secrets/**' 'nested/deep/**' 'tracked.txt' 'config.local' 'key.pem' \
-  'mode.local' '*.local' > "$REPO/.worktreeinclude"
+printf '%s\n' '# a comment line, which git ignores' '' '.env' 'secrets/**' 'nested/deep/**' \
+  'tracked.txt' 'config.local' 'key.pem' 'mode.local' '*.local' '!excluded.local' \
+  > "$REPO/.worktreeinclude"
+# Matched by the '*.local' glob and then UN-matched by the '!excluded.local' negation that follows
+# it. Getting negation right is exactly why the matching is delegated to git rather than written
+# here, so it needs an assertion.
+printf 'NEGATED\n' > "$REPO/excluded.local"
 printf 'ENVVAL\n' > "$REPO/.env"
 chmod 600 "$REPO/.env"
 mkdir -p "$REPO/secrets" "$REPO/nested/deep"
@@ -403,6 +408,12 @@ eq 'a filename containing a space is copied' 'SPACED' "$(cat "$WT/my conf.local"
 eq 'a non-ASCII filename is copied' 'UNICODE' "$(cat "$WT/café.local" 2>/dev/null)"
 eq 'a filename containing a newline is copied' 'NEWLINE' \
   "$(cat "$WT/$(printf 'two\nlines').local" 2>/dev/null)"
+# Comments and blank lines are git's to interpret, and a later negation must win over an earlier
+# glob. A hand-rolled matcher is where this goes wrong; delegating to git is why it does not.
+eq 'a later negation un-matches an earlier glob, as gitignore syntax requires' '' \
+  "$(cat "$WT/excluded.local" 2>/dev/null)"
+eq '...while a sibling the same glob matched is still copied' 'LOCAL' \
+  "$(cat "$WT/config.local" 2>/dev/null)"
 
 # Never overwrite: the worktree's own edit is the developer's.
 printf 'MINE\n' > "$WT/.env"
@@ -845,6 +856,16 @@ if [ "$(id -u)" != 0 ]; then
     "$(wt_state_is_done "$ROWT" vendor LB IB install; echo $?)"
   chmod 700 "$ROWT/.claude"
 fi
+
+# The timestamp the phase's task list asks for: recorded, and never part of the freshness
+# decision — a clock cannot tell you whether a tree is correct.
+wt_state_set "$SWT" vendor hardlink L6 I6 "done"
+eq 'a state record carries a timestamp' yes \
+  "$(tr "$RS_" '\n' < "$(wt_state_path "$SWT")" | grep '^dep' | tail -1 \
+     | awk -F"$US_" '{print ($7 ~ /^[0-9]+$/) ? "yes" : "no:" $7}')"
+eq '...and the status is still read from its own field, not the last one' 0 \
+  "$(wt_state_is_done "$SWT" vendor L6 I6 hardlink; echo $?)"
+eq '...including through wt_state_status' 'done' "$(wt_state_status "$SWT" vendor)"
 
 # Checksums
 eq 'the checksum of a string is stable' "$(wt_cksum_string 'composer install')" \

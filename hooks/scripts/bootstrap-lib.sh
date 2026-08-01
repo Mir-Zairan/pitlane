@@ -602,7 +602,13 @@ wt_state_path() {  # $1 = worktree
 # entries, and a partial write is the one thing a reader must never see.
 wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status
   local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-}
-  local file tmp rec kind rdir rest kept='' hdrok=0
+  local file tmp rec kind rdir rest kept='' hdrok=0 when
+
+  # Recorded but never compared: it answers "when did this last happen" for a developer looking at
+  # a worktree that seems stale, and gives Phase 5 something to age entries by. It is deliberately
+  # NOT part of the freshness decision — a timestamp cannot tell you whether a tree is correct, and
+  # comparing one would make re-entry depend on the clock.
+  when=$(date +%s 2>/dev/null) || when=0
 
   file=$(wt_state_path "$wt")
   [ -n "$file" ] || return 1
@@ -638,9 +644,9 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   {
     printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
     printf '%s' "$kept"
-    printf 'dep%s%s%s%s%s%s%s%s%s%s%s' \
+    printf 'dep%s%s%s%s%s%s%s%s%s%s%s%s%s' \
       "$WT_US" "$dir" "$WT_US" "$strategy" "$WT_US" "$lck" \
-      "$WT_US" "$ick" "$WT_US" "$status" "$WT_RS"
+      "$WT_US" "$ick" "$WT_US" "$status" "$WT_US" "$when" "$WT_RS"
   } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   # Atomic: a reader sees the old file or the new one, never a half-written one.
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
@@ -655,7 +661,7 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
 # it in the profile re-runs the dependency rather than trusting a tree built by the old one.
 wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy
   local wt=${1%/} dir=${2-} lck=${3-} ick=${4-} want=${5-}
-  local file rec kind rest ver rdir rstrategy rlck rick rstatus seen=0
+  local file rec kind rest ver rdir rstrategy rlck rick rstatus rwhen seen=0
 
   file=$(wt_state_path "$wt")
   [ -r "$file" ] || return 1
@@ -671,7 +677,10 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
         seen=1
         ;;
       dep)
-        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus <<<"$rest" || true
+        # SC2034: rstrategy and rwhen are read POSITIONALLY to consume their fields; dropping
+        # either would shift every field after it.
+        # shellcheck disable=SC2034
+        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen <<<"$rest" || true
         [ "$rdir" = "$dir" ] || continue
         # Quoted: bare `done` is the loop keyword to the parser.
         [ "$rstatus" = "done" ] || return 1   # `doing` means killed mid-write: redo it
@@ -711,7 +720,7 @@ wt_cksum_file() {  # $1 = path
 # is no usable record. Needed as well as wt_state_is_done because "we were interrupted" and "we
 # have never run" call for different handling — only the first justifies deleting anything.
 wt_state_status() {  # $1 = worktree, $2 = dir
-  local wt=${1%/} dir=${2-} file rec kind rest ver rdir rstatus seen=0
+  local wt=${1%/} dir=${2-} file rec kind rest ver rdir rstrategy rlck rick rstatus rwhen seen=0
   file=$(wt_state_path "$wt")
   [ -r "$file" ] || { printf ''; return 0; }
   while IFS= read -r -d "$WT_RS" rec; do
@@ -727,7 +736,10 @@ wt_state_status() {  # $1 = worktree, $2 = dir
         [ "$seen" = 1 ] || { printf ''; return 0; }
         rdir=${rest%%"$WT_US"*}
         [ "$rdir" = "$dir" ] || continue
-        rstatus=${rest##*"$WT_US"}
+        # Read POSITIONALLY, not as "the last field": a trailing timestamp now follows the status,
+        # and `${rest##*US}` would return that instead.
+        # shellcheck disable=SC2034
+        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen <<<"$rest" || true
         printf '%s' "$rstatus"
         return 0
         ;;
