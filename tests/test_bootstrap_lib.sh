@@ -56,6 +56,14 @@ contains() {  # $1 = label, $2 = needle, $3 = haystack
   esac
 }
 
+lacks() {  # $1 = label, $2 = needle that must NOT appear, $3 = haystack
+  case $3 in
+    *"$2"*) fail=$((fail + 1))
+            printf 'FAIL %s\n      must not contain: %q\n      actual: %q\n' "$1" "$2" "$3" >&2 ;;
+    *) pass=$((pass + 1)) ;;
+  esac
+}
+
 # The constructed argv, rendered one element per line so an element containing a space is
 # distinguishable from two elements — which is the entire bug class this function exists to avoid.
 argv_of() {  # $1 = command; uses the ambient PROFILE_SHELL / PROFILE_SHELLARGS
@@ -1258,74 +1266,117 @@ eq 'a tree is not deleted on the strength of an unreadable state file' 'KEEPME' 
 # ---------------------------------------------------------------------------
 # Drift reporting
 # ---------------------------------------------------------------------------
-# All FOUR kinds of evidence, against the real reference/detection.json — a fixture table would
-# only prove the fixture, and the point is that adding an ecosystem there needs no change here.
+# Against the REAL reference/detection.json — a fixture table would only prove the fixture, and the
+# point is that adding an ecosystem there needs no change here. The path is pinned rather than
+# inherited: wt_report_drift prefers an ambient WT_DETECTION_JSON and the default is resolved from
+# CLAUDE_PLUGIN_ROOT, which is set inside any Claude Code session, so without this the suite could
+# silently assert against an installed copy of the table instead of this repo's.
+WT_DETECTION_JSON=$(cd "$(dirname "${BASH_SOURCE[0]}")/../reference" && pwd -P)/detection.json
+export WT_DETECTION_JSON
 
 DRTREE=$TMP/drift
 mkdir -p "$DRTREE"
 : > "$DRTREE/composer.lock"
-CURDET=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['detectionVersion'])" \
-  "$WT_DETECTION_JSON_DEFAULT" 2>/dev/null)
+CURDET=$(wt_json_get detectionVersion <"$WT_DETECTION_JSON")
+eq 'the detection table reports a version, so the drift fixtures mean something' yes \
+  "$([ -n "$CURDET" ] && echo yes)"
 
-# Baseline: evidence matching reality says nothing at all.
-cat > "$DRTREE/p-clean.json" <<JSON
-{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
- "install":"x","lockChecksum":"$(cksum < "$DRTREE/composer.lock")"}],
- "evidence":{"detectionVersion":$CURDET,"markers":["composer.lock"],"shellMarker":""}}
-JSON
+CK=$(wt_cksum_file "$DRTREE/composer.lock")
+# The checksums now come out of PROFILE_RAW, the same stream a real load produces.
+raw_with() {  # $1 = lockChecksum to record
+  printf '0%s%s1%svendor%scomposer.lock%sinstall%sx%s%s%s%s' \
+    "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$1" "$RS_"
+}
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$CK")
+
 eq 'a profile that matches the checkout reports no drift at all' '' \
-  "$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)"
+  "$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)"
 
 # A gained ecosystem. This is the one that broke: with a single-element markers array the last
 # unterminated line was dropped by `read`, so nearly every marker went unchecked.
 : > "$DRTREE/pnpm-lock.yaml"
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a lockfile the profile never saw is reported' 'pnpm-lock.yaml' "$out"
 contains '...and points at the fix' 'worktree-calibrate' "$out"
-# Every rule in the table must be checked, not just the first: a single-marker rule is the common
-# shape, so dropping the last line made the whole check silently useless.
 : > "$DRTREE/Gemfile.lock"
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a second gained ecosystem is reported too' 'Gemfile.lock' "$out"
 rm -f "$DRTREE/Gemfile.lock" "$DRTREE/pnpm-lock.yaml"
 
+# FALSE POSITIVES ARE THE FAILURE MODE HERE. A warning that fires on a checkout that has not
+# drifted, whose suggested fix produces an identical profile, is how people learn to ignore the
+# warning that matters. Two shapes of that, both real:
+#
+#   1. A rule with several markers records only the one it matched. bun.lock and bun.lockb belong
+#      to one rule, so a repo with both must not be told it "gained" the sibling.
+: > "$DRTREE/bun.lock"
+: > "$DRTREE/bun.lockb"
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock","bun.lock"]' '' 2>&1)
+lacks 'a sibling marker of an already-recorded rule is not reported as gained' 'bun.lockb' "$out"
+rm -f "$DRTREE/bun.lock" "$DRTREE/bun.lockb"
+#   2. detection.json's sameDirPolicy accepts only one rule per target directory, so a stale
+#      package-lock.json beside the pnpm-lock.yaml that won is not a new ecosystem. The profile
+#      already has a dependency on that directory, which is how it is recognised.
+: > "$DRTREE/pnpm-lock.yaml"
+: > "$DRTREE/package-lock.json"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%snode_modules%spnpm-lock.yaml%sinstall%sx%s%s%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["pnpm-lock.yaml"]' '' 2>&1)
+lacks 'a second lockfile claiming a directory the profile already covers is not reported' \
+  'package-lock.json' "$out"
+rm -f "$DRTREE/pnpm-lock.yaml" "$DRTREE/package-lock.json"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$CK")
+
 # A lost marker.
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock","pnpm-lock.yaml"]' '' 2>&1)
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock","pnpm-lock.yaml"]' '' 2>&1)
 contains 'a lockfile the profile expects and is now gone is reported' 'no longer has: pnpm-lock.yaml' "$out"
 
 # The toolchain marker: a branch that gained a flake is now installing on the wrong toolchain.
 : > "$DRTREE/flake.nix"
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a newly appeared flake.nix is reported as a toolchain change' 'toolchain marker changed' "$out"
 contains '...naming both sides' 'none -> flake.nix' "$out"
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' 'flake.nix' 2>&1)
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' 'flake.nix' 2>&1)
 eq '...and says nothing when it was already recorded' '' "$out"
 rm -f "$DRTREE/flake.nix"
 
 # The detection table version.
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" 0 '["composer.lock"]' '' 2>&1)
+out=$(wt_report_drift "$DRTREE" 0 '["composer.lock"]' '' 2>&1)
 contains 'an older detection table version is reported' 'detection table is now version' "$out"
 
-# The per-lockfile checksums Phase 2 shipped and left unwired.
-cat > "$DRTREE/p-stale.json" <<'JSON'
-{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
- "install":"x","lockChecksum":"1 1"}],
- "evidence":{"detectionVersion":1,"markers":["composer.lock"],"shellMarker":""}}
-JSON
-out=$(wt_report_drift "$DRTREE" "$DRTREE/p-stale.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+# THE LOCKFILE CHECKSUMS, which live in deps[] and not in `evidence`. They must be checked even
+# when there is no evidence block at all — a hand-written profile still records them, and gating
+# them on evidence left the one comparator Phase 2 shipped unwired for exactly those profiles.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "1 1")
+out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a lockfile changed since calibration is reported' 'has changed since calibration' "$out"
+out=$(wt_report_drift "$DRTREE" '' '' '' 2>&1)
+contains 'and it is STILL reported when the profile carries no evidence block' \
+  'has changed since calibration' "$out"
+out=$(WT_DETECTION_JSON=/nonexistent/table.json wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
+contains 'and even when the detection table cannot be read' 'has changed since calibration' "$out"
+# A lockfile the profile names that has since vanished.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%svendor%sgone.lock%sinstall%sx%s%s9 9%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+contains 'a lockfile that has disappeared is reported' 'no longer exists' \
+  "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
 
-# A profile with NO evidence block cannot report drift, and must not pretend to.
-eq 'a profile with no evidence says nothing' '' \
-  "$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" '' '' '' 2>&1)"
+# With everything matching and no evidence, it says nothing at all.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$CK")
+eq 'a matching profile with no evidence block says nothing' '' \
+  "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
 
 # It must never block, whatever it finds.
-wt_report_drift "$DRTREE" "$DRTREE/p-stale.json" 0 '["composer.lock"]' 'flake.nix' >/dev/null 2>&1
+wt_report_drift "$DRTREE" 0 '["composer.lock"]' 'flake.nix' >/dev/null 2>&1
 eq 'drift reporting always succeeds — it warns, it never blocks' 0 $?
-# ...including when the table itself is unreadable.
-eq 'an unreadable detection table is silent rather than noisy' '' \
-  "$(WT_DETECTION_JSON=/nonexistent/table.json wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" \
-       1 '["composer.lock"]' '' 2>&1)"
+# shellcheck disable=SC2034
+PROFILE_RAW=''
 
 # ---------------------------------------------------------------------------
 # The Phase 4 hand-off

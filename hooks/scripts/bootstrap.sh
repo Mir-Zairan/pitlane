@@ -139,15 +139,25 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # `git status` of a repo whose .gitignore knows nothing about this plugin — committable by
   # accident, and enough to make `git worktree remove` refuse without --force, which Phase 5 would
   # then have to work around.
+  wt_prime_paths "$root" "$worktree"
   wt_lock_acquire "$(wt_state_path "$worktree").lock" 5 8 && held=1
 
-  wt_copy_config "$root" "$worktree" "$own_include"
+  # The copy walk and the drift check both cost real time — `git ls-files` over the main checkout,
+  # and one interpreter start — so the "global" budget has to bound them too, not just the
+  # dependency step.
+  if [ "$(wt_budget_left "$deadline")" -gt 0 ]; then
+    wt_copy_config "$root" "$worktree" "$own_include"
+  else
+    wt_log "no time left to copy config — leaving it for the next session"
+  fi
 
   # wt_load_profile publishes the evidence fields, so this does not re-split the scalar record.
   # A second positional read of the same sixteen fields would have to agree with lib.sh's forever,
   # and nothing would notice if the two drifted apart.
-  wt_report_drift "$worktree" "$PROFILE_PATH" \
-    "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}"
+  if [ "$(wt_budget_left "$deadline")" -gt 0 ]; then
+    wt_report_drift "$worktree" \
+      "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}"
+  fi
 
   wt_bootstrap_deps "$root" "$worktree" "$deadline"
   wt_runtime_handoff "$root" "$worktree"

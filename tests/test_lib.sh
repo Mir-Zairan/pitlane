@@ -399,6 +399,27 @@ worktree: two' "$err"
   printf '%s' '{"schemaVersion":1,"shell":"nix develop --command"}' >"$target"
   wt_load_profile "$pdir"
   eq 'an omitted shellArgs stays empty, not defaulted' '' "$PROFILE_SHELLARGS"
+
+  # The evidence block, read out of the SAME sixteen-field positional record. It is the field most
+  # exposed to a positional slip because it was appended last, and the consequence of getting it
+  # wrong is not silence: an empty shellMarker against a repo that has a flake.nix produces a
+  # "toolchain marker changed" warning on every single session of a nix repo — the reference repo
+  # being one. This suite is also the only one that runs under both JSON backends.
+  printf '%s' '{"schemaVersion":1,"shell":"nix develop --command","shellArgs":"argv",
+    "copy":[".env"],
+    "evidence":{"detectionVersion":7,"markers":["composer.lock","pnpm-lock.yaml"],
+                "shellMarker":"flake.nix"}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'evidence.detectionVersion is published'  '7' "$PROFILE_EV_DETECTION"
+  eq 'evidence.markers is published verbatim'  '["composer.lock","pnpm-lock.yaml"]' "$PROFILE_EV_MARKERS"
+  eq 'evidence.shellMarker is published'       'flake.nix' "$PROFILE_EV_SHELL"
+  eq '...and the field before it is unaffected, so nothing shifted' 'argv' "$PROFILE_SHELLARGS"
+  eq '...and so is the one two places before it' 'nix develop --command' "$PROFILE_SHELL"
+  printf '%s' '{"schemaVersion":1}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'a profile with no evidence block publishes empty evidence' '' \
+    "$PROFILE_EV_DETECTION$PROFILE_EV_MARKERS$PROFILE_EV_SHELL"
+
   # An invalid profile is not used at all, so the field must not survive from the previous load.
   printf '%s' '{"schemaVersion":1,"shellArgs":"sideways"}' >"$target"
   wt_load_profile "$pdir" 2>/dev/null
@@ -895,6 +916,13 @@ worktree: two' "$err"
   contains 'validate: evidence.detectionVersion must be numeric' 'evidence.detectionVersion:' "$(vv)"
   vw '{"schemaVersion":1,"evidence":{"markers":"composer.lock"}}'
   contains 'validate: evidence.markers must be an array' 'evidence.markers:' "$(vv)"
+  # A shellMarker that cannot name a file in the checkout can only ever mismatch, so it is a
+  # violation rather than a warning that would fire on every session forever.
+  vw '{"schemaVersion":1,"evidence":{"shellMarker":"../outside/flake.nix"}}'
+  contains 'validate: a traversing evidence.shellMarker is a violation' \
+    'evidence.shellMarker:' "$(vv)"
+  vw '{"schemaVersion":1,"evidence":{"shellMarker":"flake.nix"}}'
+  eq 'validate: an ordinary evidence.shellMarker is accepted' '' "$(vv)"
   vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip","lockChecksum":"not-a-cksum"}]}'
   contains 'validate: a malformed lockChecksum is a violation' 'lockChecksum:' "$(vv)"
 

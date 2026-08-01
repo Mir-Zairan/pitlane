@@ -1119,6 +1119,13 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       *) printf 'evidence.markers: must be an array, got %s\n' "$evmark"; bad=1 ;;
     esac
   fi
+  # shellMarker names a file in the checkout, and drift compares it against one. A value that is
+  # not a plain relative filename can only ever mismatch, producing a warning on every session
+  # that no amount of re-calibrating fixes.
+  if [ -n "$evshell" ] && ! wt_is_safe_relpath "$evshell"; then
+    printf 'evidence.shellMarker: "%s" must be a relative path inside the repository\n' "$evshell"
+    bad=1
+  fi
 
   [ "$bad" -eq 0 ] || return 1
   return 0

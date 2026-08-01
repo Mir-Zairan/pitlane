@@ -458,6 +458,8 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
   local root=${1%/} slug common
   slug=$(wt_slugify "${2-}") || slug=dep
   [ -n "$slug" ] || slug=dep
+  # See wt_state_path: the cache only helps once wt_prime_paths has filled it in the caller's
+  # own shell, because this function is always called in a command substitution.
   if [ "${WT_LOCKDIR_FOR:-}" = "$root" ] && [ -n "${WT_LOCKDIR_IS:-}" ]; then
     printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
     return 0
@@ -566,14 +568,17 @@ wt_lock_release() {  # $1 = fd number
 # entry left at `doing` all mean THE SAME THING — not done, do it again. Redoing safe work is
 # cheap; skipping real work leaves a worktree that looks finished and is not.
 
-# Bumped when the RECORD FORMAT changes, which is the only thing that can make an existing file
-# unreadable. Deliberately not the plugin's own version: a new release does not invalidate a
+# Bumped when the RECORD FORMAT changes in a way an older parser would MISREAD. Appending a field
+# at the end is not such a change — a reader that names fewer variables simply ignores it — so the
+# timestamp added later did not need a bump. Reordering or repurposing a field would. Deliberately not the plugin's own version: a new release does not invalidate a
 # correct install, and reading plugin.json would cost the interpreter start this file exists to
 # avoid — so every worktree on the machine would pay a full reinstall on the day of an upgrade.
 WT_STATE_VERSION=1
 
-# Memoised: this is called up to four times per dependency, and each miss spawns a `git
-# rev-parse`. The answer cannot change during one hook run.
+# Memoised — but only usefully if the cache is PRIMED first, by wt_prime_paths below. This
+# function returns its answer on stdout, so every call site is a command substitution, i.e. a
+# subshell: an assignment made here is discarded the moment it returns. Priming from the
+# entrypoint's own shell is what makes the lookup happen once instead of once per call.
 wt_state_path() {  # $1 = worktree
   local wt=${1%/} gitdir
   if [ "${WT_STATE_PATH_FOR:-}" = "$wt" ] && [ -n "${WT_STATE_PATH_IS:-}" ]; then
@@ -807,6 +812,16 @@ wt_unsafe_command_placeholder() {  # $1 = the UNEXPANDED template
     fi
   done
   printf ''
+  return 0
+}
+
+# Resolve the two git-directory lookups ONCE, in the caller's own shell, so the memos inside
+# wt_state_path and wt_lock_path are actually populated when those run inside a command
+# substitution. Without this the caches are dead code: each of the ~4 calls per dependency forks
+# `git rev-parse` again, on the re-entry path whose entire purpose is to cost milliseconds.
+wt_prime_paths() {  # $1 = main checkout, $2 = worktree
+  wt_state_path "${2%/}" >/dev/null
+  wt_lock_path "${1%/}" _prime >/dev/null
   return 0
 }
 
@@ -1145,20 +1160,53 @@ else
   WT_DETECTION_JSON_DEFAULT=${WT_BLIB_DIR:+$WT_BLIB_DIR/reference/detection.json}
 fi
 
-wt_report_drift() {  # $1 = the checkout to inspect, $2 = profile path, $3 = evidence.detectionVersion, $4 = evidence.markers, $5 = evidence.shellMarker
-  local tree=${1%/} profile=${2-} evdet=${3-} evmark=${4-} evshell=${5-}
+wt_report_drift() {  # $1 = checkout to inspect, $2 = detectionVersion, $3 = markers, $4 = shellMarker
+  local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-}
   local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT}
-  local raw rec body curdet m gained='' lost='' curshell='' problems
+  local raw rec body curdet m rdir gained='' lost='' curshell='' seen=''
+  local lock cksum now n=0
 
-  # Nothing recorded, nothing to compare. Not a warning: the evidence block is optional.
+  # THE LOCKFILE CHECKSUMS FIRST, and OUTSIDE every guard below. They live in deps[], not in
+  # `evidence`, and they need neither the evidence block nor the detection table — so gating them
+  # on either meant a profile carrying checksums but no evidence (a hand-written one, or any
+  # install where the table cannot be found) silently got no drift warning at all, leaving the one
+  # comparator Phase 2 actually shipped unwired for exactly those profiles.
+  #
+  # Read from PROFILE_RAW rather than by calling wt_profile_drifted, which would re-read the file:
+  # this runs on the path the phase just cut from four interpreter starts to one.
+  if [ -n "${PROFILE_RAW:-}" ]; then
+    while IFS= read -r -d "$WT_RS" rec; do
+      case $rec in
+        1"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      body=${rec#*"$WT_US"}
+      IFS=$WT_US read -r rdir lock _st _in _ve cksum <<<"$body" || true
+      n=$((n + 1))
+      [ -n "$lock" ] && [ -n "$cksum" ] || continue
+      wt_is_safe_relpath "$lock" || continue
+      if [ ! -f "$tree/$lock" ]; then
+        wt_log "$lock no longer exists, but the profile was calibrated against it — run /worktree-calibrate"
+        continue
+      fi
+      now=$(cksum <"$tree/$lock" 2>/dev/null) || continue
+      if [ "$now" != "$cksum" ]; then
+        wt_log "$lock has changed since calibration — the recorded install command may be for a different dependency set; run /worktree-calibrate if so"
+      fi
+    done < <(printf '%s' "$PROFILE_RAW")
+  fi
+
+  # The three `evidence` comparisons need the block and the table; without either there is simply
+  # nothing to compare, which is not a problem to report.
   if [ -z "$evdet" ] && [ -z "$evmark" ] && [ -z "$evshell" ]; then
     return 0
   fi
   [ -r "$table" ] || return 0
   wt_has_json || return 0
 
-  # One read of the table: its version, every marker any rule knows, and every shell marker.
-  raw=$(wt_json_scan detectionVersion -- deps markers -- shells marker <"$table") || return 0
+  # One read of the table: its version, each rule's markers AND the directory that rule populates,
+  # and every shell marker.
+  raw=$(wt_json_scan detectionVersion -- deps markers dir -- shells marker <"$table") || return 0
   [ -n "$raw" ] || return 0
 
   while IFS= read -r -d "$WT_RS" rec; do
@@ -1168,25 +1216,23 @@ wt_report_drift() {  # $1 = the checkout to inspect, $2 = profile path, $3 = evi
         curdet=$body
         ;;
       1"$WT_US"*)
-        # `markers` is a JSON array per rule; its elements are the filenames to look for.
+        IFS=$WT_US read -r body rdir <<<"$body" || true
+        # A RULE AT A TIME, not a marker at a time, and this matters. `evidence.markers` records
+        # only the marker each rule actually MATCHED, so a rule with several (bun.lock and
+        # bun.lockb) would otherwise report its unmatched sibling as newly gained on every single
+        # session — a warning that fires for a repo that has not drifted, whose suggested fix
+        # produces the identical profile, which is how people learn to ignore warnings.
+        if wt_rule_is_recorded "$body" "$rdir" "$evmark"; then
+          continue
+        fi
         while IFS= read -r m; do
           [ -n "$m" ] || continue
-          [ -e "$tree/$m" ] || {
-            # Recorded but no longer here.
-            case $evmark in
-              *"\"$m\""*) lost="$lost $m" ;;
-            esac
-            continue
-          }
-          # Present now. Quoted on both sides so `bun.lock` cannot match inside `bun.lockb`.
-          case $evmark in
-            *"\"$m\""*) ;;
-            *) gained="$gained $m" ;;
+          [ -e "$tree/$m" ] || continue
+          case " $seen " in
+            *" $m "*) continue ;;
           esac
-        # `printf '%s\n'`, WITH the newline: without it the last line is unterminated, and a
-        # `while read` sets the variable but returns non-zero, so the loop body never runs for it.
-        # Since most rules have a single marker, that dropped nearly every one and the check
-        # silently found nothing. Measured.
+          seen="$seen $m"
+          gained="$gained $m"
         done < <(printf '%s\n' "$body" | tr -d '[]"' | tr ',' '\n')
         ;;
       2"$WT_US"*)
@@ -1198,27 +1244,53 @@ wt_report_drift() {  # $1 = the checkout to inspect, $2 = profile path, $3 = evi
     esac
   done < <(printf '%s' "$raw")
 
+  # Anything recorded that is no longer on disk.
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ -e "$tree/$m" ] || lost="$lost $m"
+  done < <(printf '%s\n' "$evmark" | tr -d '[]"' | tr ',' '\n')
+
   if [ -n "$gained" ]; then
     wt_log "the profile was calibrated before this checkout had:$gained — run /worktree-calibrate so those are set up too"
   fi
   if [ -n "$lost" ]; then
     wt_log "the profile expects these, which this checkout no longer has:$lost — run /worktree-calibrate"
   fi
-  if [ -n "$evshell" ] || [ -n "$curshell" ]; then
-    if [ "$evshell" != "$curshell" ]; then
-      wt_log "the toolchain marker changed since calibration (${evshell:-none} -> ${curshell:-none}) — installs may be running on the wrong toolchain; run /worktree-calibrate"
-    fi
+  if [ "$evshell" != "$curshell" ]; then
+    wt_log "the toolchain marker changed since calibration (${evshell:-none} -> ${curshell:-none}) — installs may be running on the wrong toolchain; run /worktree-calibrate"
   fi
   if [ -n "$evdet" ] && [ -n "$curdet" ] && [ "$evdet" != "$curdet" ]; then
     wt_log "this plugin's detection table is now version $curdet, the profile was written against $evdet — /worktree-calibrate may propose better answers"
   fi
-
-  # And the per-lockfile checksums, which Phase 2 already implemented and left unwired.
-  problems=$(wt_profile_drifted "$profile" "$tree") || {
-    wt_log "$problems"
-    wt_log "run /worktree-calibrate if the dependency set really changed"
-  }
   return 0
+}
+
+# True when a detection rule is already accounted for by the recorded evidence — either one of its
+# markers was recorded, or the directory it populates is already a dependency in the profile.
+#
+# The second half is what handles detection.json's sameDirPolicy: when two lockfiles claim one
+# directory, only one rule is accepted, so a stale `package-lock.json` sitting beside the
+# `pnpm-lock.yaml` that won is NOT a newly gained ecosystem and must not be reported as one.
+wt_rule_is_recorded() {  # $1 = the rule's markers as compact JSON, $2 = the rule's dir, $3 = evidence.markers
+  local markers=${1-} dir=${2-} evmark=${3-} m rec body rdir
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    case $evmark in
+      *"\"$m\""*) return 0 ;;
+    esac
+  done < <(printf '%s\n' "$markers" | tr -d '[]"' | tr ',' '\n')
+
+  [ -n "$dir" ] && [ -n "${PROFILE_RAW:-}" ] || return 1
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    rdir=${body%%"$WT_US"*}
+    [ "$rdir" = "$dir" ] && return 0
+  done < <(printf '%s' "$PROFILE_RAW")
+  return 1
 }
 
 # ---------------------------------------------------------------------------
