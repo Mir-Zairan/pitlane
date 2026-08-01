@@ -2551,10 +2551,10 @@ PROFILE_HAS_RUNTIME=0
 eq 'with no runtime block the hand-off is silent (ADR-006: touch nothing)' '' \
   "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
 PROFILE_HAS_RUNTIME=1
-contains 'with a runtime block it says the work is not implemented yet' 'not implemented yet' \
-  "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
-contains '...and is honest about what that costs the developer' 'shares the app' \
-  "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
+# With a runtime block but nothing in it to act on, it is still silent about ports and files and
+# reports only what it settled on — there is no port var, no env file and no seed to mention.
+contains 'with a runtime block it reports the slug it settled on' 'runtime: slug=' \
+  "$(wt_runtime_handoff "$DREPO" "$DWT" '' 2>&1)"
 # shellcheck disable=SC2034
 PROFILE_HAS_RUNTIME=0
 

@@ -34,6 +34,15 @@ eq() {  # $1 = label, $2 = expected, $3 = actual
   fi
 }
 
+ne() {  # $1 = label, $2, $3 = values that must differ
+  if [ "$2" != "$3" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL %s\n      both were: %q\n' "$1" "$2" >&2
+  fi
+}
+
 contains() {  # $1 = label, $2 = needle, $3 = haystack
   case $3 in
     *"$2"*) pass=$((pass + 1)) ;;
@@ -58,7 +67,7 @@ make_repo() {
   git init -q "$dir"
   git -C "$dir" config user.email t@example.com
   git -C "$dir" config user.name t
-  printf '.env\n.env.extra\n.claude/worktrees/\n' > "$dir/.gitignore"
+  printf '.env\n.env.extra\n.claude/worktrees/\nvendor/\n' > "$dir/.gitignore"
   printf '.env\n' > "$dir/.worktreeinclude"
   printf 'SECRET=1\n' > "$dir/.env"
   printf 'LOCK\n' > "$dir/composer.lock"
@@ -489,6 +498,301 @@ out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\"
        | bash "$HOOK" 2>"$TMP/err" )
 contains '...and the next run sees a finished dependency, not a frozen partial one' \
   'already up to date' "$(cat "$TMP/err")"
+
+# ---------------------------------------------------------------------------
+# Layer 3 — the phase's acceptance criteria, end to end through the hook
+# ---------------------------------------------------------------------------
+#
+# The unit suite drives the engine's functions directly. This drives the ENTRYPOINT, which is the
+# only thing that proves the profile's runtime block is read, the values reach the right places,
+# and the whole sequence survives a real hook invocation.
+
+# A repo whose profile isolates a port and THREE environments — development, test and CI. Isolating
+# only the development database is the "looks right, is subtly wrong" failure the phase names: a
+# test runner that recreates its databases wholesale destroys a parallel session's test run
+# regardless of how well the dev database is separated.
+make_rt_repo() {  # $1 = dir, $2 = extra runtime JSON keys
+  local dir=$1 extra=${2-}
+  mkdir -p "$dir/.claude"
+  git init -q "$dir"
+  git -C "$dir" config user.email t@example.com
+  git -C "$dir" config user.name t
+  printf '.env.worktree.local\n.claude/worktrees/\n.claude/worktree-no-runtime\nvendor/\n' > "$dir/.gitignore"
+  printf 'LOCK\n' > "$dir/composer.lock"
+  cat > "$dir/.claude/worktree-profile.json" <<JSON
+{
+  "schemaVersion": 1,
+  "shell": "",
+  "shellArgs": "argv",
+  "deps": [{"dir":"vendor","lock":"composer.lock","strategy":"install",
+            "install":"mkdir -p vendor && printf ok > vendor/marker"}],
+  "runtime": {
+    "slug": "{slug}",
+    "port": { "var": "SERVER_PORT", "base": 3786, "span": 200 },
+    "env": {
+      "file": ".env.worktree.local",
+      "vars": {
+        "INSTALLATION_NAME": "demo_{slug}",
+        "TEST_INSTALLATION_NAME": "demo_{slug}_test",
+        "CI_INSTALLATION_NAME": "demo_{slug}_ci"
+      }
+    }$extra
+  },
+  "timeouts": { "bootstrapSeconds": 60, "seedSeconds": 20 }
+}
+JSON
+  git -C "$dir" add .gitignore composer.lock .claude/worktree-profile.json
+  git -C "$dir" commit -qm init
+}
+start_hook() {  # $1 = worktree
+  ( cd "$1" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$1\"}" \
+    | bash "$HOOK" 2>"$TMP/err" )
+}
+envval() { grep "^$2=" "$1/.env.worktree.local" 2>/dev/null | head -1 | cut -d= -f2-; }
+
+RT=$TMP/rt
+make_rt_repo "$RT"
+WA=$RT/.claude/worktrees/alice
+WB=$RT/.claude/worktrees/bob
+git -C "$RT" worktree add -q "$WA" -b worktree-alice 2>/dev/null
+git -C "$RT" worktree add -q "$WB" -b worktree-bob 2>/dev/null
+
+outA=$(start_hook "$WA"); errA=$(cat "$TMP/err")
+outB=$(start_hook "$WB"); errB=$(cat "$TMP/err")
+
+eq 'runtime work still writes NOTHING to stdout on SessionStart' '' "$outA$outB"
+eq 'both worktrees still get their dependencies' 'okok' \
+  "$(cat "$WA/vendor/marker" 2>/dev/null)$(cat "$WB/vendor/marker" 2>/dev/null)"
+
+# ACCEPTANCE: two worktrees, different ports and different databases — for EVERY environment.
+pA=$(envval "$WA" SERVER_PORT); pB=$(envval "$WB" SERVER_PORT)
+ne 'two worktrees get different ports' "$pA" "$pB"
+ne 'two worktrees get different development databases' \
+  "$(envval "$WA" INSTALLATION_NAME)" "$(envval "$WB" INSTALLATION_NAME)"
+ne 'two worktrees get different TEST databases too' \
+  "$(envval "$WA" TEST_INSTALLATION_NAME)" "$(envval "$WB" TEST_INSTALLATION_NAME)"
+ne 'and different CI databases' \
+  "$(envval "$WA" CI_INSTALLATION_NAME)" "$(envval "$WB" CI_INSTALLATION_NAME)"
+eq "alice's development database is named after her slug" 'demo_alice' \
+  "$(envval "$WA" INSTALLATION_NAME)"
+eq "and her test database is a distinct name again" 'demo_alice_test' \
+  "$(envval "$WA" TEST_INSTALLATION_NAME)"
+contains 'and the hook says what it settled on' 'runtime: slug=alice' "$errA"
+
+# ACCEPTANCE: reopening lands on the same port and the same database. A developer bookmarks the URL.
+start_hook "$WA" >/dev/null
+eq 'reopening a worktree keeps its port' "$pA" "$(envval "$WA" SERVER_PORT)"
+eq 'and its database' 'demo_alice' "$(envval "$WA" INSTALLATION_NAME)"
+
+# The override file must not show up as an untracked change — that is how one gets committed and
+# every teammate's worktree ends up pointing at one database.
+eq "the override file is invisible to git status" '' \
+  "$(git -C "$WA" status --porcelain 2>/dev/null)"
+
+# ACCEPTANCE: a developer can redirect a worktree without touching the profile, and the plugin
+# respects it on EVERY later session — warning once, not every time.
+printf 'INSTALLATION_NAME=the_shared_one\n' > "$WA/.env.worktree.local"
+start_hook "$WA" >/dev/null; first=$(cat "$TMP/err")
+start_hook "$WA" >/dev/null; second=$(cat "$TMP/err")
+eq 'a hand-edited override file survives a re-bootstrap byte for byte' \
+  'INSTALLATION_NAME=the_shared_one' "$(cat "$WA/.env.worktree.local")"
+contains 'and the developer is told once that it is now theirs' 'it will be left alone' "$first"
+lacks 'and NOT told again on the next session' 'it will be left alone' "$second"
+rm -f "$WA/.env.worktree.local"
+start_hook "$WA" >/dev/null
+eq 'deleting it hands ownership back' "$pA" "$(envval "$WA" SERVER_PORT)"
+
+# ACCEPTANCE: the opt-out marker skips layer 3 entirely and leaves dependencies working.
+rm -f "$WB/.env.worktree.local"
+mkdir -p "$WB/.claude"
+: > "$WB/.claude/worktree-no-runtime"
+start_hook "$WB" >/dev/null; errB=$(cat "$TMP/err")
+eq 'the opt-out marker writes no override file' 0 \
+  "$([ -e "$WB/.env.worktree.local" ] && echo 1 || echo 0)"
+contains 'and says so once' 'leaving this worktree' "$errB"
+eq 'while the dependencies it already had are untouched' 'ok' \
+  "$(cat "$WB/vendor/marker" 2>/dev/null)"
+rm -f "$WB/.claude/worktree-no-runtime"
+
+# ACCEPTANCE: nested and awkward names produce legal, DISTINCT slugs — through the entrypoint,
+# which is where the basename bug lived: `alice/fix-99` and `bob/fix-99` both used to reduce to
+# `fix-99`, giving two worktrees one port and one database while each believed it was isolated.
+mkdir -p "$RT/.claude/worktrees/alice" "$RT/.claude/worktrees/bob"
+WN1=$RT/.claude/worktrees/alice/fix-99
+WN2=$RT/.claude/worktrees/bob/fix-99
+git -C "$RT" worktree add -q "$WN1" -b worktree-alice-fix-99 2>/dev/null
+git -C "$RT" worktree add -q "$WN2" -b worktree-bob-fix-99 2>/dev/null
+start_hook "$WN1" >/dev/null
+start_hook "$WN2" >/dev/null
+ne 'two NESTED worktrees sharing a leaf name get different databases' \
+  "$(envval "$WN1" INSTALLATION_NAME)" "$(envval "$WN2" INSTALLATION_NAME)"
+ne 'and different ports' "$(envval "$WN1" SERVER_PORT)" "$(envval "$WN2" SERVER_PORT)"
+eq 'a nested name slugs to a legal database name' 'demo_alice_fix_99' \
+  "$(envval "$WN1" INSTALLATION_NAME)"
+
+# A long, punctuation-heavy, non-ASCII name still produces something legal.
+WLONG="$RT/.claude/worktrees/Ünïcode--Feature/Very-Long-Branch-Name-That-Goes-On-And-On-For-A-While"
+mkdir -p "${WLONG%/*}"
+git -C "$RT" worktree add -q "$WLONG" -b worktree-long 2>/dev/null
+start_hook "$WLONG" >/dev/null
+longdb=$(envval "$WLONG" INSTALLATION_NAME)
+ne 'an awkward name still yields a database name' '' "$longdb"
+eq 'and it contains only characters an identifier may have' '' \
+  "$(printf '%s' "$longdb" | tr -d 'a-z0-9_')"
+
+# A CONSTANT runtime.slug MUST NOT COLLAPSE EVERY WORKTREE ONTO ONE DATABASE. Validation only
+# WARNS about such a template, on the explicit promise that the worktree's own name is used
+# instead — so if the engine honoured it literally, two parallel sessions would run migrations
+# against one database while the developer had been told otherwise. The same-slug rule in the port
+# claim would then treat them as one worktree rather than as a collision, so nothing downstream
+# would notice either.
+RC=$TMP/rtconst
+make_rt_repo "$RC"
+python3 - "$RC/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["slug"] = "shared"
+json.dump(d, open(f, "w"))
+PYJ
+git -C "$RC" add -A; git -C "$RC" commit -qm const
+WC1=$RC/.claude/worktrees/one
+WC2=$RC/.claude/worktrees/two
+git -C "$RC" worktree add -q "$WC1" -b worktree-one 2>/dev/null
+git -C "$RC" worktree add -q "$WC2" -b worktree-two 2>/dev/null
+start_hook "$WC1" >/dev/null; constwarn=$(cat "$TMP/err")
+start_hook "$WC2" >/dev/null
+ne 'a constant runtime.slug still gives two worktrees different databases' \
+  "$(envval "$WC1" INSTALLATION_NAME)" "$(envval "$WC2" INSTALLATION_NAME)"
+ne 'and different ports' "$(envval "$WC1" SERVER_PORT)" "$(envval "$WC2" SERVER_PORT)"
+eq 'and the database is named after the worktree, as the validator promised' 'demo_one' \
+  "$(envval "$WC1" INSTALLATION_NAME)"
+contains 'and the engine says it ignored the template' 'same for every worktree' "$constwarn"
+
+# A profile that OMITS runtime.slug behaves the same way — the ordinary case, and the one whose
+# default has to expand correctly rather than leaving a literal brace in a database name.
+RD=$TMP/rtdefault
+make_rt_repo "$RD"
+python3 - "$RD/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+del d["runtime"]["slug"]
+json.dump(d, open(f, "w"))
+PYJ
+git -C "$RD" add -A; git -C "$RD" commit -qm nodefault
+WD1=$RD/.claude/worktrees/dee
+git -C "$RD" worktree add -q "$WD1" -b worktree-dee 2>/dev/null
+start_hook "$WD1" >/dev/null
+eq 'a profile with no runtime.slug names the database after the worktree' 'demo_dee' \
+  "$(envval "$WD1" INSTALLATION_NAME)"
+
+# CHANGING runtime.slug re-points a live worktree, and its seed must run again for the NEW
+# database — even with no runtime.port, where the port claim (which also resets these) never runs.
+RE=$TMP/rtreslug
+make_rt_repo "$RE" ',
+    "seed": ".claude/worktree-seed.sh"'
+python3 - "$RE/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+del d["runtime"]["port"]                      # no port claim to reset the seed marker for us
+json.dump(d, open(f, "w"))
+PYJ
+mkdir -p "$RE/.claude"
+# SC2016: single-quoted ON PURPOSE — $WT_SLUG and $WT_PATH must reach the SEED SCRIPT and be
+# expanded when it runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$WT_SLUG" >> "$WT_PATH/seeded.txt"\n' \
+  > "$RE/.claude/worktree-seed.sh"
+chmod +x "$RE/.claude/worktree-seed.sh"
+git -C "$RE" add -A; git -C "$RE" commit -qm seed
+WRS=$RE/.claude/worktrees/rs
+git -C "$RE" worktree add -q "$WRS" -b worktree-rs 2>/dev/null
+start_hook "$WRS" >/dev/null
+eq 'the seed ran for the original slug' 'rs' "$(cat "$WRS/seeded.txt" 2>/dev/null)"
+start_hook "$WRS" >/dev/null
+eq 'and is skipped while nothing has changed' 'rs' "$(cat "$WRS/seeded.txt" 2>/dev/null)"
+python3 - "$WRS/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["slug"] = "t_{slug}"
+json.dump(d, open(f, "w"))
+PYJ
+start_hook "$WRS" >/dev/null
+eq 'but a CHANGED slug seeds the new database, rather than trusting the old marker' 'rs
+t_rs' "$(cat "$WRS/seeded.txt" 2>/dev/null)"
+
+# THE SUMMARY MUST NOT CLAIM AN ENV FILE IT REFUSED TO WRITE. It is the one line a developer reads
+# before the TUI renders, and the sentence in which a wrong mapping is supposed to become obvious —
+# so naming a file that does not exist reports isolation that did not happen.
+RF=$TMP/rtrefused
+make_rt_repo "$RF"
+python3 - "$RF/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["env"]["file"] = "tracked.env"     # deliberately NOT gitignored
+json.dump(d, open(f, "w"))
+PYJ
+git -C "$RF" add -A; git -C "$RF" commit -qm refused
+WRF=$RF/.claude/worktrees/rf
+git -C "$RF" worktree add -q "$WRF" -b worktree-rf 2>/dev/null
+start_hook "$WRF" >/dev/null; errRF=$(cat "$TMP/err")
+contains 'a non-gitignored override path is refused' 'not gitignored' "$errRF"
+lacks 'and the summary does not claim it wrote one' 'env=tracked.env' "$errRF"
+contains 'while still reporting the slug it settled on' 'runtime: slug=rf' "$errRF"
+eq 'and no such file was created' 0 "$([ -e "$WRF/tracked.env" ] && echo 1 || echo 0)"
+
+# ACCEPTANCE: every runtime failure path still yields a session. A seed that fails, and one that
+# hangs past its budget.
+RS=$TMP/rtseed
+make_rt_repo "$RS" ',
+    "seed": ".claude/worktree-seed.sh"'
+mkdir -p "$RS/.claude"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$RS/.claude/worktree-seed.sh"
+chmod +x "$RS/.claude/worktree-seed.sh"
+git -C "$RS" add .claude/worktree-seed.sh; git -C "$RS" commit -qm seed
+WS=$RS/.claude/worktrees/s1
+git -C "$RS" worktree add -q "$WS" -b worktree-s1 2>/dev/null
+outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
+eq 'a failing seed still leaves a usable session (nothing on stdout)' '' "$outS"
+contains 'and it says the seed failed' 'the seed failed' "$errS"
+eq 'and the worktree still got its dependencies' 'ok' "$(cat "$WS/vendor/marker" 2>/dev/null)"
+eq 'and its port and database' 'demo_s1' "$(envval "$WS" INSTALLATION_NAME)"
+contains 'and the bootstrap still reports finishing' 'bootstrap finished in' "$errS"
+
+if command -v timeout >/dev/null 2>&1; then
+  printf '#!/usr/bin/env bash\nsleep 60\n' > "$WS/.claude/worktree-seed.sh"
+  chmod +x "$WS/.claude/worktree-seed.sh"
+  # A one-second seed budget, so the hang is stopped by the guard rather than by the platform.
+  python3 - "$WS/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["timeouts"]["seedSeconds"] = 1
+json.dump(d, open(f, "w"))
+PYJ
+  outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
+  eq 'a HANGING seed still leaves a usable session' '' "$outS"
+  contains 'and the hang is stopped and reported' 'was stopped' "$errS"
+  contains 'and the bootstrap still finishes' 'bootstrap finished in' "$errS"
+fi
+
+# ACCEPTANCE: a profile with NO runtime block changes nothing on disk, silently.
+NR=$TMP/nort
+make_repo "$NR" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+WNR=$NR/.claude/worktrees/plain
+git -C "$NR" worktree add -q "$WNR" -b worktree-plain 2>/dev/null
+start_hook "$WNR" >/dev/null
+before=$(cd "$WNR" && find . -path ./.git -prune -o -print | LC_ALL=C sort)
+errNR=$(cat "$TMP/err")
+start_hook "$WNR" >/dev/null
+after=$(cd "$WNR" && find . -path ./.git -prune -o -print | LC_ALL=C sort)
+eq 'a profile with no runtime block leaves the worktree unchanged' "$before" "$after"
+lacks 'and says nothing at all about runtime' 'runtime:' "$errNR"
+eq 'and nothing shows up in git status' '' "$(git -C "$WNR" status --porcelain 2>/dev/null)"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

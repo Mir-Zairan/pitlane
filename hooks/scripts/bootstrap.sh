@@ -160,7 +160,11 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   fi
 
   wt_bootstrap_deps "$root" "$worktree" "$deadline"
-  wt_runtime_handoff "$root" "$worktree"
+  # THE DEADLINE IS PASSED IN. `timeouts.seedSeconds` and `timeouts.bootstrapSeconds` run inside
+  # ONE hook invocation, so it is their SUM that must fit — a seed that took a fresh allowance
+  # would let the platform kill the hook before any internal guard fired, which is the one failure
+  # ADR-003 exists to prevent.
+  wt_runtime_handoff "$root" "$worktree" "$deadline"
 
   [ "$held" -eq 1 ] && wt_lock_release 8
 
@@ -292,9 +296,22 @@ case $event in
       exit 0
     fi
 
-    # SessionStart carries no `name`, so it comes from the directory. Claude Code names the
-    # directory after the worktree, so these agree for every name it accepts.
-    WT_NAME=${worktree##*/}
+    # SessionStart carries no `name`, so it comes from the directory — but NOT from its basename.
+    #
+    # A nested name lands at `.claude/worktrees/alice/fix-99/`, so the basename of `alice/fix-99`
+    # and of `bob/fix-99` is `fix-99` for both: one slug, one derived port, and — the part that
+    # matters — ONE DATABASE for two worktrees that each believe they are isolated. That is exactly
+    # the data loss this layer exists to prevent, arriving through the name it is keyed on.
+    #
+    # Taking the path RELATIVE to the worktrees directory is right for both layouts: nested gives
+    # `alice/fix-99`, and the flattened form this plugin's own WorktreeCreate branch produces gives
+    # `alice-fix-99`. wt_slugify maps both to `alice_fix_99`, so a worktree keeps one identity
+    # however it was created.
+    WT_NAME=${worktree##*"$WT_SUBPATH"}
+    # If the path is not under the worktrees directory at all, the substitution leaves it
+    # unchanged — fall back to the basename rather than using the whole absolute path as a name.
+    # (A worktree DIRECTLY in the worktrees directory is not this case: it strips fine.)
+    [ "$WT_NAME" != "$worktree" ] || WT_NAME=${worktree##*/}
     WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
     WT_PATH=$worktree
     WT_ROOT=$root

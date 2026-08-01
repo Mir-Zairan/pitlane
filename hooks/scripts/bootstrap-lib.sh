@@ -2139,9 +2139,14 @@ EOF
   esc=${rel//\'/\'\\\'\'}
   wt_log "  runtime: seeding with $rel (${secs}s of the budget left)"
   started=$(date +%s 2>/dev/null) || started=''
+  # SC2030/SC2031: the assignments below are DELIBERATELY confined to this subshell. The contract
+  # values belong to the seed child and must not leak back into the hook, whose own WT_SLUG/WT_PORT
+  # describe the same worktree but are set by the handoff, not by this function.
   (
     export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
+    # shellcheck disable=SC2030
     WT_SLUG=$slug
+    # shellcheck disable=SC2030
     WT_PORT=$port
     WT_PATH=$worktree
     WT_ROOT=$root
@@ -2185,7 +2190,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# The hand-off to Phase 4
+# Layer 3 — the whole step
 # ---------------------------------------------------------------------------
 #
 # An in-process call at the point runtime isolation has to happen: inside the SAME SessionStart
@@ -2194,9 +2199,128 @@ EOF
 # artifact pattern belongs to teardown (Phase 5), which is a genuinely separate event.
 #
 # SILENT when the profile has no runtime block, because absent means TOUCH NOTHING (ADR-006) and a
-# plugin that comments on every session start is one people uninstall. Phase 4 replaces the body.
-wt_runtime_handoff() {  # $1 = root, $2 = worktree
+# plugin that comments on every session start is one people uninstall.
+
+# The marker a developer drops in a worktree to opt that ONE worktree out of layer 3 entirely.
+#
+# It exists because editing the env override file — the other escape hatch — only redirects the
+# state; it does not stop a port being derived or a seed running. This is for the case where the
+# derived database is the LAST thing someone wants: a worktree opened to reproduce a bug against
+# the shared data, or to look at a restored snapshot. Dependencies are untouched, so the worktree
+# still works; only isolation is skipped.
+WT_NO_RUNTIME_MARKER='.claude/worktree-no-runtime'
+
+wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
+  local root=${1%/} worktree=${2%/} deadline=${3-}
+  local slug tpl envrel envstate port psrc oldslug oldseed oldcksum
+
   [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
-  wt_log "runtime isolation (ports, env overrides, seed) is not implemented yet — Phase 4 owns it; this worktree shares the app's ports and databases"
+
+  if [ -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
+    wt_log "runtime: $WT_NO_RUNTIME_MARKER is present — leaving this worktree's ports, env and database alone"
+    return 0
+  fi
+
+  # THE SLUG IS RE-SLUGIFIED AFTER EXPANSION, always. `runtime.slug` is a TEMPLATE, and the schema
+  # allows it to be `{name}` — raw branch text — while everything downstream trusts a slug to be
+  # [a-z0-9_]: a database name and a derived port among them. Running the result back through
+  # wt_slugify makes that safe BY CONSTRUCTION rather than by review, and costs nothing, since
+  # wt_slugify is idempotent on its own output.
+  #
+  # A TEMPLATE WITH NO PER-WORKTREE PLACEHOLDER IS IGNORED, and that is not cosmetic. It expands to
+  # the same text for every worktree, so every worktree derives one port and one database — and
+  # then the same-slug rule in the port claim treats them as one worktree rather than as a
+  # collision, so nothing downstream notices. wt_validate_profile already only WARNS about such a
+  # template, on the explicit promise that "the worktree's own name will be used instead"; this is
+  # where that promise is kept. Without it the warning was a lie in the most expensive direction.
+  #
+  # The default is built in two plain steps rather than with a `:-` word containing an escaped
+  # brace, whose quoting is not portable enough to bet a database name on.
+  tpl=${PROFILE_RT_SLUG:-}
+  case $tpl in
+    *'{slug}'* | *'{name}'*) ;;
+    *)
+      [ -z "$tpl" ] || wt_log "runtime: runtime.slug is \"$tpl\", which is the same for every worktree — using this worktree's own name instead"
+      tpl='{slug}'
+      ;;
+  esac
+  slug=$(wt_expand "$tpl")
+  # SC2031: shellcheck is tracking the seed function's subshell from earlier in this file; the
+  # WT_SLUG read here is the hook's own, set by the entrypoint before this runs.
+  # shellcheck disable=SC2031
+  slug=$(wt_slugify "$slug") || slug=${WT_SLUG-}
+  # shellcheck disable=SC2031
+  [ -n "$slug" ] || slug=${WT_SLUG-}
+  if [ -z "$slug" ]; then
+    wt_log "runtime: could not derive a slug for this worktree — skipping runtime isolation"
+    return 0
+  fi
+
+  # Republished, because everything below expands {slug} and the template may have changed it.
+  WT_SLUG=$slug
+  export WT_SLUG
+
+  # A CHANGED SLUG IS A DIFFERENT DATABASE, so the previous one's seed marker must not carry over.
+  # The port claim resets these too, but it returns early — before writing anything — whenever the
+  # profile has no usable `runtime.port`, so a profile with `env` and `seed` and no port would
+  # otherwise keep a `done` marker across a slug change and never seed the new database at all.
+  # Read once, here, where every later write can see it.
+  oldslug=$(wt_runtime_state_get "$worktree" slug) || oldslug=''
+  if [ -n "$oldslug" ] && [ "$oldslug" != "$slug" ]; then
+    oldseed=none
+    oldcksum=''
+  else
+    oldseed=$(wt_runtime_state_get "$worktree" seedstatus) || oldseed=none
+    oldcksum=$(wt_runtime_state_get "$worktree" seedcksum) || oldcksum=''
+  fi
+
+  # --- the port ------------------------------------------------------------------------------
+  wt_runtime_claim_port "$root" "$worktree" "$slug" \
+    "${PROFILE_RT_PORTBASE:-}" "${PROFILE_RT_PORTSPAN:-}"
+  # shellcheck disable=SC2031  # the seed's subshell is a different function; this is our own.
+  port=$WT_PORT
+  psrc=$WT_PORT_SOURCE
+  # Exported BEFORE the env file is written, because {port} in a value resolves from it.
+  WT_PORT=$port
+  export WT_PORT
+
+  # --- the env override file -------------------------------------------------------------------
+  envrel=${PROFILE_RT_ENVFILE:-}
+  envstate=$(wt_runtime_state_get "$worktree" envstate) || envstate=''
+  if [ -n "$envrel" ]; then
+    wt_runtime_env_write "$worktree" "$envrel" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}"
+    case $WT_ENV_WROTE in
+      written) envstate=ours ;;
+      developer)
+        # SAID ONCE, not every session. The state record is what makes that possible: editing this
+        # file is the supported way to point a worktree at a shared database or a colleague's, and
+        # a warning repeated on every start is one a developer learns to scroll past — at which
+        # point it stops protecting the thing it is about.
+        if [ "$envstate" != theirs ]; then
+          wt_log "runtime: $envrel is yours — it has no plugin marker line, so it will be left alone from now on. Delete it to hand it back."
+        fi
+        envstate=theirs
+        ;;
+      *) envstate=${envstate:-} ;;
+    esac
+    wt_runtime_state_set "$worktree" "$slug" "$port" "$psrc" "$envrel" "$envstate" \
+      "${oldseed:-none}" "$oldcksum" || true
+  fi
+
+  # --- the seed ----------------------------------------------------------------------------------
+  if [ -n "${PROFILE_RT_SEED:-}" ]; then
+    wt_runtime_seed "$root" "$worktree" "$slug" "$port" "$envrel" "$envstate" \
+      "${PROFILE_RT_SEED}" "$deadline"
+  fi
+
+  # ONE honest summary line, naming what this worktree actually got. It is the sentence in which a
+  # wrong mapping becomes obvious — and the only feedback a developer sees before the TUI renders.
+  # `env=` only when there IS one: wt_runtime_env_write refuses a symlink, a non-gitignored path
+  # and a failed write, and naming the file anyway would report isolation that did not happen.
+  case ${WT_ENV_WROTE:-} in
+    written | developer) ;;
+    *) envrel='' ;;
+  esac
+  wt_log "runtime: slug=$slug${port:+ port=$port}${envrel:+ env=$envrel}"
   return 0
 }
