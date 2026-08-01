@@ -865,5 +865,374 @@ if [ "$(id -u)" != 0 ]; then
   chmod 600 "$TMP/unreadable.txt"
 fi
 
+# ---------------------------------------------------------------------------
+# The dependency engine
+# ---------------------------------------------------------------------------
+# A real repo with a real worktree, and a fake "package manager" that can be told to succeed,
+# fail, hang, or record that it ran. Failure injection needs no real toolchain that way.
+
+DREPO=$TMP/drepo
+git init -q "$DREPO"
+git -C "$DREPO" config user.email t@example.com
+git -C "$DREPO" config user.name t
+printf 'LOCKV1\n' > "$DREPO/composer.lock"
+git -C "$DREPO" add composer.lock
+git -C "$DREPO" commit -qm init
+DWT=$DREPO/.claude/worktrees/dep1
+git -C "$DREPO" worktree add -q "$DWT" -b wt-dep1 2>/dev/null
+
+# shellcheck disable=SC2034
+PROFILE_SHELL='' PROFILE_SHELLARGS=''
+FAR=$(( $(date +%s) + 600 ))
+
+dep_raw() {  # $1 = dir, $2 = lock, $3 = strategy, $4 = install, $5 = verify
+  printf '0%s%s1%s%s%s%s%s%s%s%s%s%s%s' \
+    "$US_" "$RS_" "$US_" "$1" "$US_" "$2" "$US_" "$3" "$US_" "$4" "$US_" "$5" "$RS_"
+}
+
+# --- install ---------------------------------------------------------------
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf ok > vendor/marker' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'install: the command runs and populates the directory' 'ok' \
+  "$(cat "$DWT/vendor/marker" 2>/dev/null)"
+eq 'install: the dependency is recorded as done' 0 \
+  "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'mkdir -p vendor && printf ok > vendor/marker')" install; echo $?)"
+
+# Idempotence: a second run must do nothing at all, and say so.
+printf 'TOUCHED' > "$DWT/vendor/marker"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'idempotence: a second run reports it is already up to date' 'already up to date' "$out"
+eq 'idempotence: and does not re-run the install' 'TOUCHED' "$(cat "$DWT/vendor/marker")"
+
+# Changing the install command invalidates it, even though the lockfile is untouched.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf v2 > vendor/marker' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'a changed install command re-runs the dependency' 'v2' "$(cat "$DWT/vendor/marker")"
+
+# --- failure injection: the install exits non-zero -------------------------
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'exit 1' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+rc=$?
+eq 'a failing install does NOT fail the bootstrap' 0 "$rc"
+contains '...and says what happened' 'install command failed' "$out"
+eq '...and is recorded as not done, so the next session retries' 1 \
+  "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'exit 1')" install; echo $?)"
+
+# --- failure injection: the install hangs past the budget ------------------
+if command -v timeout >/dev/null 2>&1; then
+  rm -rf "$DWT/vendor"
+  NEAR=$(( $(date +%s) + 3 ))
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock install 'sleep 30' '')
+  start=$(date +%s)
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$NEAR" 2>&1)
+  rc=$?
+  took=$(( $(date +%s) - start ))
+  eq 'a hanging install is stopped rather than hanging the session' yes \
+    "$([ "$took" -lt 15 ] && echo yes)"
+  contains '...and says the budget ran out' 'was stopped' "$out"
+  eq '...and leaves the session usable, returning success' 0 "$rc"
+fi
+
+# --- failure injection: no budget left at all ------------------------------
+PAST=$(( $(date +%s) - 5 ))
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'printf SHOULDNOTRUN > /dev/null' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$PAST" 2>&1)
+contains 'with the budget already spent, the dependency is deferred, not started' 'out of time' "$out"
+
+# --- hardlink --------------------------------------------------------------
+mkdir -p "$DREPO/vendor/pkg"
+printf 'REAL\n' > "$DREPO/vendor/pkg/file.txt"
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf INSTALLED > /dev/null' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'hardlink: the tree appears in the worktree' 'REAL' "$(cat "$DWT/vendor/pkg/file.txt" 2>/dev/null)"
+contains 'hardlink: and it is reported as a link, not an install' 'hardlinked from the main checkout' "$out"
+# The point of hardlinking: the same inode, so 397 MB costs almost nothing.
+eq 'hardlink: the file really is the same inode, not a copy' \
+  "$(stat -c '%i' "$DREPO/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DREPO/vendor/pkg/file.txt")" \
+  "$(stat -c '%i' "$DWT/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DWT/vendor/pkg/file.txt")"
+
+# --- hardlink falls back when the lockfiles differ -------------------------
+rm -rf "$DWT/vendor"
+printf 'LOCKV2-DIFFERENT\n' > "$DWT/composer.lock"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf FELLBACK > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a worktree whose lockfile differs is NOT given the main checkout tree' 'differs from the main checkout' "$out"
+eq '...it gets a real install instead' 'FELLBACK' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+printf 'LOCKV1\n' > "$DWT/composer.lock"
+
+# --- hardlink falls back when the main checkout has nothing to link --------
+rm -rf "$DWT/vendor" "$DREPO/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf NOSOURCE > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'with no source directory it installs instead' 'no vendor to link from' "$out"
+eq '...and the install really ran' 'NOSOURCE' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+
+# An EMPTY source directory must not count as a successful link.
+rm -rf "$DWT/vendor"; mkdir -p "$DREPO/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf EMPTYSRC > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'an empty source directory does not count as linkable' 'is empty' "$out"
+eq '...so a real install runs' 'EMPTYSRC' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+rmdir "$DREPO/vendor" 2>/dev/null
+
+# --- missing lockfile ------------------------------------------------------
+# A linkable source must exist, or the source-missing check fires first and this asserts nothing.
+rm -rf "$DWT/vendor"
+mkdir -p "$DREPO/vendor/pkg"; printf 'REAL\n' > "$DREPO/vendor/pkg/file.txt"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor nosuch.lock hardlink 'mkdir -p vendor && printf NOLOCK > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a missing lockfile is not treated as a match' 'cannot compare' "$out"
+eq '...and it installs rather than linking a tree it cannot validate' 'NOLOCK' \
+  "$(cat "$DWT/vendor/m" 2>/dev/null)"
+
+# --- verify decides done vs dirty ------------------------------------------
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor' 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a failing verify is reported' 'verify command failed' "$out"
+eq '...and the dependency is recorded as needing a retry, not as done' 1 \
+  "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'mkdir -p vendor')" install; echo $?)"
+eq '...and it really is retried next time' 'yes' \
+  "$(out2=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); case $out2 in *'already up to date'*) echo no ;; *) echo yes ;; esac)"
+
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf x > vendor/autoload.php' 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'a passing verify records the dependency as done' 0 \
+  "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'mkdir -p vendor && printf x > vendor/autoload.php')" install; echo $?)"
+
+# --- an interrupted run leaves a partial tree that must be cleared ---------
+rm -rf "$DWT/vendor"; mkdir -p "$DWT/vendor"; printf 'PARTIAL\n' > "$DWT/vendor/half.txt"
+wt_state_set "$DWT" vendor install LX IX doing
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf CLEAN > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a directory left by an interrupted run is cleared' 'previous run was interrupted' "$out"
+eq '...so the retry does not build on debris' '' "$(cat "$DWT/vendor/half.txt" 2>/dev/null)"
+eq '...and the fresh install succeeded' 'CLEAN' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+
+# A directory with NO record is left alone: it may predate the plugin or a format change, and
+# deleting it would turn an upgrade into a mass reinstall.
+rm -rf "$DWT/vendor"; mkdir -p "$DWT/vendor"; printf 'PREEXISTING\n' > "$DWT/vendor/old.txt"
+rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'printf y > vendor/new.txt' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'a dependency directory with no record is not deleted' 'PREEXISTING' \
+  "$(cat "$DWT/vendor/old.txt" 2>/dev/null)"
+
+# --- skip and store --------------------------------------------------------
+rm -rf "$DWT/target"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw target Cargo.lock skip 'mkdir -p target' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a skip dependency is announced' 'strategy is skip' "$out"
+eq '...and genuinely not touched' '' "$([ -e "$DWT/target" ] && echo exists)"
+
+rm -rf "$DWT/store1"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw store1 composer.lock store 'mkdir -p store1 && printf s > store1/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'the unimplemented store strategy says so' 'not implemented yet' "$out"
+eq '...and installs instead of silently doing nothing' 's' "$(cat "$DWT/store1/m" 2>/dev/null)"
+
+# --- containment -----------------------------------------------------------
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw '../escape' composer.lock install 'printf pwned > ../escape/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a traversing dependency dir is refused' 'not a relative path' "$out"
+eq '...and nothing is created outside the worktree' '' \
+  "$(cat "$DREPO/.claude/worktrees/escape/m" 2>/dev/null)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor '../../../etc/passwd' install 'true' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a traversing lock path is refused too' 'refusing lock' "$out"
+
+# --- several dependencies in one run ---------------------------------------
+rm -rf "$DWT/a1" "$DWT/b2"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%sa1%scomposer.lock%sinstall%smkdir -p a1%s%s1%sb2%scomposer.lock%sinstall%smkdir -p b2%s%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'every dependency in the list is processed: the first' yes "$([ -d "$DWT/a1" ] && echo yes)"
+eq 'every dependency in the list is processed: the second' yes "$([ -d "$DWT/b2" ] && echo yes)"
+
+# ...and one failing must not stop the next. FRESH directory names: reusing b2 with the same
+# install command would be skipped as already done, which would test the cache rather than the
+# keep-going behaviour this case is for.
+rm -rf "$DWT/c3" "$DWT/d4"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%sc3%scomposer.lock%sinstall%sexit 7%s%s1%sd4%scomposer.lock%sinstall%smkdir -p d4%s%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'the failing dependency really did fail' '' "$([ -d "$DWT/c3" ] && echo exists)"
+eq 'a failing dependency does not stop the ones after it' yes "$([ -d "$DWT/d4" ] && echo yes)"
+
+# --- no profile ------------------------------------------------------------
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'with no usable profile the engine does nothing and succeeds' 0 $?
+
+# --- idempotence AFTER a hardlink fell back to install ----------------------
+# The state records the PROFILE's strategy, not the one that happened to run. If it recorded the
+# fallback instead, the next session would ask for `hardlink`, never match, and reinstall in full
+# — every session, silently, in the common case of a branch that touched its lockfile.
+rm -rf "$DWT/vendor"
+printf 'LOCK-DIFFERENT\n' > "$DWT/composer.lock"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf ONCE > vendor/m' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'the hardlink falls back as expected' 'differs from the main checkout' "$out"
+eq 'and the install ran' 'ONCE' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+printf 'AGAIN' > "$DWT/vendor/m"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a second run over a fallen-back hardlink is already up to date' 'already up to date' "$out"
+eq '...and does NOT reinstall' 'AGAIN' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+printf 'LOCKV1\n' > "$DWT/composer.lock"
+
+# --- an already-present directory is not claimed as a fresh link ------------
+rm -rf "$DWT/vendor"
+mkdir -p "$DREPO/vendor/pkg"; printf 'REAL\n' > "$DREPO/vendor/pkg/file.txt"
+mkdir -p "$DWT/vendor"; printf 'PREEXISTING\n' > "$DWT/vendor/mine.txt"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf SHOULDNOTRUN > /dev/null' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'an existing dependency directory is left alone' 'already present in the worktree' "$out"
+eq '...and its contents are untouched' 'PREEXISTING' "$(cat "$DWT/vendor/mine.txt" 2>/dev/null)"
+case $out in
+  *'hardlinked from the main checkout'*)
+    fail=$((fail+1)); printf 'FAIL claimed a hardlink it did not make\n' >&2 ;;
+  *) pass=$((pass+1)) ;;
+esac
+
+# --- command-position placeholder safety ------------------------------------
+# A worktree name comes from a less trusted party than the profile. With {name} in command
+# position, a name carrying shell syntax must stop the dependency, not run a second command.
+rm -rf "$DWT/vendor" "$TMP/pwned"
+WT_NAME='q; touch '"$TMP"'/pwned'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'printf %s {name} > /dev/null' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'a worktree name carrying shell syntax does not execute' '' \
+  "$([ -e "$TMP/pwned" ] && echo pwned)"
+contains '...and the refusal names the placeholder' 'interpolate {name}' "$out"
+# The same value is harmless when the command never interpolates it.
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf safe > vendor/m' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'a dangerous name does not block commands that never use it' 'safe' \
+  "$(cat "$DWT/vendor/m" 2>/dev/null)"
+# An ordinary name still interpolates normally.
+rm -rf "$DWT/vendor"
+WT_NAME='feature-99'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf %s {name} > vendor/m' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'an ordinary worktree name still expands into the command' 'feature-99' \
+  "$(cat "$DWT/vendor/m" 2>/dev/null)"
+# A verify command is checked too, not only install.
+rm -rf "$DWT/vendor" "$TMP/pwned2"
+WT_NAME='x; touch '"$TMP"'/pwned2'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor' 'test -n "{name}"')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'the verify command is guarded as well as the install' '' \
+  "$([ -e "$TMP/pwned2" ] && echo pwned)"
+# shellcheck disable=SC2034
+WT_NAME='dep1'
+
+# --- symlinked parent on the dependency path --------------------------------
+# This path runs `rm -rf` and `cp -al`, both of which follow symlinked ancestors.
+rm -rf "$DWT/sub" "$TMP/target-dir"
+mkdir -p "$TMP/target-dir"; printf 'PRECIOUS\n' > "$TMP/target-dir/keep.txt"
+ln -s "$TMP/target-dir" "$DWT/sub"
+wt_state_set "$DWT" sub/vendor install LZ IZ doing
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw sub/vendor composer.lock install 'true' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'a dependency under a symlinked directory is refused' 'parent directories is a symlink' "$out"
+eq '...and nothing outside the worktree is deleted' 'PRECIOUS' \
+  "$(cat "$TMP/target-dir/keep.txt" 2>/dev/null)"
+rm -f "$DWT/sub"
+
+# --- unknown strategy -------------------------------------------------------
+rm -rf "$DWT/weird"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw weird composer.lock sideways 'mkdir -p weird' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'an unrecognised strategy is refused rather than silently succeeding' 'unknown strategy' "$out"
+eq '...and nothing is recorded as done for it' 1 \
+  "$(wt_state_is_done "$DWT" weird "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'mkdir -p weird')" sideways; echo $?)"
+
+# --- empty fields -----------------------------------------------------------
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw '' composer.lock install 'true' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'an entry with no directory is skipped with a reason' 'no directory to populate' "$out"
+rm -rf "$DWT/nocmd"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw nocmd composer.lock install '' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'an install strategy with no command says so' 'no install command' "$out"
+eq '...and is recorded as needing another look, not as done' 1 \
+  "$(wt_state_is_done "$DWT" nocmd "$(wt_cksum_file "$DWT/composer.lock")" '' install; echo $?)"
+
+# --- wt_budget_left ---------------------------------------------------------
+eq 'a past deadline leaves no budget' 0 "$(wt_budget_left $(( $(date +%s) - 10 )))"
+eq 'an empty deadline falls back to the default rather than 0' "$WT_DEFAULT_TIMEOUT" \
+  "$(wt_budget_left '')"
+eq 'a non-numeric deadline falls back to the default too' "$WT_DEFAULT_TIMEOUT" \
+  "$(wt_budget_left abc)"
+left_now=$(wt_budget_left $(( $(date +%s) + 50 )))
+eq 'a future deadline reports roughly the time remaining' yes \
+  "$([ "$left_now" -ge 48 ] && [ "$left_now" -le 50 ] && echo yes)"
+
+# --- wt_state_status guard branches -----------------------------------------
+# These sit in front of the `rm -rf`: a foreign-format file read as `doing` would delete a tree.
+printf 'wtstate%s99%sdep%svendor%sinstall%sL%sI%sdoing%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$DWT")"
+eq 'a foreign-version state file reports no status, so nothing is deleted' '' \
+  "$(wt_state_status "$DWT" vendor)"
+printf 'dep%svendor%sinstall%sL%sI%sdoing%s' \
+  "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$DWT")"
+eq 'a headerless state file reports no status either' '' "$(wt_state_status "$DWT" vendor)"
+rm -f "$(wt_state_path "$DWT")"
+eq 'a missing state file reports no status' '' "$(wt_state_status "$DWT" vendor)"
+# ...and end to end: such a file must not trigger the interrupted-run cleanup.
+rm -rf "$DWT/vendor"; mkdir -p "$DWT/vendor"; printf 'KEEPME\n' > "$DWT/vendor/keep.txt"
+printf 'wtstate%s99%sdep%svendor%sinstall%sL%sI%sdoing%s' \
+  "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" > "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'true' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+case $out in
+  *'previous run was interrupted'*) fail=$((fail+1)); printf 'FAIL deleted a tree on an unreadable state file\n' >&2 ;;
+  *) pass=$((pass+1)) ;;
+esac
+eq 'a tree is not deleted on the strength of an unreadable state file' 'KEEPME' \
+  "$(cat "$DWT/vendor/keep.txt" 2>/dev/null)"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

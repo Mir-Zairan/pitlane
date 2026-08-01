@@ -22,6 +22,10 @@
 [ -n "${WT_BOOTSTRAP_LIB_SOURCED:-}" ] && return 0
 WT_BOOTSTRAP_LIB_SOURCED=1
 
+# Literal newline and carriage return, for pattern tests that cannot spell them inline.
+WT_NL=$'\n'
+WT_CR=$'\r'
+
 # Source the primitive layer rather than assuming the entrypoint did it first. Everything here
 # uses wt_log, wt_is_seconds and WT_DEFAULT_TIMEOUT, and under `set -u` a wrong source order is a
 # crash, not a missing function. lib.sh's own WT_LIB_SOURCED guard makes this idempotent, and
@@ -448,6 +452,10 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
   local root=${1%/} slug common
   slug=$(wt_slugify "${2-}") || slug=dep
   [ -n "$slug" ] || slug=dep
+  if [ "${WT_LOCKDIR_FOR:-}" = "$root" ] && [ -n "${WT_LOCKDIR_IS:-}" ]; then
+    printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
+    return 0
+  fi
   common=$(wt_git "$root" rev-parse --git-common-dir 2>/dev/null) || common=''
   if [ -n "$common" ]; then
     case $common in
@@ -455,11 +463,15 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
       *) common=$root/$common ;;
     esac
     if [ -d "$common" ]; then
-      printf '%s/worktree-locks/%s.lock' "${common%/}" "$slug"
+      WT_LOCKDIR_FOR=$root
+      WT_LOCKDIR_IS="${common%/}/worktree-locks"
+      printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
       return 0
     fi
   fi
-  printf '%s/.claude/worktree-locks/%s.lock' "$root" "$slug"
+  WT_LOCKDIR_FOR=$root
+  WT_LOCKDIR_IS="$root/.claude/worktree-locks"
+  printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
 }
 
 # Acquire the lock at $1 on file descriptor $3, waiting at most $2 seconds.
@@ -554,8 +566,14 @@ wt_lock_release() {  # $1 = fd number
 # avoid — so every worktree on the machine would pay a full reinstall on the day of an upgrade.
 WT_STATE_VERSION=1
 
+# Memoised: this is called up to four times per dependency, and each miss spawns a `git
+# rev-parse`. The answer cannot change during one hook run.
 wt_state_path() {  # $1 = worktree
   local wt=${1%/} gitdir
+  if [ "${WT_STATE_PATH_FOR:-}" = "$wt" ] && [ -n "${WT_STATE_PATH_IS:-}" ]; then
+    printf '%s' "$WT_STATE_PATH_IS"
+    return 0
+  fi
   gitdir=$(wt_git "$wt" rev-parse --git-dir 2>/dev/null) || gitdir=''
   if [ -n "$gitdir" ]; then
     case $gitdir in
@@ -563,11 +581,15 @@ wt_state_path() {  # $1 = worktree
       *) gitdir=$wt/$gitdir ;;
     esac
     if [ -d "$gitdir" ]; then
-      printf '%s/worktree-bootstrap-state' "${gitdir%/}"
+      WT_STATE_PATH_FOR=$wt
+      WT_STATE_PATH_IS="${gitdir%/}/worktree-bootstrap-state"
+      printf '%s' "$WT_STATE_PATH_IS"
       return 0
     fi
   fi
-  printf '%s/.claude/worktree-bootstrap-state' "$wt"
+  WT_STATE_PATH_FOR=$wt
+  WT_STATE_PATH_IS="$wt/.claude/worktree-bootstrap-state"
+  printf '%s' "$WT_STATE_PATH_IS"
 }
 
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
@@ -677,4 +699,385 @@ wt_cksum_file() {  # $1 = path
   [ -f "${1-}" ] && [ -r "$1" ] || { printf ''; return 0; }
   out=$(cksum <"$1" 2>/dev/null) || { printf ''; return 1; }
   printf '%s' "$out"
+}
+
+# Read back the recorded status for one dependency: `done`, `doing`, `dirty`, or empty when there
+# is no usable record. Needed as well as wt_state_is_done because "we were interrupted" and "we
+# have never run" call for different handling — only the first justifies deleting anything.
+wt_state_status() {  # $1 = worktree, $2 = dir
+  local wt=${1%/} dir=${2-} file rec kind rest ver rdir rstatus seen=0
+  file=$(wt_state_path "$wt")
+  [ -r "$file" ] || { printf ''; return 0; }
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    case $kind in
+      wtstate)
+        ver=${rest%%"$WT_US"*}
+        [ "$ver" = "$WT_STATE_VERSION" ] || { printf ''; return 0; }
+        seen=1
+        ;;
+      dep)
+        [ "$seen" = 1 ] || { printf ''; return 0; }
+        rdir=${rest%%"$WT_US"*}
+        [ "$rdir" = "$dir" ] || continue
+        rstatus=${rest##*"$WT_US"}
+        printf '%s' "$rstatus"
+        return 0
+        ;;
+    esac
+  done <"$file"
+  printf ''
+  return 0
+}
+
+# True if $1 contains a character that lets it stop being a value and start being syntax.
+#
+# Tested one character at a time rather than with a single bracket glob: a bracket expression
+# containing `[` and `]` is a well-known way to write a pattern that silently matches nothing,
+# which is exactly what a security check must not do. (It did, in the first version of this: the
+# malformed glob never fired and an injected command ran.)
+#
+# A SPACE IS DELIBERATELY ALLOWED. It can split a word, which is the profile author's problem and
+# is visible, but it cannot begin a second command — and {worktree}/{root} are absolute paths that
+# may legitimately contain one.
+wt_value_has_shell_syntax() {  # $1 = value
+  local v=${1-} c
+  case $v in
+    *"$WT_NL"* | *"$WT_CR"*) return 0 ;;
+  esac
+  # SC1003: '\' is a literal backslash, which is one of the characters being looked for.
+  # shellcheck disable=SC1003
+  for c in ';' '&' '|' '<' '>' '(' ')' '`' '$' '\' '"' "'" '*' '?' '[' ']' '{' '}' '!'; do
+    case $v in
+      *"$c"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Name the first placeholder in $1 whose value is unsafe to put in command position, or nothing.
+#
+# THIS DISCHARGES THE OBLIGATION lib.sh's wt_expand states and assigns to this phase:
+# "SUBSTITUTION IS NOT QUOTING ... a caller placing an unconstrained placeholder in command
+# position must quote it itself." An install command is exactly that position. {slug} and {port}
+# are safe by construction ([a-z0-9_] and digits); {name}, {worktree} and {root} are raw text, and
+# {name} in particular comes from a DIFFERENT AND LESS TRUSTED PARTY than the profile does — the
+# profile is committed and reviewed, while a worktree name can be chosen by whoever opens a PR or
+# by a mid-session EnterWorktree call. A profile line as ordinary as `pnpm install --filter {name}`
+# plus a branch called `q; rm -rf ~` would otherwise run the second command at session start.
+#
+# Refusing is chosen over auto-quoting because quoting cannot be done safely without knowing the
+# author's own quoting: wrapping the value in single quotes breaks `"{worktree}/bin/console"`,
+# where the inserted quotes would become literal characters. Refusing costs one dependency and
+# says exactly why; guessing costs correctness silently.
+wt_unsafe_command_placeholder() {  # $1 = the UNEXPANDED template
+  local tpl=${1-} tok val
+  for tok in name worktree root; do
+    case $tpl in
+      *"{$tok}"*) ;;
+      *) continue ;;
+    esac
+    case $tok in
+      name)     val=${WT_NAME-} ;;
+      worktree) val=${WT_PATH-} ;;
+      root)     val=${WT_ROOT-} ;;
+    esac
+    if wt_value_has_shell_syntax "$val"; then
+      printf '%s' "$tok"
+      return 0
+    fi
+  done
+  printf ''
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+#
+# One entry in deps[] at a time: decide, do, verify, record — the whole of it inside that
+# dependency's lock, because the decision and the action must not be separated by another
+# worktree's install.
+#
+# EVERY FAILURE WARNS AND CONTINUES. A worktree missing its vendor/ is a five-second fix; a
+# session that will not start is lost work (ADR-003). Nothing below returns non-zero to the
+# entrypoint, and no step's failure prevents the next dependency being attempted.
+
+# Seconds left of the bootstrap budget, floor 0.
+wt_budget_left() {  # $1 = deadline, epoch seconds
+  local now
+  now=$(date +%s 2>/dev/null) || { printf '%s' "$WT_DEFAULT_TIMEOUT"; return 0; }
+  case ${1-} in '' | *[!0-9]*) printf '%s' "$WT_DEFAULT_TIMEOUT"; return 0 ;; esac
+  if [ "$1" -le "$now" ]; then printf '0'; else printf '%s' $(($1 - now)); fi
+}
+
+# Populate one dependency directory by copying the main checkout's with hardlinks.
+#
+# Returns 0 on success, 1 to say "fall back to a real install". A hardlink copy of a 397 MB
+# vendor/ is near-instant and costs almost no disk (ADR-004), but it is only VALID when the two
+# checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
+# it is not always possible: a worktree on another filesystem cannot hardlink at all.
+#   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done.
+wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
+  # No initialisers built from $1/$3 here: with fewer arguments than expected that is a fatal
+  # unbound-variable error under `set -u`, which is precisely the crash this layer must not cause.
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} src dest
+
+  src=$root/$dir
+  dest=$worktree/$dir
+
+  if [ ! -d "$src" ]; then
+    wt_log "  $dir: the main checkout has no $dir to link from — installing instead"
+    return 1
+  fi
+  # An empty source would "succeed" and leave an empty dependency directory that then looks
+  # installed to everything downstream.
+  if [ -z "$(ls -A "$src" 2>/dev/null)" ]; then
+    wt_log "  $dir: the main checkout's $dir is empty — installing instead"
+    return 1
+  fi
+  # THE VALIDITY TEST. Hardlinking a tree built for a different lockfile gives a worktree
+  # dependencies its own branch never asked for, which is worse than a slow install because it
+  # looks like it worked. `cmp -s` rather than two checksums: it is exact and stops at the first
+  # differing byte.
+  if [ -z "$lock" ] || [ ! -f "$root/$lock" ] || [ ! -f "$worktree/$lock" ]; then
+    wt_log "  $dir: cannot compare $lock between the checkouts — installing instead"
+    return 1
+  fi
+  if ! cmp -s "$root/$lock" "$worktree/$lock"; then
+    wt_log "  $dir: $lock differs from the main checkout — installing instead"
+    return 1
+  fi
+  if [ -e "$dest" ]; then
+    # A distinct code, not success: the caller must not report a link it did not make.
+    wt_log "  $dir: already present in the worktree — leaving it alone"
+    return 2
+  fi
+
+  # `cp -al` fails on a cross-filesystem copy and on filesystems without hardlinks. Both are
+  # ordinary situations, not errors: fall back rather than dying (ADR-003). Any partial tree is
+  # removed first, or the install that follows would run on top of debris.
+  if cp -al "$src" "$dest" 2>/dev/null; then
+    return 0
+  fi
+  rm -rf "$dest" 2>/dev/null
+  wt_log "  $dir: could not hardlink (a different filesystem, or one without hardlinks) — installing instead"
+  return 1
+}
+
+# Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
+wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
+  local root=${1%/} worktree=${2%/} deadline=${3-}
+  local rec body dir lock strategy install verify _cksum n=-1
+  local lckhash ickhash status left rc lockpath held effective started elapsed bad
+
+  [ -n "${PROFILE_RAW:-}" ] || return 0
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    n=$((n + 1))
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+
+    # Public entry point, so the shapes are re-checked rather than assumed validated. A `dir` of
+    # ../../.. reaches `rm -rf` and `cp -al` further down.
+    if [ -n "$dir" ] && ! wt_is_safe_relpath "$dir"; then
+      wt_log "deps[$n]: refusing \"$dir\" — not a relative path inside the repository"
+      continue
+    fi
+    if [ -n "$lock" ] && ! wt_is_safe_relpath "$lock"; then
+      wt_log "deps[$n]: refusing lock \"$lock\" — not a relative path inside the repository"
+      continue
+    fi
+    # The shape check is not enough on THIS path, because what follows is `rm -rf` and `cp -al`.
+    # Both follow symlinked ancestors, so a profile naming `sub/vendor` plus a committed
+    # `sub -> /home/alice/.ssh` would delete and write outside the worktree entirely. Same guard
+    # the copier and the locking already apply; this is the one path that DELETES trees.
+    if [ -n "$dir" ] && { wt_has_symlinked_parent "$worktree" "$dir" || wt_has_symlinked_parent "$root" "$dir"; }; then
+      wt_log "deps[$n]: refusing \"$dir\" — one of its parent directories is a symlink"
+      continue
+    fi
+
+    case $strategy in
+      skip)
+        wt_log "  ${dir:-deps[$n]}: strategy is skip — not touched"
+        continue
+        ;;
+      store)
+        # A valid schema value that no phase has built (Phase 7). Treated as install, which is
+        # always correct if slower, and said out loud so nobody assumes a store exists.
+        wt_log "  ${dir:-deps[$n]}: strategy \"store\" is not implemented yet — installing instead"
+        strategy=install
+        ;;
+      install | hardlink) ;;
+      *)
+        # Reachable only with WT_SKIP_VALIDATION, but this function re-checks rather than assumes.
+        # Falling through would reach the else branch below and record the dependency `done`
+        # having done nothing at all.
+        wt_log "  ${dir:-deps[$n]}: unknown strategy \"$strategy\" — skipping it"
+        continue
+        ;;
+    esac
+    if [ -z "$dir" ]; then
+      wt_log "deps[$n]: no directory to populate — skipping"
+      continue
+    fi
+
+    # A command that interpolates an unconstrained placeholder is refused when that placeholder's
+    # value would be shell syntax rather than a value. See wt_unsafe_command_placeholder.
+    bad=$(wt_unsafe_command_placeholder "$install")
+    [ -n "$bad" ] || bad=$(wt_unsafe_command_placeholder "$verify")
+    if [ -n "$bad" ]; then
+      wt_log "  ${dir:-deps[$n]}: refusing to run its commands — they interpolate {$bad}, whose value contains shell metacharacters"
+      continue
+    fi
+
+    # Placeholders expand HERE, not at read time, so the checksum recorded in the state file is
+    # of the command that actually ran.
+    install=$(wt_expand "$install")
+    verify=$(wt_expand "$verify")
+
+    lckhash=$(wt_cksum_file "$worktree/$lock")
+    ickhash=$(wt_cksum_string "$install")
+
+    if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      wt_log "  $dir: already up to date"
+      continue
+    fi
+
+    left=$(wt_budget_left "$deadline")
+    if [ "$left" -le 0 ]; then
+      wt_log "  $dir: out of time before starting — leaving it for the next session"
+      continue
+    fi
+
+    # ONE lock around decide-and-do. Splitting them would let another worktree's install land
+    # between "the lockfiles match" and the `cp -al` that relies on it.
+    lockpath=$(wt_lock_path "$root" "$dir")
+    held=0
+    wt_lock_acquire "$lockpath" "$WT_LOCK_WAIT" 9
+    case $? in
+      0) held=1 ;;
+      1) wt_log "  $dir: another worktree is working on it — continuing without the lock" ;;
+    esac
+
+    # RE-CHECK UNDER THE LOCK. Two sessions entering the same worktree both decide "not done"
+    # outside it; without this the second waits out the lock and then repeats an install the
+    # first just finished. Checking the marker outside the lock and acting on it inside is the
+    # source conversation's bug 1 in a different costume.
+    if [ "$held" -eq 1 ] && wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      wt_log "  $dir: another session finished it while we waited"
+      wt_lock_release 9
+      continue
+    fi
+
+    # Only a dependency we KNOW was interrupted is cleared. A directory with no record at all may
+    # be a perfectly good tree from before this plugin, or from a state-format change, and
+    # deleting it would turn an upgrade into a mass reinstall.
+    #
+    # ONLY WHEN THE LOCK IS HELD. Without the lock, another worktree may be mid-install into this
+    # very directory — deleting under it destroys its work and leaves both sessions believing
+    # they succeeded.
+    status=$(wt_state_status "$worktree" "$dir")
+    if [ "$status" = doing ] && [ -e "$worktree/$dir" ]; then
+      if [ "$held" -eq 1 ]; then
+        wt_log "  $dir: a previous run was interrupted — clearing the partial directory"
+        rm -rf "${worktree:?}/${dir:?}" 2>/dev/null || wt_log "  $dir: could not clear the partial directory"
+      else
+        wt_log "  $dir: a previous run was interrupted, but another process holds the lock — leaving the directory alone"
+      fi
+    fi
+
+    # The budget may have gone while waiting for the lock and clearing the tree. Without this
+    # re-test a spent budget reaches wt_run_in_shell as 0, which wt_is_seconds rejects, and the
+    # DEFAULT of ten minutes is substituted — turning a spent budget into the longest wait of all.
+    left=$(wt_budget_left "$deadline")
+    if [ "$left" -le 0 ]; then
+      wt_log "  $dir: the budget ran out while waiting — leaving it for the next session"
+      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+
+    wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" doing || true
+
+    # `effective` is what actually HAPPENED, used only for the log line. The state records the
+    # profile's `strategy`, because that is what the next run compares against: a hardlink that
+    # fell back to install must still match `hardlink` next time, or every such dependency
+    # reinstalls in full on every single session — silently, and exactly in the common case of a
+    # branch that touched its lockfile.
+    effective=$strategy
+    if [ "$strategy" = hardlink ]; then
+      wt_hardlink_dep "$root" "$worktree" "$dir" "$lock"
+      case $? in
+        0) effective=hardlink ;;
+        2) effective=present ;;
+        *) effective=install ;;
+      esac
+    fi
+
+    rc=0
+    if [ "$effective" = install ]; then
+      if [ -z "$install" ]; then
+        wt_log "  $dir: no install command to run — leaving it empty"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      # Recomputed and re-tested IMMEDIATELY before the run. An earlier check is not enough:
+      # the lock wait and clearing a partial tree both take time, and a `left` of 0 reaching
+      # wt_run_in_shell is rejected by wt_is_seconds and replaced with the ten-minute DEFAULT —
+      # turning an exhausted budget into the longest wait of the whole session.
+      left=$(wt_budget_left "$deadline")
+      if [ "$left" -le 0 ]; then
+        wt_log "  $dir: the budget ran out before the install could start — leaving it for the next session"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      wt_log "  $dir: installing (${left}s of the budget left)"
+      case ${PROFILE_SHELL:-} in
+        nix*) wt_log "  $dir: evaluating the nix environment first, which can take a minute on a cold worktree" ;;
+      esac
+      started=$(date +%s 2>/dev/null) || started=''
+      wt_run_in_shell "$install" "$worktree" "$left"
+      rc=$?
+      elapsed=''
+      [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
+      case $rc in
+        0) wt_log "  $dir: installed${elapsed:+ in ${elapsed}s}" ;;
+        124) wt_log "  $dir: the install ran past the ${left}s left in the budget and was stopped — the worktree may be incomplete" ;;
+        *) wt_log "  $dir: the install command failed (exit $rc) — the worktree may be incomplete" ;;
+      esac
+    elif [ "$effective" = hardlink ]; then
+      wt_log "  $dir: hardlinked from the main checkout"
+    fi
+
+    # The optional cheap sanity check. It decides `done` versus `dirty`, and `dirty` is what makes
+    # the next entry try again rather than trust this one.
+    if [ "$rc" -eq 0 ] && [ -n "$verify" ]; then
+      left=$(wt_budget_left "$deadline")
+      if [ "$left" -le 0 ]; then
+        wt_log "  $dir: no budget left to verify — recording it as needing another look"
+        rc=1
+      else
+        wt_run_in_shell "$verify" "$worktree" "$left"
+        rc=$?
+        [ "$rc" -eq 0 ] || wt_log "  $dir: the verify command failed (exit $rc) — it will be retried next session"
+      fi
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "done" || true
+    else
+      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+    fi
+
+    [ "$held" -eq 1 ] && wt_lock_release 9
+  done < <(printf '%s' "$PROFILE_RAW")
+  return 0
 }
