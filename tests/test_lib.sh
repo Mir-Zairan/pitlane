@@ -358,6 +358,7 @@ worktree: two' "$err"
   rc_is 'load_profile returns 0 with no profile' 0 $?
   eq 'no profile -> not present'      '0'   "$PROFILE_PRESENT"
   eq 'no profile -> empty shell'      ''    "$PROFILE_SHELL"
+  eq 'no profile -> empty shellArgs'  ''    "$PROFILE_SHELLARGS"
   eq 'no profile -> no runtime'       '0'   "$PROFILE_HAS_RUNTIME"
   eq 'no profile -> default timeout'  '600' "$PROFILE_BOOTSTRAP_TIMEOUT"
   eq 'no profile -> path still reported' "$target" "$PROFILE_PATH"
@@ -382,6 +383,27 @@ worktree: two' "$err"
   eq 'minimal profile -> present'         '1'   "$PROFILE_PRESENT"
   eq 'minimal profile -> no runtime'      '0'   "$PROFILE_HAS_RUNTIME"
   eq 'minimal profile -> default timeout' '600' "$PROFILE_BOOTSTRAP_TIMEOUT"
+
+  # shellArgs, end to end: profile JSON -> PROFILE_SHELLARGS -> the engine's argv construction.
+  # It is read POSITIONALLY out of the fifteen-field scalar record, so a path added to
+  # wt_profile_scan in the wrong place would hand this variable the value of a different field —
+  # and nothing else in the suite would notice. Empty is a THIRD distinct state, not a synonym for
+  # "argv": only an absent field may fall back to matching the shell string.
+  printf '%s' '{"schemaVersion":1,"shell":"nix-shell --run","shellArgs":"string"}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'shellArgs "string" is loaded as given'  'string' "$PROFILE_SHELLARGS"
+  eq '...alongside the shell it belongs to'   'nix-shell --run' "$PROFILE_SHELL"
+  printf '%s' '{"schemaVersion":1,"shell":"nix develop --command","shellArgs":"argv"}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'shellArgs "argv" is loaded as given'    'argv' "$PROFILE_SHELLARGS"
+  printf '%s' '{"schemaVersion":1,"shell":"nix develop --command"}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'an omitted shellArgs stays empty, not defaulted' '' "$PROFILE_SHELLARGS"
+  # An invalid profile is not used at all, so the field must not survive from the previous load.
+  printf '%s' '{"schemaVersion":1,"shellArgs":"sideways"}' >"$target"
+  wt_load_profile "$pdir" 2>/dev/null
+  eq 'an invalid profile leaves shellArgs empty, not half-loaded' '' "$PROFILE_SHELLARGS"
+  eq '...and is not present' '0' "$PROFILE_PRESENT"
 
   # ADR-006: absent runtime means touch nothing. An explicit false or {} says the same.
   cp "$TMP/profile-runtime-false.json" "$target"

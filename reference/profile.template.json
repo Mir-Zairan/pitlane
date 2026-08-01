@@ -37,10 +37,9 @@
   "shell": "nix develop --command",
 
   "_comment_shellArgs": [
-    "NOT YET HONOURED — owner: Phase 3. Phase 3's run_in_shell() currently derives the calling",
-    "convention by matching the `shell` string against a known list, so a profile setting this today is",
-    "ignored. Phase 3 must either read it or drop it from this schema; an inert documented field is",
-    "worse than no field.",
+    "HONOURED, by wt_build_shell_argv() in hooks/scripts/bootstrap-lib.sh. Set it and the plugin uses",
+    "it; omit it and the plugin falls back to matching the `shell` string, which is why the field",
+    "exists — see the last paragraph.",
     "",
     "How the wrapper in `shell` takes the command it wraps:",
     "  \"argv\"   — the command follows as separate arguments: `nix develop --command composer install`",
@@ -52,8 +51,12 @@
     "It is recorded rather than re-derived because string-matching only works for wrappers already on",
     "the list. A hand-written `shell` — `docker compose run --rm app`, an `sh -c` wrapper, a repo's own",
     "`./dev` script — has no entry to match, so a consumer that infers has to guess exactly where",
-    "guessing is ungraceful. Optional; defaults to \"argv\", correct for everything except",
-    "`nix-shell --run` and `sh -c`-shaped wrappers."
+    "guessing is ungraceful.",
+    "",
+    "OPTIONAL. When it is absent the plugin matches the `shell` string instead: a wrapper ending in",
+    "`--run` or `-c` is treated as \"string\", everything else as \"argv\". That fallback is right for",
+    "every wrapper in reference/detection.json, and wrong exactly where this field is needed — so",
+    "calibration always writes it, and a hand-written profile with an unusual wrapper should too."
   ],
   "shellArgs": "argv",
 

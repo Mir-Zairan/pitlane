@@ -1185,6 +1185,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #   PROFILE_PRESENT         1 if a usable profile was loaded, else 0
 #   PROFILE_SCHEMA_VERSION  as read, or empty
 #   PROFILE_SHELL           toolchain wrapper, e.g. "nix develop --command"; "" = host shell
+#   PROFILE_SHELLARGS       how that wrapper takes its command: "argv" | "string" | "" if unset
 #   PROFILE_HAS_RUNTIME     1 if a runtime block exists (ADR-006: absent means touch nothing)
 #   PROFILE_BOOTSTRAP_TIMEOUT / PROFILE_SEED_TIMEOUT   seconds, validated
 #
@@ -1202,6 +1203,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_PRESENT=0
   PROFILE_SCHEMA_VERSION=''
   PROFILE_SHELL=''
+  PROFILE_SHELLARGS=''
   PROFILE_HAS_RUNTIME=0
   PROFILE_BOOTSTRAP_TIMEOUT=$WT_DEFAULT_TIMEOUT
   PROFILE_SEED_TIMEOUT=$WT_DEFAULT_TIMEOUT
@@ -1276,6 +1278,10 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
 
   PROFILE_PRESENT=1
   PROFILE_SHELL=$shell
+  # Left EMPTY when the profile omits it, rather than defaulted here. The consumer needs to tell
+  # "the profile said argv" from "the profile said nothing", because only the second may fall
+  # back to matching the shell string against a table of known wrappers.
+  PROFILE_SHELLARGS=$shellargs
 
   # An explicit `false` or an empty block means the same as absent: touch nothing (ADR-006).
   case $runtime in
