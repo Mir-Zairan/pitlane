@@ -833,10 +833,22 @@ wt_runtime_state_set() {  # $1 = worktree, $2 = slug, $3 = port, $4 = portsource
 # They were both 1 in the first draft, which made `v=$(... seedstatuss) || v=none` turn a typo into
 # a silent default — the caller cannot tell "not set up yet" from "you asked for nothing".
 wt_runtime_state_get() {  # $1 = worktree, $2 = field name
-  local wt=${1%/} want=${2-} file rec kind rest seen=0
+  local file
+  file=$(wt_state_path "${1%/}")
+  wt_runtime_state_read "$file" "${2-}"
+}
+
+# The same read, given the state FILE rather than the worktree that owns it.
+#
+# Sibling enumeration needs this: resolving a path with wt_state_path costs a `git rev-parse` fork,
+# and doing that per sibling would undo the reason the admin directories are read directly at all.
+# It also makes the liveness check in wt_runtime_siblings load-bearing rather than incidental —
+# reading through the worktree path happens to fail for a deleted checkout, which is not the same
+# as refusing it.
+wt_runtime_state_read() {  # $1 = state file, $2 = field name
+  local file=${1-} want=${2-} rec kind rest seen=0
   local rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen
 
-  file=$(wt_state_path "$wt")
   [ -r "$file" ] || return 1
 
   while IFS= read -r -d "$WT_RS" rec; do
@@ -1466,6 +1478,242 @@ wt_rule_is_recorded() {  # $1 = the rule's markers as compact JSON, $2 = the rul
     [ "$rdir" = "$dir" ] && return 0
   done < <(printf '%s' "$PROFILE_RAW")
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Layer 3 — port allocation
+# ---------------------------------------------------------------------------
+#
+# TWO DIFFERENT QUESTIONS, kept apart because the right answer to each is opposite:
+#
+#   "is this port claimed by another WORKTREE?"  -> probe forward past it. We allocated that one,
+#                                                   we know it is spoken for, and stepping aside is
+#                                                   strictly better than colliding.
+#   "is something ELSE listening on it?"         -> warn and keep the derived value. Guessing around
+#                                                   a foreign process causes more confusion than it
+#                                                   prevents: the process may exit a second later,
+#                                                   and moving means a developer's bookmarked URL
+#                                                   changes for a reason they cannot see.
+#
+# PORTS FAIL OPEN. If none of this can be worked out, the derived port is used and a warning is
+# printed — a port collision costs one bind error, which is loud, immediate and destroys nothing.
+# The SEED does the opposite and fails closed, because a wrong database name destroys work. That
+# asymmetry is the whole reason these are separate decisions rather than one "is it safe" flag.
+
+# Collect every LIVE sibling worktree of $1 that has a runtime allocation. Sets WT_SIBLINGS to the
+# records (`slug US port`, RS-terminated) and WT_SIBLINGS_OK to 1 when the enumeration can be
+# trusted, 0 when it cannot.
+#
+# IT SETS BOTH RATHER THAN PRINTING THE RECORDS. A function that prints is called in a command
+# substitution, and a flag assigned inside that subshell is discarded the moment it returns — so a
+# caller could have the records or the trust signal but never both. That matters more here than
+# anywhere else in this file: the flag is what the SEED reads to decide whether it may run at all,
+# and a seed that silently read a stale 1 would clone a database against an enumeration it could
+# not see. (wt_runtime_claim_port has the same two-results shape for the same reason.)
+#
+# It reads the shared git directory's own `worktrees/` administration rather than calling
+# `git worktree list` per sibling: everything needed is already on disk, so the whole scan costs
+# ONE `git rev-parse` for the common directory and no forks at all per sibling.
+#
+# LIVENESS NEEDS BOTH HALVES. `git worktree remove` deletes the admin directory, but a developer
+# who runs `rm -rf` on the checkout instead leaves it behind — measured — and that stale entry
+# still holds the old allocation. Treating it as live would make the name permanently unreusable:
+# the next worktree of that name would step around a port nothing is using, forever.
+#
+# ANY SIBLING IT CANNOT READ DROPS THE FLAG TO 0. A partially blind scan that reported itself
+# trustworthy is worse than one that admits it, because the seed's whole fail-closed rule rests on
+# this number.
+wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
+  local root=${1%/} mine=${2%/} common admin gitdirf wtpath slug port
+
+  # SC2034: these two ARE the function's results — see the header for why they are set
+  # rather than printed.
+  # shellcheck disable=SC2034
+  WT_SIBLINGS=''
+  # shellcheck disable=SC2034
+  WT_SIBLINGS_OK=0
+  common=$(wt_git "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
+  [ -n "$common" ] || return 0
+  case $common in
+    /*) ;;
+    *) common=$root/$common ;;
+  esac
+  # No linked worktrees yet is a trustworthy answer of "none", not a failure to look.
+  # shellcheck disable=SC2034
+  [ -d "$common/worktrees" ] || { WT_SIBLINGS_OK=1; return 0; }
+
+  # shellcheck disable=SC2034
+  WT_SIBLINGS_OK=1
+  for admin in "$common"/worktrees/*/; do
+    admin=${admin%/}
+    [ -d "$admin" ] || continue                      # an unmatched glob
+    gitdirf=$admin/gitdir
+    if [ ! -r "$gitdirf" ]; then
+      # shellcheck disable=SC2034
+      WT_SIBLINGS_OK=0                               # an entry we cannot classify at all
+      continue
+    fi
+    # shellcheck disable=SC2034
+    IFS= read -r wtpath <"$gitdirf" || { WT_SIBLINGS_OK=0; continue; }
+    wtpath=${wtpath%/.git}
+    # `git worktree add --relative-paths` (and worktree.useRelativePaths, git 2.48+) writes this
+    # pointer RELATIVE TO THE ADMIN DIRECTORY. Resolving it against the hook's working directory
+    # instead would make every sibling look like a deleted orphan — collision avoidance would stop
+    # working silently, while the flag still claimed the scan was trustworthy.
+    case $wtpath in
+      /*) ;;
+      *) wtpath=$admin/$wtpath ;;
+    esac
+    [ "$wtpath" = "$mine" ] && continue              # ourselves
+    # The orphan check: the admin directory outlives an `rm -rf` of the checkout.
+    [ -n "$wtpath" ] && [ -d "$wtpath" ] || continue
+    [ -r "$admin/worktree-bootstrap-state" ] || continue
+    slug=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" slug) || continue
+    port=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" port) || continue
+    [ -n "$port" ] || continue
+    WT_SIBLINGS="$WT_SIBLINGS$slug$WT_US$port$WT_RS"
+  done
+  return 0
+}
+
+# True if something is already listening on 127.0.0.1:$1.
+#
+# ADVISORY ONLY — its answer never changes which port is allocated, it only decides whether to say
+# something. bash's own /dev/tcp is used rather than `ss`, `lsof` or `nc`, because it is a shell
+# feature rather than a binary that may not be installed; when it is unavailable the answer is
+# "do not know" and nothing is printed, since a warning is all this could ever produce.
+#
+# The host is the LITERAL 127.0.0.1 and the port has already been through wt_is_posint, so nothing
+# from a profile reaches the /dev/tcp path as anything but digits.
+#
+# Bounded by `timeout` where there is one: a connect to a filtered port can hang, and this runs on
+# the path that blocks session start. Without `timeout` the probe is skipped rather than risked.
+wt_port_in_use() {  # $1 = port
+  local port=${1-}
+  wt_is_posint "$port" || return 1
+  command -v timeout >/dev/null 2>&1 || return 1
+  # A subshell so a failed redirection cannot disturb the caller's descriptors.
+  ( timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" ) >/dev/null 2>&1
+}
+
+# Decide this worktree's port AND record the claim. Sets WT_PORT (empty when there is no usable
+# port configuration) and WT_PORT_SOURCE (`derived` or `probed`); returns 0 either way.
+#
+# IT SETS RATHER THAN PRINTS, for the reason wt_runtime_siblings gives: two results cannot both
+# survive a command substitution.
+#
+# THE WRITE IS INSIDE THE LOCK, and that is the entire point of the lock. A first version took the
+# lock, enumerated siblings, chose a port, released, and left the recording to its caller — which
+# serialises nothing at all: two sessions starting together each take the lock in turn, each see a
+# sibling that has not recorded anything yet, and each choose the same port. A lock around a
+# read-only computation is decoration. What has to be atomic is decide-AND-claim, so the next
+# holder's enumeration can see this one.
+#
+# ORDER OF PREFERENCE, and the first rule is what the acceptance criteria rest on:
+#   1. THE PORT ALREADY RECORDED FOR THIS SLUG WINS. That is what makes reopening a worktree land
+#      where it was — a developer bookmarks the URL — and it must beat re-derivation, because a
+#      sibling created in between could otherwise push this worktree off the port it has been using
+#      all week. It is still range-checked: a recorded value outside the port space is no more
+#      usable than a derived one would be.
+#   2. Otherwise derive from the slug, then step forward past ports live siblings have claimed.
+#   3. If every candidate is claimed, keep the derived one and warn.
+wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 = span
+  local root=${1%/} worktree=${2%/} slug=${3-} base=${4-} span=${5-}
+  local recslug recport recsource chosen derived source='derived' lockpath held=0
+  local cand skip sslug sport oenvfile oenvstate oseed ocksum
+
+  # SC2034: the function's two results; wt_runtime_handoff reads them.
+  # shellcheck disable=SC2034
+  WT_PORT=''
+  # shellcheck disable=SC2034
+  WT_PORT_SOURCE=derived
+  wt_is_posint "$base" && wt_is_posint "$span" || return 0
+  derived=$(wt_derive_port "$slug" "$base" "$span") || return 0
+  [ -n "$derived" ] || return 0
+
+  # The recorded port depends on nothing another worktree can change, so it is read before the lock.
+  recslug=$(wt_runtime_state_get "$worktree" slug) || recslug=''
+  recport=$(wt_runtime_state_get "$worktree" port) || recport=''
+  if [ -n "$recport" ] && [ "$recslug" = "$slug" ] && wt_is_posint "$recport" &&
+     [ "$((10#$recport))" -ge "$WT_PORT_MIN" ] && [ "$((10#$recport))" -le "$WT_PORT_MAX" ]; then
+    recsource=$(wt_runtime_state_get "$worktree" portsource) || recsource=derived
+    # shellcheck disable=SC2034
+    WT_PORT=$recport
+    # shellcheck disable=SC2034
+    WT_PORT_SOURCE=${recsource:-derived}
+    return 0
+  fi
+
+  lockpath=$(wt_lock_path "$root" _runtime-ports)
+  wt_lock_acquire "$lockpath" "$WT_LOCK_WAIT" 7
+  case $? in
+    0) held=1 ;;
+    # wt_lock_acquire returns 1 both for contention and for flock being absent, and it has already
+    # said which. Claiming "another worktree is allocating" on a machine with no flock(1) — stock
+    # macOS — would be a confident lie on every single session.
+    1) wt_log "  runtime: allocating a port without the lock" ;;
+  esac
+
+  wt_runtime_siblings "$root" "$worktree"
+  chosen=''
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    skip=0
+    if [ -n "$WT_SIBLINGS" ]; then
+      while IFS=$WT_US read -r -d "$WT_RS" sslug sport; do
+        # A sibling on the SAME slug is not a collision — it is this worktree seen through a stale
+        # record, and stepping around it would move a port that is rightfully ours.
+        [ "$sport" = "$cand" ] && [ "$sslug" != "$slug" ] && { skip=1; break; }
+      done <<EOF
+$WT_SIBLINGS
+EOF
+    fi
+    [ "$skip" = 1 ] && continue
+    chosen=$cand
+    break
+  done <<EOF
+$(wt_port_candidates "$slug" "$base" "$span")
+EOF
+
+  if [ -z "$chosen" ]; then
+    chosen=$derived
+    wt_log "  runtime: every port in ${base}-$((10#$base + 10#$span - 1)) is claimed by another worktree — using $chosen anyway, which may fail to bind"
+  elif [ "$chosen" != "$derived" ]; then
+    source=probed
+    wt_log "  runtime: port $derived is taken by another worktree — using $chosen instead"
+  fi
+
+  # THE CLAIM, written before the lock is released so the next holder can see it. The other rt
+  # fields are carried forward rather than blanked — but ONLY for the same slug: a changed slug is
+  # a different logical allocation whose env file and seed have not happened yet, and inheriting a
+  # `done` seed marker across that boundary would skip seeding the new database entirely.
+  if [ "$recslug" = "$slug" ]; then
+    oenvfile=$(wt_runtime_state_get "$worktree" envfile) || oenvfile=''
+    oenvstate=$(wt_runtime_state_get "$worktree" envstate) || oenvstate=''
+    oseed=$(wt_runtime_state_get "$worktree" seedstatus) || oseed=''
+    ocksum=$(wt_runtime_state_get "$worktree" seedcksum) || ocksum=''
+  else
+    oenvfile=''; oenvstate=''; oseed=''; ocksum=''
+  fi
+  wt_runtime_state_set "$worktree" "$slug" "$chosen" "$source" \
+    "$oenvfile" "$oenvstate" "${oseed:-none}" "$ocksum" || \
+    wt_log "  runtime: could not record the port allocation — it may be re-derived next session"
+
+  [ "$held" -eq 1 ] && wt_lock_release 7
+
+  # Advisory only, and deliberately AFTER both the decision and the lock release: a foreign
+  # listener never moves the port, and the probe can take a second — which is a second no other
+  # worktree should spend waiting on this lock. Running it here also keeps the probe's child from
+  # inheriting the lock descriptor and holding the flock past the release.
+  if wt_port_in_use "$chosen"; then
+    wt_log "  runtime: something is already listening on port $chosen that is not one of this repository's worktrees — leaving the port as it is; the app may fail to bind"
+  fi
+
+  # shellcheck disable=SC2034
+  WT_PORT=$chosen
+  # shellcheck disable=SC2034
+  WT_PORT_SOURCE=$source
+  return 0
 }
 
 # ---------------------------------------------------------------------------
