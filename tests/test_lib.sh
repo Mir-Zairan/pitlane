@@ -757,6 +757,97 @@ worktree: two' "$err"
     "$(printf '%s' "$SCAN" | wt_json_records deps dir lock)" \
     "$(js nope -- deps dir lock | sed "s/^0${US}${RS}//; s/${RS}1${US}/${RS}/g; s/^1${US}//")"
 
+  # --- wt_json_kv -----------------------------------------------------------
+  # The object reader, added for runtime.env.vars — a map whose KEYS the plugin cannot know in
+  # advance (ADR-006), so no dotted path reaches them and no array iterates them. Asserted on
+  # BOTH backends for the same reason the other three are: it shares their value renderer, and
+  # a divergence would mean the reader that VALIDATES a var and the reader that WRITES it to a
+  # file disagree about what it says.
+  KV='{"vars":{"INSTALLATION_NAME":"demo_{slug}","APP_ENV":"dev"},
+       "one":{"A":"1"},"empty":{},"arr":[1,2],"scalar":"s","nested":{"o":{"deep":{"K":"v"}}},
+       "types":{"n":5,"t":true,"f":false,"nul":null,"o":{"x":1},"a":[1],"s":""},
+       "uni":{"café":"über"}}'
+  jk() { printf '%s' "$KV" | wt_json_kv "$@"; }
+
+  # Document order, US between key and value, RS after EVERY pair including the last.
+  eq 'kv: pairs come back in document order, RS-terminated' \
+    "INSTALLATION_NAME${US}demo_{slug}${RS}APP_ENV${US}dev${RS}" "$(jk vars)"
+  eq 'kv: a single-entry object' "A${US}1${RS}" "$(jk one)"
+  eq 'kv: a dotted path reaches a nested object' "K${US}v${RS}" "$(jk nested.o.deep)"
+
+  # Every data outcome is silent and rc 0, so the two backends stay indistinguishable — jq exits
+  # non-zero on a parse error where python exits 0, which is why the wrapper normalises.
+  eq 'kv: an empty object yields nothing' '' "$(jk empty)"
+  eq 'kv: an array is not an object -> nothing' '' "$(jk arr)"
+  eq 'kv: a scalar is not an object -> nothing' '' "$(jk scalar)"
+  eq 'kv: an absent path -> nothing' '' "$(jk nope)"
+  eq 'kv: an unparseable document -> nothing' '' "$(printf 'not json' | wt_json_kv vars)"
+  for bad in empty arr scalar nope; do
+    rc_is "kv: $bad is a data outcome, rc 0" 0 "$(jk $bad >/dev/null; echo $?)"
+  done
+  rc_is 'kv: unparseable document -> rc 0 on both backends' 0 \
+    "$(printf 'not json' | wt_json_kv vars >/dev/null; echo $?)"
+
+  # Value rendering is the shared one, python's True/False trap included.
+  eq 'kv: value rendering matches every other reader' \
+    "n${US}5${RS}t${US}true${RS}f${US}false${RS}nul${US}${RS}o${US}{\"x\":1}${RS}a${US}[1]${RS}s${US}${RS}" \
+    "$(jk types)"
+  eq 'kv: non-ASCII keys and values match wt_json_get byte for byte' \
+    "café${US}über${RS}" "$(jk uni)"
+
+  # SEPARATOR INJECTION THROUGH A KEY, which is the half no other reader has to think about: a
+  # key is about to become the left-hand side of a KEY=value line. JSON encodes these legally
+  # and the profile arrives with anyone's branch, so an unstripped key would forge a pair.
+  eq 'kv: an embedded US, RS, CR or LF in a KEY cannot forge a pair' \
+    "AFORGED${US}1${RS}BFORGED${US}2${RS}C D${US}3${RS}" \
+    "$(printf '%s' '{"v":{"A\u001fFORGED":"1","B\u001eFORGED":"2","C\r\nD":"3"}}' | wt_json_kv v)"
+  eq 'kv: the same bytes in a VALUE are stripped too' "K${US}aFORGED b${RS}" \
+    "$(printf '%s' '{"v":{"K":"a\u001fFORGED\nb"}}' | wt_json_kv v)"
+
+  # Caller errors stay distinguishable from data outcomes.
+  rc_is 'kv: no arguments is a caller error' 1 "$(wt_json_kv >/dev/null 2>&1; echo $?)"
+  rc_is 'kv: two arguments is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_kv a b >/dev/null 2>&1; echo $?)"
+  rc_is 'kv: an empty path is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_kv '' >/dev/null 2>&1; echo $?)"
+  rc_is 'kv: no JSON backend is a caller error, not an empty object' 1 \
+    "$(printf '%s' '{"v":{"A":"1"}}' | bash -c ". '$LIB'
+         wt_has_json() { return 1; }
+         wt_json_kv v >/dev/null 2>&1; echo \$?")"
+
+  # An option-like path must stay DATA, as it must for every other reader.
+  eq 'kv: an option-like path is data, not an option' "A${US}1${RS}" \
+    "$(printf '%s' '{"-i":{"A":"1"}}' | wt_json_kv -i)"
+  # Trailing junk and concatenated documents fail here exactly as they do elsewhere.
+  eq 'kv: a document with trailing junk yields nothing' '' \
+    "$(printf '%s' '{"v":{"A":"1"}} junk' | wt_json_kv v)"
+  eq 'kv: two concatenated documents yield nothing' '' \
+    "$(printf '%s' '{"v":{"A":"1"}}{"v":{"A":"2"}}' | wt_json_kv v)"
+  eq 'kv: a UTF-8 BOM is tolerated, as it is by the other readers' "A${US}1${RS}" \
+    "$(printf '\357\273\277%s' '{"v":{"A":"1"}}' | wt_json_kv v)"
+
+  # A KEY THAT RENDERS EMPTY. Every case above is about framing — this one is about MEANING: an
+  # empty left-hand side is the difference between a pair and a malformed line, and a key made
+  # only of separators desep's away to nothing. Both must still come back as ONE well-framed
+  # record rather than being dropped or merged into a neighbour, because dropping it silently
+  # would hide the very entry a consumer has to refuse.
+  eq 'kv: a literal empty key survives as one empty-keyed record' "${US}1${RS}" \
+    "$(printf '%s' '{"v":{"":"1"}}' | wt_json_kv v)"
+  eq 'kv: a key that is only separators desep-s to empty, still one record' "${US}1${RS}" \
+    "$(printf '%s' '{"v":{"\u001f":"1"}}' | wt_json_kv v)"
+  eq 'kv: an empty key does not swallow the pair after it' "${US}1${RS}B${US}2${RS}" \
+    "$(printf '%s' '{"v":{"":"1","B":"2"}}' | wt_json_kv v)"
+
+  # AGREEMENT BETWEEN THE TWO VIEWS OF ONE OBJECT. wt_profile_scan publishes runtime.env.vars as
+  # compact JSON so a caller can tell absent from {}, and reads the pairs with wt_json_kv — so the
+  # two must never disagree about whether there is anything there. Both halves are exercised
+  # HERE: an earlier version of this assertion called only wt_json_get, so no kv regression could
+  # have failed it.
+  eq 'kv: an empty object is {} to wt_json_get and no records here' '{}|' \
+    "$(printf '%s' "$KV" | wt_json_get empty)|$(jk empty)"
+  eq 'kv: a populated object is non-empty to both readers, with matching key count' '2|2' \
+    "$(printf '%s' "$KV" | wt_json_get vars | tr -cd ':' | wc -c | tr -d ' ')|$(jk vars | tr -cd "$RS" | wc -c | tr -d ' ')"
+
   # --- wt_is_safe_relpath ---------------------------------------------------
   # The shape check that runs BEFORE any existence check. Note it tests SEGMENTS, not
   # substrings: a directory legitimately called `..cache` must be accepted, and a

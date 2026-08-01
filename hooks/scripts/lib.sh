@@ -277,7 +277,40 @@ wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field pat
   return 0
 }
 
-# THE ONE BACKEND PROGRAM. Every JSON read in this library goes through here; the three functions
+# Read the key/value pairs of ONE JSON OBJECT: $1 is the dotted path to the object. Emits one
+# record per entry, `key US value RS`, in the order the document lists them.
+#
+# WHY THIS EXISTS rather than a loop over wt_json_get: the three readers above can only address
+# fields whose NAME THE CALLER ALREADY KNOWS. `runtime.env.vars` is a map from arbitrary env var
+# names to templates — the whole point is that the plugin does not know what a repo calls its
+# tenant selector (ADR-006) — so there is no dotted path to enumerate and no array to iterate.
+# Reading it any other way means parsing JSON in bash, which is the thing this layer exists to
+# avoid.
+#
+# Values are rendered EXACTLY as every other reader renders them, because it is the same program
+# and the same `val`/`desep` — see wt_json_backend for why copies that must agree are not copies.
+# KEYS go through the same rendering, which matters more than it looks: a key carrying a US, RS,
+# CR or LF would otherwise forge a field or end a record early, and unlike a value a key is about
+# to become the left-hand side of a `KEY=value` line in a file the app loads. Stripping is ALL this
+# reader promises: it guarantees the record framing survives, and nothing more. A key that desep's to
+# the empty string, or to `A=B`, or to `export FOO`, comes back intact — so the consumer that turns
+# these into file lines owes a stricter shape check that a key is a legal env var name. Phase 4's env
+# writer owns that gate; do not read this function as having applied it.
+#
+# RETURN CONTRACT: identical to wt_json_records — 1 only for a CALLER error (wrong argument count,
+# an empty path, no JSON backend), 0 for every DATA outcome, including "absent", "not an object"
+# and "the document does not parse". So an empty stream cannot tell you which of those happened;
+# a caller needing that distinction reads the object's compact JSON as a scalar first, which is
+# what wt_profile_scan already publishes for `runtime.env.vars`.
+wt_json_kv() {  # $1 = dotted path to the object
+  [ "$#" -eq 1 ] || return 1
+  wt_has_json || return 1
+  [ -n "$1" ] || return 1
+  wt_json_backend kv 1 "$1" || true
+  return 0
+}
+
+# THE ONE BACKEND PROGRAM. Every JSON read in this library goes through here; the four functions
 # above are argument validation and a mode.
 #
 # ONE jq filter and ONE python program, not one per reader. That is not tidiness. The value
@@ -291,6 +324,7 @@ wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field pat
 #   get      the scalar fields joined by WT_US. No tag, no trailing WT_RS.
 #   records  one record per array element, fields joined by WT_US, each terminated by WT_RS.
 #   scan     a tagged scalar record (tag 0), then tagged records per array group (1, 2, ...).
+#   kv       one record per entry of ONE object, `key US value RS`, in document order.
 #
 # Value rendering, in every mode:
 #   missing / null / a non-object on the way down -> empty string
@@ -336,6 +370,12 @@ wt_json_backend() {  # $1 = mode, $2 = scalar count, $@ = scalar paths [-- array
             | . as $p
             | (try ($doc | getpath($p | split("."))) catch null) | val | desep ] as $scal
         | if $mode == "get" then ($scal | join(""))
+          elif $mode == "kv" then
+            ( (try ($doc | getpath($sp[0] | split("."))) catch null) as $obj
+              | if ($obj | type) != "object" then empty
+                else $obj | to_entries[]
+                  | ((.key | val | desep) + "" + (.value | val | desep)) + ""
+                end )
           else
             ( if $mode == "scan" then ((["0"] + $scal) | join("")) + "" else empty end )
             , ( $gs | to_entries[] as $g
@@ -405,6 +445,10 @@ n = int(sys.argv[2])
 scal = [val(walk(doc, p.split("."))) for p in sys.argv[3:3 + n]]
 if mode == "get":
     sys.stdout.write(US.join(scal))
+elif mode == "kv":
+    obj = walk(doc, sys.argv[3].split("."))
+    if isinstance(obj, dict):
+        sys.stdout.write("".join(val(k) + US + val(v) + RS for k, v in obj.items()))
 else:
     out = []
     if mode == "scan":
