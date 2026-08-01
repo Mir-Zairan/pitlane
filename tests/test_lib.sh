@@ -21,7 +21,8 @@
 # single break hides everything after it.
 set -uo pipefail
 
-LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")/../hooks/scripts" && pwd)/lib.sh
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+LIB=$REPO_ROOT/hooks/scripts/lib.sh
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -430,7 +431,7 @@ worktree: two' "$err"
   done
 
   # --- wt_is_safe_envkey ------------------------------------------------------
-  # The gate wt_json_kv deliberately leaves to its consumer. A key becomes the left-hand side of a
+  # The gate the JSON layer deliberately leaves to its consumer. A key becomes the left-hand side of a
   # KEY=value line, so the shapes that must be refused are the ones that would write a line naming
   # a DIFFERENT variable than the profile appears to name.
   for good in A A_B _leading FOO123 INSTALLATION_NAME a; do
@@ -444,7 +445,7 @@ worktree: two' "$err"
   done
   # NEWLINES AND FRIENDS, which are the point of the gate rather than an edge of it: a key of
   # $'FOO\nDATABASE_URL' writes TWO lines into the env file, the second setting a variable the
-  # profile never names. wt_json_kv folds CR/LF to a space, so this is defence in depth for a key
+  # profile never names. The JSON layer folds CR/LF to a space, so this is defence in depth for a key
   # that reached the writer another way — a hand-built pair, or a future reader that does not fold.
   for bad in $'A\nB' $'A\tB' $'A\rB' $'A\n' $'\nA'; do
     # rc CAPTURED FIRST. A command substitution in the label argument runs before `$?` is read and
@@ -606,6 +607,7 @@ EOF
 
   # --- wt_load_profile ------------------------------------------------------
   local pdir="$TMP/proj"
+  local pcase pbody pwant empty_case
   mkdir -p "$pdir/.claude"
   local target="$pdir/.claude/worktree-profile.json"
 
@@ -633,6 +635,68 @@ EOF
   eq 'v1 profile -> timeouts read' '420' "$PROFILE_BOOTSTRAP_TIMEOUT"
   eq 'v1 profile -> seed timeout'  '120' "$PROFILE_SEED_TIMEOUT"
   eq 'v1 profile is silent' '' "$(wt_load_profile "$pdir" 2>&1 >/dev/null)"
+
+  # THE RUNTIME BLOCK IS PUBLISHED, so layer 3 never re-splits the scalar record for itself —
+  # a second positional reader is the drift hazard wt_profile_scalars exists to remove.
+  # The seed and teardown scripts are created so the (correct) missing-script warning does not
+  # add noise to this suite's output; their absence is asserted on its own elsewhere.
+  : >"$pdir/.claude/s.sh"
+  : >"$pdir/.claude/t.sh"
+  printf '%s' '{"schemaVersion":1,
+    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
+               "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}},
+               "seed":".claude/s.sh","teardown":".claude/t.sh"}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'runtime profile -> present'          '1'                      "$PROFILE_PRESENT"
+  eq 'runtime profile -> has runtime'      '1'                      "$PROFILE_HAS_RUNTIME"
+  eq 'runtime profile -> slug template'    '{slug}'                 "$PROFILE_RT_SLUG"
+  eq 'runtime profile -> port var'         'SERVER_PORT'            "$PROFILE_RT_PORTVAR"
+  eq 'runtime profile -> port base'        '3786'                   "$PROFILE_RT_PORTBASE"
+  eq 'runtime profile -> port span'        '200'                    "$PROFILE_RT_PORTSPAN"
+  eq 'runtime profile -> env file'         '.env.worktree.local'    "$PROFILE_RT_ENVFILE"
+  eq 'runtime profile -> seed path'        '.claude/s.sh'           "$PROFILE_RT_SEED"
+  eq 'runtime profile -> teardown path'    '.claude/t.sh'           "$PROFILE_RT_TEARDOWN"
+  # env.vars is published as COMPACT JSON, not as pairs: that answers "is there anything to write"
+  # for free, and the pairs themselves arrive as group 3 of the same scan.
+  eq 'runtime profile -> env vars as compact JSON' '{"INSTALLATION_NAME":"demo_{slug}"}' \
+    "$PROFILE_RT_ENVVARS"
+
+  # STALE FIELDS BETWEEN LOADS. wt_load_profile is called more than once per process —
+  # bootstrap.sh picks between the worktree's profile and the main checkout's — so a leftover port
+  # base from the previous call would have layer 3 act on a profile that never asked for it.
+  #
+  # The order here is deliberate and the assertions are worthless without it. Each case below runs
+  # DIRECTLY after the runtime profile above, which left every RT field populated, so what is
+  # pinned is that the field was CLEARED rather than that it happened to be empty already. An
+  # intervening valid no-runtime load would clear them by assignment and hide the bug.
+  #
+  # This one exits EARLY (before the assignments at the end), so only the initialisation can have
+  # cleared it — which is exactly the path a reader is most likely to think unnecessary.
+  printf '%s' 'not json at all' >"$target"
+  wt_load_profile "$pdir" 2>/dev/null
+  eq 'an unparseable profile -> not present' '0' "$PROFILE_PRESENT"
+  eq 'an unparseable profile clears the RT fields left by the previous load' '' \
+    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN"
+
+  # An INVALID profile also exits early — no partial trust, so not even the fields that parsed.
+  printf '%s' '{"schemaVersion":1,
+    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
+               "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}}}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'reloaded: the RT fields are populated again' 'SERVER_PORT' "$PROFILE_RT_PORTVAR"
+  printf '%s' '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":200},
+    "env":{"file":".e","vars":{"BAD KEY":"1"}}}}' >"$target"
+  wt_load_profile "$pdir" 2>/dev/null
+  eq 'an invalid profile -> not present'  '0' "$PROFILE_PRESENT"
+  eq 'an invalid profile publishes no runtime fields at all' '' \
+    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_ENVFILE"
+
+  # And a plain valid profile with no runtime block reports none.
+  printf '%s' '{"schemaVersion":1}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'no runtime block -> HAS_RUNTIME is 0' '0' "$PROFILE_HAS_RUNTIME"
+  eq 'no runtime block -> every RT field is empty' '' \
+    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN"
 
   cp "$TMP/profile-minimal.json" "$target"
   wt_load_profile "$pdir"
@@ -1013,96 +1077,68 @@ EOF
     "$(printf '%s' "$SCAN" | wt_json_records deps dir lock)" \
     "$(js nope -- deps dir lock | sed "s/^0${US}${RS}//; s/${RS}1${US}/${RS}/g; s/^1${US}//")"
 
-  # --- wt_json_kv -----------------------------------------------------------
-  # The object reader, added for runtime.env.vars — a map whose KEYS the plugin cannot know in
-  # advance (ADR-006), so no dotted path reaches them and no array iterates them. Asserted on
-  # BOTH backends for the same reason the other three are: it shares their value renderer, and
-  # a divergence would mean the reader that VALIDATES a var and the reader that WRITES it to a
-  # file disagree about what it says.
-  KV='{"vars":{"INSTALLATION_NAME":"demo_{slug}","APP_ENV":"dev"},
+  # --- wt_json_scan: --kv groups ----------------------------------------------
+  # An object's OWN pairs, added for runtime.env.vars — a map whose keys the plugin cannot know in
+  # advance (ADR-006), so no dotted path reaches them and no array iterates them. It is a GROUP
+  # rather than a separate reader so the validator and the engine both get the pairs out of the
+  # scan they already pay for; a standalone reader cost two extra cold interpreter starts on the
+  # hook that blocks session start. Asserted on BOTH backends, like every other group.
+  KV='{"v":1,"vars":{"INSTALLATION_NAME":"demo_{slug}","APP_ENV":"dev"},
        "one":{"A":"1"},"empty":{},"arr":[1,2],"scalar":"s","nested":{"o":{"deep":{"K":"v"}}},
        "types":{"n":5,"t":true,"f":false,"nul":null,"o":{"x":1},"a":[1],"s":""},
-       "uni":{"café":"über"}}'
-  jk() { printf '%s' "$KV" | wt_json_kv "$@"; }
+       "uni":{"café":"über"},"d":[{"x":"y"}]}'
+  jk() { printf '%s' "$KV" | wt_json_scan v --kv "$1"; }
 
-  # Document order, US between key and value, RS after EVERY pair including the last.
-  eq 'kv: pairs come back in document order, RS-terminated' \
-    "INSTALLATION_NAME${US}demo_{slug}${RS}APP_ENV${US}dev${RS}" "$(jk vars)"
-  eq 'kv: a single-entry object' "A${US}1${RS}" "$(jk one)"
-  eq 'kv: a dotted path reaches a nested object' "K${US}v${RS}" "$(jk nested.o.deep)"
-
-  # Every data outcome is silent and rc 0, so the two backends stay indistinguishable — jq exits
-  # non-zero on a parse error where python exits 0, which is why the wrapper normalises.
-  eq 'kv: an empty object yields nothing' '' "$(jk empty)"
-  eq 'kv: an array is not an object -> nothing' '' "$(jk arr)"
-  eq 'kv: a scalar is not an object -> nothing' '' "$(jk scalar)"
-  eq 'kv: an absent path -> nothing' '' "$(jk nope)"
-  eq 'kv: an unparseable document -> nothing' '' "$(printf 'not json' | wt_json_kv vars)"
-  for bad in empty arr scalar nope; do
-    rc_is "kv: $bad is a data outcome, rc 0" 0 "$(jk $bad >/dev/null; echo $?)"
+  eq 'kv group: pairs in document order, tagged, RS-terminated' \
+    "0${US}1${RS}1${US}INSTALLATION_NAME${US}demo_{slug}${RS}1${US}APP_ENV${US}dev${RS}" "$(jk vars)"
+  eq 'kv group: a dotted path reaches a nested object' "0${US}1${RS}1${US}K${US}v${RS}" \
+    "$(jk nested.o.deep)"
+  # Every data outcome contributes no records but still emits the scalar record, so a caller can
+  # tell "the document did not parse" from "the object was empty" — the parse proof scan exists for.
+  for empty_case in empty arr scalar nope; do
+    eq "kv group: $empty_case contributes no records" "0${US}1${RS}" "$(jk $empty_case)"
   done
-  rc_is 'kv: unparseable document -> rc 0 on both backends' 0 \
-    "$(printf 'not json' | wt_json_kv vars >/dev/null; echo $?)"
-
-  # Value rendering is the shared one, python's True/False trap included.
-  eq 'kv: value rendering matches every other reader' \
-    "n${US}5${RS}t${US}true${RS}f${US}false${RS}nul${US}${RS}o${US}{\"x\":1}${RS}a${US}[1]${RS}s${US}${RS}" \
+  eq 'kv group: value rendering matches every other reader' \
+    "0${US}1${RS}1${US}n${US}5${RS}1${US}t${US}true${RS}1${US}f${US}false${RS}1${US}nul${US}${RS}1${US}o${US}{\"x\":1}${RS}1${US}a${US}[1]${RS}1${US}s${US}${RS}" \
     "$(jk types)"
-  eq 'kv: non-ASCII keys and values match wt_json_get byte for byte' \
-    "café${US}über${RS}" "$(jk uni)"
+  eq 'kv group: non-ASCII keys and values survive intact' "0${US}1${RS}1${US}café${US}über${RS}" \
+    "$(jk uni)"
 
-  # SEPARATOR INJECTION THROUGH A KEY, which is the half no other reader has to think about: a
-  # key is about to become the left-hand side of a KEY=value line. JSON encodes these legally
-  # and the profile arrives with anyone's branch, so an unstripped key would forge a pair.
-  eq 'kv: an embedded US, RS, CR or LF in a KEY cannot forge a pair' \
-    "AFORGED${US}1${RS}BFORGED${US}2${RS}C D${US}3${RS}" \
-    "$(printf '%s' '{"v":{"A\u001fFORGED":"1","B\u001eFORGED":"2","C\r\nD":"3"}}' | wt_json_kv v)"
-  eq 'kv: the same bytes in a VALUE are stripped too' "K${US}aFORGED b${RS}" \
-    "$(printf '%s' '{"v":{"K":"a\u001fFORGED\nb"}}' | wt_json_kv v)"
+  # TAGS KEEP COUNTING ACROSS KINDS. An array group and an object group in one scan must be
+  # numbered in the order they were named, or a caller dispatching on the tag reads one group's
+  # records as another's — silently, since both are just fields.
+  eq 'kv group: array and object groups are numbered in the order named' \
+    "0${US}1${RS}1${US}y${RS}2${US}A${US}1${RS}" \
+    "$(printf '%s' "$KV" | wt_json_scan v -- d x --kv one)"
+  eq 'kv group: ...and the other way round' \
+    "0${US}1${RS}1${US}A${US}1${RS}2${US}y${RS}" \
+    "$(printf '%s' "$KV" | wt_json_scan v --kv one -- d x)"
 
-  # Caller errors stay distinguishable from data outcomes.
-  rc_is 'kv: no arguments is a caller error' 1 "$(wt_json_kv >/dev/null 2>&1; echo $?)"
-  rc_is 'kv: two arguments is a caller error' 1 \
-    "$(printf '%s' '{}' | wt_json_kv a b >/dev/null 2>&1; echo $?)"
-  rc_is 'kv: an empty path is a caller error' 1 \
-    "$(printf '%s' '{}' | wt_json_kv '' >/dev/null 2>&1; echo $?)"
-  rc_is 'kv: no JSON backend is a caller error, not an empty object' 1 \
-    "$(printf '%s' '{"v":{"A":"1"}}' | bash -c ". '$LIB'
-         wt_has_json() { return 1; }
-         wt_json_kv v >/dev/null 2>&1; echo \$?")"
+  # SEPARATOR INJECTION THROUGH A KEY — the half no array group has to think about, because a key
+  # becomes the left-hand side of a KEY=value line. These bytes are legal in JSON and the profile
+  # arrives with anyone's branch.
+  eq 'kv group: an embedded US, RS, CR or LF in a KEY cannot forge a pair' \
+    "0${US}${RS}1${US}AFORGED${US}1${RS}1${US}BFORGED${US}2${RS}1${US}C D${US}3${RS}" \
+    "$(printf '%s' '{"v":{"A\u001fFORGED":"1","B\u001eFORGED":"2","C\r\nD":"3"}}' \
+       | wt_json_scan nope --kv v)"
+  eq 'kv group: a key that renders empty is still one well-framed record' \
+    "0${US}${RS}1${US}${US}1${RS}1${US}B${US}2${RS}" \
+    "$(printf '%s' '{"v":{"":"1","B":"2"}}' | wt_json_scan nope --kv v)"
 
-  # An option-like path must stay DATA, as it must for every other reader.
-  eq 'kv: an option-like path is data, not an option' "A${US}1${RS}" \
-    "$(printf '%s' '{"-i":{"A":"1"}}' | wt_json_kv -i)"
-  # Trailing junk and concatenated documents fail here exactly as they do elsewhere.
-  eq 'kv: a document with trailing junk yields nothing' '' \
-    "$(printf '%s' '{"v":{"A":"1"}} junk' | wt_json_kv v)"
-  eq 'kv: two concatenated documents yield nothing' '' \
-    "$(printf '%s' '{"v":{"A":"1"}}{"v":{"A":"2"}}' | wt_json_kv v)"
-  eq 'kv: a UTF-8 BOM is tolerated, as it is by the other readers' "A${US}1${RS}" \
-    "$(printf '\357\273\277%s' '{"v":{"A":"1"}}' | wt_json_kv v)"
-
-  # A KEY THAT RENDERS EMPTY. Every case above is about framing — this one is about MEANING: an
-  # empty left-hand side is the difference between a pair and a malformed line, and a key made
-  # only of separators desep's away to nothing. Both must still come back as ONE well-framed
-  # record rather than being dropped or merged into a neighbour, because dropping it silently
-  # would hide the very entry a consumer has to refuse.
-  eq 'kv: a literal empty key survives as one empty-keyed record' "${US}1${RS}" \
-    "$(printf '%s' '{"v":{"":"1"}}' | wt_json_kv v)"
-  eq 'kv: a key that is only separators desep-s to empty, still one record' "${US}1${RS}" \
-    "$(printf '%s' '{"v":{"\u001f":"1"}}' | wt_json_kv v)"
-  eq 'kv: an empty key does not swallow the pair after it' "${US}1${RS}B${US}2${RS}" \
-    "$(printf '%s' '{"v":{"":"1","B":"2"}}' | wt_json_kv v)"
-
-  # AGREEMENT BETWEEN THE TWO VIEWS OF ONE OBJECT. wt_profile_scan publishes runtime.env.vars as
-  # compact JSON so a caller can tell absent from {}, and reads the pairs with wt_json_kv — so the
-  # two must never disagree about whether there is anything there. Both halves are exercised
-  # HERE: an earlier version of this assertion called only wt_json_get, so no kv regression could
-  # have failed it.
-  eq 'kv: an empty object is {} to wt_json_get and no records here' '{}|' \
-    "$(printf '%s' "$KV" | wt_json_get empty)|$(jk empty)"
-  eq 'kv: a populated object is non-empty to both readers, with matching key count' '2|2' \
-    "$(printf '%s' "$KV" | wt_json_get vars | tr -cd ':' | wc -c | tr -d ' ')|$(jk vars | tr -cd "$RS" | wc -c | tr -d ' ')"
+  # Shape errors in the group list are CALLER errors. An object group takes one path and no field
+  # list — a field path after it would otherwise be silently ignored, so the caller never learns
+  # that the field they asked for was never read.
+  rc_is 'kv group: a field path after the object path is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan a --kv m extra >/dev/null 2>&1; echo $?)"
+  rc_is 'kv group: a trailing --kv with no path is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan a --kv >/dev/null 2>&1; echo $?)"
+  rc_is 'kv group: --kv immediately after -- is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan a -- --kv m >/dev/null 2>&1; echo $?)"
+  rc_is 'kv group: a valid --kv group is not a caller error' 0 \
+    "$(printf '%s' '{}' | wt_json_scan a --kv m >/dev/null 2>&1; echo $?)"
+  # Unparseable input emits nothing at all, including no scalar record — the parse proof.
+  eq 'kv group: an unparseable document emits nothing' '' \
+    "$(printf 'not json' | wt_json_scan v --kv vars)"
 
   # --- wt_is_safe_relpath ---------------------------------------------------
   # The shape check that runs BEFORE any existence check. Note it tests SEGMENTS, not
@@ -1161,6 +1197,68 @@ EOF
     "$(wt_expand 'demo_{slug}')"
   unset WT_SLUG
 
+  # --- wt_profile_scalars -----------------------------------------------------
+  # THE DRIFT GUARD. wt_profile_scan defines the field order and this function reads it, and they
+  # used to be three lists (scan, load, validate) that had to agree forever with nothing able to
+  # notice when they stopped — the failure being silent, since one extra path shifts every later
+  # field so the timeout check receives `runtime`. One profile with a DISTINCT, RECOGNISABLE value
+  # in every single field pins the whole mapping at once: a shift by one lands a value in the
+  # wrong variable and exactly one assertion below changes.
+  SCP="$TMP/scalars.json"
+  cat >"$SCP" <<'JSON'
+{"schemaVersion":1,
+ "shell":"F2_shell","shellArgs":"argv",
+ "deps":[{"dir":"F4_dep"}],
+ "runtime":{"seed":"F10_seed","teardown":"F11_teardown",
+            "env":{"file":"F12_envfile","vars":{"F14_KEY":"F14_val"}},
+            "slug":"F13_slug",
+            "port":{"var":"F17_PORTVAR","base":3786,"span":200}},
+ "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
+ "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
+ "copy":["F15_copy"]}
+JSON
+  wt_profile_scalars "$(wt_profile_scan "$SCP")"
+  eq 'scalars field 1 is schemaVersion'            '1'                "$WT_PS_VERSION"
+  eq 'scalars field 2 is shell'                    'F2_shell'         "$WT_PS_SHELL"
+  eq 'scalars field 3 is shellArgs'                'argv'             "$WT_PS_SHELLARGS"
+  contains 'scalars field 4 is deps as compact JSON' 'F4_dep'         "$WT_PS_DEPS"
+  contains 'scalars field 5 is runtime as compact JSON' 'F13_slug'    "$WT_PS_RUNTIME"
+  eq 'scalars field 6 is bootstrapSeconds'         '66'               "$WT_PS_BOOT"
+  eq 'scalars field 7 is seedSeconds'              '77'               "$WT_PS_SEEDT"
+  eq 'scalars field 8 is evidence.detectionVersion' '8'               "$WT_PS_EVDET"
+  contains 'scalars field 9 is evidence.markers'   'F9_marker'        "$WT_PS_EVMARK"
+  eq 'scalars field 10 is runtime.seed'            'F10_seed'         "$WT_PS_SEED"
+  eq 'scalars field 11 is runtime.teardown'        'F11_teardown'     "$WT_PS_TEARDOWN"
+  eq 'scalars field 12 is runtime.env.file'        'F12_envfile'      "$WT_PS_ENVFILE"
+  eq 'scalars field 13 is runtime.slug'            'F13_slug'         "$WT_PS_SLUG"
+  contains 'scalars field 14 is runtime.env.vars'  'F14_KEY'          "$WT_PS_ENVVARS"
+  contains 'scalars field 15 is copy'              'F15_copy'         "$WT_PS_COPY"
+  eq 'scalars field 16 is evidence.shellMarker'    'F16_shellmarker'  "$WT_PS_EVSHELL"
+  eq 'scalars field 17 is runtime.port.var'        'F17_PORTVAR'      "$WT_PS_PORTVAR"
+  eq 'scalars field 18 is runtime.port.base'       '3786'             "$WT_PS_PORTBASE"
+  eq 'scalars field 19 is runtime.port.span'       '200'              "$WT_PS_PORTSPAN"
+  contains 'scalars field 20 is runtime.port as compact JSON' 'F17_PORTVAR' "$WT_PS_PORT"
+  # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
+  # variables than the record has fields makes bash `read` pack the remainder into the last one —
+  # but only visibly when the extra field is non-empty: `read` strips exactly one trailing
+  # delimiter (measured), so an appended field that happens to be absent leaves no trace at all.
+  # Counting the separators catches the scan list growing whether the new field has a value or not.
+  scan_rec=$(wt_profile_scan "$SCP")
+  scan_rec=${scan_rec%%"$RS"*}
+  eq 'the scalar record carries exactly 20 fields plus its tag' 20 \
+    "$(printf '%s' "$scan_rec" | tr -cd "$US" | wc -c | tr -d ' ')"
+  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_PORT"
+  # An absent field is EMPTY, not a shift of everything after it.
+  wt_profile_scalars "$(printf '%s' '{"schemaVersion":1,"evidence":{"shellMarker":"only"}}' \
+    | wt_json_scan schemaVersion shell shellArgs deps runtime \
+        timeouts.bootstrapSeconds timeouts.seedSeconds \
+        evidence.detectionVersion evidence.markers \
+        runtime.seed runtime.teardown runtime.env.file \
+        runtime.slug runtime.env.vars copy evidence.shellMarker \
+        runtime.port.var runtime.port.base runtime.port.span)"
+  eq 'a sparse record still lands shellMarker in field 16' 'only' "$WT_PS_EVSHELL"
+  eq 'and the fields around it are empty, not shifted' '' "$WT_PS_SLUG$WT_PS_PORTVAR$WT_PS_COPY"
+
   # --- wt_validate_profile --------------------------------------------------
   VR="$TMP/vrepo"
   mkdir -p "$VR/.claude"
@@ -1187,6 +1285,137 @@ EOF
   eq 'validate: an empty deps array is valid' '' "$(vv)"
   vw '{"schemaVersion":1,"runtime":{}}'
   eq 'validate: an empty runtime block is valid (means touch nothing)' '' "$(vv)"
+
+  # --- validate: the runtime block --------------------------------------------
+  # The severity split is the whole design here, so it is asserted rather than assumed. A field
+  # with a SAFE FALLBACK warns and the profile survives; a field without one is fatal. Getting
+  # this backwards in either direction is expensive: a wrong rejection silently downgrades a
+  # working repo to bare defaults, and a wrong acceptance writes a broken env file.
+  vw '{"schemaVersion":1,"runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
+        "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}}}}'
+  eq 'validate: a complete, well-formed runtime block reports nothing' '' "$(vv)"
+
+  # EVERY PORT PROBLEM IS A WARNING, NOT A VIOLATION, and the line is drawn on consequence. A port
+  # that cannot be derived means the port line is not written: two worktrees share a port and the
+  # second app fails to bind — loud, immediate, no data lost. Discarding the whole profile instead
+  # would take the toolchain shell and every dependency with it, over a typo in a field whose
+  # worst outcome is a bind error. Contrast the env.vars keys below, which select DATABASES and
+  # are therefore fatal.
+  # Captures the WARNINGS (stderr) and discards the violations (stdout). SC2069: the order is the
+  # point, not a mistake — `2>&1` first points stderr at the capture, then `>/dev/null` sends
+  # stdout away, which is exactly the stderr-only view these assertions need. The same idiom is
+  # used inline throughout this suite.
+  # shellcheck disable=SC2069
+  vpw() { wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null; }
+  for pcase in \
+    '"var":"A=B","base":3786,"span":200|runtime.port.var: "A=B" is not a legal environment variable name' \
+    '"var":"P","base":80,"span":10|runtime.port.base: "80"' \
+    '"var":"P","base":65000,"span":1000|runs past 65535' \
+    '"var":"P","base":3786,"span":"wide"|runtime.port.span: "wide"' \
+    '"var":"P"|no port.base/port.span to derive a port from' \
+    '"base":3786,"span":200|nowhere to write the derived port'
+  do
+    pbody=${pcase%%|*}; pwant=${pcase#*|}
+    vw '{"schemaVersion":1,"runtime":{"port":{'"$pbody"'},"env":{"file":".e","vars":{"A":"1"}}}}'
+    eq "validate: port case ($pbody) is not a violation" '' "$(vv)"
+    contains "validate: port case ($pbody) warns instead" "$pwant" "$(vpw)"
+  done
+  # A span of 1 is honoured but means every worktree lands on one port.
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":1},"env":{"file":".e","vars":{"A":"1"}}}}'
+  eq 'validate: a span of 1 is not a violation' '' "$(vv)"
+  contains 'validate: ...but it warns that every worktree gets one port' \
+    'every worktree derives port 3786' "$(vpw)"
+  # A well-formed port block says nothing at all.
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
+  eq 'validate: a well-formed port block is silent on stderr too' '' "$(vpw)"
+
+  # `port` ITSELF is shape-checked, not merely its three children. `"port": 3786` is the obvious
+  # shorthand a developer reaches for, and it walks all three children to nothing — so without this
+  # every rule above is skipped and the profile validates clean while port isolation silently never
+  # happens. This one IS fatal: unlike a bad value, a wrong-shaped container means the developer
+  # asked for something the schema cannot express, and there is nothing safe to fall back to.
+  vw '{"schemaVersion":1,"runtime":{"port":3786,"env":{"file":".e","vars":{"A":"1"}}}}'
+  contains 'validate: a scalar runtime.port is a violation' \
+    'runtime.port: must be an object' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"port":[3786,200],"env":{"file":".e","vars":{"A":"1"}}}}'
+  contains 'validate: an array runtime.port is a violation' \
+    'runtime.port: must be an object' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"port":{},"env":{"file":".e","vars":{"A":"1"}}}}'
+  eq 'validate: an empty port object is valid (means no port isolation)' '' "$(vv)"
+
+  # EVERY KEY of env.vars, and this is the one runtime rule that is fatal on the KEY. A key of
+  # `A=1` writes a line setting a different variable than the profile appears to name; a key with
+  # a newline writes a second line outright. Neither can be defended against on the value side.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"GOOD":"1","BAD KEY":"2"}}}}'
+  contains 'validate: an env.vars key with a space is a violation' \
+    'runtime.env.vars: "BAD KEY" is not a legal environment variable name' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"A=B":"2"}}}}'
+  contains 'validate: an env.vars key containing = is a violation' \
+    'runtime.env.vars: "A=B"' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"1LEADING":"2"}}}}'
+  contains 'validate: an env.vars key starting with a digit is a violation' \
+    'runtime.env.vars: "1LEADING"' "$(vv)"
+  # A GOOD key alongside a bad one must not be what makes it pass — every key is checked, and the
+  # violation names the offending one so a developer can act on it directly.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"AAA":"1","BBB":"2","c d":"3"}}}}'
+  contains 'validate: a bad key among good ones is still caught, and named' '"c d"' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"AAA":"1","BBB":"2"}}}}'
+  eq 'validate: an all-good vars map reports nothing' '' "$(vv)"
+  # vars must be an object. A JSON string of "{not-an-object" renders with the same first byte, so
+  # both ends are checked — the same trap deps[] already guards.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":"{oops"}}}'
+  contains 'validate: a vars that is not an object is a violation' 'runtime.env.vars: must be an object' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":[]}}}'
+  contains 'validate: a vars array is a violation too' 'runtime.env.vars: must be an object' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{}}}}'
+  eq 'validate: an empty vars object is valid' '' "$(vv)"
+  # FAIL CLOSED when a NON-EMPTY map yields no pairs. The reader swallows a backend failure by
+  # contract (rc 0, no records), so without this guard a half-produced stream would skip every key
+  # check while the profile was pronounced clean — the same trap deps[] and copy[] already have.
+  # Shadowing the reader is the only way to reach the condition without corrupting a backend.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"A":"1"}}}}'
+  contains 'validate: a non-empty vars that reads as empty is refused, not treated as empty' \
+    'could not be read' \
+    "$(bash -c ". '$LIB'
+        wt_profile_scan() { wt_json_scan schemaVersion shell shellArgs deps runtime \
+            timeouts.bootstrapSeconds timeouts.seedSeconds \
+            evidence.detectionVersion evidence.markers \
+            runtime.seed runtime.teardown runtime.env.file \
+            runtime.slug runtime.env.vars copy evidence.shellMarker \
+            runtime.port.var runtime.port.base runtime.port.span runtime.port \
+            -- deps dir lock strategy install verify lockChecksum \
+            -- copy . <\"\$1\"; }
+        wt_validate_profile '$VP' '$VR' 2>/dev/null")"
+
+  # Values with nowhere to go, and a file with nothing to put in it. The first is fatal (the
+  # developer asked for isolation and would silently not get it); the second only warns.
+  vw '{"schemaVersion":1,"runtime":{"env":{"vars":{"A":"1"}}}}'
+  contains 'validate: vars without env.file is a violation' \
+    'there is nowhere to write them' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".env.wt"}}}'
+  eq 'validate: an env.file with no vars and no port.var is not a violation' '' "$(vv)"
+  contains 'validate: ...but it warns the file would be empty' 'would be written empty' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  vw '{"schemaVersion":1,"runtime":{"port":{"base":3786,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
+  contains 'validate: port base/span with no var warns rather than failing' \
+    'nowhere to write the derived port' "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+
+  # runtime.slug is a TEMPLATE. One naming neither placeholder expands identically for every
+  # worktree — one port and one database for all of them, reached by configuration rather than by
+  # accident. A warning, because the engine has a safe fallback: the worktree's own name.
+  vw '{"schemaVersion":1,"runtime":{"slug":"shared","env":{"file":".e","vars":{"A":"1"}}}}'
+  eq 'validate: a constant runtime.slug is not a violation' '' "$(vv)"
+  contains 'validate: ...but it warns that every worktree would collide' \
+    'contains no per-worktree placeholder' "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  vw '{"schemaVersion":1,"runtime":{"slug":"{slug}_x","env":{"file":".e","vars":{"A":"1"}}}}'
+  eq 'validate: a slug template mentioning {slug} is silent' '' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null | grep -c 'no per-worktree placeholder' | tr -d ' ' | sed 's/^0$//')"
+
+  # THE SHIPPED TEMPLATE MUST VALIDATE. It is what /worktree-calibrate fills in and what a
+  # developer copies, so a rule that rejects it is a rule that breaks every new repo. Checked with
+  # no root, since this plugin repo has neither of the template's example lockfiles.
+  eq 'validate: reference/profile.template.json passes its own rules' '' \
+    "$(wt_validate_profile "$REPO_ROOT/reference/profile.template.json" '' 2>/dev/null)"
 
   # schemaVersion is the one mandatory key.
   vw '{"shell":"x"}'

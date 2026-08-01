@@ -62,6 +62,15 @@ WT_US=$'\037'
 # shellcheck disable=SC2034
 WT_RS=$'\036'
 
+# Literal newline and carriage return, for pattern tests that cannot spell them inline. They live
+# here rather than in bootstrap-lib.sh, which used to own them, because wt_validate_profile needs
+# them too — and two definitions of one byte is the kind of copy this file keeps deleting.
+# SC2034: read by the engine and by the validator, not within sight of this declaration.
+# shellcheck disable=SC2034
+WT_NL=$'\n'
+# shellcheck disable=SC2034
+WT_CR=$'\r'
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -215,11 +224,23 @@ wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within e
 
 # Read a whole document — scalars AND several arrays — in ONE backend invocation.
 #
-#   wt_json_scan <scalar path>... -- <array path> <field path>... [-- <array path> <field>...]
+#   wt_json_scan <scalar path>... [-- <array path> <field path>...] [--kv <object path>]...
 #
 # Emits TAGGED records, each field-joined by WT_US and terminated by WT_RS. The first field of
-# every record is the tag: `0` is the one scalar record, `1` the first array group's elements,
-# `2` the second's, in the order the groups were named.
+# every record is the tag: `0` is the one scalar record, then `1`, `2`, ... for each group in the
+# order the groups were named, whichever kind each one is.
+#
+# TWO KINDS OF GROUP:
+#   `--`   an ARRAY of objects. One record per element, one field per named field path.
+#   `--kv` ONE OBJECT's own pairs. One record per entry, always exactly two fields, key then value.
+#          It takes a single path and no field list, because an object's fields ARE its keys — a
+#          field path after it is a caller error rather than something silently ignored.
+#
+# `--kv` exists because `runtime.env.vars` maps env var names the plugin cannot know in advance
+# (ADR-006 forbids inferring which variable selects a tenant) to templates. It is a GROUP rather
+# than its own reader so that reading it costs no additional interpreter start: the validator and
+# the engine both need those pairs, and a separate reader meant two more cold starts on the hook
+# that blocks session start 1:1.
 #
 # WHY THIS EXISTS. The two readers above are single-purpose, so a caller needing scalars and two
 # arrays paid three cold interpreter starts. That is the whole cost on the session-start path: a
@@ -251,7 +272,7 @@ wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within e
 # RETURN CONTRACT: identical to wt_json_records — 1 only for a CALLER error (no arguments, a
 # malformed group list, an empty path, no JSON backend), 0 for every data outcome.
 wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field paths...>
-  local _p nscalars=0 seen_group=0 want_path=0
+  local _p nscalars=0 seen_group=0 want_path=0 kv_open=0 kv_seen=0
   [ "$#" -ge 1 ] || return 1
   wt_has_json || return 1
   for _p in "$@"; do [ -n "$_p" ] || return 1; done
@@ -260,14 +281,20 @@ wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field pat
   # error on both. It matters more than it looks: an empty group would renumber every tag after
   # it, silently handing one array's records to the branch expecting another's.
   for _p in "$@"; do
-    if [ "$_p" = '--' ]; then
-      [ "$want_path" -eq 0 ] || return 1   # a `--` immediately after a `--`
+    if [ "$_p" = '--' ] || [ "$_p" = '--kv' ]; then
+      [ "$want_path" -eq 0 ] || return 1   # a group introducer immediately after another
       seen_group=1
       want_path=1
+      [ "$_p" = '--kv' ] && kv_open=1 || kv_open=0
     elif [ "$want_path" -eq 1 ]; then
       want_path=0
+      # A `--kv` group takes ONE path and no field list: an object's fields are its own keys.
+      # Anything after it would silently be read as a field path that the emitter ignores.
+      [ "$kv_open" -eq 1 ] && kv_seen=1 || kv_seen=0
     elif [ "$seen_group" -eq 0 ]; then
       nscalars=$((nscalars + 1))
+    elif [ "$kv_seen" -eq 1 ]; then
+      return 1                             # a field path after a `--kv` object path
     fi
   done
   [ "$want_path" -eq 0 ] || return 1       # a trailing `--` with no array path
@@ -277,40 +304,7 @@ wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field pat
   return 0
 }
 
-# Read the key/value pairs of ONE JSON OBJECT: $1 is the dotted path to the object. Emits one
-# record per entry, `key US value RS`, in the order the document lists them.
-#
-# WHY THIS EXISTS rather than a loop over wt_json_get: the three readers above can only address
-# fields whose NAME THE CALLER ALREADY KNOWS. `runtime.env.vars` is a map from arbitrary env var
-# names to templates — the whole point is that the plugin does not know what a repo calls its
-# tenant selector (ADR-006) — so there is no dotted path to enumerate and no array to iterate.
-# Reading it any other way means parsing JSON in bash, which is the thing this layer exists to
-# avoid.
-#
-# Values are rendered EXACTLY as every other reader renders them, because it is the same program
-# and the same `val`/`desep` — see wt_json_backend for why copies that must agree are not copies.
-# KEYS go through the same rendering, which matters more than it looks: a key carrying a US, RS,
-# CR or LF would otherwise forge a field or end a record early, and unlike a value a key is about
-# to become the left-hand side of a `KEY=value` line in a file the app loads. Stripping is ALL this
-# reader promises: it guarantees the record framing survives, and nothing more. A key that desep's to
-# the empty string, or to `A=B`, or to `export FOO`, comes back intact — so the consumer that turns
-# these into file lines owes a stricter shape check that a key is a legal env var name. Phase 4's env
-# writer owns that gate; do not read this function as having applied it.
-#
-# RETURN CONTRACT: identical to wt_json_records — 1 only for a CALLER error (wrong argument count,
-# an empty path, no JSON backend), 0 for every DATA outcome, including "absent", "not an object"
-# and "the document does not parse". So an empty stream cannot tell you which of those happened;
-# a caller needing that distinction reads the object's compact JSON as a scalar first, which is
-# what wt_profile_scan already publishes for `runtime.env.vars`.
-wt_json_kv() {  # $1 = dotted path to the object
-  [ "$#" -eq 1 ] || return 1
-  wt_has_json || return 1
-  [ -n "$1" ] || return 1
-  wt_json_backend kv 1 "$1" || true
-  return 0
-}
-
-# THE ONE BACKEND PROGRAM. Every JSON read in this library goes through here; the four functions
+# THE ONE BACKEND PROGRAM. Every JSON read in this library goes through here; the three functions
 # above are argument validation and a mode.
 #
 # ONE jq filter and ONE python program, not one per reader. That is not tidiness. The value
@@ -324,7 +318,6 @@ wt_json_kv() {  # $1 = dotted path to the object
 #   get      the scalar fields joined by WT_US. No tag, no trailing WT_RS.
 #   records  one record per array element, fields joined by WT_US, each terminated by WT_RS.
 #   scan     a tagged scalar record (tag 0), then tagged records per array group (1, 2, ...).
-#   kv       one record per entry of ONE object, `key US value RS`, in document order.
 #
 # Value rendering, in every mode:
 #   missing / null / a non-object on the way down -> empty string
@@ -355,9 +348,15 @@ wt_json_backend() {  # $1 = mode, $2 = scalar count, $@ = scalar paths [-- array
       # The seed group collects anything before the first `--`; the callers guarantee there is
       # nothing there, and dropping index 0 outright keeps the tags stable. Filtering empty
       # groups instead would renumber them.
+      # A group is introduced by -- (an array of objects) or --kv (the pairs of one object),
+      # and carries its kind as its first element so the emitter branches without re-deriving it.
+      # NOTE: no apostrophe and no backtick anywhere in this program. It is single-quoted shell,
+      # so an apostrophe ends the quote and takes the rest of the filter with it.
       def groups:
         reduce .[] as $x ([[]];
-          if $x == "--" then . + [[]] else .[0:-1] + [(.[-1] + [$x])] end)
+          if $x == "--" then . + [["arr"]]
+          elif $x == "--kv" then . + [["kv"]]
+          else .[0:-1] + [(.[-1] + [$x])] end)
         | .[1:];
       if length != 1 then empty
       else
@@ -380,12 +379,21 @@ wt_json_backend() {  # $1 = mode, $2 = scalar count, $@ = scalar paths [-- array
             ( if $mode == "scan" then ((["0"] + $scal) | join("")) + "" else empty end )
             , ( $gs | to_entries[] as $g
                 | (($g.key + 1) | tostring) as $tag
-                | ($g.value[0] | split(".")) as $arrp
-                | ($g.value[1:] | map(if . == "." then null else split(".") end)) as $fps
-                | (try ($doc | getpath($arrp)) catch null) as $arr
-                | if ($arr | type) != "array" then empty
+                | $g.value[0] as $kind
+                | ($g.value[1] | split(".")) as $arrp
+                | ($g.value[2:] | map(if . == "." then null else split(".") end)) as $fps
+                | (try ($doc | getpath($arrp)) catch null) as $node
+                | if $kind == "kv" then
+                    if ($node | type) != "object" then empty
+                    else
+                      $node | to_entries[]
+                      | (((if $mode == "scan" then [$tag] else [] end)
+                          + [(.key | val | desep), (.value | val | desep)])
+                         | join("")) + ""
+                    end
+                  elif ($node | type) != "array" then empty
                   else
-                    $arr[] as $el
+                    $node[] as $el
                     | (((if $mode == "scan" then [$tag] else [] end)
                         + [ $fps[] as $fp
                             | (if $fp == null then $el
@@ -458,16 +466,23 @@ else:
     groups = [[]]
     for x in sys.argv[3 + n:]:
         if x == "--":
-            groups.append([])
+            groups.append(["arr"])
+        elif x == "--kv":
+            groups.append(["kv"])
         else:
             groups[-1].append(x)
     for i, g in enumerate(groups[1:]):
-        arr = walk(doc, g[0].split("."))
-        if not isinstance(arr, list):
-            continue
-        fps = [None if f == "." else f.split(".") for f in g[1:]]
+        node = walk(doc, g[1].split("."))
         tag = [str(i + 1)] if mode == "scan" else []
-        for el in arr:
+        if g[0] == "kv":
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    out.append(US.join(tag + [val(k), val(v)]) + RS)
+            continue
+        if not isinstance(node, list):
+            continue
+        fps = [None if f == "." else f.split(".") for f in g[2:]]
+        for el in node:
             out.append(US.join(tag + [val(walk(el, f)) for f in fps]) + RS)
     sys.stdout.write("".join(out))' "$@" 2>/dev/null
   fi
@@ -690,7 +705,7 @@ wt_slugify() {  # $1 = worktree name
 # True if $1 is safe to use as the NAME of an environment variable: a leading letter or underscore,
 # then letters, digits and underscores, within a sane length.
 #
-# This is the gate wt_json_kv deliberately does not apply. A key out of `runtime.env.vars` becomes
+# This is the gate the JSON layer deliberately does not apply. A key out of `runtime.env.vars` becomes
 # the left-hand side of a `KEY=value` line in a file the application loads, and that profile is
 # committed (ADR-008) so the key arrives with anyone's branch. Without a shape check, a key of
 # `A=1` writes a line that sets a DIFFERENT variable than the profile appears to name, and a key
@@ -917,21 +932,64 @@ wt_is_safe_relpath() {  # $1 = candidate
 #  10 runtime.seed   11 runtime.teardown            12 runtime.env.file
 #  13 runtime.slug   14 runtime.env.vars            15 copy
 #  16 evidence.shellMarker
-# A new field goes on the END, never in the middle: the consumers read positionally, so an
+#  17 runtime.port.var                18 runtime.port.base            19 runtime.port.span
+#  20 runtime.port
+# A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
-# Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[].
+# Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
+# group 3 = runtime.env.vars as key/value pairs.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
-# a distinction no record stream can express.
+# a distinction no record stream can express. `runtime` and `runtime.env.vars` are there for the
+# same reason.
 wt_profile_scan() {  # $1 = profile path
   wt_json_scan schemaVersion shell shellArgs deps runtime \
     timeouts.bootstrapSeconds timeouts.seedSeconds \
     evidence.detectionVersion evidence.markers \
     runtime.seed runtime.teardown runtime.env.file \
     runtime.slug runtime.env.vars copy evidence.shellMarker \
+    runtime.port.var runtime.port.base runtime.port.span runtime.port \
     -- deps dir lock strategy install verify lockChecksum \
-    -- copy . <"$1"
+    -- copy . \
+    --kv runtime.env.vars <"$1"
+}
+
+# Split the scalar record of a wt_profile_scan stream into named variables — the ONE place that
+# knows the field order, matching the ONE place above that defines it.
+#
+# WHY THIS IS A FUNCTION. wt_load_profile and wt_validate_profile each used to carry their own
+# `IFS=$WT_US read -r version shell …` naming all sixteen fields in order, and both had to agree
+# forever with wt_profile_scan and with each other — three places, no way for any of them to
+# notice a disagreement, and the failure mode is silent: one path added in one list and not the
+# other shifts every later field, so the code checking timeouts receives `runtime`. The drift had
+# already begun before this was extracted: the comment above one of the two copies said "ALL
+# FIFTEEN are named" while the list beneath it named sixteen. This phase would have made it three
+# copies of nineteen.
+#
+# EVERY field is named even though most callers want a handful: bash `read` puts the unconsumed
+# remainder in the LAST variable, so naming fewer would silently pack the rest — separators and
+# all — into whichever variable happened to come last.
+#
+# Sets WT_PS_* and nothing else. `|| true` because a short record makes `read` return 1, which
+# would abort a caller running under `set -e`.
+#
+# SC2034: every WT_PS_* looks unused here because they ARE this function's return value; the
+# readers are its two callers.
+# shellcheck disable=SC2034
+wt_profile_scalars() {  # $1 = a wt_profile_scan stream
+  local raw=${1-} rec body
+  rec=${raw%%"$WT_RS"*}
+  body=${rec#*"$WT_US"}
+  IFS=$WT_US read -r \
+    WT_PS_VERSION WT_PS_SHELL WT_PS_SHELLARGS WT_PS_DEPS WT_PS_RUNTIME \
+    WT_PS_BOOT WT_PS_SEEDT \
+    WT_PS_EVDET WT_PS_EVMARK \
+    WT_PS_SEED WT_PS_TEARDOWN WT_PS_ENVFILE \
+    WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
+    WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
+    <<<"$body" || true
+  return 0
 }
 
 # The only schemaVersion this build understands. A profile written by a newer plugin
@@ -1008,8 +1066,9 @@ WT_STRATEGIES='install hardlink store skip'
 # because one timeout is mistyped degrades a WORKING repo invisibly, which is harder to
 # notice than the thing it was protecting against.
 #
-# COSTS ONE BACKEND INVOCATION. It used to cost three — scalars, then deps records, then copy
-# records — which is the "one spawn or two" question docs/phases/phase-3-bootstrap.md asked Phase 3
+# COSTS ONE BACKEND INVOCATION — still one, including the runtime.env.vars key check, which reads
+# its pairs out of the same stream as group 3 rather than opening the file again. It used to cost
+# three — scalars, then deps records, then copy records — which is the "one spawn or two" question docs/phases/phase-3-bootstrap.md asked Phase 3
 # to settle. It matters because it runs inside wt_load_profile, on a hook measured to block session
 # start 1:1. Measured on the python3 backend with a counting shim in front of the interpreter:
 # wt_validate_profile went 3 spawns -> 1 and wt_load_profile 4 -> 2, worth ~78ms -> ~41ms per load
@@ -1022,6 +1081,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local evdet evmark evshell n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
   local slug envvars copy cpath
   local seedp downp envfile unk tok
+  local portvar portbase portspan portobj ekey eval_ nkeys=0
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1053,11 +1113,17 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     printf 'profile: %s is not parseable as a single JSON document\n' "$file"
     return 1
   fi
-  # The scalar record is always first; strip its tag and read the fields positionally.
-  rec=${raw%%"$WT_RS"*}
-  body=${rec#*"$WT_US"}
-  IFS=$WT_US read -r version shell shellargs deps runtime boot seedt \
-    evdet evmark seedp downp envfile slug envvars copy evshell <<<"$body" || true
+  # ONE reader for the field order, shared with wt_load_profile. The locals below are aliases for
+  # readability in the checks that follow — the positional knowledge lives in wt_profile_scalars
+  # and nowhere else, so adding a field cannot shift this function's view of the record.
+  wt_profile_scalars "$raw"
+  version=$WT_PS_VERSION;   shell=$WT_PS_SHELL;       shellargs=$WT_PS_SHELLARGS
+  deps=$WT_PS_DEPS;         runtime=$WT_PS_RUNTIME;   boot=$WT_PS_BOOT
+  seedt=$WT_PS_SEEDT;       evdet=$WT_PS_EVDET;       evmark=$WT_PS_EVMARK
+  seedp=$WT_PS_SEED;        downp=$WT_PS_TEARDOWN;    envfile=$WT_PS_ENVFILE
+  slug=$WT_PS_SLUG;         envvars=$WT_PS_ENVVARS;   copy=$WT_PS_COPY
+  evshell=$WT_PS_EVSHELL;   portvar=$WT_PS_PORTVAR;   portbase=$WT_PS_PORTBASE
+  portspan=$WT_PS_PORTSPAN; portobj=$WT_PS_PORT
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -1289,6 +1355,124 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         unk=$(wt_unknown_placeholders "$tok") \
           || wt_log "runtime: \"$tok\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
       done
+
+      # --- runtime.slug -------------------------------------------------------
+      # A TEMPLATE naming neither {slug} nor {name} expands to the same text for every worktree,
+      # so every worktree derives one port and one database — the exact collision this layer
+      # exists to prevent, arrived at by configuration rather than by accident. A WARNING and not
+      # a violation because there is a safe per-field fallback (the engine re-slugifies the
+      # worktree name instead) and because refusing the whole profile would take the dependencies
+      # down with it.
+      if [ -n "$slug" ]; then
+        case $slug in
+          *'{slug}'* | *'{name}'*) ;;
+          *) wt_log "runtime.slug is \"$slug\", which contains no per-worktree placeholder — every worktree would derive the same slug, and therefore the same port and the same database; the worktree's own name will be used instead" ;;
+        esac
+      fi
+
+      # --- runtime.port -------------------------------------------------------
+      # EVERY PROBLEM HERE IS A WARNING, and the line is drawn on consequence rather than on tidiness.
+      # A port that cannot be derived means the port line is simply not written, so two worktrees
+      # share a port and the second app fails to bind — loud, immediate, and costing no data. An
+      # env.vars key, by contrast, selects a DATABASE, so a silently-skipped one destroys work; that
+      # is why keys below are fatal and these are not.
+      #
+      # Discarding the whole profile over a port typo would take the toolchain shell and every
+      # dependency down with it, on a profile that arrived with a colleague's branch — the
+      # wrong-rejection failure this function's docstring calls the more expensive direction. The
+      # engine re-checks these before acting, as every public entry point in this codebase does.
+      case $portvar in
+        '') ;;
+        *) wt_is_safe_envkey "$portvar" || wt_log "runtime.port.var: \"$portvar\" is not a legal environment variable name — no port will be written" ;;
+      esac
+      if [ -n "$portbase" ] || [ -n "$portspan" ]; then
+        [ -n "$portvar" ] || wt_log "runtime.port sets base/span but no var — there is nowhere to write the derived port, so it will not be written"
+        if ! wt_is_posint "$portbase" || [ "$((10#${portbase:-0}))" -lt "$WT_PORT_MIN" ]; then
+          wt_log "runtime.port.base: \"$portbase\" is not a whole number of at least $WT_PORT_MIN — no port will be derived"
+        elif ! wt_is_posint "$portspan"; then
+          wt_log "runtime.port.span: \"$portspan\" is not a whole number of at least 1 — no port will be derived"
+        elif [ "$((10#$portbase + 10#$portspan - 1))" -gt "$WT_PORT_MAX" ]; then
+          wt_log "runtime.port: base $portbase plus span $portspan runs past $WT_PORT_MAX, the highest port there is — no port will be derived"
+        elif [ "$((10#$portspan))" -lt 2 ]; then
+          wt_log "runtime.port.span is $portspan, so every worktree derives port $portbase — widen it if more than one worktree will run the app at once"
+        fi
+      elif [ -n "$portvar" ]; then
+        # The mirror of the case above, and it was silent until a reviewer asked for it: a var with
+        # no range to derive from can never be written either.
+        wt_log "runtime.port.var names $portvar but there is no port.base/port.span to derive a port from — no port will be written"
+      fi
+      # `port` ITSELF is shape-checked, not merely its three children. A profile writing
+      # `"port": 3786` — the obvious shorthand — walks all three children to nothing, skips every
+      # rule above and validates clean while port isolation silently never happens. Every other
+      # container in this schema (deps, copy, runtime, env.vars) is checked the same way.
+      case $portobj in
+        '' | 'null' | '{}' | '{'*'}') ;;
+        *) printf 'runtime.port: must be an object with var/base/span, got %s\n' "$portobj"; bad=1 ;;
+      esac
+
+      # --- runtime.env.vars ---------------------------------------------------
+      # EVERY KEY IS CHECKED, and this is the one runtime rule that is fatal on the key rather
+      # than the value. A key becomes the left-hand side of a `KEY=value` line in a file the
+      # application loads: a key of `A=1` writes a line setting a DIFFERENT variable than the
+      # profile appears to name, and a key carrying a newline writes a second line entirely. No
+      # amount of care on the value side defends against that, because the damage is done before
+      # the `=` the writer adds. The profile is committed (ADR-008), so these arrive with anyone's
+      # branch.
+      #
+      # It costs NO extra backend invocation: the pairs arrive as group 3 of the same
+      # wt_profile_scan stream every other check here reads, so the shape decision and the key
+      # decision come from ONE read of ONE document rather than from two reads that could differ.
+      case $envvars in
+        '' | 'null' | '{}') ;;
+        '{'*'}')
+          while IFS= read -r -d "$WT_RS" rec; do
+            # Group 3 is runtime.env.vars; skip the scalar record and the deps[]/copy[] records.
+            case $rec in
+              3"$WT_US"*) ;;
+              *) continue ;;
+            esac
+            body=${rec#*"$WT_US"}
+            IFS=$WT_US read -r ekey eval_ <<<"$body" || true
+            nkeys=$((nkeys + 1))
+            if ! wt_is_safe_envkey "$ekey"; then
+              printf 'runtime.env.vars: "%s" is not a legal environment variable name\n' "$ekey"
+              bad=1
+            fi
+            # A value is not shape-checked — it is data, and the writer quotes nothing by design
+            # (dotenv dialects disagree about quoting, so the profile author's own text is used
+            # verbatim). But a value carrying a newline would still write a second line, and that
+            # the writer cannot fix either. The JSON layer already folds CR/LF to a space, so this can
+            # only fire if that ever stops being true — which is exactly when it should.
+            case $eval_ in
+              *"$WT_NL"* | *"$WT_CR"*)
+                printf 'runtime.env.vars["%s"]: the value contains a line break\n' "$ekey"
+                bad=1
+                ;;
+            esac
+          done < <(printf '%s' "$raw")
+          # A non-empty map that yielded no pairs must not be treated as empty, for the same
+          # reason deps[] and copy[] are not: the reader swallows a backend failure by contract,
+          # so without this a half-produced stream would skip every key check while the profile
+          # was pronounced clean.
+          if [ "$nkeys" -eq 0 ]; then
+            printf 'runtime.env.vars: is a non-empty object but could not be read — refusing to treat it as empty\n'
+            bad=1
+          fi
+          ;;
+        *)
+          printf 'runtime.env.vars: must be an object, got %s\n' "$envvars"
+          bad=1
+          ;;
+      esac
+      # An env file with nothing to put in it, or values with nowhere to go: each is harmless on
+      # its own and pointless together, so say so rather than silently doing nothing.
+      if [ -n "$envfile" ] && [ "$nkeys" -eq 0 ] && [ -z "$portvar" ]; then
+        wt_log "runtime.env.file names $envfile but runtime has no port.var and no env.vars — the file would be written empty"
+      fi
+      if [ "$nkeys" -gt 0 ] && [ -z "$envfile" ]; then
+        printf 'runtime.env.vars: is set but runtime.env.file is not, so there is nowhere to write them\n'
+        bad=1
+      fi
       ;;
     *) printf 'runtime: must be an object (or omitted to mean "touch nothing"), got %s\n' "$runtime"; bad=1 ;;
   esac
@@ -1396,16 +1580,30 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #                           be acted on, which is the no-partial-trust rule again.
 #   PROFILE_HAS_RUNTIME     1 if a runtime block exists (ADR-006: absent means touch nothing)
 #   PROFILE_BOOTSTRAP_TIMEOUT / PROFILE_SEED_TIMEOUT   seconds, validated
-#
-# Phase 1 reads scalars only. The deps[] and runtime{} bodies are Phase 2's schema and
-# Phase 3's consumers; this is the stub loader those phases grow.
+#   PROFILE_RT_SLUG / PROFILE_RT_PORTVAR / PROFILE_RT_PORTBASE / PROFILE_RT_PORTSPAN
+#   PROFILE_RT_ENVFILE / PROFILE_RT_ENVVARS / PROFILE_RT_SEED / PROFILE_RT_TEARDOWN
+#                           the runtime block, published for the same reason the evidence block is:
+#                           layer 3 must not re-split the scalar record for itself. Two positional
+#                           readers of one record have to agree forever and nothing notices when
+#                           they stop — which is why there is now exactly one, wt_profile_scalars.
+#                           All are empty unless PROFILE_PRESENT is 1.
+#                           PROFILE_RT_ENVVARS is the map's COMPACT JSON, not its pairs: it answers
+#                           "is there anything to write" for free. The pairs themselves are group 3
+#                           of PROFILE_RAW, so reading them costs no interpreter start either.
+#                           PROFILE_RT_SLUG is an UNEXPANDED TEMPLATE, not a slug. A consumer must
+#                           wt_expand it and then put the result through wt_slugify — the value can
+#                           legally be "{name}", which is raw branch text, and everything
+#                           downstream trusts a slug to be [a-z0-9_]. Re-slugifying makes that safe
+#                           by construction rather than by review; do not skip it. Validation only
+#                           WARNS when the template has no per-worktree placeholder at all, so a
+#                           consumer that wants the promised fallback must apply it itself.
 #
 # SC2034: every PROFILE_* assignment below looks unused to shellcheck because they ARE
 # this function's return value — the callers that read them live in other files.
 # shellcheck disable=SC2034
 wt_load_profile() {  # $1 = repo root (default: $PWD)
-  local root=${1:-$PWD} raw rec body version shell runtime boot seed problems
-  local shellargs deps evdet evmark evshell seedp downp envfile slug envvars copy
+  local root=${1:-$PWD} raw version shell runtime boot seed problems
+  local shellargs evdet evmark evshell
 
   PROFILE_PATH="${root%/}/.claude/worktree-profile.json"
   PROFILE_PRESENT=0
@@ -1419,6 +1617,14 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_HAS_RUNTIME=0
   PROFILE_BOOTSTRAP_TIMEOUT=$WT_DEFAULT_TIMEOUT
   PROFILE_SEED_TIMEOUT=$WT_DEFAULT_TIMEOUT
+  PROFILE_RT_SLUG=''
+  PROFILE_RT_PORTVAR=''
+  PROFILE_RT_PORTBASE=''
+  PROFILE_RT_PORTSPAN=''
+  PROFILE_RT_ENVFILE=''
+  PROFILE_RT_ENVVARS=''
+  PROFILE_RT_SEED=''
+  PROFILE_RT_TEARDOWN=''
 
   [ -e "$PROFILE_PATH" ] || return 0
 
@@ -1443,16 +1649,13 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
     wt_log "$PROFILE_PATH could not be parsed as JSON — using defaults"
     return 0
   fi
-  # The scalar record is first; strip its tag, then read the fields POSITIONALLY in the order
-  # wt_profile_scan documents. ALL FIFTEEN are named even though this function uses five of
-  # them: bash `read` puts the unconsumed remainder in the LAST variable, so reading five here
-  # would silently pack ten more fields — separators and all — into `seed`.
-  # `|| true` because a short record makes `read` return 1, which would abort a caller
-  # running under `set -e`.
-  rec=${raw%%"$WT_RS"*}
-  body=${rec#*"$WT_US"}
-  IFS=$WT_US read -r version shell shellargs deps runtime boot seed \
-    evdet evmark seedp downp envfile slug envvars copy evshell <<<"$body" || true
+  # ONE reader for the field order, shared with wt_validate_profile. This function used to carry
+  # its own copy of the list, which had to agree with the validator's and with wt_profile_scan
+  # forever — see wt_profile_scalars for what that cost.
+  wt_profile_scalars "$raw"
+  version=$WT_PS_VERSION;  shell=$WT_PS_SHELL;      shellargs=$WT_PS_SHELLARGS
+  runtime=$WT_PS_RUNTIME;  boot=$WT_PS_BOOT;        seed=$WT_PS_SEEDT
+  evdet=$WT_PS_EVDET;      evmark=$WT_PS_EVMARK;    evshell=$WT_PS_EVSHELL
 
   if [ -z "$version" ]; then
     wt_log "$PROFILE_PATH has no schemaVersion — ignoring it and using defaults"
@@ -1504,6 +1707,22 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
     '' | 'false' | 'null' | '{}') PROFILE_HAS_RUNTIME=0 ;;
     *) PROFILE_HAS_RUNTIME=1 ;;
   esac
+
+  # The runtime block. Assigned UNCONDITIONALLY rather than under a PROFILE_HAS_RUNTIME test: every
+  # one of these paths lives inside `runtime`, so when there is no runtime block they are all empty
+  # already and the test could never change an outcome. A guard that cannot fire reads like it is
+  # protecting something and is one more thing to keep true. What DOES matter is that the
+  # initialisation above runs on every call — bootstrap.sh loads a profile twice, once per
+  # checkout, and a leftover port base from the first load would have layer 3 act on a profile
+  # that never asked for it.
+  PROFILE_RT_SLUG=$WT_PS_SLUG
+  PROFILE_RT_PORTVAR=$WT_PS_PORTVAR
+  PROFILE_RT_PORTBASE=$WT_PS_PORTBASE
+  PROFILE_RT_PORTSPAN=$WT_PS_PORTSPAN
+  PROFILE_RT_ENVFILE=$WT_PS_ENVFILE
+  PROFILE_RT_ENVVARS=$WT_PS_ENVVARS
+  PROFILE_RT_SEED=$WT_PS_SEED
+  PROFILE_RT_TEARDOWN=$WT_PS_TEARDOWN
 
   if [ -n "$boot" ]; then
     if wt_is_seconds "$boot"; then

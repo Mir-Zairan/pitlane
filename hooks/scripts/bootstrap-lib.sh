@@ -22,10 +22,6 @@
 [ -n "${WT_BOOTSTRAP_LIB_SOURCED:-}" ] && return 0
 WT_BOOTSTRAP_LIB_SOURCED=1
 
-# Literal newline and carriage return, for pattern tests that cannot spell them inline.
-WT_NL=$'\n'
-WT_CR=$'\r'
-
 # Source the primitive layer rather than assuming the entrypoint did it first. Everything here
 # uses wt_log, wt_is_seconds and WT_DEFAULT_TIMEOUT, and under `set -u` a wrong source order is a
 # crash, not a missing function. lib.sh's own WT_LIB_SOURCED guard makes this idempotent, and
