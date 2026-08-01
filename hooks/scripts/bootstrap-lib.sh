@@ -207,9 +207,15 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
 # two questions, and the second needs its own `git check-ignore` pass. A tracked file listed in
 # `.worktreeinclude` is therefore skipped, which is native's behaviour too.
 #
-# COPY-IF-MISSING, NEVER OVERWRITE. A worktree's own edited `.env` is the developer's, and this
-# runs on EVERY entry rather than only at creation — which is the one thing native cannot do, and
-# is what lets a worktree that lost a config file heal itself on the next session.
+# COPY-IF-MISSING, NEVER OVERWRITE. A worktree's own edited `.env` is the developer's.
+#
+# The self-healing this enables is real but NARROWER than it first looks, so state it precisely:
+# it covers the profile's `copy[]` only. That list is re-applied on every entry, so a worktree
+# that lost one of those files gets it back next session — something native cannot do, since
+# `.worktreeinclude` is honoured at creation and never again. `.worktreeinclude` itself is
+# re-applied only on the WorktreeCreate path, where native never ran; on SessionStart it is
+# deliberately left alone, because redoing what native already did could only ever disagree
+# with it.
 
 # Emit, NUL-separated, the paths `.worktreeinclude` selects: untracked files matching its patterns.
 # The gitignored half of the rule is applied later, by the copier, in one batched call.

@@ -1189,6 +1189,11 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #   PROFILE_SCHEMA_VERSION  as read, or empty
 #   PROFILE_SHELL           toolchain wrapper, e.g. "nix develop --command"; "" = host shell
 #   PROFILE_SHELLARGS       how that wrapper takes its command: "argv" | "string" | "" if unset
+#   PROFILE_EV_DETECTION / PROFILE_EV_MARKERS / PROFILE_EV_SHELL
+#                           the evidence block, published so a consumer does not have to re-split
+#                           the scalar record itself. A second positional read of the same
+#                           sixteen fields elsewhere is a silent-drift hazard: the two lists must
+#                           agree forever, and nothing would notice if they stopped.
 #   PROFILE_RAW             the wt_profile_scan stream this load came from, so a consumer can
 #                           iterate deps[] and copy[] WITHOUT a second interpreter start. Empty
 #                           unless PROFILE_PRESENT is 1 — an unusable profile's records must not
@@ -1212,6 +1217,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_SHELL=''
   PROFILE_SHELLARGS=''
   PROFILE_RAW=''
+  PROFILE_EV_DETECTION=''
+  PROFILE_EV_MARKERS=''
+  PROFILE_EV_SHELL=''
   PROFILE_HAS_RUNTIME=0
   PROFILE_BOOTSTRAP_TIMEOUT=$WT_DEFAULT_TIMEOUT
   PROFILE_SEED_TIMEOUT=$WT_DEFAULT_TIMEOUT
@@ -1286,6 +1294,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
 
   PROFILE_PRESENT=1
   PROFILE_RAW=$raw
+  PROFILE_EV_DETECTION=$evdet
+  PROFILE_EV_MARKERS=$evmark
+  PROFILE_EV_SHELL=$evshell
   PROFILE_SHELL=$shell
   # Left EMPTY when the profile omits it, rather than defaulted here. The consumer needs to tell
   # "the profile said argv" from "the profile said nothing", because only the second may fall
