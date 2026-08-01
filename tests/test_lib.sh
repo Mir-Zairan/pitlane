@@ -614,6 +614,106 @@ worktree: two' "$err"
   eq 'records: a UTF-8 BOM is tolerated on both backends' "vendor${RS}" \
     "$(wt_json_records deps dir <"$TMP/bom.json")"
 
+  # --- wt_json_scan ---------------------------------------------------------
+  # The one-invocation reader: a leading tagged scalar record, then one tagged record per
+  # element of each named array group. Its value rendering must agree with the other two
+  # readers byte for byte, because it is the same document read a different way.
+  SCAN='{"schemaVersion":1,"shell":"nix develop --command","copy":[".env",".env.local"],
+         "deps":[{"dir":"vendor","lock":"composer.lock"},{"dir":"node_modules","lock":null}],
+         "bool":true,"num":7,"obj":{"a":1},"uni":"café"}'
+  js() { printf '%s' "$SCAN" | wt_json_scan "$@"; }
+
+  eq 'scan: scalars come back as one tag-0 record' \
+    "0${US}1${US}nix develop --command${RS}" "$(js schemaVersion shell)"
+  eq 'scan: a missing scalar is empty, exactly as wt_json_get renders it' \
+    "0${US}${US}1${RS}" "$(js nope schemaVersion)"
+  eq 'scan: booleans, numbers, objects and non-ASCII render as wt_json_get renders them' \
+    "0${US}true${US}7${US}{\"a\":1}${US}café${RS}" "$(js bool num obj uni)"
+  eq 'scan: one array group is tagged 1, one record per element' \
+    "0${US}1${RS}1${US}vendor${US}composer.lock${RS}1${US}node_modules${US}${RS}" \
+    "$(js schemaVersion -- deps dir lock)"
+  eq 'scan: a second group is tagged 2, and the "." field is the element itself' \
+    "0${US}1${RS}1${US}vendor${RS}1${US}node_modules${RS}2${US}.env${RS}2${US}.env.local${RS}" \
+    "$(js schemaVersion -- deps dir -- copy .)"
+  eq 'scan: an absent array contributes no records at all' \
+    "0${US}1${RS}" "$(js schemaVersion -- nosucharray x)"
+  eq 'scan: a present-but-not-an-array value contributes no records' \
+    "0${US}1${RS}" "$(js schemaVersion -- obj x)"
+  eq 'scan: an empty array contributes no records' \
+    "0${US}${RS}" "$(printf '%s' '{"deps":[]}' | wt_json_scan nope -- deps dir)"
+
+  # THE PARSE PROOF. The scalar record is emitted whenever the document parsed, so no output
+  # at all means it did not — which is what removes wt_json_records' check-parseability-first
+  # caveat. Trailing junk and two concatenated documents must fail on BOTH backends, as they
+  # do for the other two readers.
+  eq 'scan: an unparseable document emits nothing' '' \
+    "$(printf 'not json at all' | wt_json_scan a -- b c)"
+  eq 'scan: ...and still returns 0, so the two backends stay indistinguishable' 0 \
+    "$(printf 'not json at all' | wt_json_scan a -- b c >/dev/null; echo $?)"
+  eq 'scan: trailing junk after a valid document emits nothing' '' \
+    "$(printf '%s' '{"a":1} junk' | wt_json_scan a -- b c)"
+  eq 'scan: two concatenated documents emit nothing' '' \
+    "$(printf '%s' '{"a":1}{"a":2}' | wt_json_scan a -- b c)"
+  eq 'scan: a UTF-8 BOM is tolerated, as it is by the other readers' "0${US}vendor${RS}" \
+    "$(printf '\357\273\277%s' '{"d":"vendor"}' | wt_json_scan d)"
+
+  # Caller errors return 1 and are distinguishable from a data outcome. A malformed group list
+  # matters more than it looks: an empty group would renumber every later tag, silently handing
+  # one array's records to the branch expecting another's.
+  rc_is 'scan: no arguments is a caller error' 1 "$(wt_json_scan >/dev/null 2>&1; echo $?)"
+  rc_is 'scan: no scalar path before the first group is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan -- deps dir >/dev/null 2>&1; echo $?)"
+  rc_is 'scan: a trailing separator with no array path is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan a -- >/dev/null 2>&1; echo $?)"
+  rc_is 'scan: two separators in a row is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan a -- -- deps >/dev/null 2>&1; echo $?)"
+  rc_is 'scan: an empty path is a caller error' 1 \
+    "$(printf '%s' '{}' | wt_json_scan '' -- deps dir >/dev/null 2>&1; echo $?)"
+
+  # Separator injection. These bytes are LEGAL in JSON as escapes, and the profile arrives
+  # from other people's branches, so a value carrying one would otherwise forge a field or end
+  # a record early. Both readers strip them; this one must too.
+  printf '%s' '{"deps":[{"dir":"a\u001fFORGED","lock":"b\u001eFORGED","strategy":"c\nd\re"}]}' \
+    >"$TMP/inject.json"
+  eq 'scan: an embedded US, RS, CR or LF cannot forge a field or a record' \
+    "0${US}${RS}1${US}aFORGED${US}bFORGED${US}c d e${RS}" \
+    "$(wt_json_scan nope -- deps dir lock strategy <"$TMP/inject.json")"
+
+  # Every value shape the renderer branches on, including the ones wt_json_records pins, so the
+  # shared program cannot regress on one reader's behalf. Exponent notation is deliberately
+  # absent — that divergence is documented and accepted.
+  NUMS='{"n":7,"neg":-3,"flt":1.5,"t":true,"f":false,"o":{"a":1},"arr":[1,2],"nul":null,"s":""}'
+  eq 'scan: numbers, negatives, floats, booleans, objects, arrays and null all render' \
+    "0${US}7${US}-3${US}1.5${US}true${US}false${US}{\"a\":1}${US}[1,2]${US}${US}${RS}" \
+    "$(printf '%s' "$NUMS" | wt_json_scan n neg flt t f o arr nul s)"
+
+  # An option-like path must stay DATA. This diverged between the two backends before the `--`
+  # was added — jq returned nothing and python returned the value — so it is pinned for every
+  # reader, in both scalar and field position.
+  eq 'scan: an option-like scalar path is data, not an option' "0${US}x${RS}" \
+    "$(printf '%s' '{"-i":"x"}' | wt_json_scan -i)"
+  eq 'scan: an option-like field path inside a group is data too' "0${US}${RS}1${US}y${RS}" \
+    "$(printf '%s' '{"d":[{"--flag":"y"}]}' | wt_json_scan nope -- d --flag)"
+
+  # No backend at all is a CALLER error, not an empty document. Without the guard a toolless
+  # machine returns 0 and no output, which every caller would have to read as a data outcome —
+  # the same "no backend looks like an empty repo" confusion wt_json_records guards against.
+  rc_is 'scan: no JSON backend is a caller error, not an empty result' 1 \
+    "$(printf '%s' '{"a":1}' | bash -c ". '$LIB'
+         wt_has_json() { return 1; }
+         wt_json_scan a -- deps dir >/dev/null 2>&1; echo \$?")"
+
+  # Agreement with the two readers that now share its backend program. They are wrappers over
+  # one implementation, so this pins the WRAPPERS — the tag/record stripping each mode does.
+  eq 'scan: its scalar record matches wt_json_get field for field' \
+    "$(printf '%s' "$SCAN" | wt_json_get schemaVersion shell uni obj)" \
+    "$(s=$(js schemaVersion shell uni obj); s=${s%"$RS"}; printf '%s' "${s#0"$US"}")"
+  # Anchored to record starts: an unanchored `s/1<US>//g` would also eat a value that happens
+  # to end in the digit 1, and pass only because no fixture has one.
+  eq 'scan: its array records match wt_json_records element for element' \
+    "$(printf '%s' "$SCAN" | wt_json_records deps dir lock)" \
+    "$(js nope -- deps dir lock | sed "s/^0${US}${RS}//; s/${RS}1${US}/${RS}/g; s/^1${US}//")"
+
   # --- wt_is_safe_relpath ---------------------------------------------------
   # The shape check that runs BEFORE any existence check. Note it tests SEGMENTS, not
   # substrings: a directory legitimately called `..cache` must be accepted, and a
@@ -868,6 +968,50 @@ worktree: two' "$err"
   vw '{"schemaVersion":1,"copy":"env"}'
   contains 'validate: copy must be an array' 'copy: must be an array' "$(vv)"
 
+  # copy[] needs the SAME fail-closed guard deps[] has, and more urgently now that both arrays
+  # arrive in one invocation: a stream truncated after the deps records would leave the copy
+  # loop with zero iterations and pronounce a traversing entry clean. The stub emits only the
+  # scalar record, with a hostile copy[] in field 15, so this assertion fails if the guard is
+  # removed. The record is built here and passed through the environment rather than
+  # interpolated, because it is made of control characters.
+  cpad=''
+  cn=0
+  while [ "$cn" -lt 13 ]; do cpad="$cpad$US"; cn=$((cn + 1)); done
+  # tag 0, schemaVersion 1, fields 2-14 empty, field 15 = copy
+  SCALARONLY="0${US}1${cpad}${US}[\"../../../.ssh/id_rsa\"]${RS}"
+  vw '{"schemaVersion":1,"copy":["../../../.ssh/id_rsa"]}'
+  out=$(SCALARONLY="$SCALARONLY" bash -c ". '$LIB'
+    wt_json_scan() { printf '%s' \"\$SCALARONLY\"; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  contains 'validate: a copy array whose records are lost is a violation, not an empty one' \
+    'copy: is a non-empty array but could not be read' "$out"
+  contains 'validate: and a lost hostile copy entry fails validation' '|rc=1' "$out"
+
+  # deps[] AND copy[] populated together — the demultiplexing the single invocation introduced.
+  # A mis-scoped tag filter or an unreset index would hand one array's records to the other
+  # branch, and no other fixture in this suite has both.
+  vw '{"schemaVersion":1,
+       "deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip"},
+               {"dir":"../escape","lock":"composer.lock","strategy":"skip"}],
+       "copy":[".env","/etc/shadow"]}'
+  got=$(vv)
+  contains 'validate: with both arrays, the offending dep is indexed among deps' \
+    'deps[1].dir:' "$got"
+  contains 'validate: with both arrays, the offending copy entry is indexed among copy' \
+    'copy[1]:' "$got"
+  eq 'validate: with both arrays, no copy element is mistaken for a dep' 0 \
+    "$(printf '%s\n' "$got" | grep -c 'deps\[.*shadow')"
+  eq 'validate: with both arrays, exactly the two real violations are reported' 2 \
+    "$(printf '%s\n' "$got" | grep -c .)"
+
+  # The pre-read hand-off wt_load_profile uses: passing the scan output must produce exactly
+  # what re-reading the file produces, or a load and a calibrate run would disagree about the
+  # same profile.
+  eq 'validate: a caller-supplied scan gives the same verdict as reading the file' \
+    "$(wt_validate_profile "$VP" "$VR")" \
+    "$(wt_validate_profile "$VP" "$VR" "$(wt_profile_scan "$VP")")"
+
   # A JSON *string* beginning with [ or { rendered as `[not-an-array`, which a
   # leading-byte-only type test accepted.
   vw '{"schemaVersion":1,"deps":"[not-an-array"}'
@@ -876,23 +1020,36 @@ worktree: two' "$err"
   contains 'validate: a string that starts with { is not an object' 'runtime: must be an object' "$(vv)"
 
   # A non-empty deps array that yields no records must NOT be treated as empty: that is how
-  # a failed second interpreter invocation silently skipped every per-dep check while
-  # pronouncing the profile clean. It can only be reached by a reader failure, so the reader
-  # is stubbed in a CHILD shell (stubbing here would break every later assertion).
+  # a failed interpreter invocation silently skipped every per-dep check while pronouncing the
+  # profile clean. It can only be reached by a reader failure, so the reader is stubbed in a
+  # CHILD shell (stubbing here would break every later assertion).
+  #
+  # The stub emits ONLY the scalar record — tag 0, schemaVersion 1, then empty shell and
+  # shellArgs, then a non-empty deps array — which is exactly the partial failure the guard is
+  # for now that scalars and records come from ONE invocation. A total reader failure emits
+  # nothing at all and is caught earlier, as the next assertion pins.
   vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip"}]}'
   eq 'validate: a readable deps array validates normally' '' "$(vv)"
   out=$(bash -c ". '$LIB'
-    wt_json_records() { return 0; }
+    wt_json_scan() { printf '0%s1%s%s%s[{\"dir\":\"v\"}]%s' \"\$WT_US\" \"\$WT_US\" \"\$WT_US\" \"\$WT_US\" \"\$WT_RS\"; }
     wt_validate_profile '$VP' '$VR' 2>/dev/null
     printf '|rc=%s' \$?" 2>/dev/null)
-  contains 'validate: an unreadable deps array is a violation, not an empty one' \
+  contains 'validate: a deps array whose records are lost is a violation, not an empty one' \
     'could not be read' "$out"
   contains 'validate: and it returns non-zero rather than passing' '|rc=1' "$out"
+  # A reader that produces nothing at all cannot be told from an unparseable document, and both
+  # are fail-closed.
+  out=$(bash -c ". '$LIB'
+    wt_json_scan() { return 0; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  contains 'validate: a reader that emits nothing fails closed' 'not parseable' "$out"
+  contains 'validate: and returns non-zero' '|rc=1' "$out"
   # The hostile version: a dep that WOULD escape the worktree must not slip through when the
   # records read fails.
   vw '{"schemaVersion":1,"deps":[{"dir":"../../../../etc","lock":"/etc/passwd","strategy":"bogus"}]}'
   out=$(bash -c ". '$LIB'
-    wt_json_records() { return 0; }
+    wt_json_scan() { printf '0%s1%s%s%s[{\"dir\":\"v\"}]%s' \"\$WT_US\" \"\$WT_US\" \"\$WT_US\" \"\$WT_US\" \"\$WT_RS\"; }
     wt_validate_profile '$VP' '$VR' >/dev/null 2>&1
     printf 'rc=%s' \$?" 2>/dev/null)
   eq 'validate: an unreadable hostile deps array still fails validation' 'rc=1' "$out"

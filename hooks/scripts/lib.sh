@@ -162,6 +162,154 @@ wt_json_get() {  # $@ = dotted paths
   [ "$#" -gt 0 ] || return 1
   local _p
   for _p in "$@"; do [ -n "$_p" ] || return 1; done
+  # rc is the BACKEND's, deliberately: jq exits non-zero on a parse error and callers written
+  # against this function use `out=$(wt_json_get ...) || return 1`. The two record readers below
+  # swallow it instead, for the reason their own contracts give.
+  wt_json_backend get "$#" "$@"
+}
+
+# Read an ARRAY of objects: $1 is the dotted path to the array, every remaining argument is a
+# dotted path WITHIN each element. Emits one record per element, fields joined by WT_US, each
+# record terminated by WT_RS.
+#
+# Why this exists rather than a loop over wt_json_get: wt_json_get cannot address array elements
+# at all. Measured on both backends — `deps.0.dir` returns the empty string, because jq's
+# getpath() rejects a string segment on an array (the error is caught and becomes null) and the
+# python branch guards with `isinstance(v, dict)`.
+#
+# It is also the only shape that keeps the cost right. deps[] has ~6 fields per element, so a
+# per-element or per-field call would be 6N cold interpreter starts on the session-start path,
+# where a cold python3 already dominates (measured: 5 fields cost ~590ms as five calls and
+# ~120ms as one).
+#
+# A field path of "." means THE ELEMENT ITSELF, which is how an array of bare strings such as
+# copy[] is read — no dotted path can reach a value that is not inside an object.
+#
+# Iterate it like this — note the trailing WT_RS on every record, including the last, which is
+# what stops `read -d` dropping the final element:
+#
+#   while IFS=$WT_US read -r -d "$WT_RS" dir lock strategy; do
+#     ...
+#   done < <(wt_json_records deps dir lock strategy <"$profile")
+#
+# RETURN CONTRACT, and it matters: returns 1 only for a CALLER error — no arguments, an empty
+# path, or no JSON backend on PATH. Returns 0 for every DATA outcome, including "the array is
+# absent", "it is not an array", and "the document does not parse at all", all of which produce
+# no records. That is deliberate: jq exits non-zero on a parse error while python exits 0, so
+# propagating the backend's status would make the two distinguishable, and every caller would
+# then behave differently depending on which tool the machine has.
+#
+# The consequence for callers is explicit: AN EMPTY RECORD STREAM CANNOT TELL YOU WHETHER THE
+# ARRAY IS EMPTY OR THE DOCUMENT IS CORRUPT, so establish that the document parses first.
+# wt_load_profile and wt_profile_drifted read a scalar with wt_json_get before they read records.
+# A caller that needs scalars AND arrays should use wt_json_scan instead, which answers both in
+# one invocation and whose leading record IS the parse proof.
+wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within each element
+  [ "$#" -ge 2 ] || return 1
+  wt_has_json || return 1
+  local _p
+  for _p in "$@"; do [ -n "$_p" ] || return 1; done
+  wt_json_backend records 0 -- "$@" || true
+  return 0
+}
+
+# Read a whole document — scalars AND several arrays — in ONE backend invocation.
+#
+#   wt_json_scan <scalar path>... -- <array path> <field path>... [-- <array path> <field>...]
+#
+# Emits TAGGED records, each field-joined by WT_US and terminated by WT_RS. The first field of
+# every record is the tag: `0` is the one scalar record, `1` the first array group's elements,
+# `2` the second's, in the order the groups were named.
+#
+# WHY THIS EXISTS. The two readers above are single-purpose, so a caller needing scalars and two
+# arrays paid three cold interpreter starts. That is the whole cost on the session-start path: a
+# cold python3 dominates, and wt_validate_profile — which runs inside wt_load_profile, on a hook
+# measured to block session start 1:1 — cost exactly those three. This is the "one spawn or two"
+# question docs/phases/phase-3-bootstrap.md asks Phase 3 to settle, answered as one. Measured with
+# a counting shim in front of the interpreter: wt_validate_profile went 3 spawns -> 1 and
+# wt_load_profile 4 -> 2, worth ~78ms -> ~41ms per load over 10 reps on a warm cache.
+#
+# IT ALSO REMOVES THE CHECK-PARSEABILITY-FIRST CAVEAT above. The scalar record is emitted whenever
+# the document parsed, so its PRESENCE is the proof: no output at all means the document did not
+# parse (or there is no backend). That is one check, not two.
+#
+# The scalar record is tagged even though it is always first, because the groups are heterogeneous
+# — different field counts — so a caller cannot read them all with one fixed `read`. Read each
+# record whole and dispatch on its tag:
+#
+#   while IFS= read -r -d "$WT_RS" rec; do
+#     tag=${rec%%"$WT_US"*}; body=${rec#*"$WT_US"}
+#     case $tag in
+#       0) IFS=$WT_US read -r version shell <<<"$body" ;;
+#       1) IFS=$WT_US read -r dir lock strategy <<<"$body" ;;
+#     esac
+#   done < <(wt_json_scan schemaVersion shell -- deps dir lock strategy <"$profile")
+#
+# The `<<<` is safe for the same reason the delimited readers are: desep has already folded every
+# CR and LF out of every value.
+#
+# RETURN CONTRACT: identical to wt_json_records — 1 only for a CALLER error (no arguments, a
+# malformed group list, an empty path, no JSON backend), 0 for every data outcome.
+wt_json_scan() {  # $@ = scalar paths, then repeated: -- <array path> <field paths...>
+  local _p nscalars=0 seen_group=0 want_path=0
+  [ "$#" -ge 1 ] || return 1
+  wt_has_json || return 1
+  for _p in "$@"; do [ -n "$_p" ] || return 1; done
+
+  # Argument-shape check, done here rather than in the backend so a malformed list is a caller
+  # error on both. It matters more than it looks: an empty group would renumber every tag after
+  # it, silently handing one array's records to the branch expecting another's.
+  for _p in "$@"; do
+    if [ "$_p" = '--' ]; then
+      [ "$want_path" -eq 0 ] || return 1   # a `--` immediately after a `--`
+      seen_group=1
+      want_path=1
+    elif [ "$want_path" -eq 1 ]; then
+      want_path=0
+    elif [ "$seen_group" -eq 0 ]; then
+      nscalars=$((nscalars + 1))
+    fi
+  done
+  [ "$want_path" -eq 0 ] || return 1       # a trailing `--` with no array path
+  [ "$nscalars" -ge 1 ] || return 1
+
+  wt_json_backend scan "$nscalars" "$@" || true
+  return 0
+}
+
+# THE ONE BACKEND PROGRAM. Every JSON read in this library goes through here; the three functions
+# above are argument validation and a mode.
+#
+# ONE jq filter and ONE python program, not one per reader. That is not tidiness. The value
+# renderer used to be copied per function per backend, and those copies had ALREADY diverged twice
+# in this codebase's history — non-ASCII escaping, and a UTF-8 BOM. The consequence of a
+# divergence here is specific and bad: the reader that VALIDATES a profile value and the reader
+# that ACTS on it would disagree about what the value is, on a committed file that arrives with
+# anyone's branch. Copies that must agree byte for byte should not be copies.
+#
+# Modes, which differ ONLY in what is emitted, never in how a value is rendered:
+#   get      the scalar fields joined by WT_US. No tag, no trailing WT_RS.
+#   records  one record per array element, fields joined by WT_US, each terminated by WT_RS.
+#   scan     a tagged scalar record (tag 0), then tagged records per array group (1, 2, ...).
+#
+# Value rendering, in every mode:
+#   missing / null / a non-object on the way down -> empty string
+#   true / false                                  -> "true" / "false", never python's True/False
+#   object / array                                -> compact JSON, so a caller can test presence
+#   an embedded US, RS, CR or LF                  -> stripped or folded, see WT_RS
+#
+# Three hardenings apply to all of it, each for a measured reason: `--` so an option-like path
+# stays data (it returned nothing on jq and the value on python), `--slurp` plus a length check so
+# trailing junk and concatenated documents fail on jq exactly as they already did on python, and
+# emptiness on any parse failure so the two backends stay indistinguishable.
+#
+# ensure_ascii=False so a non-ASCII object matches jq's output byte for byte.
+#
+# Paths are passed as DATA (jq --args, python argv) and never interpolated into the program text.
+# The reference implementation in the source conversation built both the jq filter and the python
+# SOURCE by string interpolation, so a field name containing a quote or a dot broke it — and its
+# python branch printed `True` for a boolean.
+wt_json_backend() {  # $1 = mode, $2 = scalar count, $@ = scalar paths [-- array path fields...]
   if wt_use_jq; then
     jq -rj --args --slurp '
       def val:
@@ -169,14 +317,43 @@ wt_json_get() {  # $@ = dotted paths
         elif type == "string" then .
         elif type == "boolean" or type == "number" then tostring
         else tojson end;
-      def desep: gsub("[]"; "") | gsub("[\r\n]+"; " ");
+      def desep: gsub("[]"; "") | gsub("[\r\n]+"; " ");
+      # The seed group collects anything before the first `--`; the callers guarantee there is
+      # nothing there, and dropping index 0 outright keeps the tags stable. Filtering empty
+      # groups instead would renumber them.
+      def groups:
+        reduce .[] as $x ([[]];
+          if $x == "--" then . + [[]] else .[0:-1] + [(.[-1] + [$x])] end)
+        | .[1:];
       if length != 1 then empty
       else
         .[0] as $doc
-        | [ $ARGS.positional[]
+        | $ARGS.positional[0] as $mode
+        | ($ARGS.positional[1] | tonumber) as $n
+        | $ARGS.positional[2:2+$n] as $sp
+        | ($ARGS.positional[2+$n:] | groups) as $gs
+        | [ $sp[]
             | . as $p
-            | (try ($doc | getpath($p | split("."))) catch null) | val | desep ]
-        | join("")
+            | (try ($doc | getpath($p | split("."))) catch null) | val | desep ] as $scal
+        | if $mode == "get" then ($scal | join(""))
+          else
+            ( if $mode == "scan" then ((["0"] + $scal) | join("")) + "" else empty end )
+            , ( $gs | to_entries[] as $g
+                | (($g.key + 1) | tostring) as $tag
+                | ($g.value[0] | split(".")) as $arrp
+                | ($g.value[1:] | map(if . == "." then null else split(".") end)) as $fps
+                | (try ($doc | getpath($arrp)) catch null) as $arr
+                | if ($arr | type) != "array" then empty
+                  else
+                    $arr[] as $el
+                    | (((if $mode == "scan" then [$tag] else [] end)
+                        + [ $fps[] as $fp
+                            | (if $fp == null then $el
+                               else (try ($el | getpath($fp)) catch null) end)
+                            | val | desep ])
+                       | join("")) + ""
+                  end )
+          end
       end' -- "$@" 2>/dev/null
   else
     python3 -c "${WT_PY_LF}"'import json,re,sys
@@ -185,134 +362,18 @@ try:
 except Exception:
     sys.exit(0)
 
+US = "\x1f"
+RS = "\x1e"
+
 def desep(s):
-    # Newlines as well as the two separators: the bash side reads these with a
-    # LINE-delimited read, so an embedded newline truncates the record and silently
-    # blanks every field after it. (No backticks in this comment -- shellcheck reads
-    # them as command substitution even inside the single-quoted python program.)
-    return re.sub(r"[\r\n]+", " ", s.replace("\x1f", "").replace("\x1e", ""))
-
-def get(path):
-    v = doc
-    for seg in path.split("."):
-        if isinstance(v, dict) and seg in v:
-            v = v[seg]
-        else:
-            return ""
-    if v is None:
-        return ""
-    if v is True:
-        return "true"
-    if v is False:
-        return "false"
-    if isinstance(v, str):
-        return desep(v)
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return repr(v)
-    return desep(json.dumps(v, separators=(",", ":"), ensure_ascii=False))
-
-sys.stdout.write("\x1f".join(get(p) for p in sys.argv[1:]))' "$@" 2>/dev/null
-  fi
-}
-
-# Read an ARRAY of objects in one backend invocation: $1 is the dotted path to the array,
-# every remaining argument is a dotted path WITHIN each element. Emits one record per
-# element, fields joined by WT_US, each record terminated by WT_RS.
-#
-# Why this exists rather than a loop over wt_json_get: wt_json_get cannot address array
-# elements at all. Measured on both backends — `deps.0.dir` returns the empty string,
-# because jq's getpath() rejects a string segment on an array (the error is caught and
-# becomes null) and the python branch guards with `isinstance(v, dict)`. Teaching it
-# numeric segments would mean editing the one function whose byte-for-byte agreement
-# across two backends is load-bearing, and whose behaviour 284 existing assertions pin.
-# A separate reader that does its own traversal leaves all of that untouched.
-#
-# It is also the only shape that keeps the cost right. deps[] has ~6 fields per element,
-# so a per-element or per-field call would be 6N cold interpreter starts on the
-# session-start path, where a cold python3 already dominates (measured: 5 fields cost
-# ~590ms as five calls and ~120ms as one).
-#
-# Value rendering is IDENTICAL to wt_json_get, deliberately duplicated rather than shared:
-#   missing / null / a non-object element / a non-object on the way down -> empty string
-#   true / false                                                        -> "true" / "false"
-#   object / array                                                      -> compact JSON
-#   an embedded US, RS, CR or LF byte                                   -> stripped, see WT_RS
-#
-# A field path of "." means THE ELEMENT ITSELF, which is how an array of bare strings such
-# as copy[] is read — no dotted path can reach a value that is not inside an object.
-#
-# It carries the same three hardenings as wt_json_get, for the same measured reasons: `--`
-# so an option-like path stays data, `--slurp` plus a length check so trailing junk and
-# concatenated documents fail on jq exactly as they already did on python, and an empty
-# path argument rejected rather than silently meaning "the whole document" on jq.
-#
-# Iterate it like this — note the trailing WT_RS on every record, including the last,
-# which is what stops `read -d` dropping the final element:
-#
-#   while IFS=$WT_US read -r -d "$WT_RS" dir lock strategy; do
-#     ...
-#   done < <(wt_json_records deps dir lock strategy <"$profile")
-#
-# RETURN CONTRACT, and it matters: returns 1 only for a CALLER error — no arguments, or
-# no JSON backend on PATH. Returns 0 for every DATA outcome, including "the array is
-# absent", "it is not an array", and "the document does not parse at all", all of which
-# produce no records. That is deliberate: jq exits non-zero on a parse error while python
-# exits 0, so propagating the backend's status would make the two distinguishable, and
-# every caller would then behave differently depending on which tool the machine has.
-# The consequence for callers is explicit: ESTABLISH THAT THE DOCUMENT PARSES FIRST
-# (wt_load_profile and wt_validate_profile both read a scalar with wt_json_get before
-# they read records), because an empty record stream on its own cannot tell you whether
-# the profile has no dependencies or is corrupt.
-wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within each element
-  [ "$#" -ge 2 ] || return 1
-  wt_has_json || return 1
-  local _p
-  for _p in "$@"; do [ -n "$_p" ] || return 1; done
-  if wt_use_jq; then
-    jq -rj --args --slurp '
-      def val:
-        if . == null then ""
-        elif type == "string" then .
-        elif type == "boolean" or type == "number" then tostring
-        else tojson end;
-      def desep: gsub("[]"; "") | gsub("[\r\n]+"; " ");
-      if length != 1 then empty
-      else
-        .[0] as $doc
-        | ($ARGS.positional[0] | split(".")) as $ap
-        | ($ARGS.positional[1:] | map(if . == "." then null else split(".") end)) as $fps
-        | (try ($doc | getpath($ap)) catch null) as $arr
-        | if ($arr | type) != "array" then empty
-          else
-            $arr[] as $el
-            | ([ $fps[] as $fp
-                 | (if $fp == null then $el else (try ($el | getpath($fp)) catch null) end)
-                 | val | desep ]
-               | join("")) + ""
-          end
-      end' -- "$@" 2>/dev/null || true
-  else
-    python3 -c "${WT_PY_LF}"'import json,re,sys
-try:
-    doc = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-
-# Absent and explicitly-null both render as the empty string, exactly as wt_json_get
-# does, so walk() returns None for a missing path rather than a distinct sentinel. A
-# sentinel would draw a distinction nothing here can observe — mutation-testing it
-# changed no assertion — and no field in the schema treats "" as meaningful.
-def desep(s):
-    # Newlines as well as the two separators: the bash side reads these with a
-    # LINE-delimited read, so an embedded newline truncates the record and silently
-    # blanks every field after it. (No backticks in this comment -- shellcheck reads
-    # them as command substitution even inside the single-quoted python program.)
-    return re.sub(r"[\r\n]+", " ", s.replace("\x1f", "").replace("\x1e", ""))
+    # Newlines as well as the two separators: the bash side reads these with a delimited
+    # read, so an embedded newline truncates the record and silently blanks every field
+    # after it. (No backticks in this comment -- shellcheck reads them as command
+    # substitution even inside the single-quoted python program.)
+    return re.sub(r"[\r\n]+", " ", s.replace(US, "").replace(RS, ""))
 
 def walk(node, segs):
-    # segs is None for the "." field, which means the element itself — needed for an array
+    # segs is None for the "." field, which means the element itself -- needed for an array
     # of bare strings such as copy[], where no field path can reach the value.
     if segs is None:
         return node
@@ -339,18 +400,33 @@ def val(v):
         return repr(v)
     return desep(json.dumps(v, separators=(",", ":"), ensure_ascii=False))
 
-arr = walk(doc, sys.argv[1].split("."))
-if not isinstance(arr, list):
-    sys.exit(0)
-# Split each field path ONCE, not once per element: deps[] has ~6 fields, so re-splitting
-# inside the loop is 6N string operations for no gain.
-fields = [None if f == "." else f.split(".") for f in sys.argv[2:]]
-out = []
-for el in arr:
-    out.append("\x1f".join(val(walk(el, f)) for f in fields) + "\x1e")
-sys.stdout.write("".join(out))' "$@" 2>/dev/null || true
+mode = sys.argv[1]
+n = int(sys.argv[2])
+scal = [val(walk(doc, p.split("."))) for p in sys.argv[3:3 + n]]
+if mode == "get":
+    sys.stdout.write(US.join(scal))
+else:
+    out = []
+    if mode == "scan":
+        out.append(US.join(["0"] + scal) + RS)
+    # The seed group holds anything before the first "--"; dropping index 0 keeps the tags
+    # stable where filtering empty groups would renumber them.
+    groups = [[]]
+    for x in sys.argv[3 + n:]:
+        if x == "--":
+            groups.append([])
+        else:
+            groups[-1].append(x)
+    for i, g in enumerate(groups[1:]):
+        arr = walk(doc, g[0].split("."))
+        if not isinstance(arr, list):
+            continue
+        fps = [None if f == "." else f.split(".") for f in g[1:]]
+        tag = [str(i + 1)] if mode == "scan" else []
+        for el in arr:
+            out.append(US.join(tag + [val(walk(el, f)) for f in fps]) + RS)
+    sys.stdout.write("".join(out))' "$@" 2>/dev/null
   fi
-  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -647,6 +723,36 @@ wt_is_safe_relpath() {  # $1 = candidate
 # Profile
 # ---------------------------------------------------------------------------
 
+# THE canonical one-invocation read of a profile, and the single definition of the scalar
+# field order. wt_load_profile and wt_validate_profile both consume it — load makes the call
+# and hands the result to validate, so a profile load costs ONE backend spawn.
+#
+# It is a function rather than a list repeated at two call sites because the consumers read the
+# scalar record POSITIONALLY: one path added in one place and not the other would silently shift
+# every later field, handing `runtime` to the code checking timeouts. There is no way for a
+# caller to notice that.
+#
+# Scalar record field order, after the tag:
+#   1 schemaVersion   2 shell        3 shellArgs     4 deps          5 runtime
+#   6 timeouts.bootstrapSeconds      7 timeouts.seedSeconds
+#   8 evidence.detectionVersion      9 evidence.markers
+#  10 runtime.seed   11 runtime.teardown            12 runtime.env.file
+#  13 runtime.slug   14 runtime.env.vars            15 copy
+# Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[].
+#
+# `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
+# compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
+# a distinction no record stream can express.
+wt_profile_scan() {  # $1 = profile path
+  wt_json_scan schemaVersion shell shellArgs deps runtime \
+    timeouts.bootstrapSeconds timeouts.seedSeconds \
+    evidence.detectionVersion evidence.markers \
+    runtime.seed runtime.teardown runtime.env.file \
+    runtime.slug runtime.env.vars copy \
+    -- deps dir lock strategy install verify lockChecksum \
+    -- copy . <"$1"
+}
+
 # The only schemaVersion this build understands. A profile written by a newer plugin
 # warns and falls back to defaults rather than acting on fields it may misread.
 WT_SCHEMA_VERSION=1
@@ -710,14 +816,18 @@ WT_STRATEGIES='install hardlink store skip'
 # because one timeout is mistyped degrades a WORKING repo invisibly, which is harder to
 # notice than the thing it was protecting against.
 #
-# Costs two backend invocations (scalars, then deps records). See the note in
-# docs/phases/phase-3-bootstrap.md about collapsing that to one once a real consumer exists.
+# COSTS ONE BACKEND INVOCATION. It used to cost three — scalars, then deps records, then copy
+# records — which is the "one spawn or two" question docs/phases/phase-3-bootstrap.md asked Phase 3
+# to settle. It matters because it runs inside wt_load_profile, on a hook measured to block session
+# start 1:1. Measured on the python3 backend with a counting shim in front of the interpreter:
+# wt_validate_profile went 3 spawns -> 1 and wt_load_profile 4 -> 2, worth ~78ms -> ~41ms per load
+# over 10 reps on a warm cache. wt_json_scan reads the whole document at once.
 #
 # Never calls `exit` — it is library code, and its caller's contract is to survive
 # everything (ADR-003).
-wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence)
-  local file=${1-} root=${2-} raw version shell shellargs deps runtime boot seedt
-  local evdet evmark n=0 bad=0 dir lock strategy install verify cksum sum recs
+wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-read wt_profile_scan output
+  local file=${1-} root=${2-} raw rec body version shell shellargs deps runtime boot seedt
+  local evdet evmark n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
   local slug envvars copy cpath
   local seedp downp envfile unk tok
 
@@ -738,19 +848,24 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence
     return 0
   fi
 
-  raw=$(wt_json_get schemaVersion shell shellArgs deps runtime \
-        timeouts.bootstrapSeconds timeouts.seedSeconds \
-        evidence.detectionVersion evidence.markers \
-        runtime.seed runtime.teardown runtime.env.file \
-        runtime.slug runtime.env.vars copy <"$file") || true
+  # ONE invocation for the scalars and both arrays, and the caller may hand us one it already
+  # made — wt_load_profile does, so a profile load costs one backend spawn rather than two.
+  # The leading scalar record is emitted whenever the document parsed, so its presence is the
+  # parse check; the caveat that used to force a separate scalar read is gone.
+  if [ "$#" -ge 3 ]; then
+    raw=$3
+  else
+    raw=$(wt_profile_scan "$file") || true
+  fi
   if [ -z "$raw" ]; then
-    # Empty output means the document did not parse as exactly one JSON value. This is the
-    # check that lets the deps read below trust an empty record stream — see wt_json_records.
     printf 'profile: %s is not parseable as a single JSON document\n' "$file"
     return 1
   fi
+  # The scalar record is always first; strip its tag and read the fields positionally.
+  rec=${raw%%"$WT_RS"*}
+  body=${rec#*"$WT_US"}
   IFS=$WT_US read -r version shell shellargs deps runtime boot seedt \
-    evdet evmark seedp downp envfile slug envvars copy <<<"$raw" || true
+    evdet evmark seedp downp envfile slug envvars copy <<<"$body" || true
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -780,19 +895,15 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence
     esac
   fi
   if [ -n "$deps" ] && [ "$deps" != '[]' ]; then
-    # Capture the records BEFORE iterating, so their absence can be distinguished from an
-    # array that is genuinely empty. wt_json_records reports every data outcome as success
-    # and swallows a backend failure, which is right for its own contract but wrong here:
-    # if the second interpreter invocation dies after `deps` was already seen as a non-empty
-    # array, an uncaptured loop simply never runs, `bad` stays 0, and every per-dep check —
-    # path escapes, unknown strategies, missing install commands — is silently skipped while
-    # the profile is pronounced clean. Measured with a stub that failed only the second call.
-    recs=$(wt_json_records deps dir lock strategy install verify lockChecksum <"$file")
-    if [ -z "$recs" ]; then
-      printf 'deps: is a non-empty array but could not be read — refusing to treat it as empty\n'
-      bad=1
-    fi
-    while IFS=$WT_US read -r -d "$WT_RS" dir lock strategy install verify cksum; do
+    while IFS= read -r -d "$WT_RS" rec; do
+      # Group 1 is deps[]; skip the scalar record and the copy[] records.
+      case $rec in
+        1"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      ndeps=$((ndeps + 1))
+      body=${rec#*"$WT_US"}
+      IFS=$WT_US read -r dir lock strategy install verify cksum <<<"$body" || true
       # Index in the SAME numbering the file uses, so a message can be acted on directly.
       case $strategy in
         '') printf 'deps[%d].strategy: missing\n' "$n"; bad=1 ;;
@@ -864,7 +975,17 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence
       done
 
       n=$((n + 1))
-    done < <(printf '%s' "$recs")
+    done < <(printf '%s' "$raw")
+
+    # A non-empty deps array that yielded no records must NOT be treated as empty. The reader
+    # swallows a backend failure by contract, so without this a half-produced stream would skip
+    # every per-dep check — path escapes, unknown strategies, missing install commands — while
+    # the profile was pronounced clean. A total reader failure is already caught above (no
+    # scalar record at all); this catches the partial case.
+    if [ "$ndeps" -eq 0 ]; then
+      printf 'deps: is a non-empty array but could not be read — refusing to treat it as empty\n'
+      bad=1
+    fi
   fi
 
   # --- copy[] ---------------------------------------------------------------
@@ -879,14 +1000,31 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root (for path existence
   fi
   if [ -n "$copy" ] && [ "$copy" != '[]' ]; then
     n=0
-    while IFS=$WT_US read -r -d "$WT_RS" cpath; do
+    while IFS= read -r -d "$WT_RS" rec; do
+      # Group 2 is copy[].
+      case $rec in
+        2"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      cpath=${rec#*"$WT_US"}
       if [ -n "$cpath" ] && ! wt_is_safe_relpath "$cpath"; then
         printf 'copy[%d]: "%s" must be a relative path inside the repository\n' "$n" "$cpath"
         bad=1
       fi
+      ncopy=$((ncopy + 1))
       n=$((n + 1))
-    done < <(wt_json_records copy . <"$file")
+    done < <(printf '%s' "$raw")
     n=0
+
+    # The same fail-closed guard the deps loop has, and for a sharper reason now that both
+    # arrays come from ONE invocation: a stream truncated after the deps records leaves this
+    # loop with zero iterations, `bad` untouched, and every copy[] path-escape check skipped
+    # while the profile is pronounced clean. copy[] entries are paths a later phase performs
+    # file operations on, arriving in a committed file from anyone's branch.
+    if [ "$ncopy" -eq 0 ]; then
+      printf 'copy: is a non-empty array but could not be read — refusing to treat it as empty\n'
+      bad=1
+    fi
   fi
 
   # --- timeouts -------------------------------------------------------------
@@ -1057,7 +1195,8 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 # this function's return value — the callers that read them live in other files.
 # shellcheck disable=SC2034
 wt_load_profile() {  # $1 = repo root (default: $PWD)
-  local root=${1:-$PWD} raw version shell runtime boot seed problems
+  local root=${1:-$PWD} raw rec body version shell runtime boot seed problems
+  local shellargs deps evdet evmark seedp downp envfile slug envvars copy
 
   PROFILE_PATH="${root%/}/.claude/worktree-profile.json"
   PROFILE_PRESENT=0
@@ -1082,16 +1221,24 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
     return 0
   fi
 
-  # One backend invocation for every field; see wt_json_get.
-  raw=$(wt_json_get schemaVersion shell runtime timeouts.bootstrapSeconds timeouts.seedSeconds \
-        <"$PROFILE_PATH")
+  # ONE backend invocation for the whole load, validation included: this reads the document
+  # once with wt_profile_scan and hands the very same output to wt_validate_profile below,
+  # rather than each of them parsing the file for itself.
+  raw=$(wt_profile_scan "$PROFILE_PATH")
   if [ -z "$raw" ]; then
     wt_log "$PROFILE_PATH could not be parsed as JSON — using defaults"
     return 0
   fi
+  # The scalar record is first; strip its tag, then read the fields POSITIONALLY in the order
+  # wt_profile_scan documents. ALL FIFTEEN are named even though this function uses five of
+  # them: bash `read` puts the unconsumed remainder in the LAST variable, so reading five here
+  # would silently pack ten more fields — separators and all — into `seed`.
   # `|| true` because a short record makes `read` return 1, which would abort a caller
-  # running under `set -e`. Assumes no profile value contains a newline or a US byte.
-  IFS=$WT_US read -r version shell runtime boot seed <<<"$raw" || true
+  # running under `set -e`.
+  rec=${raw%%"$WT_RS"*}
+  body=${rec#*"$WT_US"}
+  IFS=$WT_US read -r version shell shellargs deps runtime boot seed \
+    evdet evmark seedp downp envfile slug envvars copy <<<"$body" || true
 
   if [ -z "$version" ]; then
     wt_log "$PROFILE_PATH has no schemaVersion — ignoring it and using defaults"
@@ -1120,7 +1267,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
     wt_log "WT_SKIP_VALIDATION is set — $PROFILE_PATH is being used without validation"
   fi
   if [ -z "${WT_SKIP_VALIDATION:-}" ]; then
-    problems=$(wt_validate_profile "$PROFILE_PATH" "$root") || {
+    problems=$(wt_validate_profile "$PROFILE_PATH" "$root" "$raw") || {
       wt_log "$PROFILE_PATH is not valid — using defaults. Run /worktree-calibrate to rewrite it:"
       wt_log "$problems"
       return 0
