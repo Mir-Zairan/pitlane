@@ -738,6 +738,9 @@ wt_is_safe_relpath() {  # $1 = candidate
 #   8 evidence.detectionVersion      9 evidence.markers
 #  10 runtime.seed   11 runtime.teardown            12 runtime.env.file
 #  13 runtime.slug   14 runtime.env.vars            15 copy
+#  16 evidence.shellMarker
+# A new field goes on the END, never in the middle: the consumers read positionally, so an
+# insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[].
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
@@ -748,7 +751,7 @@ wt_profile_scan() {  # $1 = profile path
     timeouts.bootstrapSeconds timeouts.seedSeconds \
     evidence.detectionVersion evidence.markers \
     runtime.seed runtime.teardown runtime.env.file \
-    runtime.slug runtime.env.vars copy \
+    runtime.slug runtime.env.vars copy evidence.shellMarker \
     -- deps dir lock strategy install verify lockChecksum \
     -- copy . <"$1"
 }
@@ -827,7 +830,7 @@ WT_STRATEGIES='install hardlink store skip'
 # everything (ADR-003).
 wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-read wt_profile_scan output
   local file=${1-} root=${2-} raw rec body version shell shellargs deps runtime boot seedt
-  local evdet evmark n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
+  local evdet evmark evshell n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
   local slug envvars copy cpath
   local seedp downp envfile unk tok
 
@@ -865,7 +868,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   rec=${raw%%"$WT_RS"*}
   body=${rec#*"$WT_US"}
   IFS=$WT_US read -r version shell shellargs deps runtime boot seedt \
-    evdet evmark seedp downp envfile slug envvars copy <<<"$body" || true
+    evdet evmark seedp downp envfile slug envvars copy evshell <<<"$body" || true
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -1201,7 +1204,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 # shellcheck disable=SC2034
 wt_load_profile() {  # $1 = repo root (default: $PWD)
   local root=${1:-$PWD} raw rec body version shell runtime boot seed problems
-  local shellargs deps evdet evmark seedp downp envfile slug envvars copy
+  local shellargs deps evdet evmark evshell seedp downp envfile slug envvars copy
 
   PROFILE_PATH="${root%/}/.claude/worktree-profile.json"
   PROFILE_PRESENT=0
@@ -1245,7 +1248,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   rec=${raw%%"$WT_RS"*}
   body=${rec#*"$WT_US"}
   IFS=$WT_US read -r version shell shellargs deps runtime boot seed \
-    evdet evmark seedp downp envfile slug envvars copy <<<"$body" || true
+    evdet evmark seedp downp envfile slug envvars copy evshell <<<"$body" || true
 
   if [ -z "$version" ]; then
     wt_log "$PROFILE_PATH has no schemaVersion — ignoring it and using defaults"

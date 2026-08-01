@@ -1234,5 +1234,91 @@ esac
 eq 'a tree is not deleted on the strength of an unreadable state file' 'KEEPME' \
   "$(cat "$DWT/vendor/keep.txt" 2>/dev/null)"
 
+# ---------------------------------------------------------------------------
+# Drift reporting
+# ---------------------------------------------------------------------------
+# All FOUR kinds of evidence, against the real reference/detection.json — a fixture table would
+# only prove the fixture, and the point is that adding an ecosystem there needs no change here.
+
+DRTREE=$TMP/drift
+mkdir -p "$DRTREE"
+: > "$DRTREE/composer.lock"
+CURDET=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['detectionVersion'])" \
+  "$WT_DETECTION_JSON_DEFAULT" 2>/dev/null)
+
+# Baseline: evidence matching reality says nothing at all.
+cat > "$DRTREE/p-clean.json" <<JSON
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+ "install":"x","lockChecksum":"$(cksum < "$DRTREE/composer.lock")"}],
+ "evidence":{"detectionVersion":$CURDET,"markers":["composer.lock"],"shellMarker":""}}
+JSON
+eq 'a profile that matches the checkout reports no drift at all' '' \
+  "$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)"
+
+# A gained ecosystem. This is the one that broke: with a single-element markers array the last
+# unterminated line was dropped by `read`, so nearly every marker went unchecked.
+: > "$DRTREE/pnpm-lock.yaml"
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+contains 'a lockfile the profile never saw is reported' 'pnpm-lock.yaml' "$out"
+contains '...and points at the fix' 'worktree-calibrate' "$out"
+# Every rule in the table must be checked, not just the first: a single-marker rule is the common
+# shape, so dropping the last line made the whole check silently useless.
+: > "$DRTREE/Gemfile.lock"
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+contains 'a second gained ecosystem is reported too' 'Gemfile.lock' "$out"
+rm -f "$DRTREE/Gemfile.lock" "$DRTREE/pnpm-lock.yaml"
+
+# A lost marker.
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock","pnpm-lock.yaml"]' '' 2>&1)
+contains 'a lockfile the profile expects and is now gone is reported' 'no longer has: pnpm-lock.yaml' "$out"
+
+# The toolchain marker: a branch that gained a flake is now installing on the wrong toolchain.
+: > "$DRTREE/flake.nix"
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+contains 'a newly appeared flake.nix is reported as a toolchain change' 'toolchain marker changed' "$out"
+contains '...naming both sides' 'none -> flake.nix' "$out"
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" "$CURDET" '["composer.lock"]' 'flake.nix' 2>&1)
+eq '...and says nothing when it was already recorded' '' "$out"
+rm -f "$DRTREE/flake.nix"
+
+# The detection table version.
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" 0 '["composer.lock"]' '' 2>&1)
+contains 'an older detection table version is reported' 'detection table is now version' "$out"
+
+# The per-lockfile checksums Phase 2 shipped and left unwired.
+cat > "$DRTREE/p-stale.json" <<'JSON'
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+ "install":"x","lockChecksum":"1 1"}],
+ "evidence":{"detectionVersion":1,"markers":["composer.lock"],"shellMarker":""}}
+JSON
+out=$(wt_report_drift "$DRTREE" "$DRTREE/p-stale.json" "$CURDET" '["composer.lock"]' '' 2>&1)
+contains 'a lockfile changed since calibration is reported' 'has changed since calibration' "$out"
+
+# A profile with NO evidence block cannot report drift, and must not pretend to.
+eq 'a profile with no evidence says nothing' '' \
+  "$(wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" '' '' '' 2>&1)"
+
+# It must never block, whatever it finds.
+wt_report_drift "$DRTREE" "$DRTREE/p-stale.json" 0 '["composer.lock"]' 'flake.nix' >/dev/null 2>&1
+eq 'drift reporting always succeeds — it warns, it never blocks' 0 $?
+# ...including when the table itself is unreadable.
+eq 'an unreadable detection table is silent rather than noisy' '' \
+  "$(WT_DETECTION_JSON=/nonexistent/table.json wt_report_drift "$DRTREE" "$DRTREE/p-clean.json" \
+       1 '["composer.lock"]' '' 2>&1)"
+
+# ---------------------------------------------------------------------------
+# The Phase 4 hand-off
+# ---------------------------------------------------------------------------
+PROFILE_HAS_RUNTIME=0
+eq 'with no runtime block the hand-off is silent (ADR-006: touch nothing)' '' \
+  "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
+PROFILE_HAS_RUNTIME=1
+contains 'with a runtime block it says the work is not implemented yet' 'not implemented yet' \
+  "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
+contains '...and is honest about what that costs the developer' 'shares the app' \
+  "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
+# shellcheck disable=SC2034
+PROFILE_HAS_RUNTIME=0
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

@@ -1081,3 +1081,141 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   done < <(printf '%s' "$PROFILE_RAW")
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# Drift: has the checkout moved away from what the profile was calibrated on?
+# ---------------------------------------------------------------------------
+#
+# Phase 2 shipped the `evidence` block and a comparator for its checksums but deliberately no call
+# site. This is that call site, and it covers ALL of the evidence, not just the checksums — until
+# now `evidence.markers`, `evidence.shellMarker` and `evidence.detectionVersion` were written and
+# validated with no reader at all, which is the inert-field smell this repo dislikes.
+#
+# Each answers a different question a checksum cannot:
+#   markers           the repo has GAINED (or lost) an ecosystem the profile knows nothing about
+#   shellMarker       a flake.nix has appeared, so installs are running on the wrong toolchain
+#   detectionVersion  a newer shipped table might propose better answers
+#
+# IT IS A STRING COMPARE AND A FILE TEST, NEVER A RE-DETECTION. That is what keeps it legal inside
+# a hook at all (ADR-002 forbids a hook doing discovery), and it WARNS WITHOUT EVER BLOCKING
+# (ADR-003). Its honest limits are recorded in reference/detection.md: a lockfile can churn with
+# nothing meaningful changing, and — worse — a hazard can appear in composer.json's `scripts`
+# without touching any lockfile, so the case where a warning matters most produces none.
+#
+# The detection table is READ, not copied into this file. reference/detection.json is ground truth
+# and Phase 2's rule is that adding an ecosystem is one entry there and nothing else; a duplicated
+# marker list here would be a second copy to rot. It costs one interpreter start, and only for a
+# profile that actually carries evidence — a profile without it cannot report drift anyway.
+# Resolved to an ABSOLUTE path at source time. A bare `dirname "${BASH_SOURCE[0]}"` is relative
+# when the library is sourced by a relative path, and a hook runs from wherever the user launched
+# their session — so the table simply would not be found, and drift would silently never report.
+# (Measured: it did exactly that until this was fixed.)
+# Located the same way detect.sh locates it: the platform's own CLAUDE_PLUGIN_ROOT first, since
+# that is what a hook actually receives, and a path derived from this file only as a fallback.
+#
+# The fallback climbs with parameter expansion rather than `cd ..`. A `..` left in the path is not
+# merely untidy: it is resolved by whoever opens the file, and some sandboxes refuse a traversal
+# that points at a directory they would otherwise allow. Measured while building this — both
+# `<root>/hooks/scripts/../reference/detection.json` and a `cd` through it failed, while the plain
+# `<root>/reference/detection.json` worked — and the symptom was drift silently never reporting.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/reference/detection.json" ]; then
+  WT_DETECTION_JSON_DEFAULT="${CLAUDE_PLUGIN_ROOT}/reference/detection.json"
+else
+  WT_BLIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || WT_BLIB_DIR=''
+  WT_BLIB_DIR=${WT_BLIB_DIR%/*}          # .../hooks
+  WT_BLIB_DIR=${WT_BLIB_DIR%/*}          # the plugin root
+  WT_DETECTION_JSON_DEFAULT=${WT_BLIB_DIR:+$WT_BLIB_DIR/reference/detection.json}
+fi
+
+wt_report_drift() {  # $1 = the checkout to inspect, $2 = profile path, $3 = evidence.detectionVersion, $4 = evidence.markers, $5 = evidence.shellMarker
+  local tree=${1%/} profile=${2-} evdet=${3-} evmark=${4-} evshell=${5-}
+  local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT}
+  local raw rec body curdet m gained='' lost='' curshell='' problems
+
+  # Nothing recorded, nothing to compare. Not a warning: the evidence block is optional.
+  if [ -z "$evdet" ] && [ -z "$evmark" ] && [ -z "$evshell" ]; then
+    return 0
+  fi
+  [ -r "$table" ] || return 0
+  wt_has_json || return 0
+
+  # One read of the table: its version, every marker any rule knows, and every shell marker.
+  raw=$(wt_json_scan detectionVersion -- deps markers -- shells marker <"$table") || return 0
+  [ -n "$raw" ] || return 0
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    body=${rec#*"$WT_US"}
+    case $rec in
+      0"$WT_US"*)
+        curdet=$body
+        ;;
+      1"$WT_US"*)
+        # `markers` is a JSON array per rule; its elements are the filenames to look for.
+        while IFS= read -r m; do
+          [ -n "$m" ] || continue
+          [ -e "$tree/$m" ] || {
+            # Recorded but no longer here.
+            case $evmark in
+              *"\"$m\""*) lost="$lost $m" ;;
+            esac
+            continue
+          }
+          # Present now. Quoted on both sides so `bun.lock` cannot match inside `bun.lockb`.
+          case $evmark in
+            *"\"$m\""*) ;;
+            *) gained="$gained $m" ;;
+          esac
+        # `printf '%s\n'`, WITH the newline: without it the last line is unterminated, and a
+        # `while read` sets the variable but returns non-zero, so the loop body never runs for it.
+        # Since most rules have a single marker, that dropped nearly every one and the check
+        # silently found nothing. Measured.
+        done < <(printf '%s\n' "$body" | tr -d '[]"' | tr ',' '\n')
+        ;;
+      2"$WT_US"*)
+        # First match wins, exactly as the table is ordered for detection.
+        [ -n "$curshell" ] && continue
+        [ -n "$body" ] || continue
+        [ -e "$tree/$body" ] && curshell=$body
+        ;;
+    esac
+  done < <(printf '%s' "$raw")
+
+  if [ -n "$gained" ]; then
+    wt_log "the profile was calibrated before this checkout had:$gained — run /worktree-calibrate so those are set up too"
+  fi
+  if [ -n "$lost" ]; then
+    wt_log "the profile expects these, which this checkout no longer has:$lost — run /worktree-calibrate"
+  fi
+  if [ -n "$evshell" ] || [ -n "$curshell" ]; then
+    if [ "$evshell" != "$curshell" ]; then
+      wt_log "the toolchain marker changed since calibration (${evshell:-none} -> ${curshell:-none}) — installs may be running on the wrong toolchain; run /worktree-calibrate"
+    fi
+  fi
+  if [ -n "$evdet" ] && [ -n "$curdet" ] && [ "$evdet" != "$curdet" ]; then
+    wt_log "this plugin's detection table is now version $curdet, the profile was written against $evdet — /worktree-calibrate may propose better answers"
+  fi
+
+  # And the per-lockfile checksums, which Phase 2 already implemented and left unwired.
+  problems=$(wt_profile_drifted "$profile" "$tree") || {
+    wt_log "$problems"
+    wt_log "run /worktree-calibrate if the dependency set really changed"
+  }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# The hand-off to Phase 4
+# ---------------------------------------------------------------------------
+#
+# An in-process call at the point runtime isolation has to happen: inside the SAME SessionStart
+# invocation, before the hook returns, because env overrides must exist before the session starts.
+# There is no cross-process boundary here to justify serialising the hand-off through a file — the
+# artifact pattern belongs to teardown (Phase 5), which is a genuinely separate event.
+#
+# SILENT when the profile has no runtime block, because absent means TOUCH NOTHING (ADR-006) and a
+# plugin that comments on every session start is one people uninstall. Phase 4 replaces the body.
+wt_runtime_handoff() {  # $1 = root, $2 = worktree
+  [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
+  wt_log "runtime isolation (ports, env overrides, seed) is not implemented yet — Phase 4 owns it; this worktree shares the app's ports and databases"
+  return 0
+}
