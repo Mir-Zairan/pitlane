@@ -1500,6 +1500,34 @@ wt_rule_is_recorded() {  # $1 = the rule's markers as compact JSON, $2 = the rul
 # The SEED does the opposite and fails closed, because a wrong database name destroys work. That
 # asymmetry is the whole reason these are separate decisions rather than one "is it safe" flag.
 
+# Collapse `..` segments in an absolute path, textually and without a fork.
+#
+# A relative `gitdir` pointer (git 2.48 worktree.useRelativePaths) builds a path like
+# `<admin>/../../../.claude/worktrees/x`, which names the right directory but never string-equals
+# the caller's own path — so a worktree would fail to recognise ITSELF among its siblings, and the
+# seed's collision check would then refuse every session, blaming a colleague's worktree that does
+# not exist. `pwd -P` would also resolve symlinks and costs a subshell per sibling; this is a
+# textual normalisation, which is what a comparison between two paths git itself produced needs.
+wt_collapse_dotdot() {  # $1 = path
+  local p=${1-} out='' seg rest
+  case $p in
+    */../*) ;;
+    *) printf '%s' "$p"; return 0 ;;      # nothing to do, and no cost for the common case
+  esac
+  rest=$p
+  case $rest in /*) out='' ;; esac
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
+    case $seg in
+      '' | '.') continue ;;
+      '..') out=${out%/*} ;;
+      *) out="$out/$seg" ;;
+    esac
+  done
+  printf '%s' "${out:-/}"
+}
+
 # Collect every LIVE sibling worktree of $1 that has a runtime allocation. Sets WT_SIBLINGS to the
 # records (`slug US port`, RS-terminated) and WT_SIBLINGS_OK to 1 when the enumeration can be
 # trusted, 0 when it cannot.
@@ -1564,13 +1592,19 @@ wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
       /*) ;;
       *) wtpath=$admin/$wtpath ;;
     esac
+    wtpath=$(wt_collapse_dotdot "$wtpath")
     [ "$wtpath" = "$mine" ] && continue              # ourselves
     # The orphan check: the admin directory outlives an `rm -rf` of the checkout.
     [ -n "$wtpath" ] && [ -d "$wtpath" ] || continue
     [ -r "$admin/worktree-bootstrap-state" ] || continue
     slug=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" slug) || continue
     port=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" port) || continue
-    [ -n "$port" ] || continue
+    # A RECORD IS EMITTED WHENEVER THERE IS A SLUG, PORT OR NOT. Skipping portless records was a
+    # real hole: a sibling that seeded a database but never got a port — a profile with `seed` and
+    # no `runtime.port`, or one whose port allocation had not run yet — was invisible to the seed's
+    # collision check, which is the one guard standing between a derived name and a colleague's
+    # database. The port loop is unaffected: an empty port never equals a candidate.
+    [ -n "$slug" ] || continue
     WT_SIBLINGS="$WT_SIBLINGS$slug$WT_US$port$WT_RS"
   done
   return 0
@@ -1925,6 +1959,228 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     rm -f "$tmp"
     wt_log "  runtime: could not put $rel in place"
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Layer 3 — the seed contract
+# ---------------------------------------------------------------------------
+#
+# THE CONTRACT, which the reference template and the calibrate skill both describe and which a
+# repo-owned script is written against:
+#
+#   * it runs INSIDE the profile's `shell`, with the WORKTREE as its working directory;
+#   * it receives WT_NAME, WT_SLUG, WT_PORT, WT_PATH, WT_ROOT and WT_ENV_FILE in the environment —
+#     never as arguments and never interpolated into a command line;
+#   * a non-zero exit warns and the session continues (ADR-003); the state file records the
+#     failure so a re-entry can retry;
+#   * it is time-boxed, out of what is LEFT of the bootstrap budget rather than out of a fresh
+#     allowance, because both run inside one hook invocation and their SUM has to fit.
+#
+# WHY VALUES ARRIVE AS ENVIRONMENT AND NOT AS ARGUMENTS. `runtime.seed` is a PATH, not a command
+# template, so nothing expands into command position and the whole injection class Phase 3 had to
+# defend against with wt_unsafe_command_placeholder does not arise here. The path itself is the one
+# thing that does reach a command string, so it is invoked as `./'<path>'` relative to the working
+# directory the runner already sets — which keeps $WT_PATH, and therefore the untrusted worktree
+# name embedded in it, out of the command entirely.
+#
+# THE SEED IS THE ONE STEP THAT FAILS CLOSED. Everything else in layer 3 fails open, because a
+# missing port costs a bind error and a missing env file costs a misconfigured app — both loud,
+# both recoverable. A seed clones or creates a DATABASE from a name this plugin derived, so acting
+# on a name it cannot vouch for destroys a colleague's work. It therefore refuses unless it can
+# prove three things, and says which one it could not.
+
+# Run the seed. Sets WT_SEED_STATUS to one of: done, failed, timeout, skipped, refused, none.
+wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env state $7=seed rel $8=deadline
+  local root=${1%/} worktree=${2%/} slug=${3-} port=${4-} envrel=${5-} envstate=${6-}
+  local rel=${7-} deadline=${8-} abs esc cksum prev prevck prevslug left secs full rc started elapsed
+  local sibslug sibport
+
+  # SC2034: WT_SEED_STATUS is this function's result — wt_runtime_handoff reports on it.
+  # shellcheck disable=SC2034
+  WT_SEED_STATUS=none
+  [ -n "$rel" ] || return 0
+
+  if ! wt_is_safe_relpath "$rel"; then
+    wt_log "  runtime: refusing to run the seed \"$rel\" — not a relative path inside the worktree"
+    WT_SEED_STATUS=refused
+    return 0
+  fi
+  abs=$worktree/$rel
+  if wt_has_symlinked_parent "$worktree" "$rel" || [ -L "$abs" ]; then
+    wt_log "  runtime: refusing to run the seed $rel — it or one of its parents is a symlink, so it is not the script this branch committed"
+    WT_SEED_STATUS=refused
+    return 0
+  fi
+  if [ ! -f "$abs" ]; then
+    # Not an error: the profile may name a script a later commit adds, and calibration deliberately
+    # scaffolds one before it is written.
+    wt_log "  runtime: the seed script $rel is not in this worktree — skipping the seed step"
+    WT_SEED_STATUS=skipped
+    return 0
+  fi
+
+  # --- SKIP FIRST: already done, and nothing has changed -------------------------------------
+  # BEFORE the refusals, deliberately. If nothing is going to run, none of the three questions need
+  # asking — and asking them anyway means a worktree that seeded successfully weeks ago starts
+  # reporting `refused` and printing a warning on every session the moment its developer takes
+  # ownership of the env file, which is a supported thing to do and already recorded.
+  #
+  # Fingerprinted on the SCRIPT'S CONTENT and the slug, exactly as a dependency is fingerprinted on
+  # its lockfile and install command. Editing the script re-runs it; nothing else does.
+  cksum=$(wt_cksum_file "$abs")
+  prev=$(wt_runtime_state_get "$worktree" seedstatus) || prev=''
+  prevck=$(wt_runtime_state_get "$worktree" seedcksum) || prevck=''
+  prevslug=$(wt_runtime_state_get "$worktree" slug) || prevslug=''
+  # Quoted: bare `done` is the loop keyword to the parser (the same trap wt_state_is_done notes).
+  if [ "$prev" = "done" ] && [ "$prevck" = "$cksum" ] && [ "$prevslug" = "$slug" ]; then
+    WT_SEED_STATUS="done"
+    return 0
+  fi
+
+  # NOT EXECUTABLE is a skip, not a failure. `chmod +x` does not change a file's CONTENT, so
+  # recording a failure here would fingerprint the script and then refuse to retry it — leaving
+  # "edit it to try again" as the only escape from a problem editing does not fix.
+  if [ ! -x "$abs" ]; then
+    wt_log "  runtime: the seed script $rel is not executable — run chmod +x on it; skipping the seed step"
+    WT_SEED_STATUS=skipped
+    return 0
+  fi
+
+  # --- REFUSAL 1: the app is not pointed where this seed thinks it is ------------------------
+  # A developer-managed env file means the worktree deliberately points somewhere else — a shared
+  # database, a colleague's, a restored snapshot. Seeding WT_SLUG then creates or clones something
+  # the app will never read, and in the worst case does it to a name someone else is using.
+  if [ "$envstate" = theirs ]; then
+    wt_log "  runtime: not seeding — $envrel is managed by you, so this worktree is pointed somewhere the seed's WT_SLUG=$slug does not describe. Delete that file to hand it back."
+    WT_SEED_STATUS=refused
+    return 0
+  fi
+
+  # --- REFUSAL 2: we cannot see the other worktrees ------------------------------------------
+  # THE SCAN IS RUN HERE, not inherited. Reading whatever a previous caller left in the globals was
+  # a real defect: wt_runtime_claim_port returns EARLY — before scanning — whenever a port is
+  # already recorded for this slug, and it never runs at all for a profile with a seed but no
+  # `runtime.port`. So the flag was stale or unset in the ordinary case, and the seed refused
+  # forever after its first session, blaming an enumeration nobody had attempted. The scan is
+  # fork-free per sibling, so running it again costs one `rev-parse`.
+  wt_runtime_siblings "$root" "$worktree"
+  # The sibling scan is what proves no live worktree already owns this slug. If it could not run,
+  # the honest answer is that we do not know — and for the one irreversible step, not knowing has
+  # to mean not doing. Ports fail open on the same signal; the seed must not.
+  if [ "${WT_SIBLINGS_OK:-0}" != 1 ]; then
+    wt_log "  runtime: not seeding — could not enumerate this repository's other worktrees, so it cannot be established that no other worktree already owns the name \"$slug\""
+    WT_SEED_STATUS=refused
+    return 0
+  fi
+
+  # --- REFUSAL 3: another live worktree already owns this slug -------------------------------
+  # There is no safe "probe forward" for a database name the way there is for a port: inventing an
+  # alternative is exactly the inference ADR-006 forbids. Refuse, name the collision, let the
+  # developer rename the worktree or fix the profile.
+  # Distinct names: `prev`/`prevck` hold the RECORDED SEED FINGERPRINT read above, and reusing them
+  # as this loop's variables clobbered it — so the "do not retry an unchanged failure" rule below
+  # silently never fired and a failing stub re-ran on every session, which is the exact cost that
+  # rule exists to avoid.
+  # shellcheck disable=SC2034  # sibport is read POSITIONALLY to consume its field.
+  while IFS=$WT_US read -r -d "$WT_RS" sibslug sibport; do
+    if [ "$sibslug" = "$slug" ]; then
+      wt_log "  runtime: not seeding — another live worktree already owns the name \"$slug\". Rename this worktree, or give runtime.slug a template that distinguishes them."
+      WT_SEED_STATUS=refused
+      return 0
+    fi
+  done <<EOF
+${WT_SIBLINGS-}
+EOF
+
+  # A PREVIOUS FAILURE IS NOT RE-PAID EVERY SESSION. Calibration deliberately scaffolds a seed stub
+  # that exits non-zero until edited, so without this a repo that has not written its seed yet
+  # would burn the whole seed timeout on every single session, forever, for a failure it has
+  # already been told about. One line instead — and the moment the script or the slug changes, it
+  # retries by itself, with no reset step to remember.
+  case $prev in
+    failed | timeout)
+      if [ "$prevck" = "$cksum" ] && [ "$prevslug" = "$slug" ]; then
+        wt_log "  runtime: the seed $rel failed last time and has not changed since — not retrying. Edit it to try again."
+        WT_SEED_STATUS=$prev
+        return 0
+      fi
+      ;;
+  esac
+
+  # --- RUN -----------------------------------------------------------------------------------
+  # The budget is what is LEFT, clamped by the profile's own seedSeconds. Both this and the
+  # dependency work run inside one hook invocation, so taking a fresh seedSeconds here is how the
+  # platform ends up killing the hook before any internal guard fires.
+  left=$(wt_budget_left "$deadline")
+  secs=${PROFILE_SEED_TIMEOUT:-$WT_DEFAULT_TIMEOUT}
+  wt_is_seconds "$secs" || secs=$WT_DEFAULT_TIMEOUT
+  full=$secs
+  # `left` may legitimately be "0", which wt_is_posint REJECTS — so testing it with that would
+  # skip the clamp exactly when the budget is spent and hand the seed the profile's full
+  # allowance. Digits, including zero, is the right test here.
+  case $left in
+    '' | *[!0-9]*) left='' ;;
+  esac
+  if [ -n "$left" ] && [ "$((10#$left))" -lt "$((10#$secs))" ]; then
+    secs=$left
+  fi
+  if ! wt_is_posint "$secs"; then
+    wt_log "  runtime: no time left in the bootstrap budget to run the seed — leaving it for the next session"
+    wt_runtime_state_set "$worktree" "$slug" "$port" \
+      "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
+      "$envrel" "$envstate" failed "" || true
+    WT_SEED_STATUS=failed
+    return 0
+  fi
+
+  # `./'<path>'` keeps $WT_PATH — and the untrusted worktree name inside it — out of the command
+  # string. An embedded single quote in the path is escaped rather than assumed absent.
+  esc=${rel//\'/\'\\\'\'}
+  wt_log "  runtime: seeding with $rel (${secs}s of the budget left)"
+  started=$(date +%s 2>/dev/null) || started=''
+  (
+    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
+    WT_SLUG=$slug
+    WT_PORT=$port
+    WT_PATH=$worktree
+    WT_ROOT=$root
+    WT_ENV_FILE=$envrel
+    wt_run_in_shell "./'$esc'" "$worktree" "$secs"
+  )
+  rc=$?
+  elapsed=''
+  [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
+
+  case $rc in
+    0)
+      wt_log "  runtime: seeded${elapsed:+ in ${elapsed}s}"
+      WT_SEED_STATUS="done"
+      ;;
+    124)
+      # A TIMEOUT CAUSED BY A SHORT BUDGET MUST STAY RETRYABLE. If the seed got less than the
+      # profile allows — a slow dependency install ate the budget — then the script was never the
+      # problem, and fingerprinting it here would wedge seeding permanently: no later session would
+      # retry however much time it had, and "edit the script" is advice about a script that is
+      # fine. Clearing the fingerprint makes the next session try again.
+      if [ "$((10#$secs))" -lt "$((10#$full))" ]; then
+        wt_log "  runtime: the seed only had ${secs}s of the ${full}s it asks for, because the rest of the bootstrap used the budget — it was stopped, and will be tried again next session"
+        cksum=''
+      else
+        wt_log "  runtime: the seed ran past the ${secs}s it had and was stopped — the database may be half-made; it will be retried when the script changes"
+      fi
+      WT_SEED_STATUS=timeout
+      ;;
+    *)
+      wt_log "  runtime: the seed failed (exit $rc) — the worktree has its own port and env file, but its database may not be ready"
+      WT_SEED_STATUS=failed
+      ;;
+  esac
+
+  wt_runtime_state_set "$worktree" "$slug" "$port" \
+    "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
+    "$envrel" "$envstate" "$WT_SEED_STATUS" "$cksum" || \
+    wt_log "  runtime: could not record the seed outcome — it will run again next session"
   return 0
 }
 

@@ -1645,7 +1645,12 @@ cp "$TMP/gitdir.abs" "$BADMIN/gitdir"
 # A sibling that has never allocated a port contributes nothing rather than an empty record, which
 # would otherwise look like a claim on port "".
 wt_runtime_state_set "$PB" beta_slug '' '' '' '' none ''
-eq 'a sibling with no port yet contributes no record' '' "$(sib "$PREPO" "$PA")"
+# A PORTLESS SIBLING STILL COUNTS. Skipping these was a hole in the one guard between a derived
+# database name and a colleague's data: a worktree that seeded but never allocated a port — a
+# profile with `seed` and no `runtime.port` — was invisible to the seed's collision check. The port
+# loop is unaffected, since an empty port never equals a candidate.
+eq 'a sibling with no port still contributes its slug' "beta_slug${US_}${RS_}" \
+  "$(sib "$PREPO" "$PA")"
 # A corrupt or foreign-version sibling state file contributes nothing either.
 printf 'garbage' > "$BADMIN/worktree-bootstrap-state"
 eq 'a corrupt sibling state file contributes no record' '' "$(sib "$PREPO" "$PA")"
@@ -2192,6 +2197,352 @@ eq 'and the file is byte-identical after both runs' "$before" "$(cat "$EW/$EF")"
 
 rm -f "$EW/$EF"
 unset WT_PORT
+
+# ---------------------------------------------------------------------------
+# Layer 3 — the seed contract
+# ---------------------------------------------------------------------------
+SREPO2=$TMP/srepo
+mkdir -p "$SREPO2"
+git init -q "$SREPO2"
+git -C "$SREPO2" config user.email t@example.com
+git -C "$SREPO2" config user.name t
+printf '.env.worktree.local\n' >"$SREPO2/.gitignore"
+: >"$SREPO2/f"; git -C "$SREPO2" add -A; git -C "$SREPO2" commit -qm init
+git -C "$SREPO2" worktree add -q "$SREPO2/.claude/worktrees/sw" -b sw 2>/dev/null
+SW=$SREPO2/.claude/worktrees/sw
+mkdir -p "$SW/.claude"
+SEEDREL=.claude/worktree-seed.sh
+
+# The default state for these tests: a trustworthy sibling scan with no siblings, and an env file
+# this plugin owns. Each refusal below flips exactly one of those.
+# shellcheck disable=SC2034
+WT_SIBLINGS_OK=1
+# shellcheck disable=SC2034
+WT_SIBLINGS=''
+# shellcheck disable=SC2034
+PROFILE_SEED_TIMEOUT=30
+# shellcheck disable=SC2034
+PROFILE_SHELL=''
+seed_deadline() { printf '%s' "$(( $(date +%s) + 300 ))"; }
+write_seed() { printf '%s' "$1" >"$SW/$SEEDREL"; chmod +x "$SW/$SEEDREL"; }
+reset_seed_state() { rm -f "$(wt_state_path "$SW")"; }
+
+WT_NAME=seedwt; WT_SLUG=seed_slug; WT_PATH=$SW; WT_ROOT=$SREPO2
+export WT_NAME WT_SLUG WT_PATH WT_ROOT
+
+# --- the happy path, and what the script actually receives -----------------------------------
+reset_seed_state
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+{ printf "name=%s\n" "$WT_NAME"
+  printf "slug=%s\n" "$WT_SLUG"
+  printf "port=%s\n" "$WT_PORT"
+  printf "path=%s\n" "$WT_PATH"
+  printf "root=%s\n" "$WT_ROOT"
+  printf "envfile=%s\n" "$WT_ENV_FILE"
+  printf "cwd=%s\n" "$PWD"
+} >"$WT_PATH/seed-saw.txt"
+'
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'a seed that succeeds is recorded done' 'done' "$WT_SEED_STATUS"
+eq 'the seed receives WT_SLUG'     'slug=seed_slug'              "$(grep '^slug='    "$SW/seed-saw.txt")"
+eq 'the seed receives WT_PORT'     'port=3812'                   "$(grep '^port='    "$SW/seed-saw.txt")"
+eq 'the seed receives WT_ENV_FILE' 'envfile=.env.worktree.local' "$(grep '^envfile=' "$SW/seed-saw.txt")"
+eq 'the seed receives WT_ROOT'     "root=$SREPO2"                "$(grep '^root='    "$SW/seed-saw.txt")"
+eq 'the seed receives WT_NAME'     'name=seedwt'                 "$(grep '^name='    "$SW/seed-saw.txt")"
+eq 'and it runs with the WORKTREE as its working directory' "cwd=$SW" \
+  "$(grep '^cwd=' "$SW/seed-saw.txt")"
+eq 'the outcome is recorded in the state file' 'done' "$(wt_runtime_state_get "$SW" seedstatus)"
+ne 'along with a fingerprint of the script' '' "$(wt_runtime_state_get "$SW" seedcksum)"
+
+# --- SKIP when nothing has changed, RETRY when the script does -------------------------------
+rm -f "$SW/seed-saw.txt"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'a second run with an unchanged script does not re-run it' 0 \
+  "$([ -e "$SW/seed-saw.txt" ] && echo 1 || echo 0)"
+eq 'and still reports done' 'done' "$WT_SEED_STATUS"
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+printf changed >"$WT_PATH/seed-saw.txt"
+'
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'editing the script makes it run again' 'changed' "$(cat "$SW/seed-saw.txt" 2>/dev/null)"
+# A CHANGED SLUG is a different database, so a `done` marker from the old one must not skip it.
+rm -f "$SW/seed-saw.txt"
+wt_runtime_seed "$SREPO2" "$SW" other_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'a changed slug re-runs the seed for the new database' 'changed' \
+  "$(cat "$SW/seed-saw.txt" 2>/dev/null)"
+
+# --- A FAILURE IS NOT RE-PAID EVERY SESSION --------------------------------------------------
+# Calibration deliberately scaffolds a stub that exits non-zero until edited. Retrying it forever
+# would burn the whole seed timeout on every session for a failure already reported.
+reset_seed_state
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+printf ran >>"$WT_PATH/seed-runs.txt"
+echo "worktree-seed.sh is still the unedited stub" >&2
+exit 1
+'
+rm -f "$SW/seed-runs.txt"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a failing seed is recorded failed' 'failed' "$WT_SEED_STATUS"
+eq 'and the session survives it' 0 $?
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'an unchanged failing seed is NOT retried on later sessions' 'ran' \
+  "$(cat "$SW/seed-runs.txt" 2>/dev/null)"
+contains 'and it says how to try again' 'Edit it to try again' \
+  "$(wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>&1)"
+# ...but editing it retries by itself, with no reset step to remember.
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+printf ran >>"$WT_PATH/seed-runs.txt"
+exit 0
+'
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'editing a failed seed retries it without any reset step' 'ranran' \
+  "$(cat "$SW/seed-runs.txt" 2>/dev/null)"
+eq 'and it is recorded done this time' 'done' "$WT_SEED_STATUS"
+
+# --- A HANGING SEED IS STOPPED, and still leaves a usable session ----------------------------
+reset_seed_state
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+sleep 30
+'
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+  "$(( $(date +%s) + 2 ))" 2>/dev/null
+eq 'a seed that outruns its budget is stopped and recorded as a timeout' 'timeout' "$WT_SEED_STATUS"
+eq 'and the timeout is recorded, so an unchanged script is not re-run' 'timeout' \
+  "$(wt_runtime_state_get "$SW" seedstatus)"
+# The budget comes out of what is LEFT, not a fresh allowance: both run inside one hook invocation.
+reset_seed_state
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+  "$(( $(date +%s) - 10 ))" 2>/dev/null
+eq 'an exhausted budget does not start the seed at all' 'failed' "$WT_SEED_STATUS"
+contains 'and says why' 'no time left' \
+  "$(reset_seed_state
+     wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+       "$(( $(date +%s) - 10 ))" 2>&1)"
+
+# --- THE THREE REFUSALS ----------------------------------------------------------------------
+# This is the one step that fails CLOSED: everything else in layer 3 fails open, because a missing
+# port costs a bind error while a wrong database name destroys a colleague's work.
+reset_seed_state
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+printf ran >>"$WT_PATH/seed-refuse.txt"
+'
+rm -f "$SW/seed-refuse.txt"
+
+# 1. The env file is the developer's, so the app is pointed somewhere WT_SLUG does not describe.
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a developer-managed env file refuses the seed' 'refused' "$WT_SEED_STATUS"
+contains 'and explains how to hand it back' 'Delete that file' \
+  "$(wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)" 2>&1)"
+
+# 2. The sibling scan could not run, so it cannot be shown that nobody else owns this slug. The
+# seed runs that scan ITSELF now — inheriting a flag a previous caller happened to leave was a real
+# defect, because wt_runtime_claim_port returns before scanning whenever a port is already recorded
+# and never runs at all for a profile with a seed and no runtime.port. So this is forced by
+# shadowing the scan rather than by setting a global the function no longer reads.
+seed_with_broken_scan() {
+  # shellcheck disable=SC2329
+  wt_runtime_siblings() { WT_SIBLINGS=''; WT_SIBLINGS_OK=0; }
+  wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+  printf '%s' "$WT_SEED_STATUS"
+}
+reset_seed_state
+eq 'an untrustworthy sibling scan refuses the seed — it fails CLOSED' 'refused' \
+  "$(seed_with_broken_scan 2>/dev/null)"
+contains 'and says it could not enumerate the other worktrees' 'could not enumerate' \
+  "$( # shellcheck disable=SC2329
+      wt_runtime_siblings() { WT_SIBLINGS=''; WT_SIBLINGS_OK=0; }
+      reset_seed_state
+      wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+        "$(seed_deadline)" 2>&1)"
+
+# 3. Another LIVE worktree already owns this slug — with a real sibling worktree, not a hand-set
+# global, since the whole point is that the seed establishes this for itself. There is no safe way
+# to invent an alternative database name, so it refuses and names the collision.
+git -C "$SREPO2" worktree add -q "$SREPO2/.claude/worktrees/rival" -b rival 2>/dev/null
+RIVAL=$SREPO2/.claude/worktrees/rival
+wt_runtime_state_set "$RIVAL" seed_slug 3900 derived .e ours "done" RCK
+reset_seed_state
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a slug another live worktree owns refuses the seed' 'refused' "$WT_SEED_STATUS"
+contains 'and names what to do about it' 'Rename this worktree' \
+  "$(reset_seed_state
+     wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+       "$(seed_deadline)" 2>&1)"
+# A PORTLESS rival still blocks it — that sibling seeded a database even though it never got a port.
+wt_runtime_state_set "$RIVAL" seed_slug '' '' .e ours "done" RCK
+reset_seed_state
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a rival with no port recorded still blocks the seed' 'refused' "$WT_SEED_STATUS"
+
+# NOT ONE of the refusals may have run the script — asserted before the positive case below.
+eq 'no refusal ever ran the script' 0 \
+  "$([ -e "$SW/seed-refuse.txt" ] && echo 1 || echo 0)"
+
+# A DIFFERENT slug on that sibling is not a collision, which proves the refusals were about the
+# collision rather than about refusing everything.
+wt_runtime_state_set "$RIVAL" other_slug 3900 derived .e ours "done" RCK
+reset_seed_state
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'a sibling on a different slug does not refuse it' 'done' "$WT_SEED_STATUS"
+eq 'and the script really did run that time' 'ran' "$(cat "$SW/seed-refuse.txt" 2>/dev/null)"
+
+# AN ORPHANED rival — its checkout deleted with `rm -rf` rather than `git worktree remove` — must
+# NOT block the seed, or a name becomes permanently unusable.
+wt_runtime_state_set "$RIVAL" seed_slug 3900 derived .e ours "done" RCK
+mv "$RIVAL" "$RIVAL.gone"
+reset_seed_state
+rm -f "$SW/seed-refuse.txt"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'an orphaned rival does not block the seed forever' 'done' "$WT_SEED_STATUS"
+mv "$RIVAL.gone" "$RIVAL"
+git -C "$SREPO2" worktree remove --force "$RIVAL" 2>/dev/null
+
+# THE SKIP COMES FIRST, before any refusal. A worktree that seeded successfully and whose developer
+# then took ownership of the env file must stay quiet — the file is a supported escape hatch and
+# the outcome is already recorded, so re-asking the refusal questions would warn on every session
+# about a seed that is not going to run anyway.
+reset_seed_state
+rm -f "$SW/seed-refuse.txt"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'a seed that has run is recorded done' 'done' "$WT_SEED_STATUS"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)"
+eq 'taking ownership of the env file afterwards still reports done, not refused' 'done' \
+  "$WT_SEED_STATUS"
+eq 'and says nothing at all about it' '' \
+  "$(wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)" 2>&1)"
+
+# A WORKTREE MUST RECOGNISE ITSELF among the siblings, even when git wrote its gitdir pointer
+# RELATIVELY (2.48+ worktree.useRelativePaths). Without collapsing the `..` segments, the path never
+# string-equals our own, this worktree appears as its own rival, and the seed then refuses on every
+# single session — blaming a colleague's worktree that does not exist, in a design where refusing
+# looks deliberate.
+SWADMIN=$SREPO2/.git/worktrees/sw
+cp "$SWADMIN/gitdir" "$TMP/sw-gitdir.abs"
+printf '../../../.claude/worktrees/sw/.git\n' >"$SWADMIN/gitdir"
+reset_seed_state
+rm -f "$SW/seed-refuse.txt"
+# Give ourselves a recorded slug, so a failure to exclude self shows up as a self-collision.
+wt_runtime_state_set "$SW" seed_slug 3812 derived .env.worktree.local ours none ''
+( cd / && wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+    "$(seed_deadline)" >/dev/null 2>&1
+  printf '%s' "$WT_SEED_STATUS" ) >"$TMP/self-seed-status"
+eq 'a worktree with a RELATIVE gitdir pointer does not refuse itself as a rival' 'done' \
+  "$(cat "$TMP/self-seed-status")"
+cp "$TMP/sw-gitdir.abs" "$SWADMIN/gitdir"
+
+# A COMMITTED-BUT-NOT-EXECUTABLE seed is a SKIP, not a failure. `chmod +x` does not change a file's
+# content, so recording a failure would fingerprint the script and then refuse to retry it —
+# leaving "edit it to try again" as the only escape from a problem editing does not fix.
+reset_seed_state
+rm -f "$SW/seed-runs.txt"
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+printf ran >>"$WT_PATH/seed-runs.txt"
+'
+chmod -x "$SW/$SEEDREL"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a non-executable seed is skipped, not failed' 'skipped' "$WT_SEED_STATUS"
+eq 'and it did not run' 0 "$([ -e "$SW/seed-runs.txt" ] && echo 1 || echo 0)"
+contains 'and it says to chmod +x rather than to edit it' 'chmod +x' \
+  "$(wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+       "$(seed_deadline)" 2>&1)"
+eq 'and no fingerprint is recorded, so chmod +x alone makes it run' '' \
+  "$(wt_runtime_state_get "$SW" seedcksum)"
+chmod +x "$SW/$SEEDREL"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)"
+eq 'chmod +x alone is enough to run it, with no edit' 'ran' "$(cat "$SW/seed-runs.txt" 2>/dev/null)"
+
+# A TIMEOUT CAUSED BY A SHORT BUDGET STAYS RETRYABLE. If a slow dependency install ate the budget,
+# the script was never the problem — fingerprinting it would wedge seeding permanently, and
+# "edit the script" would be advice about a script that is fine.
+reset_seed_state
+# SC2016: single-quoted ON PURPOSE — the $WT_* references must reach the SCRIPT and be expanded
+# when the seed runs with the environment the contract gives it, not by this suite.
+# shellcheck disable=SC2016
+write_seed '#!/usr/bin/env bash
+sleep 30
+'
+if command -v timeout >/dev/null 2>&1; then
+  # A generous profile allowance, but only ~2s of budget left: the clamp bites, so the timeout is
+  # the budget's fault and not the script's.
+  # shellcheck disable=SC2034
+  PROFILE_SEED_TIMEOUT=120
+  wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+    "$(( $(date +%s) + 2 ))" 2>/dev/null
+  eq 'a budget-starved seed is recorded as a timeout' 'timeout' "$WT_SEED_STATUS"
+  eq 'but WITHOUT a fingerprint, so the next session tries again' '' \
+    "$(wt_runtime_state_get "$SW" seedcksum)"
+  contains 'and it blames the budget rather than the script' 'used the budget' \
+    "$(reset_seed_state
+       wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+         "$(( $(date +%s) + 2 ))" 2>&1)"
+  # ...whereas a seed given its FULL allowance and still hanging is the script's fault, so that one
+  # IS fingerprinted and not retried until it changes.
+  reset_seed_state
+  # shellcheck disable=SC2034
+  PROFILE_SEED_TIMEOUT=2
+  wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" \
+    "$(seed_deadline)" 2>/dev/null
+  eq 'a seed that hangs with its full allowance is a timeout too' 'timeout' "$WT_SEED_STATUS"
+  ne 'and IS fingerprinted, so it is not retried until it changes' '' \
+    "$(wt_runtime_state_get "$SW" seedcksum)"
+  # shellcheck disable=SC2034
+  PROFILE_SEED_TIMEOUT=30
+fi
+
+# --- the script itself must be the one this branch committed ---------------------------------
+reset_seed_state
+rm -f "$SW/$SEEDREL"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .e ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a seed script that is not there is skipped, not an error' 'skipped' "$WT_SEED_STATUS"
+ln -sf /bin/echo "$SW/$SEEDREL"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .e ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+eq 'a symlinked seed script is refused' 'refused' "$WT_SEED_STATUS"
+rm -f "$SW/$SEEDREL"
+for bad in ../evil.sh /etc/evil.sh; do
+  wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .e ours "$bad" "$(seed_deadline)" 2>/dev/null
+  eq "a seed path escaping the worktree ($bad) is refused" 'refused' "$WT_SEED_STATUS"
+done
+
+# --- a path carrying shell syntax is DATA, not a command -------------------------------------
+# The worktree path (which embeds an untrusted name) never enters the command string, and the seed
+# path is quoted. A file whose NAME contains shell syntax must run, not be interpreted.
+reset_seed_state
+mkdir -p "$SW/.claude"
+ODD=".claude/we'ird;\$(touch PWNED).sh"
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nprintf odd >"$WT_PATH/seed-odd.txt"\n' >"$SW/$ODD"
+chmod +x "$SW/$ODD"
+wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .e ours "$ODD" "$(seed_deadline)" 2>/dev/null
+eq 'a seed path containing shell syntax is executed, not interpreted' 'odd' \
+  "$(cat "$SW/seed-odd.txt" 2>/dev/null)"
+eq 'and nothing it looked like was run' 0 \
+  "$( { [ -e "$SW/PWNED" ] || [ -e PWNED ]; } && echo 1 || echo 0)"
+
+reset_seed_state
+rm -rf "$SW/seed-saw.txt" "$SW/seed-runs.txt" "$SW/seed-refuse.txt" "$SW/seed-odd.txt"
+unset WT_SIBLINGS WT_SIBLINGS_OK
 
 # ---------------------------------------------------------------------------
 # The Phase 4 hand-off
