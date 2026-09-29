@@ -1016,6 +1016,130 @@ eq 'a runtime write leaves no temporary file behind' 0 \
   "$(find "$(dirname "$(wt_state_path "$SWT")")" -maxdepth 1 -name '.wtstate.*' 2>/dev/null | wc -l | tr -d ' ')"
 rm -f "$(wt_state_path "$SWT")"
 
+# ---------------------------------------------------------------------------
+# The runtime ledger — the record of an allocation that outlives its worktree
+# ---------------------------------------------------------------------------
+#
+# A repository of its own: the rt tests above re-point one worktree at several slugs, and each of
+# those is correctly preserved as a separate entry, which would make "exactly one" unprovable here.
+LREPO=$TMP/lrepo
+git init -q "$LREPO"
+git -C "$LREPO" config user.email t@example.com
+git -C "$LREPO" config user.name t
+printf 'x\n' > "$LREPO/f.txt"
+git -C "$LREPO" add f.txt
+git -C "$LREPO" commit -qm init
+LWT=$LREPO/.claude/worktrees/alice/fix-99
+git -C "$LREPO" worktree add -q "$LWT" -b wt-fix-99 2>/dev/null
+LEDGER=$LREPO/.git/worktree-ledger
+
+ledger_count() {  # every file in the ledger, whatever the readers think of it
+  find "$LEDGER" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '
+}
+
+WT_NAME=alice/fix-99
+out=$(wt_runtime_state_set "$LWT" alice_fix_99 3812 derived .env.worktree.local ours "done" SCL 2>"$TMP/ledger-err")
+eq 'an rt write prints nothing, ledger included (stdout is a protocol)' '' "$out"
+wt_runtime_state_set "$LWT" alice_fix_99 3812 derived .env.worktree.local ours "done" SCL 2>"$TMP/ledger-err"
+eq 'an rt write in a linked worktree creates exactly one ledger entry' 1 "$(ledger_count)"
+eq '...named after the admin id git gave the worktree' 'fix-99' \
+  "$(find "$LEDGER" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null)"
+eq '...and it is written quietly' '' "$(cat "$TMP/ledger-err")"
+eq 'ledger field: path'       "$LWT"                "$(wt_ledger_field "$LREPO" fix-99 path)"
+eq 'ledger field: admin'      'fix-99'              "$(wt_ledger_field "$LREPO" fix-99 admin)"
+eq 'ledger field: name, as bootstrap knows it' 'alice/fix-99' "$(wt_ledger_field "$LREPO" fix-99 name)"
+eq 'ledger field: slug'       'alice_fix_99'        "$(wt_ledger_field "$LREPO" fix-99 slug)"
+eq 'ledger field: port'       '3812'                "$(wt_ledger_field "$LREPO" fix-99 port)"
+eq 'ledger field: portsource' 'derived'             "$(wt_ledger_field "$LREPO" fix-99 portsource)"
+eq 'ledger field: envfile'    '.env.worktree.local' "$(wt_ledger_field "$LREPO" fix-99 envfile)"
+eq 'ledger field: envstate'   'ours'                "$(wt_ledger_field "$LREPO" fix-99 envstate)"
+eq 'ledger field: seedstatus' 'done'                "$(wt_ledger_field "$LREPO" fix-99 seedstatus)"
+eq 'ledger field: seedcksum'  'SCL'                 "$(wt_ledger_field "$LREPO" fix-99 seedcksum)"
+eq 'ledger field: when matches the state record' "$(wt_runtime_state_get "$LWT" when)" \
+  "$(wt_ledger_field "$LREPO" fix-99 when)"
+eq 'the ledger is found from inside the worktree as well' 'alice_fix_99' \
+  "$(wt_ledger_field "$LWT" fix-99 slug)"
+wt_ledger_field "$LREPO" fix-99 nosuchfield >/dev/null
+eq 'an unknown ledger field is a caller error (2), as for the rt accessor' 2 $?
+wt_ledger_field "$LREPO" no-such-entry slug >/dev/null
+eq 'a missing entry is a different failure (1)' 1 $?
+wt_ledger_field "$LREPO" ../HEAD slug >/dev/null
+eq 'a traversal entry name is refused as a caller error (2)' 2 $?
+
+# The enumeration stream: one record per entry, entry name first, then every field in order.
+eq 'wt_ledger_entries emits one record per entry, entry name first' \
+  "fix-99|$LWT|fix-99|alice/fix-99|alice_fix_99|3812|derived|.env.worktree.local|ours|done|SCL|$(wt_ledger_field "$LREPO" fix-99 when)" \
+  "$(wt_ledger_entries "$LREPO" | tr "$US_$RS_" '|\n')"
+
+# Same worktree, same slug, new values: the entry is REPLACED, not set aside.
+wt_runtime_state_set "$LWT" alice_fix_99 3813 probed .env.worktree.local ours failed SCM 2>/dev/null
+eq 'rewriting the rt record for the same worktree still leaves one entry' 1 "$(ledger_count)"
+eq '...carrying the new allocation' '3813' "$(wt_ledger_field "$LREPO" fix-99 port)"
+eq 'a ledger write leaves no temporary file behind' 0 \
+  "$(find "$LEDGER" -maxdepth 1 -name '.wtledger.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+# THE POINT OF IT: git deletes the admin directory, and with it the state file, but not the ledger.
+git -C "$LREPO" worktree remove --force "$LWT" 2>/dev/null
+eq 'git worktree remove takes the state file with it' 1 "$([ -e "$LREPO/.git/worktrees/fix-99" ] && echo 0 || echo 1)"
+eq '...but the ledger entry survives it' '3813' "$(wt_ledger_field "$LREPO" fix-99 port)"
+
+# A REUSED ADMIN ID. git hands `fix-99` to the next worktree whose basename is fix-99, and
+# overwriting the entry would erase the only record of the first worktree's database.
+LWT2=$LREPO/.claude/worktrees/bob/fix-99
+git -C "$LREPO" worktree add -q "$LWT2" -b wt-bob-fix-99 2>/dev/null
+eq 'the fixture really does reuse the admin id' 1 "$([ -d "$LREPO/.git/worktrees/fix-99" ] && echo 1 || echo 0)"
+WT_NAME=bob/fix-99
+wt_runtime_state_set "$LWT2" bob_fix_99 3900 derived .env.worktree.local ours none '' 2>/dev/null
+eq 'a reused id with a different path keeps both entries' 2 "$(ledger_count)"
+eq '...the new one under the id' "$LWT2" "$(wt_ledger_field "$LREPO" fix-99 path)"
+old_entry=$(wt_ledger_entries "$LREPO" | tr "$RS_" '\n' | grep -v '^fix-99'"$US_" | cut -d "$US_" -f1)
+case $old_entry in
+  fix-99.[0-9]*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL the earlier entry is set aside as <id>.<when>: %q\n' "$old_entry" >&2 ;;
+esac
+eq '...and the earlier one still says what the first worktree allocated' 'alice_fix_99' \
+  "$(wt_ledger_field "$LREPO" "$old_entry" slug)"
+eq '...including where it was' "$LWT" "$(wt_ledger_field "$LREPO" "$old_entry" path)"
+
+# Same path, different slug: a branch that edited runtime.slug has orphaned the old database.
+wt_runtime_state_set "$LWT2" bob_renamed 3901 derived .env.worktree.local ours none '' 2>/dev/null
+eq 'a changed slug for the same worktree sets the old entry aside too' 3 "$(ledger_count)"
+eq '...and the id now records the new slug' 'bob_renamed' "$(wt_ledger_field "$LREPO" fix-99 slug)"
+
+# FORGET removes exactly what it is named, and nothing a traversal name could reach.
+wt_ledger_forget "$LREPO" '../HEAD' 2>"$TMP/ledger-err"
+eq 'forgetting a traversal name is refused' 2 $?
+contains '...and says so' 'not an entry name' "$(cat "$TMP/ledger-err")"
+eq '...leaving what it pointed at alone' 1 "$([ -f "$LREPO/.git/HEAD" ] && echo 1 || echo 0)"
+wt_ledger_forget "$LREPO" 'a/b' 2>/dev/null
+eq 'forgetting a name containing / is refused' 2 $?
+wt_ledger_forget "$LREPO" "$old_entry"
+eq 'forgetting a named entry succeeds' 0 $?
+eq '...and removes only that one' 2 "$(ledger_count)"
+wt_ledger_field "$LREPO" "$old_entry" slug >/dev/null
+eq '...which no longer reads' 1 $?
+eq 'the live entry is untouched' 'bob_renamed' "$(wt_ledger_field "$LREPO" fix-99 slug)"
+wt_ledger_forget "$LREPO" "$old_entry" 2>/dev/null
+eq 'forgetting an entry that is not there is a failure (1)' 1 $?
+
+# A ledger that cannot be written warns and costs the rt write nothing.
+if [ "$(id -u)" != 0 ]; then
+  chmod 500 "$LEDGER"
+  out=$(wt_runtime_state_set "$LWT2" bob_renamed 3902 derived .env.worktree.local ours none '' 2>"$TMP/ledger-err")
+  eq 'an unwritable ledger does not fail the rt write' 0 $?
+  eq '...prints nothing on stdout' '' "$out"
+  contains '...and warns on stderr' 'ledger' "$(cat "$TMP/ledger-err")"
+  eq '...while the state file took the write' '3902' "$(wt_runtime_state_get "$LWT2" port)"
+  chmod 700 "$LEDGER"
+fi
+
+# The main checkout has no admin id, so there is nothing to key an entry on.
+rm -rf "${LEDGER:?}"
+wt_runtime_state_set "$LREPO" main_slug 3999 derived .e ours none '' 2>/dev/null
+eq 'an rt write in the main checkout records no ledger entry' 0 "$(ledger_count)"
+eq 'an absent ledger enumerates as no entries' '' "$(wt_ledger_entries "$LREPO")"
+unset WT_NAME old_entry
+
 # The non-git fallback location, and a write that cannot succeed.
 PLAINWT=$TMP/plainwt; mkdir -p "$PLAINWT"
 case "$(wt_state_path "$PLAINWT")" in

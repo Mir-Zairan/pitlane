@@ -458,6 +458,21 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
 # enough that two worktrees started together serialise properly, short enough that nobody waits.
 WT_LOCK_WAIT=10
 
+# The repository's SHARED git directory as an absolute path, as seen from $1. Every worktree of one
+# repository gets the same answer, which is what makes it the place for anything the worktrees
+# must agree on — the dependency locks and the runtime ledger. git reports it relative to $1 in
+# the main checkout, so it is anchored there. Prints nothing and returns 1 when git cannot say.
+wt_git_common_dir() {  # $1 = any directory inside the repository
+  local dir=${1%/} common
+  common=$(wt_git "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
+  [ -n "$common" ] || return 1
+  case $common in
+    /*) ;;
+    *) common=$dir/$common ;;
+  esac
+  printf '%s' "${common%/}"
+}
+
 # Where a dependency's lock file lives. The directory name is slugified because it may contain
 # `/` — `assets/node_modules` is a real case. Two different directories CAN slug to one name,
 # which costs a little concurrency and no correctness: the worst outcome is that two unrelated
@@ -478,18 +493,12 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
     printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
     return 0
   fi
-  common=$(wt_git "$root" rev-parse --git-common-dir 2>/dev/null) || common=''
-  if [ -n "$common" ]; then
-    case $common in
-      /*) ;;
-      *) common=$root/$common ;;
-    esac
-    if [ -d "$common" ]; then
-      WT_LOCKDIR_FOR=$root
-      WT_LOCKDIR_IS="${common%/}/worktree-locks"
-      printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
-      return 0
-    fi
+  common=$(wt_git_common_dir "$root") || common=''
+  if [ -n "$common" ] && [ -d "$common" ]; then
+    WT_LOCKDIR_FOR=$root
+    WT_LOCKDIR_IS="$common/worktree-locks"
+    printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
+    return 0
   fi
   WT_LOCKDIR_FOR=$root
   WT_LOCKDIR_IS="$root/.claude/worktree-locks"
@@ -827,13 +836,19 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
 # header rule — a file whose version we do not recognise is not merged with, it is replaced.
 wt_runtime_state_set() {  # $1 = worktree, $2 = slug, $3 = port, $4 = portsource, $5 = envfile, $6 = envstate, $7 = seedstatus, $8 = seedcksum
   local wt=${1%/} slug=${2-} port=${3-} psrc=${4-} envfile=${5-} envstate=${6-}
-  local sstatus=${7-} scksum=${8-} when rec
+  local sstatus=${7-} scksum=${8-} when rec rc
 
   when=$(date +%s 2>/dev/null) || when=0
 
   # An empty key: `rt` is a single slot, so whichever record is there is the one replaced.
   wt_state_join rt "$slug" "$port" "$psrc" "$envfile" "$envstate" "$sstatus" "$scksum" "$when"
-  wt_state_rewrite "$wt" rt '' "$WT_STATE_REC"
+  rec=$WT_STATE_REC
+  wt_state_rewrite "$wt" rt '' "$rec"
+  rc=$?
+  # Whatever the state write's outcome: the allocation is real either way, and the ledger is the
+  # record of it that has to survive the worktree. It never changes this function's status.
+  wt_ledger_write "$wt" "$rec"
+  return "$rc"
 }
 
 # Read one field of this worktree's `rt` record, by NAME. Prints nothing and returns 1 when there
@@ -897,6 +912,218 @@ wt_runtime_state_read() {  # $1 = state file, $2 = field name
     esac
   done <"$file"
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# The runtime LEDGER — a record of each allocation that outlives its worktree
+# ---------------------------------------------------------------------------
+#
+# The `rt` record lives in the worktree's admin directory, and git deletes that directory with the
+# worktree: on `git worktree remove`, on Claude Code's own removal of a launch-time worktree, and on
+# `git worktree prune` after a checkout was deleted by hand. Not every one of those runs our
+# teardown first, so the one record naming the database a seed created — and the port and env file
+# beside it — can vanish while the database itself lives on, and `/worktree-prune` cannot find what
+# nothing records.
+#
+# So every `rt` write is copied to `<git-common-dir>/worktree-ledger/<admin id>`: the shared git
+# directory, because it outlives every linked worktree and never shows in any `git status`; keyed
+# by the admin id, because that is the one name git itself keeps unique among LIVE worktrees.
+#
+# THE SAME ENCODING AS THE STATE FILE, not a second format: a `wtstate` version header, then one
+# `worktree` record (path, admin id, name) and the `rt` record byte-for-byte as the state file got
+# it. That makes wt_runtime_state_read work on an entry unchanged, so the rt fields keep exactly
+# one reader.
+#
+# AN ID IS UNIQUE ONLY AMONG LIVE WORKTREES. Once a worktree is gone git hands its id to the next
+# one of that name, and a plain overwrite would then erase the only record of the old allocation —
+# precisely the one prune exists to find. So an existing entry for another path, or for another
+# slug (a branch that edits runtime.slug re-points a live worktree at a new database and orphans
+# the old one), is moved aside to `<id>.<its when>` before the new entry is written.
+#
+# ALWAYS ADVISORY. A ledger that cannot be written costs a later sweep its evidence, never this
+# session: the writer warns and returns 0, and nothing it does touches stdout.
+
+WT_LEDGER_DIRNAME='worktree-ledger'
+# The prefix of an entry still being written. Enumeration skips it, so a reader never sees half an
+# entry.
+WT_LEDGER_TMP_PREFIX=.wtledger.
+
+# Parse one ledger entry into WT_LEDGER_PATH, WT_LEDGER_ADMIN, WT_LEDGER_NAME and WT_LEDGER_RT (the
+# `rt` record's fields, still US-joined). Returns 1 for anything not wholly trustworthy — unreadable,
+# a foreign version, a record before the header, or either record missing — under the same
+# no-partial-trust rule as the state file.
+#
+# Sets globals rather than printing for the reason wt_state_join does: the writer runs this on the
+# session-start path, and a command substitution per field would be a fork per field.
+wt_ledger_parse() {  # $1 = entry file
+  local file=${1-} rec kind rest seen=0 have_wt=0 have_rt=0
+
+  WT_LEDGER_PATH='' WT_LEDGER_ADMIN='' WT_LEDGER_NAME='' WT_LEDGER_RT=''
+  [ -f "$file" ] && [ -r "$file" ] || return 1
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    if [ "$kind" = wtstate ]; then
+      [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
+      seen=1
+      continue
+    fi
+    [ "$seen" = 1 ] || return 1
+    case $kind in
+      worktree)
+        IFS=$WT_US read -r WT_LEDGER_PATH WT_LEDGER_ADMIN WT_LEDGER_NAME <<<"$rest" || true
+        have_wt=1
+        ;;
+      rt)
+        WT_LEDGER_RT=$rest
+        have_rt=1
+        ;;
+    esac
+  done <"$file"
+  [ "$have_wt" = 1 ] && [ "$have_rt" = 1 ]
+}
+
+# Record this worktree's allocation in the ledger. $2 is the `rt` record exactly as it was written
+# to the state file, so the two can never disagree about what was allocated.
+#
+# THE ADMIN DIRECTORY IS READ OFF THE STATE PATH, not asked of git. wt_state_path has already
+# resolved it — primed in the entrypoint's own shell — and a linked worktree's git dir is always
+# `<common>/worktrees/<id>`, so the id and the common dir are parameter expansions away. A
+# `git rev-parse` here would be a fork on every session for an answer already in hand. Anything
+# that is not that shape — the main checkout, the `.claude/` fallback — has no admin id to key on
+# and is not a worktree prune would sweep, so it is skipped rather than guessed at. The `gitdir`
+# file is required as well: git writes one into every linked worktree's admin directory, and it
+# is what stops a checkout that merely sits in a directory called `worktrees` passing for one.
+wt_ledger_write() {  # $1 = worktree, $2 = the rt record
+  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug
+
+  wt_state_path "$wt" >/dev/null
+  state=${WT_STATE_PATH_IS-}
+  [ "${WT_STATE_PATH_FOR-}" = "$wt" ] && [ -n "$state" ] || return 0
+  admin=${state%/*}
+  [ "$admin" != "$wt/.claude" ] && [ -f "$admin/gitdir" ] || return 0
+  id=${admin##*/}
+  common=${admin%/*}
+  [ "${common##*/}" = worktrees ] && [ -n "$id" ] || return 0
+  common=${common%/*}
+  ledger=$common/$WT_LEDGER_DIRNAME
+  entry=$ledger/$id
+
+  if [ ! -d "$ledger" ] && ! mkdir -p "$ledger" 2>/dev/null; then
+    wt_log "runtime: could not create the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
+    return 0
+  fi
+
+  # An entry that does not parse is set aside too: it cannot be shown to be this worktree's, so it
+  # is not this worktree's to erase.
+  if [ -e "$entry" ]; then
+    slug=${rtrec#rt"$WT_US"}
+    slug=${slug%%"$WT_US"*}
+    if ! wt_ledger_parse "$entry" || [ "$WT_LEDGER_PATH" != "$wt" ] \
+      || [ "${WT_LEDGER_RT%%"$WT_US"*}" != "$slug" ]; then
+      when=$(wt_runtime_state_read "$entry" when 2>/dev/null) || when=''
+      wt_is_posint "$when" || when=$(date +%s 2>/dev/null) || when=0
+      kept=$entry.$when
+      n=0
+      while [ -e "$kept" ]; do
+        n=$((n + 1))
+        kept=$entry.$when.$n
+      done
+      if ! mv -f "$entry" "$kept" 2>/dev/null; then
+        wt_log "runtime: could not set aside the earlier ledger entry $entry — keeping it, and not recording this worktree's allocation over it"
+        return 0
+      fi
+    fi
+  fi
+
+  wt_state_join worktree "$wt" "$id" "${WT_NAME-}"
+  if ! tmp=$(mktemp "$ledger/${WT_LEDGER_TMP_PREFIX}XXXXXX" 2>/dev/null); then
+    wt_log "runtime: could not write to the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
+    return 0
+  fi
+  if ! {
+    printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
+    printf '%s%s' "$WT_STATE_REC" "$WT_RS"
+    printf '%s%s' "$rtrec" "$WT_RS"
+  } >"$tmp" 2>/dev/null || ! mv -f "$tmp" "$entry" 2>/dev/null; then
+    rm -f "${tmp:?}"
+    wt_log "runtime: could not write the ledger entry $entry — /worktree-prune will not know about this worktree's allocation"
+  fi
+  return 0
+}
+
+# The ledger directory for the repository containing $1, which need not exist yet. The readers
+# are not on the session-start path, so they ask git; the writer derives the same directory from
+# the state path it already holds.
+wt_ledger_dir() {  # $1 = any directory inside the repository
+  local common
+  common=$(wt_git_common_dir "${1:-$PWD}") || return 1
+  printf '%s/%s' "$common" "$WT_LEDGER_DIRNAME"
+}
+
+# True if $1 may name a ledger entry. The readers join it onto the ledger directory and
+# wt_ledger_forget deletes the result, so a `/` or `..` would let a caller reach outside it.
+wt_ledger_is_entry_name() {  # $1 = candidate
+  case ${1-} in
+    '' | */* | *..* | "$WT_LEDGER_TMP_PREFIX"*) return 1 ;;
+  esac
+  return 0
+}
+
+# Every readable ledger entry of the repository containing $1, one WT_RS-terminated record each,
+# fields joined by WT_US — the shape wt_json_records emits:
+#
+#   entry  path  admin  name  slug  port  portsource  envfile  envstate  seedstatus  seedcksum  when
+#
+# `entry` is the file name, which is what wt_ledger_field and wt_ledger_forget take; the rest are
+# the recorded values in the order the records hold them. An entry that does not parse is left out
+# of the stream but not deleted: it may be an allocation a newer build wrote.
+#
+# Returns 1 only when the repository cannot be resolved; an absent ledger is simply no entries.
+wt_ledger_entries() {  # $1 = any directory inside the repository
+  local ledger file entry
+  ledger=$(wt_ledger_dir "${1:-$PWD}") || return 1
+  [ -d "$ledger" ] || return 0
+  for file in "$ledger"/*; do
+    entry=${file##*/}
+    wt_ledger_is_entry_name "$entry" || continue
+    wt_ledger_parse "$file" || continue
+    printf '%s%s%s%s%s%s%s%s%s%s' "$entry" "$WT_US" "$WT_LEDGER_PATH" "$WT_US" \
+      "$WT_LEDGER_ADMIN" "$WT_US" "$WT_LEDGER_NAME" "$WT_US" "$WT_LEDGER_RT" "$WT_RS"
+  done
+  return 0
+}
+
+# Read one field of one ledger entry, by NAME: `path`, `admin`, `name`, or any field of the `rt`
+# record. The status contract is wt_runtime_state_get's, so a consumer handles both alike:
+#   0  read; the value is on stdout (possibly empty)
+#   1  no usable entry by that name
+#   2  a caller error — a field name no entry has, or a string that is not an entry name
+wt_ledger_field() {  # $1 = any directory inside the repository, $2 = entry, $3 = field name
+  local ledger entry=${2-} want=${3-}
+  wt_ledger_is_entry_name "$entry" || return 2
+  ledger=$(wt_ledger_dir "${1:-$PWD}") || return 1
+  wt_ledger_parse "$ledger/$entry" || return 1
+  case $want in
+    path)  printf '%s' "$WT_LEDGER_PATH" ;;
+    admin) printf '%s' "$WT_LEDGER_ADMIN" ;;
+    name)  printf '%s' "$WT_LEDGER_NAME" ;;
+    *)     wt_runtime_state_read "$ledger/$entry" "$want" ;;
+  esac
+}
+
+# Remove exactly one ledger entry. Only once its allocation has been torn down: afterwards nothing
+# records it. Returns 2 for a string that is not an entry name, 1 when there is no such entry or it
+# could not be removed.
+wt_ledger_forget() {  # $1 = any directory inside the repository, $2 = entry
+  local ledger entry=${2-}
+  if ! wt_ledger_is_entry_name "$entry"; then
+    wt_log "refusing to forget ledger entry \"$entry\": not an entry name"
+    return 2
+  fi
+  ledger=$(wt_ledger_dir "${1:-$PWD}") || return 1
+  [ -f "$ledger/$entry" ] || return 1
+  rm -f "${ledger:?}/${entry:?}" 2>/dev/null && [ ! -e "$ledger/$entry" ]
 }
 
 # `cksum` of a string, for fingerprinting an install command. Empty for empty input, so a missing
@@ -1578,12 +1805,7 @@ wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
   WT_SIBLINGS=''
   # shellcheck disable=SC2034
   WT_SIBLINGS_OK=0
-  common=$(wt_git "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
-  [ -n "$common" ] || return 0
-  case $common in
-    /*) ;;
-    *) common=$root/$common ;;
-  esac
+  common=$(wt_git_common_dir "$root") || return 0
   # No linked worktrees yet is a trustworthy answer of "none", not a failure to look.
   # shellcheck disable=SC2034
   [ -d "$common/worktrees" ] || { WT_SIBLINGS_OK=1; return 0; }
