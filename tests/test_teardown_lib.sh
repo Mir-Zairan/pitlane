@@ -135,6 +135,15 @@ make_repo "$MOVED"
 add_worktree "$MOVED" x
 mv "$MOVED" "$SCRATCH/moved-away"
 
+# A non-ASCII name and one near the per-component length limit, which a byte-mangling reader or a
+# truncating buffer would get wrong on one backend and not the other.
+add_worktree "$R" 'café ü'
+W6=$R/.claude/worktrees/café\ ü
+LONG_A=$(printf 'a%.0s' $(seq 1 110))
+LONG_B=$(printf 'b%.0s' $(seq 1 110))
+add_worktree "$R" "long/$LONG_A/$LONG_B"
+W7=$R/.claude/worktrees/long/$LONG_A/$LONG_B
+
 ln -s "$W1" "$TMP/link to worktree"
 ln -s "$SCRATCH" "$TMP/alias"
 
@@ -167,24 +176,26 @@ run_resolver_suite() {
   eq 'worktree_path wins over path' "$W1" "$WT_RM_WORKTREE"
 
   # --- refusals: nothing of any refused target may survive in the globals ---
-  local label bad
+  local label bad why saved_home=$HOME
   for label in 'the main checkout' 'the common git dir' '/' 'HOME' 'a non-worktree directory' \
     'a directory inside a worktree' 'a relative path' 'an unregistered copy of a worktree'; do
     case $label in
-      'the main checkout') bad=$R ;;
-      'the common git dir') bad=$R/.git ;;
-      /) bad=/ ;;
-      HOME) bad=$HOME ;;
-      'a non-worktree directory') bad=$SCRATCH ;;
-      'a directory inside a worktree') mkdir -p "$W1/sub"; bad=$W1/sub ;;
-      'a relative path') bad='.claude/worktrees/my fix' ;;
-      'an unregistered copy of a worktree') bad=$R/.claude/worktrees/copied ;;
+      'the main checkout') bad=$R why='it is a main checkout' ;;
+      'the common git dir') bad=$R/.git why='it is a git directory' ;;
+      /) bad=/ why='it is / or the home directory' ;;
+      # HOME is a registered worktree here, so only the HOME guard stands between it and success.
+      HOME) HOME=$W1 bad=$W1 why='it is / or the home directory' ;;
+      'a non-worktree directory') bad=$SCRATCH why='no readable .git file' ;;
+      'a directory inside a worktree') mkdir -p "$W1/sub"; bad=$W1/sub why='no readable .git file' ;;
+      'a relative path') bad='.claude/worktrees/my fix' why='not an absolute path' ;;
+      'an unregistered copy of a worktree') bad=$R/.claude/worktrees/copied why='do not point at each other' ;;
     esac
     WT_RM_WORKTREE=stale
     resolve "{\"worktree_path\":\"$(jstr "$bad")\",\"cwd\":\"$(jstr "$R")\"}"
+    HOME=$saved_home
     eq "refuses $label" 1 "$rc"
     eq "...and resolves nothing for it" '' "$WT_RM_WORKTREE$WT_RM_ROOT$WT_RM_ADMIN$WT_RM_LEDGER_ENTRY"
-    contains "...saying why" 'worktree: ' "$(cat "$TMP/resolve-err")"
+    contains "...saying why ($label)" "$why" "$(cat "$TMP/resolve-err")"
   done
   rmdir "$W1/sub"
 
@@ -198,6 +209,29 @@ run_resolver_suite() {
   resolve 'not json'
   eq 'refuses an unparseable payload' 1 "$rc"
   contains '...saying no worktree was named' 'names no worktree' "$(cat "$TMP/resolve-err")"
+
+  # The readers fold CR/LF to a space and strip US/RS, so an encoded control character would reach
+  # the resolver as a DIFFERENT path — here, a real worktree's.
+  resolve "{\"worktree_path\":\"$(jstr "$R/.claude/worktrees/my")\\nfix\"}"
+  eq 'refuses a path encoding a newline, which the reader folds into the space of a real worktree' 1 "$rc"
+  eq '...resolving nothing' '' "$WT_RM_WORKTREE"
+  contains '...saying why' 'encodes a control character' "$(cat "$TMP/resolve-err")"
+  resolve "{\"worktree_path\":\"$(jstr "$R/.claude/worktrees/my")\\u001F fix\"}"
+  eq 'refuses a path encoding a unit separator, which the reader strips' 1 "$rc"
+  contains '...saying why' 'encodes a control character' "$(cat "$TMP/resolve-err")"
+  resolve "{\"worktree_path\":\"$(jstr "$W1")\",\"cwd\":\"$(jstr "$R")\\r\"}"
+  eq 'refuses a payload whose cwd encodes a carriage return' 1 "$rc"
+  contains '...saying why' 'encodes a control character' "$(cat "$TMP/resolve-err")"
+  resolve "{\"worktree_path\":\"$(jstr "$R/.claude/worktrees/my\\nfix")\"}"
+  eq 'an escaped backslash before an n is a backslash, not a newline' 2 "$rc"
+  lacks '...and is not refused as one' 'control character' "$(cat "$TMP/resolve-err")"
+
+  resolve "{\"worktree_path\":\"$(jstr "$W6")\"}"
+  eq 'a non-ASCII worktree name resolves' 0 "$rc"
+  eq '...to the same bytes' "$W6" "$WT_RM_WORKTREE"
+  resolve "{\"worktree_path\":\"$(jstr "$W7")\"}"
+  eq 'a long worktree path resolves' 0 "$rc"
+  eq '...untruncated' "$W7" "$WT_RM_WORKTREE"
 
   resolve "{\"worktree_path\":\"$(jstr "$SCRATCH/moved-away/.claude/worktrees/x")\"}"
   eq 'refuses a worktree whose main checkout has moved' 1 "$rc"
@@ -286,6 +320,136 @@ done
 BACKEND=none
 
 # ---------------------------------------------------------------------------
+# wt_resolve_worktree_path — the path entry point the prune sweep calls. No JSON, so it runs once.
+# ---------------------------------------------------------------------------
+
+resolve_path() {  # $@ = path, repository hint
+  wt_resolve_worktree_path "$@" 2>"$TMP/resolve-err"
+  rc=$?
+}
+err() { cat "$TMP/resolve-err"; }
+
+resolve_path "$W1"
+eq 'a path resolves a live worktree' 0 "$rc"
+eq '...to it' "$W1" "$WT_RM_WORKTREE"
+resolve_path "$SCRATCH"
+eq 'a refused path after a resolved one' 1 "$rc"
+eq '...leaves nothing of the previous target behind' '' \
+  "$WT_RM_WORKTREE$WT_RM_ROOT$WT_RM_ADMIN$WT_RM_LEDGER_ENTRY"
+resolve_path "$R/.claude/worktrees/my"$'\n'"fix"
+eq 'refuses a path containing a newline' 1 "$rc"
+contains '...saying why' 'contains a control character' "$(err)"
+resolve_path ''
+eq 'refuses an empty path' 1 "$rc"
+resolve_path "$W3" "$R"
+eq 'a gone path is found through the repository hint' 0 "$rc"
+eq '...by its ledger entry' 'gone-one' "$WT_RM_LEDGER_ENTRY"
+
+resolve_path "$R/f.txt"
+eq 'refuses a file' 1 "$rc"
+contains '...saying why' 'not a directory' "$(err)"
+
+# A registered worktree whose .git file names ANOTHER worktree's admin dir: git still lists it, so
+# only the pairing check stops it being torn down against the other's state.
+cp "$W1/.git" "$TMP/w1.git"
+printf 'gitdir: %s\n' "$ADMIN2" >"$W1/.git"
+resolve_path "$W1"
+eq 'refuses a worktree whose .git names an admin dir that points elsewhere' 1 "$rc"
+contains '...saying why' 'do not point at each other' "$(err)"
+cp "$TMP/w1.git" "$W1/.git"
+
+cp "$ADMIN2/gitdir" "$TMP/admin2.gitdir"
+printf '%s\n' "$W1/.git" >"$ADMIN2/gitdir"
+resolve_path "$ADMIN2"
+eq 'refuses an admin dir naming a worktree that points at a different admin dir' 1 "$rc"
+contains '...saying why' 'do not point at each other' "$(err)"
+cp "$TMP/admin2.gitdir" "$ADMIN2/gitdir"
+
+mv "$ADMIN2/commondir" "$TMP/admin2.commondir"
+resolve_path "$W2"
+eq 'refuses a worktree whose git dir has no commondir' 1 "$rc"
+contains '...saying why' 'no usable commondir' "$(err)"
+mv "$TMP/admin2.commondir" "$ADMIN2/commondir"
+
+# useRelativePaths: the .git file names its admin dir relative to the worktree.
+printf 'gitdir: ../../../../.git/worktrees/%s\n' "${ADMIN2##*/}" >"$W2/.git"
+resolve_path "$W2"
+eq 'a relative .git pointer resolves' 0 "$rc"
+eq '...to its admin dir' "$ADMIN2" "$WT_RM_ADMIN"
+printf 'gitdir: %s\n' "$ADMIN2" >"$W2/.git"
+
+cp "$ADMIN5/gitdir" "$TMP/admin5.gitdir"
+printf '%s\n' "$SCRATCH/elsewhere" >"$ADMIN5/gitdir"
+resolve_path "$ADMIN5"
+eq 'refuses an admin dir whose gitdir does not name a .git' 1 "$rc"
+contains '...saying why' "does not name a worktree's .git" "$(err)"
+printf '%s\n' "$SCRATCH/elsewhere/.git" >"$ADMIN5/gitdir"
+resolve_path "$W5" "$R"
+eq 'a gone worktree whose admin id now belongs elsewhere still resolves' 0 "$rc"
+eq '...but without that admin dir' '' "$WT_RM_ADMIN"
+cp "$TMP/admin5.gitdir" "$ADMIN5/gitdir"
+
+resolve_path "$ADMIN5"
+eq 'a surviving admin dir of a deleted checkout resolves' 0 "$rc"
+eq '...to the checkout it recorded' "$W5" "$WT_RM_WORKTREE"
+eq '...as not present' 0 "$WT_RM_PRESENT"
+eq '...keeping the admin dir' "$ADMIN5" "$WT_RM_ADMIN"
+eq '...and its entry' 'half-gone' "$WT_RM_LEDGER_ENTRY"
+
+mkdir "$W3"
+resolve_path "$ADMIN3"
+eq 'refuses a pruned admin id whose recorded worktree path exists again' 1 "$rc"
+contains '...saying why' 'which is not gone' "$(err)"
+rmdir "$W3"
+
+# A committed directory that merely holds files named gitdir and commondir is not an admin dir,
+# however well its pointers are aimed.
+mkdir "$R/fake admin"
+printf '%s\n' "$W3/.git" >"$R/fake admin/gitdir"
+printf '../.git\n' >"$R/fake admin/commondir"
+resolve_path "$R/fake admin"
+eq 'refuses a look-alike admin dir' 1 "$rc"
+eq '...resolving nothing' '' "$WT_RM_WORKTREE$WT_RM_LEDGER_ENTRY"
+contains '...saying why' 'not a linked worktree admin dir' "$(err)"
+rm -rf "$R/fake admin"
+
+SEP=$SCRATCH/sep
+git init -q --separate-git-dir "$SCRATCH/sep-git" "$SEP"
+git -C "$SEP" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+git -C "$SEP" worktree add -q "$SEP/.claude/worktrees/s" -b s
+resolve_path "$SEP/.claude/worktrees/s"
+eq 'refuses a worktree of a --separate-git-dir repository' 1 "$rc"
+contains '...saying why' 'not <root>/.git' "$(err)"
+
+# ---------------------------------------------------------------------------
+# wt_ledger_entry_for — which of several entries for one path is the live one
+# ---------------------------------------------------------------------------
+
+# An entry's `when` is the last field of its last record.
+ledger_copy_with_when() {  # $1 = source entry file, $2 = destination, $3 = when
+  local body
+  body=$(cat "$1"; printf x)
+  body=${body%x}
+  body=${body%"$WT_RS"}
+  printf '%s%s%s%s' "${body%"$WT_US"*}" "$WT_US" "$3" "$WT_RS" >"$2"
+}
+# shellcheck disable=SC2034  # read by the sourced ledger writer
+WT_NAME=alice/fix-99
+wt_runtime_state_set "$W2" alice_fix_99 3902 derived .env.worktree.local ours "done" SCL 2>/dev/null
+unset WT_STATE_PATH_FOR WT_STATE_PATH_IS
+L=$R/.git/worktree-ledger
+cp "$L/fix-99" "$TMP/fix-99.orig"
+# Name order and age order disagree, so neither first-seen nor last-seen can pass for newest.
+ledger_copy_with_when "$TMP/fix-99.orig" "$L/fix-99.1" 200
+ledger_copy_with_when "$TMP/fix-99.orig" "$L/fix-99.2" 300
+ledger_copy_with_when "$TMP/fix-99.orig" "$L/fix-99.3" 100
+ledger_copy_with_when "$TMP/fix-99.orig" "$L/fix-99" 50
+eq 'the live entry wins over newer set-aside ones' 'fix-99' "$(wt_ledger_entry_for "$R" "$W2" '')"
+rm -f "$L/fix-99"
+eq 'without it, the newest set-aside entry wins' 'fix-99.2' "$(wt_ledger_entry_for "$R" "$W2" '')"
+rm -f "$L"/fix-99.*
+
+# ---------------------------------------------------------------------------
 # wt_worktree_holds_work
 # ---------------------------------------------------------------------------
 
@@ -352,6 +516,45 @@ contains '...reported with its lock reason' 'agent running' "$reasons"
 git -C "$H" worktree unlock "$HW"
 holds 'unlocked again, it is clean' 1 "$HW"
 
+# Every in-progress marker, each on its own, so a misspelt marker name cannot hide behind another.
+HW_GITDIR=$(cd -P "$(git -C "$HW" rev-parse --git-dir)" && pwd -P)
+for marker in MERGE_HEAD:merge rebase-merge:rebase rebase-apply:rebase \
+  CHERRY_PICK_HEAD:cherry-pick REVERT_HEAD:revert BISECT_LOG:bisect; do
+  case ${marker%%:*} in
+    rebase-*) mkdir "$HW_GITDIR/${marker%%:*}" ;;
+    *) git -C "$HW" rev-parse HEAD >"$HW_GITDIR/${marker%%:*}" ;;
+  esac
+  holds "${marker%%:*} is work" 0 "$HW"
+  contains "...reported as ${marker#*:} in progress" "${marker#*:} in progress" "$reasons"
+  rm -rf "${HW_GITDIR:?}/${marker%%:*}"
+done
+holds 'with every marker gone, it is clean' 1 "$HW"
+
+git -C "$HW" symbolic-ref HEAD refs/heads/never-born
+holds 'an unborn HEAD cannot be verified, so it holds work' 0 "$HW"
+contains '...saying HEAD names no commit' 'does not name a commit' "$reasons"
+git -C "$HW" symbolic-ref HEAD refs/heads/worktree-my-fix
+
+cp "$HW_GITDIR/index" "$TMP/hw.index"
+printf 'not an index\n' >"$HW_GITDIR/index"
+holds 'a status git cannot produce holds work' 0 "$HW"
+contains '...saying status failed' 'git status failed' "$reasons"
+cp "$TMP/hw.index" "$HW_GITDIR/index"
+
+# A git whose symbolic-ref dies, as it does on a corrupt HEAD, while everything else answers.
+mkdir -p "$TMP/shim"
+REAL_GIT=$(command -v git)
+export REAL_GIT
+cat >"$TMP/shim/git" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = symbolic-ref ] && exit 128; done
+exec "$REAL_GIT" "$@"
+SHIM
+chmod +x "$TMP/shim/git"
+reasons=$(PATH="$TMP/shim:$PATH" wt_worktree_holds_work "$HW" 2>/dev/null)
+eq 'a branch git cannot name holds work' 0 "$?"
+contains '...saying so' 'cannot tell which branch' "$reasons"
+
 printf 'b\n' >"$HW/b.txt"; git -C "$HW" add b.txt; git -C "$HW" commit -qm 'on branch'
 holds 'a commit on no other branch is work' 0 "$HW"
 contains '...reported as a commit only here' '1 commit' "$reasons"
@@ -368,6 +571,8 @@ git -C "$HN" checkout -q --detach
 printf 'd\n' >"$HN/d.txt"; git -C "$HN" add d.txt; git -C "$HN" commit -qm detached
 holds 'a detached HEAD with a new commit is work' 0 "$HN"
 contains '...reported as detached' 'detached' "$reasons"
+eq '...and does not abort a set -e caller' reached \
+  "$( set -e; wt_worktree_holds_work "$HN" >/dev/null 2>&1; echo reached )"
 git -C "$HN" checkout -q "worktree-alice-fix-99"
 holds 'the nested worktree back on its branch is clean' 1 "$HN"
 
@@ -383,7 +588,52 @@ git -C "$HS" -c protocol.file.allow=always submodule update -q --init >/dev/null
 holds 'a worktree with a clean submodule is clean' 1 "$HS"
 printf 'dirty\n' >"$HS/sub/f.txt"
 holds 'a dirty submodule is work, even with submodule.ignore=all' 0 "$HS"
-contains '...naming it' 'sub' "$reasons"
+contains '...naming it' '(first: sub)' "$reasons"
+git -C "$HS/sub" checkout -q -- f.txt
+holds '...and clean again once reverted' 1 "$HS"
+
+# A commit only the submodule has lives in its git dir, which sits under the worktree's admin dir
+# and goes with it. Back on the recorded commit, the superproject's status cannot see it.
+SUB_TIP=$(git -C "$HS/sub" rev-parse HEAD)
+git -C "$HS/sub" checkout -q -b local-only
+printf 's\n' >"$HS/sub/s.txt"; git -C "$HS/sub" add s.txt
+git -C "$HS/sub" -c user.email=t@example.com -c user.name=t commit -qm 'only here'
+git -C "$HS/sub" checkout -q --detach "$SUB_TIP"
+holds 'a commit only an initialized submodule has is work' 0 "$HS"
+contains '...naming the submodule' '1 commit(s) in submodule sub ' "$reasons"
+git -C "$HS/sub" branch -q -D local-only
+holds '...and clean once that branch is gone' 1 "$HS"
+
+# The same, two submodules down.
+INNER=$SCRATCH/inner
+OUTER=$SCRATCH/outer
+S=$SCRATCH/super
+make_repo "$INNER"
+make_repo "$OUTER"
+git -C "$OUTER" -c protocol.file.allow=always submodule add -q "$INNER" inner >/dev/null 2>&1
+git -C "$OUTER" commit -qm 'add inner'
+make_repo "$S"
+git -C "$S" -c protocol.file.allow=always submodule add -q "$OUTER" outer >/dev/null 2>&1
+git -C "$S" commit -qm 'add outer'
+add_worktree "$S" nest
+SN=$S/.claude/worktrees/nest
+git -C "$SN" -c protocol.file.allow=always submodule update -q --init --recursive >/dev/null 2>&1
+holds 'a worktree with clean nested submodules is clean' 1 "$SN"
+INNER_TIP=$(git -C "$SN/outer/inner" rev-parse HEAD)
+git -C "$SN/outer/inner" checkout -q -b deep
+printf 'i\n' >"$SN/outer/inner/i.txt"; git -C "$SN/outer/inner" add i.txt
+git -C "$SN/outer/inner" -c user.email=t@example.com -c user.name=t commit -qm deep
+git -C "$SN/outer/inner" checkout -q --detach "$INNER_TIP"
+holds 'a commit only a nested submodule has is work' 0 "$SN"
+contains '...naming it by its path' 'in submodule outer/inner ' "$reasons"
+git -C "$SN/outer/inner" branch -q -D deep
+
+cp "$SN/outer/.git" "$TMP/outer.git"
+printf 'gitdir: %s\n' "$SCRATCH/nowhere" >"$SN/outer/.git"
+holds 'a submodule git cannot read holds work' 0 "$SN"
+contains '...saying which' 'could not verify: submodule outer ' "$reasons"
+cp "$TMP/outer.git" "$SN/outer/.git"
+holds '...and clean once repaired' 1 "$SN"
 
 holds 'a directory that is not there cannot be verified, so it holds work' 0 "$SCRATCH/nowhere"
 contains '...saying it could not verify' 'could not verify' "$reasons"
@@ -394,6 +644,45 @@ contains '...saying it could not verify' 'could not verify' "$reasons"
 eq '...and prints nothing but reasons on stdout' '' "$(printf '%s\n' "$reasons" | grep -v '^could not verify: ')"
 mv "$HW/.git.good" "$HW/.git"
 holds 'repaired, it is clean again' 1 "$HW"
+
+# A repository that ignores .claude/worktrees/, as a real one does: git walking up out of a broken
+# worktree then lands on a clean main checkout, and nested worktrees vanish from status.
+G=$SCRATCH/ignoring
+make_repo "$G"
+printf '.claude/worktrees/\n' >>"$G/.gitignore"
+git -C "$G" commit -qam 'ignore worktrees'
+add_worktree "$G" a
+GA=$G/.claude/worktrees/a
+GA_ADMIN=$(cd -P "$(git -C "$GA" rev-parse --git-dir)" && pwd -P)
+holds 'a fresh worktree of an ignoring repository is clean' 1 "$GA"
+
+mv "$GA/.git" "$TMP/ga.git"
+printf 'mine\n' >"$GA/untracked.txt"
+holds 'a worktree whose .git is gone cannot be verified, though git would read the main checkout' 0 "$GA"
+contains '...saying git resolved something else' 'could not verify: git resolves' "$reasons"
+rm -f "$GA/untracked.txt"
+mv "$TMP/ga.git" "$GA/.git"
+
+mkdir "$GA/deeper"
+holds 'a subdirectory of a worktree is not that worktree' 0 "$GA/deeper"
+contains '...saying git resolved something else' 'could not verify: git resolves' "$reasons"
+rmdir "$GA/deeper"
+
+cp "$GA_ADMIN/gitdir" "$TMP/ga.gitdir"
+printf '%s\n' "$SCRATCH/elsewhere/.git" >"$GA_ADMIN/gitdir"
+holds 'a worktree whose admin dir points elsewhere cannot be verified' 0 "$GA"
+contains '...saying so' 'does not point back at' "$reasons"
+cp "$TMP/ga.gitdir" "$GA_ADMIN/gitdir"
+
+git -C "$G" worktree add -q "$GA/.claude/worktrees/b" -b wb
+holds 'a registered worktree nested inside is work' 0 "$GA"
+contains '...naming it' "a registered worktree is nested inside it: $GA/.claude/worktrees/b" "$reasons"
+holds '...while the nested one itself is clean' 1 "$GA/.claude/worktrees/b"
+git -C "$G" worktree remove "$GA/.claude/worktrees/b"
+holds 'without it, the outer one is clean again' 1 "$GA"
+
+holds 'the main checkout is not a linked worktree' 0 "$G"
+contains '...saying so' 'is not a linked worktree' "$reasons"
 
 printf '%d passed, %d failed, %d backend(s) exercised\n' "$pass" "$fail" "$backends_run" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$backends_run" -gt 0 ]

@@ -10,8 +10,14 @@
 # Two questions every destructive path must answer before it touches anything, answered once here
 # so the hook and the sweep cannot come to different conclusions about the same directory:
 #
-#   wt_resolve_removal_target   WHICH worktree a removal names, and whether it is ours to act on.
+#   wt_resolve_worktree_path    WHICH worktree a path names, and whether it is ours to act on.
+#   wt_resolve_removal_target   the same, for the path a WorktreeRemove payload names.
 #   wt_worktree_holds_work      whether removing it would lose anything the user made.
+#
+# The prune sweep calls wt_resolve_worktree_path once per candidate — a ledger entry's recorded path
+# or a `git worktree list` path, with the main checkout as the hint — then wt_worktree_holds_work on
+# each one it resolved as present. Every call starts from empty results, so a loop cannot act on a
+# previous candidate's target after a refusal.
 #
 # THE ASYMMETRY IS THE DESIGN (docs/phases/phase-5-teardown.md). Creating the wrong thing wastes
 # disk; deleting the wrong thing destroys work. So both functions fail CLOSED: a path that cannot be
@@ -59,7 +65,7 @@ WT_TEARDOWN_LIB_SOURCED=1
 # wt_symlink_refuses copies that rule), so no worktree it removes is named by one, and a payload
 # that is one would be steering a destructive operation at whatever the link points to.
 
-# Results of wt_resolve_removal_target. Every one is reset on entry, so a refusal never leaves a
+# Results of wt_resolve_worktree_path and wt_resolve_removal_target. Every one is reset on entry, so a refusal never leaves a
 # previous call's target in place for a careless caller to act on.
 #   WT_RM_WORKTREE      the worktree, as an absolute physical path. May no longer exist.
 #   WT_RM_ROOT          its main checkout.
@@ -160,6 +166,13 @@ wt_rm_accept_live() {  # $1 = physical worktree path, $2 = expected admin dir or
     wt_log "refusing to tear down $wt: its .git file and the admin dir ${expect:-$pointer} do not point at each other"
     return 1
   fi
+  # git lists a worktree off its admin dir's gitdir file, so a .git file naming ANOTHER worktree's
+  # admin dir would pass registration and then be torn down against that worktree's state.
+  if ! pointer=$(wt_read_git_pointer "$admin/gitdir" "$admin") \
+    || [ "$(wt_physical_path "$pointer")" != "$wt/.git" ]; then
+    wt_log "refusing to tear down $wt: its .git file and the admin dir $admin do not point at each other"
+    return 1
+  fi
   if ! pointer=$(wt_read_git_pointer "$admin/commondir" "$admin") \
     || ! common=$(cd -P "$pointer" 2>/dev/null && pwd -P); then
     wt_log "refusing to tear down $wt: it is not a linked worktree (its git dir $admin has no usable commondir — a submodule, or damaged)"
@@ -249,32 +262,48 @@ wt_rm_accept_gone() {  # $1 = physical worktree path, $@ = candidate directories
   return 2
 }
 
-# Resolve the worktree a WorktreeRemove payload names into the WT_RM_* globals above.
-#
-# The payload is the JSON text bootstrap.sh already reads into HOOK_INPUT (wt_read_input), so this
-# takes it the way wt_read_field does: as $1, defaulting to HOOK_INPUT. stdin is drained once, by
-# the entrypoint.
+# True if $1 is a linked worktree's admin dir, `<git dir>/worktrees/<id>`: holding `gitdir` and
+# `commondir` files is not enough, since any committed directory can, and its pointers would then
+# steer resolution at whatever they name. The directory must sit directly under the `worktrees/`
+# of a real git dir, have no `.git` of its own, and name that git dir as its commondir.
+wt_rm_is_admin_dir() {  # $1 = physical directory
+  local dir=$1 gitroot pointer common
+  [ ! -e "$dir/.git" ] || return 1
+  gitroot=${dir%/*}
+  [ "${gitroot##*/}" = worktrees ] || return 1
+  gitroot=${gitroot%/worktrees}
+  [ -n "$gitroot" ] && [ -f "$gitroot/HEAD" ] && [ -d "$gitroot/refs" ] && [ -d "$gitroot/objects" ] \
+    || return 1
+  pointer=$(wt_read_git_pointer "$dir/commondir" "$dir") || return 1
+  common=$(cd -P "$pointer" 2>/dev/null && pwd -P) || return 1
+  [ "$common" = "$gitroot" ]
+}
+
+# Resolve the worktree an absolute path names into the WT_RM_* globals above. The path may be the
+# checkout or its admin dir, and either may already be gone. $2, when given, is a directory inside
+# the repository, tried first when only a ledger entry is left to find it by — the payload's cwd,
+# or the main checkout for a caller sweeping one repository.
 #
 #   0  resolved; WT_RM_* describe it
 #   1  refused, with the reason on stderr; WT_RM_* are empty
 #   2  the directory is gone and nothing of ours records it; WT_RM_* are empty
-wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
-  local json=${1-${HOOK_INPUT-}} fields named given cwd target physical home pointer admin
-  local id gitroot root entry recorded
+wt_resolve_worktree_path() {  # $1 = absolute path, $2 = directory inside its repository, or empty
+  local target=${1-} hint=${2-} physical home admin pointer id gitroot root entry recorded
 
   WT_RM_WORKTREE='' WT_RM_ROOT='' WT_RM_ADMIN='' WT_RM_LEDGER_ENTRY='' WT_RM_PRESENT=0
 
-  fields=''
-  if [ -n "$json" ] && wt_has_json; then
-    fields=$(printf '%s' "$json" | wt_json_get worktree_path path cwd 2>/dev/null) || fields=''
-  fi
-  IFS=$WT_US read -r named given cwd <<<"$fields"
-  target=${named:-$given}
-
   if [ -z "$target" ]; then
-    wt_log "the removal payload names no worktree (no worktree_path or path) — doing nothing"
+    wt_log "the removal names no worktree — doing nothing"
     return 1
   fi
+  # No worktree Claude Code creates has one, and every reader of this plugin's records folds or
+  # strips them, so a path carrying one could only ever match the wrong record.
+  case $target in
+    *[[:cntrl:]]*)
+      wt_log "refusing to tear down \"$target\": it contains a control character"
+      return 1
+      ;;
+  esac
   case $target in
     /*) ;;
     *)
@@ -292,7 +321,7 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
     target=${target%/}
   done
   if [ "$target" = / ]; then
-    wt_log "refusing to tear down /"
+    wt_log "refusing to tear down /: it is / or the home directory"
     return 1
   fi
   if [ -L "$target" ]; then
@@ -305,7 +334,7 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
   fi
   home=''
   [ -n "${HOME-}" ] && home=$(cd -P "$HOME" 2>/dev/null && pwd -P)
-  if [ "$physical" = / ] || { [ -n "$home" ] && [ "$physical" = "$home" ]; }; then
+  if [ -z "$physical" ] || [ "$physical" = / ] || { [ -n "$home" ] && [ "$physical" = "$home" ]; }; then
     wt_log "refusing to tear down $target: it is / or the home directory"
     return 1
   fi
@@ -319,6 +348,10 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
     # file there, and a `commondir` that no checkout has.
     if [ -f "$physical/gitdir" ] && [ -f "$physical/commondir" ]; then
       admin=$physical
+      if ! wt_rm_is_admin_dir "$admin"; then
+        wt_log "refusing to tear down $target: it holds gitdir and commondir files but is not a linked worktree admin dir (<git dir>/worktrees/<id>)"
+        return 1
+      fi
       if ! pointer=$(wt_read_git_pointer "$admin/gitdir" "$admin"); then
         wt_log "refusing to tear down $target: its gitdir file is unreadable"
         return 1
@@ -340,13 +373,12 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
         return
       fi
       gitroot=${admin%/worktrees/*}
-      wt_rm_accept_gone "$physical" "$cwd" "${gitroot%/.git}"
+      wt_rm_accept_gone "$physical" "$hint" "${gitroot%/.git}"
       return
     fi
     wt_rm_accept_live "$physical" ''
     return
   fi
-
   # Gone, and named by its admin dir: git pruned that too, so only the id in the path is left to
   # find the ledger entry by. `<G>/worktrees/<id>` counts only when G is a git directory.
   case $physical in
@@ -384,7 +416,46 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
     *"$WT_SUBPATH"*) gitroot=${physical%"$WT_SUBPATH"*} ;;
     *) gitroot='' ;;
   esac
-  wt_rm_accept_gone "$physical" "$cwd" "$gitroot"
+  wt_rm_accept_gone "$physical" "$hint" "$gitroot"
+}
+
+# Resolve the worktree a WorktreeRemove payload names, exactly as wt_resolve_worktree_path does,
+# with the payload's cwd as the repository hint. Same return codes.
+#
+# The payload is the JSON text bootstrap.sh already reads into HOOK_INPUT (wt_read_input), so this
+# takes it the way wt_read_field does: as $1, defaulting to HOOK_INPUT. stdin is drained once, by
+# the entrypoint.
+#
+# AN ENCODED CONTROL CHARACTER ANYWHERE IN THE PAYLOAD IS REFUSED, not just in the fields read. The
+# JSON readers fold CR and LF to a space and strip US and RS (see WT_RS in lib.sh), so a path
+# encoding one arrives here as a DIFFERENT path — possibly a real worktree's — and no test after
+# extraction can tell. JSON forbids the raw bytes inside a string, so the escapes are all there is
+# to find; `\\` pairs are dropped first so an escaped backslash before an `n` is not one.
+wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
+  local json=${1-${HOOK_INPUT-}} fields named given cwd target escaped_backslash="\\\\" unescaped
+
+  WT_RM_WORKTREE='' WT_RM_ROOT='' WT_RM_ADMIN='' WT_RM_LEDGER_ENTRY='' WT_RM_PRESENT=0
+
+  unescaped=${json//"$escaped_backslash"/}
+  case $unescaped in
+    *'\n'* | *'\r'* | *'\t'* | *'\b'* | *'\f'* | *'\u00'[01]*)
+      wt_log "refusing the removal payload: it encodes a control character, which the JSON reader would fold away, so the path it names is a guess — doing nothing"
+      return 1
+      ;;
+  esac
+
+  fields=''
+  if [ -n "$json" ] && wt_has_json; then
+    fields=$(printf '%s' "$json" | wt_json_get worktree_path path cwd 2>/dev/null) || fields=''
+  fi
+  IFS=$WT_US read -r named given cwd <<<"$fields"
+  target=${named:-$given}
+
+  if [ -z "$target" ]; then
+    wt_log "the removal payload names no worktree (no worktree_path or path) — doing nothing"
+    return 1
+  fi
+  wt_resolve_worktree_path "$target" "$cwd"
 }
 
 # ---------------------------------------------------------------------------
@@ -398,9 +469,15 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
 #
 # WORK IS what `git worktree remove --force` would lose: changes to tracked files, staged or not;
 # untracked files that are not ignored; dirty submodules; a merge, rebase, cherry-pick, revert or
-# bisect half done; a `git worktree lock`, which is someone saying "not this one"; and commits that
-# nothing else keeps — no OTHER local branch and no remote-tracking ref contains them. A detached
-# HEAD is the sharp case: its commits have no branch at all, so removal orphans them.
+# bisect half done; a `git worktree lock`, which is someone saying "not this one"; another
+# registered worktree nested inside it; commits that nothing else keeps — no OTHER local branch and
+# no remote-tracking ref contains them; and the same for any initialized submodule, whose refs die
+# with the admin dir. A detached HEAD is the sharp case: its commits have no branch at all, so
+# removal orphans them.
+#
+# THE ANSWER MUST BE ABOUT $1 ITSELF. git walks up from a directory it cannot read as a checkout,
+# so $1 must be what git reports as its own top level, with a git dir that is a linked worktree's
+# admin dir pointing back at it. Anything else is "could not verify".
 #
 # GITIGNORED FILES ARE NEVER WORK. vendor/, node_modules/ and the env override file are what the
 # bootstrap put there, and the override is only ever written when it is gitignored
@@ -411,18 +488,38 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
 # submodule. GIT_OPTIONAL_LOCKS=0 keeps the index refresh from writing: a read-only question must
 # not race a session still using the worktree.
 wt_worktree_holds_work() {  # $1 = worktree
-  local wt=${1%/} gitdir status line code path holds=0 marker why tip branch count
+  local wt=${1%/} resolved top gitdir common pointer status line code path holds=0 marker why
+  local tip branch count rc listed
   local staged=0 modified=0 untracked=0 first_staged='' first_modified='' first_untracked=''
   local exclude=()
 
-  if ! gitdir=$(wt_git "$wt" rev-parse --git-dir 2>/dev/null) || [ -z "$gitdir" ]; then
-    printf 'could not verify: git cannot read %s as a worktree\n' "$wt"
+  if ! wt=$(cd -P "$wt" 2>/dev/null && pwd -P) \
+    || ! resolved=$(wt_git "$wt" rev-parse --show-toplevel --git-dir --git-common-dir 2>/dev/null); then
+    printf 'could not verify: git cannot read %s as a worktree\n' "${1%/}"
     return 0
   fi
-  case $gitdir in
-    /*) ;;
-    *) gitdir=$wt/$gitdir ;;
-  esac
+  { IFS= read -r top; IFS= read -r gitdir; IFS= read -r common; } <<<"$resolved"
+  # git walks UP from a directory it cannot read as a checkout: with the .git file gone, or from a
+  # subdirectory, every answer below would be about some other checkout — typically the main one,
+  # which ignores .claude/worktrees/ and so reads clean.
+  top=$(cd -P "$top" 2>/dev/null && pwd -P) || top=''
+  if [ "$top" != "$wt" ]; then
+    printf 'could not verify: git resolves %s to the checkout %s, not to itself\n' "$wt" "${top:-(none)}"
+    return 0
+  fi
+  case $gitdir in /*) ;; *) gitdir=$wt/$gitdir ;; esac
+  case $common in /*) ;; *) common=$wt/$common ;; esac
+  gitdir=$(cd -P "$gitdir" 2>/dev/null && pwd -P) || gitdir=''
+  common=$(cd -P "$common" 2>/dev/null && pwd -P) || common=''
+  if [ -z "$gitdir" ] || [ -z "$common" ] || [ "${gitdir%/*}" != "$common/worktrees" ]; then
+    printf 'could not verify: %s is not a linked worktree (its git dir is %s)\n' "$wt" "${gitdir:-unknown}"
+    return 0
+  fi
+  if ! pointer=$(wt_read_git_pointer "$gitdir/gitdir" "$gitdir") \
+    || [ "$(wt_physical_path "$pointer")" != "$wt/.git" ]; then
+    printf 'could not verify: the admin dir %s does not point back at %s\n' "$gitdir" "$wt"
+    return 0
+  fi
 
   if status=$(GIT_OPTIONAL_LOCKS=0 wt_git "$wt" status --porcelain \
     --untracked-files=normal --ignore-submodules=none 2>/dev/null); then
@@ -461,6 +558,28 @@ wt_worktree_holds_work() {  # $1 = worktree
     holds=1
   fi
 
+  # Another worktree inside this one goes with it, and a repository that ignores
+  # .claude/worktrees/ hides it from status.
+  if listed=$(wt_git "$wt" worktree list --porcelain 2>/dev/null); then
+    while IFS= read -r line; do
+      case $line in
+        'worktree '*) line=${line#worktree } ;;
+        *) continue ;;
+      esac
+      [ -d "$line" ] || continue
+      line=$(cd -P "$line" 2>/dev/null && pwd -P) || line=''
+      case $line in
+        "$wt"/*)
+          printf 'a registered worktree is nested inside it: %s\n' "$line"
+          holds=1
+          ;;
+      esac
+    done <<<"$listed"
+  else
+    printf 'could not verify: cannot list the worktrees registered alongside %s\n' "$wt"
+    holds=1
+  fi
+
   for marker in MERGE_HEAD:merge rebase-merge:rebase rebase-apply:rebase \
     CHERRY_PICK_HEAD:cherry-pick REVERT_HEAD:revert BISECT_LOG:bisect; do
     if [ -e "$gitdir/${marker%%:*}" ]; then
@@ -477,12 +596,15 @@ wt_worktree_holds_work() {  # $1 = worktree
     holds=1
   fi
 
+  wt_submodules_hold_commits "$wt" '' && holds=1
+
   if ! tip=$(wt_git "$wt" rev-parse --verify -q HEAD 2>/dev/null) || [ -z "$tip" ]; then
     printf 'could not verify: HEAD in %s does not name a commit\n' "$wt"
     return 0
   fi
-  branch=$(wt_git "$wt" symbolic-ref -q HEAD 2>/dev/null)
-  case $? in
+  # rc captured this way so a detached HEAD (1) does not abort a `set -e` caller.
+  branch=$(wt_git "$wt" symbolic-ref -q HEAD 2>/dev/null) && rc=0 || rc=$?
+  case $rc in
     0) branch=${branch#refs/heads/}; exclude=("--exclude=$branch") ;;
     1) branch='' ;;
     *)
@@ -507,4 +629,46 @@ wt_worktree_holds_work() {  # $1 = worktree
     holds=1
   fi
   [ "$holds" = 1 ]
+}
+
+# Print a reason for every initialized submodule under $1, at any depth, holding commits that no
+# remote-tracking ref of its own contains, and return 0 if there was one. A linked worktree's
+# submodules keep their git dirs under ITS admin dir (`<admin>/modules/<name>`), so removing the
+# worktree deletes every ref in them — branches, tags and stash alike, hence `--all`. Their dirty
+# files are already the superproject status's to report. Anything git cannot answer is a reason.
+#
+# ls-files ends with a sentinel record, which has no tab where every real record has one, so a
+# listing cut short by a failure is told apart from a complete one.
+wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktree, `/`-terminated, or empty
+  local dir=$1 prefix=${2-} rec path sub top count rc=1 complete=0 tab=$'\t'
+  while IFS= read -r -d '' rec; do
+    case $rec in
+      "$tab"end) complete=1; continue ;;
+      160000' '*"$tab"*) path=${rec#*"$tab"} ;;
+      *) continue ;;
+    esac
+    sub=$dir/$path
+    [ -e "$sub/.git" ] || continue
+    top=$(wt_git "$sub" rev-parse --show-toplevel 2>/dev/null) && top=$(cd -P "$top" 2>/dev/null && pwd -P) \
+      || top=''
+    if [ -z "$top" ] || [ "$top" != "$(cd -P "$sub" 2>/dev/null && pwd -P)" ]; then
+      printf 'could not verify: submodule %s%s is not a repository git can read\n' "$prefix" "$path"
+      rc=0
+      continue
+    fi
+    if ! count=$(wt_git "$sub" rev-list --count --all --not --remotes 2>/dev/null) || [ -z "$count" ]; then
+      printf 'could not verify: submodule %s%s: cannot list the commits only it has\n' "$prefix" "$path"
+      rc=0
+    elif [ "$count" -gt 0 ]; then
+      printf '%d commit(s) in submodule %s%s that no remote-tracking ref of its own contains\n' \
+        "$count" "$prefix" "$path"
+      rc=0
+    fi
+    wt_submodules_hold_commits "$sub" "$prefix$path/" && rc=0
+  done < <(wt_git "$dir" ls-files --stage -z 2>/dev/null && printf '\tend\0')
+  if [ "$complete" != 1 ]; then
+    printf 'could not verify: cannot list the submodules of %s\n' "$dir"
+    rc=0
+  fi
+  return "$rc"
 }
