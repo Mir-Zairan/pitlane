@@ -1075,6 +1075,10 @@ eq 'wt_ledger_entries emits one record per entry, entry name first' \
 wt_runtime_state_set "$LWT" alice_fix_99 3813 probed .env.worktree.local ours failed SCM 2>/dev/null
 eq 'rewriting the rt record for the same worktree still leaves one entry' 1 "$(ledger_count)"
 eq '...carrying the new allocation' '3813' "$(wt_ledger_field "$LREPO" fix-99 port)"
+# A later SessionStart derives the flattened name from the path; the seed saw the first one.
+WT_NAME=alice-fix-99 wt_runtime_state_set "$LWT" alice_fix_99 3813 probed .env.worktree.local ours failed SCM 2>/dev/null
+eq '...keeping the name first recorded for the same path and slug' 'alice/fix-99' \
+  "$(wt_ledger_field "$LREPO" fix-99 name)"
 eq 'a ledger write leaves no temporary file behind' 0 \
   "$(find "$LEDGER" -maxdepth 1 -name '.wtledger.*' 2>/dev/null | wc -l | tr -d ' ')"
 
@@ -1102,9 +1106,11 @@ eq '...and the earlier one still says what the first worktree allocated' 'alice_
 eq '...including where it was' "$LWT" "$(wt_ledger_field "$LREPO" "$old_entry" path)"
 
 # Same path, different slug: a branch that edited runtime.slug has orphaned the old database.
-wt_runtime_state_set "$LWT2" bob_renamed 3901 derived .env.worktree.local ours none '' 2>/dev/null
+WT_NAME=bob-renamed wt_runtime_state_set "$LWT2" bob_renamed 3901 derived .env.worktree.local ours none '' 2>/dev/null
 eq 'a changed slug for the same worktree sets the old entry aside too' 3 "$(ledger_count)"
 eq '...and the id now records the new slug' 'bob_renamed' "$(wt_ledger_field "$LREPO" fix-99 slug)"
+eq '...and records the current name, not the set-aside one' 'bob-renamed' \
+  "$(wt_ledger_field "$LREPO" fix-99 name)"
 
 # FORGET removes exactly what it is named, and nothing a traversal name could reach.
 wt_ledger_forget "$LREPO" '../HEAD' 2>"$TMP/ledger-err"

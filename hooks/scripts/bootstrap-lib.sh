@@ -1068,8 +1068,14 @@ wt_ledger_parse() {  # $1 = entry file
 # replace an existing name, so each session claims a free name or tries the next. The link is not
 # undone if the write after it fails: the copy under the id may meanwhile be another session's,
 # and a duplicate of an old entry costs prune nothing, where a lost one costs it a database.
+#
+# THE NAME IS THE FIRST ONE RECORDED for this path and slug: it is what teardown hands the teardown
+# script as WT_NAME, and it must be the name the seed saw. A seed that first ran in a later session
+# than the one that wrote the entry (a WorktreeCreate seed that failed, retried at SessionStart)
+# saw the later name; the entry still holds the first. The rt record has no name field, so a
+# teardown with no ledger entry derives the name from the path (wt_read_allocation).
 wt_ledger_write() {  # $1 = worktree, $2 = the rt record
-  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug recorded_wt
+  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug recorded_wt name
 
   wt_state_path "$wt" >/dev/null
   state=${WT_STATE_PATH_IS-}
@@ -1098,6 +1104,7 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
   # would never match its own entry and be set aside again every session.
   wt_state_join "$wt"
   recorded_wt=$WT_STATE_REC
+  name=${WT_NAME-}
   if [ -e "$entry" ]; then
     slug=${rtrec#rt"$WT_US"}
     slug=${slug%%"$WT_US"*}
@@ -1115,10 +1122,15 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
         n=$((n + 1))
         kept=$entry.$when.$n
       done
+    elif [ -n "$WT_LEDGER_NAME" ]; then
+      # The same worktree and allocation: keep the name first recorded. A worktree WorktreeCreate
+      # made from `alice/fix-99` lives in `alice-fix-99/`, so a later SessionStart derives a
+      # different name from the path — and the seed, run on creation, saw the payload's.
+      name=$WT_LEDGER_NAME
     fi
   fi
 
-  wt_state_join worktree "$wt" "$id" "${WT_NAME-}"
+  wt_state_join worktree "$wt" "$id" "$name"
   if ! tmp=$(mktemp "$ledger/${WT_LEDGER_TMP_PREFIX}XXXXXX" 2>/dev/null); then
     wt_log "runtime: could not write to the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
     return 0

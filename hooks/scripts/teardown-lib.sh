@@ -695,7 +695,9 @@ wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktre
 #   WT_TD_KEEP_REASON  the lock functions' reason for keeping the worktree, when they return 1.
 #   WT_TD_SOURCE       where the allocation was read: the state file's path, `ledger`, or empty
 #                      when nothing records one.
-#   WT_TD_NAME         the name the seed saw: the ledger's, else wt_name_from_path's.
+#   WT_TD_NAME         the name the seed saw: the one the ledger entry first recorded, else
+#                      wt_name_from_path's — which differs for a WorktreeCreate name with a `/`
+#                      (`alice/fix-99` lives in `alice-fix-99/`) when the ledger entry is missing.
 #   WT_TD_SLUG, WT_TD_PORT, WT_TD_PORTSOURCE, WT_TD_ENVFILE, WT_TD_ENVSTATE
 #                      the `rt` record's fields, empty when WT_TD_SOURCE is.
 #   WT_TD_STATUS       the teardown script's outcome: none (nothing to run), done, failed, timeout,
@@ -781,8 +783,10 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
   WT_TD_SOURCE='' WT_TD_NAME='' WT_TD_SLUG='' WT_TD_PORT='' WT_TD_PORTSOURCE=''
   WT_TD_ENVFILE='' WT_TD_ENVSTATE=''
 
-  # The ledger recorded the name the seed saw; without an entry it is derived exactly as the
-  # SessionStart branch of bootstrap.sh derives it.
+  # The ledger keeps the first name recorded for this allocation (wt_ledger_write), even when the
+  # state file is the source: the rt record holds no name. Without an entry it is derived exactly as
+  # the SessionStart branch of bootstrap.sh derives it — the flattened directory name, not a
+  # WorktreeCreate payload's `/`-separated one.
   [ -n "$entry" ] && { WT_TD_NAME=$(wt_ledger_field "$root" "$entry" name) || WT_TD_NAME=''; }
   [ -n "$WT_TD_NAME" ] || WT_TD_NAME=$(wt_name_from_path "$wt")
 

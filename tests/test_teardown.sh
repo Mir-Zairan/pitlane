@@ -125,6 +125,7 @@ JSON
   {
     printf '#!/usr/bin/env bash\n'
     printf 'printf "%%s\\n" "$WT_SLUG" > "%s/$WT_SLUG"\n' "$DB"
+    printf 'printf "%%s\\n" "$WT_NAME" > "%s/$WT_SLUG.seed-name"\n' "$LOGS"
   } >"$dir/.claude/worktree-seed.sh"
   # shellcheck disable=SC2016
   {
@@ -621,6 +622,27 @@ eq 'hostile: the teardown script dropped the database the seed made' no "$(exist
 contains 'hostile: WT_NAME is the name the seed saw' "WT_NAME=$hostile" "$log"
 contains 'hostile: WT_PATH is the worktree' "WT_PATH=$WHN" "$log"
 eq 'hostile: its ledger entry is forgotten' "$ledger_before" "$(ls -A "$R/.git/worktree-ledger")"
+
+# ---------------------------------------------------------------------------
+# A nested WorktreeCreate name survives a later SessionStart
+# ---------------------------------------------------------------------------
+#
+# WorktreeCreate seeds with the payload's name, `alice/fix-99`, in the flattened directory
+# `alice-fix-99`. A SessionStart in that worktree has no payload name and derives `alice-fix-99`
+# from the path, and it rewrites the rt record — so the ledger must keep the name first recorded,
+# or the teardown script is handed a WT_NAME the seed never saw.
+
+WA=$(create "$R" alice/fix-99)
+eq 'nested name: fixture: flattened directory' "$R/.claude/worktrees/alice-fix-99" "$WA"
+seed_name=$(cat "$LOGS/alice_fix_99.seed-name" 2>/dev/null)
+eq 'nested name: fixture: the seed saw the payload name' 'alice/fix-99' "$seed_name"
+( cd "$WA" && printf '{"hook_event_name":"SessionStart","source":"startup","cwd":"%s"}' "$WA" \
+  | bash "$CREATE_HOOK" >/dev/null 2>"$TMP/create-err" )
+out=$(remove "$(remove_payload "$WA" "$R")" "$R")
+log=$(cat "$LOGS/alice_fix_99.log" 2>/dev/null)
+eq 'nested name: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'nested name: the teardown script dropped the database' no "$(exists "$DB/alice_fix_99")"
+contains 'nested name: teardown gets the WT_NAME the seed saw' "WT_NAME=$seed_name"$'\n' "$log"
 
 # ---------------------------------------------------------------------------
 # The rm -rf fallback deletes only what was checked, and says when it could not
