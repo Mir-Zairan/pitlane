@@ -55,21 +55,6 @@ source_kind=$(wt_read_field source) || source_kind=''
 payload_cwd=$(wt_read_field cwd) || payload_cwd=''
 here=${payload_cwd:-$PWD}
 
-# Where Claude Code puts worktrees. Used to tell "this session is in a worktree" from
-# "this session is in the main checkout", which is how the SessionStart path stays inert
-# for ordinary sessions.
-WT_SUBPATH='/.claude/worktrees/'
-
-# The profile is committed (ADR-008), so a branch that adds a dependency also updates it.
-# The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
-# a worktree gets bootstrapped from whatever main happens to have, while Phase 3 reads its
-# *lockfiles* from the worktree, and the two disagree.
-wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
-  local which=$1
-  [ -f "$1/.claude/worktree-profile.json" ] || which=$2
-  wt_load_profile "$which"
-}
-
 # Refuse a worktree path that a symlink could redirect out of the repository.
 #
 # THE ORDER OF THIS CHECK IS THE WHOLE POINT, and it is why registering WorktreeCreate is

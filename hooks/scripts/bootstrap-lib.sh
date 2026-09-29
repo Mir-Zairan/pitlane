@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 #
-# The bootstrap ENGINE. Sourced by bootstrap.sh, by nothing else.
+# The bootstrap ENGINE. Sourced by bootstrap.sh, and by teardown-lib.sh for the state, ledger and
+# profile readers teardown shares with it.
 #
 # WHY THIS IS NOT IN lib.sh. lib.sh is the primitive layer — JSON access, repository geometry,
 # slugs and placeholders, the profile — and every hook this plugin will ever ship sources it on
-# the session-start path. Teardown (Phase 5) and the calibrate skill's helpers need all of that
-# and none of what is in here: dependency strategies, locking, per-worktree state. Keeping the
+# the session-start path. The calibrate skill's helpers need all of that and none of what is in
+# here: dependency strategies, locking, per-worktree state. Teardown needs the state and ledger
+# readers too, which is why it sources this file rather than lib.sh alone. Keeping the
 # engine separate is the same split `detect.sh` already uses — a large consumer sitting on top of
 # lib.sh, with its own test file — and it keeps a phase-sized feature out of the diff of the file
 # whose byte-for-byte dual-backend behaviour 700-odd assertions pin.
@@ -30,6 +32,31 @@ WT_BOOTSTRAP_LIB_SOURCED=1
 # shellcheck source=lib.sh
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# ---------------------------------------------------------------------------
+# Which worktree, which profile
+# ---------------------------------------------------------------------------
+#
+# Here rather than in the entrypoint because teardown and prune must answer both questions exactly
+# as bootstrap did: a second copy that drifted would tear a worktree down under a different profile,
+# or a different name, from the one it was set up with.
+
+# Where Claude Code puts worktrees. Used to tell "this session is in a worktree" from
+# "this session is in the main checkout", which is how the SessionStart path stays inert
+# for ordinary sessions.
+# SC2034: read by the entrypoints that source this file.
+# shellcheck disable=SC2034
+WT_SUBPATH='/.claude/worktrees/'
+
+# The profile is committed (ADR-008), so a branch that adds a dependency also updates it.
+# The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
+# a worktree gets bootstrapped from whatever main happens to have, while Phase 3 reads its
+# *lockfiles* from the worktree, and the two disagree.
+wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
+  local which=$1
+  [ -f "$1/.claude/worktree-profile.json" ] || which=$2
+  wt_load_profile "$which"
+}
 
 # ---------------------------------------------------------------------------
 # Running a command inside the project's toolchain
