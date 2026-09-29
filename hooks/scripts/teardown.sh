@@ -89,6 +89,19 @@ if [ "$present" = 1 ]; then
 fi
 
 # --- 2. what this plugin allocated, read BEFORE anything is deleted ---------------------------
+# Held until exit, through the ledger step: /worktree-prune releases the same entries.
+if [ -n "$entry" ]; then
+  if ! wt_acquire_allocation_lock "$root" "$entry" 9; then
+    if [ "$present" = 1 ]; then
+      wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
+    else
+      wt_log "not tearing down $worktree: $WT_TD_KEEP_REASON; /worktree-prune will list it"
+    fi
+    exit 0
+  fi
+  # The release it waited on may have finished, and forgotten the entry.
+  wt_ledger_field "$root" "$entry" path >/dev/null || entry=''
+fi
 wt_read_allocation "$state" "$root" "$entry" "$worktree"
 
 # The profile the worktree was set up with: its own committed copy wins (ADR-008). Once the
@@ -121,6 +134,7 @@ if [ "$present" = 1 ]; then
   # Nothing else is unlinked first: the state records no symlink this plugin made (dependencies
   # are hardlinked or installed, config is copied), and neither `git worktree remove` nor `rm -rf`
   # follows a symlink out of the tree.
+  # shellcheck disable=SC2153  # set by wt_read_allocation, in teardown-lib.sh
   envfile=$WT_TD_ENVFILE
   if [ "$WT_TD_ENVSTATE" = ours ] && [ -n "$envfile" ] && wt_is_safe_relpath "$envfile" \
     && ! wt_has_symlinked_parent "$worktree" "$envfile" \

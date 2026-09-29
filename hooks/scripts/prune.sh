@@ -17,7 +17,8 @@
 #   id  kind  path  bytes  action  reason
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
-#   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | held
+#   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | held; `store` is reserved
+#           for Phase 7's unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
 #   action  delete    remove the path.
@@ -31,14 +32,17 @@
 #   A tab or newline inside a path or reason is printed as a space; the item's own key, not the
 #   printed path, is what --apply acts on.
 #
-# --APPLY re-runs discovery and every check before each item, in report order, so an item that
-# changed since the report is judged as it is now. Each outcome is one line:
+# --APPLY takes the repository's prune lock, then re-runs discovery and every check before each
+# item, in report order, so an item that changed since the report is judged as it is now. A runtime
+# allocation is released under its ledger entry's lock too — the one teardown.sh holds — and
+# re-checked once that is held. Each outcome is one line, and a summary line always closes them:
 #
 #   applied  id  kind  path  freed-bytes  detail      freed = du before - du after
 #   refused  id  kind  path  -            reason      also said on stderr
+#   # <applied> applied, <refused> refused, <freed> bytes freed by du
 #
 # Exit status: 0 every id was applied, 1 at least one was refused (the others still ran), 2 a usage
-# error or a repository that cannot be resolved.
+# error, or a repository that cannot be resolved or surveyed.
 #
 # WHAT IS NEVER DONE, whatever an item says:
 #   * no live registered worktree is touched — the ones Claude Code created natively and the
@@ -46,8 +50,11 @@
 #   * no process is killed; the repo's teardown script is the only thing that may stop what its
 #     seed started.
 #   * no shared state is removed: the main checkout a dependency was hardlinked from, package
-#     caches, <common>/worktree-locks/ (only this script's own lock file is created there), and no
-#     repository-wide `git worktree prune`.
+#     caches, <common>/worktree-locks/ (only lock files are created there: this script's own, and
+#     the per-entry allocation locks it shares with teardown.sh), and no repository-wide
+#     `git worktree prune`.
+#   * no allocation whose worktree git still registers or locks is released, wherever the ledger
+#     says the worktree was: `git worktree move` changes the one and not the other.
 #   * nothing that cannot be proven safe is removed. Every check fails CLOSED, into `refuse`.
 #
 # AN ORPHAN DIRECTORY CANNOT BE ASKED "DO YOU HOLD WORK": git no longer knows it, so there is no
@@ -182,30 +189,33 @@ wt_prune_shared_note() {  # $1 = path
 #   WT_PRUNE_WTDIR     <root>/.claude/worktrees, physical, or empty when there is none (or it is a
 #                      symlink, which is never followed)
 #   WT_PRUNE_LIVE      every registered linked worktree whose directory exists, physical
+#   WT_PRUNE_LOCKED    every locked linked worktree whose directory does not, as git lists it — on
+#                      a disk that is not mounted, say, and as much in use as a live one
 #   WT_PRUNE_ORPHANS   the largest directories under WT_PRUNE_WTDIR that are not a live worktree,
 #                      not inside one, and hold none
 #   WT_PRUNE_TEARDOWN  what a runtime leftover would be applied as: teardown, forget, or refuse
 #                      with WT_PRUNE_TEARDOWN_WHY
 WT_PRUNE_ROOT='' WT_PRUNE_COMMON='' WT_PRUNE_WTDIR='' WT_PRUNE_TEARDOWN='' WT_PRUNE_TEARDOWN_WHY=''
-WT_PRUNE_LIVE=() WT_PRUNE_ORPHANS=()
+WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=() WT_PRUNE_ORPHANS=()
 
 wt_prune_list_live() {
-  local listed line first=1
-  WT_PRUNE_LIVE=()
+  local listed line wt='' physical n=0
+  WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=()
   listed=$(wt_git "$WT_PRUNE_ROOT" worktree list --porcelain 2>/dev/null) || return 1
   while IFS= read -r line; do
     case $line in
-      'worktree '*) line=${line#worktree } ;;
-      *) continue ;;
+      'worktree '*)
+        wt=${line#worktree }
+        n=$((n + 1))
+        # The first entry is the main checkout.
+        [ "$n" -gt 1 ] && [ -d "$wt" ] || continue
+        physical=$(cd -P "$wt" 2>/dev/null && pwd -P) || continue
+        WT_PRUNE_LIVE[${#WT_PRUNE_LIVE[@]}]=$physical
+        ;;
+      locked | 'locked '*)
+        [ "$n" -gt 1 ] && [ ! -d "$wt" ] && WT_PRUNE_LOCKED[${#WT_PRUNE_LOCKED[@]}]=$wt
+        ;;
     esac
-    # The first entry is the main checkout.
-    if [ "$first" = 1 ]; then
-      first=0
-      continue
-    fi
-    [ -d "$line" ] || continue
-    line=$(cd -P "$line" 2>/dev/null && pwd -P) || continue
-    WT_PRUNE_LIVE[${#WT_PRUNE_LIVE[@]}]=$line
   done <<<"$listed"
   return 0
 }
@@ -214,6 +224,14 @@ wt_prune_is_live() {  # $1 = physical path
   local live
   for live in ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
     [ "$live" = "$1" ] && return 0
+  done
+  return 1
+}
+
+wt_prune_is_locked() {  # $1 = recorded worktree path
+  local locked
+  for locked in ${WT_PRUNE_LOCKED[@]+"${WT_PRUNE_LOCKED[@]}"}; do
+    [ "$locked" = "$1" ] && return 0
   done
   return 1
 }
@@ -447,6 +465,25 @@ wt_prune_alive_elsewhere() {  # $1 = recorded worktree path, $2 = admin id or em
   return 0
 }
 
+# Why the allocation a ledger entry records may still belong to a worktree in use, one reason per
+# line, or nothing: everything wt_prune_alive_elsewhere says, and whether git still registers the
+# entry's admin dir or lists its worktree as locked. A registered admin dir is left to its own
+# stale-admin item, whatever it points at — after `git worktree move` it points at the worktree's
+# new home, which the ledger does not know.
+wt_prune_list_allocation_holds() {  # $1 = recorded worktree path, $2 = admin id or empty
+  local wt=$1 id=${2-}
+  wt_prune_alive_elsewhere "$wt" "$id"
+  if [ -n "$id" ] && { [ -e "$WT_PRUNE_COMMON/worktrees/$id" ] || [ -L "$WT_PRUNE_COMMON/worktrees/$id" ]; }; then
+    printf 'its admin dir %s is still registered — the worktree may have been moved or locked\n' \
+      "$WT_PRUNE_COMMON/worktrees/$id"
+  fi
+  if wt_prune_is_locked "$wt"; then
+    # shellcheck disable=SC2016  # the backticks are literal text
+    printf 'its worktree is locked with `git worktree lock`\n'
+  fi
+  return 0
+}
+
 wt_find_stale_admin_dirs() {
   local admin id pointer wt alive why marker head count slug entry rt_id state bytes shared
   [ -d "$WT_PRUNE_COMMON/worktrees" ] || return 0
@@ -513,14 +550,19 @@ wt_find_stale_admin_dirs() {
 }
 
 wt_find_runtime_leftovers() {
-  local entry path admin slug rest alive why orphan_id
+  local entry path admin slug rest holds why waits_on
   while IFS=$WT_US read -r -d "$WT_RS" entry path admin _ slug rest; do
     wt_prune_is_live "$path" && continue
-    alive=$(wt_prune_alive_elsewhere "$path" "$admin")
-    if [ -n "$alive" ]; then
-      why=$(wt_prune_join_reasons "$alive")
-      orphan_id=$(wt_prune_item_id orphan-dir "$path")
-      wt_prune_find_item "$orphan_id" >/dev/null && why="$why — remove it first ($orphan_id)"
+    holds=$(wt_prune_list_allocation_holds "$path" "$admin")
+    if [ -n "$holds" ]; then
+      why=$(wt_prune_join_reasons "$holds")
+      # Orphans are keyed physically; the ledger recorded the path as the worktree saw it.
+      waits_on=$(wt_prune_item_id orphan-dir "$(wt_physical_path "$path")")
+      wt_prune_find_item "$waits_on" >/dev/null && why="$why — remove it first ($waits_on)"
+      if [ -n "$admin" ]; then
+        waits_on=$(wt_prune_item_id stale-admin "$WT_PRUNE_COMMON/worktrees/$admin")
+        wt_prune_find_item "$waits_on" >/dev/null && why="$why — settle its admin dir first ($waits_on)"
+      fi
       wt_prune_add runtime-leftover "ledger:$entry" "$path" - refuse "$why" ''
       continue
     fi
@@ -614,45 +656,118 @@ wt_apply_stale_admin() {  # $1 = item index
   WT_PRUNE_DETAIL='deleted (only this admin dir; no repository-wide prune)'
 }
 
+# The descriptor an allocation's lock is held on while one runtime-leftover is applied; the prune
+# lock holds 8.
+WT_PRUNE_ALLOCATION_FD=9
+
 # The allocation is read from ONE record, as teardown.sh reads it, and the teardown script runs from
-# the main checkout with the environment the seed had — wt_run_teardown_script does both.
+# the main checkout with the environment the seed had — wt_run_teardown_script does both. All of it
+# happens under the lock teardown.sh takes on the same record: its ledger entry's allocation lock,
+# or, for a record only a state file holds, the worktree's own lock that bootstrap takes.
 wt_apply_runtime_leftover() {  # $1 = item index
-  local key=${PRUNE_KEY[$1]} wt=${PRUNE_PATH[$1]} action=${PRUNE_ACTION[$1]} entry='' state=''
+  local key=${PRUNE_KEY[$1]} rc
   case $key in
-    ledger:*) entry=${key#ledger:} ;;
-    state:*) state=${key#state:} ;;
+    ledger:*)
+      if ! wt_acquire_allocation_lock "$WT_PRUNE_ROOT" "${key#ledger:}" "$WT_PRUNE_ALLOCATION_FD"; then
+        WT_PRUNE_DETAIL=$WT_TD_KEEP_REASON
+        return 1
+      fi
+      ;;
+    state:*)
+      if command -v flock >/dev/null 2>&1 \
+        && ! wt_lock_acquire "${key#state:}.lock" 5 "$WT_PRUNE_ALLOCATION_FD"; then
+        WT_PRUNE_DETAIL='a bootstrap or teardown holds its worktree, or its lock cannot be taken'
+        return 1
+      fi
+      ;;
     *) WT_PRUNE_DETAIL="unknown record $key"; return 1 ;;
   esac
-  wt_read_allocation "$state" "$WT_PRUNE_ROOT" "$entry" "$wt"
+  wt_prune_release_allocation "$1"
+  rc=$?
+  wt_lock_release "$WT_PRUNE_ALLOCATION_FD"
+  return "$rc"
+}
+
+# Why the allocation of item $1 must not be released now, re-checked under its lock, or nothing.
+# The holder the lock waited on may have released it already, or the worktree come back.
+wt_prune_recheck_allocation() {  # $1 = item index
+  local key=${PRUNE_KEY[$1]} wt=${PRUNE_PATH[$1]} entry admin state pointer
+  if ! wt_prune_list_live; then
+    printf 'git cannot list the worktrees now\n'
+    return 0
+  fi
+  if wt_prune_is_live "$(wt_physical_path "$wt")"; then
+    printf '%s is a live worktree now\n' "$wt"
+    return 0
+  fi
+  case $key in
+    ledger:*)
+      entry=${key#ledger:}
+      if ! admin=$(wt_ledger_field "$WT_PRUNE_ROOT" "$entry" admin); then
+        printf 'its ledger entry %s is gone — another teardown or prune released it\n' "$entry"
+        return 0
+      fi
+      wt_prune_list_allocation_holds "$wt" "$admin"
+      ;;
+    state:*)
+      state=${key#state:}
+      if [ ! -f "$state" ] || [ -L "$state" ]; then
+        printf 'its state file %s is gone\n' "$state"
+        return 0
+      fi
+      [ -e "${state%/*}/locked" ] && printf 'its admin dir is locked now\n'
+      if ! pointer=$(wt_read_git_pointer "${state%/*}/gitdir" "${state%/*}") || [ -e "$pointer" ]; then
+        printf 'its admin dir no longer names a checkout that is gone\n'
+      fi
+      wt_prune_alive_elsewhere "$wt" ''
+      ;;
+  esac
+  return 0
+}
+
+# Release the allocation of item $1 with its lock held: nothing is forgotten unless the teardown
+# script ran to `done`, or the action is `forget` and the allocation could be read.
+wt_prune_release_allocation() {  # $1 = item index
+  local key=${PRUNE_KEY[$1]} wt=${PRUNE_PATH[$1]} action=${PRUNE_ACTION[$1]} entry='' state='' why record
+  case $key in
+    ledger:*) entry=${key#ledger:}; record="the ledger entry $entry" ;;
+    state:*) state=${key#state:}; record="the state file $state" ;;
+  esac
+  why=$(wt_prune_recheck_allocation "$1")
+  if [ -n "$why" ]; then
+    WT_PRUNE_DETAIL="not released: $(wt_prune_join_reasons "$why")"
+    return 1
+  fi
+  if ! wt_read_allocation "$state" "$WT_PRUNE_ROOT" "$entry" "$wt"; then
+    WT_PRUNE_DETAIL="the allocation in $record cannot be read — nothing was run, and the record is kept"
+    return 1
+  fi
   WT_TD_STATUS=none
   if [ "$action" = teardown ]; then
     # Loaded again because the discovery's load may be minutes old in a long apply.
     wt_load_profile "$WT_PRUNE_ROOT"
-    if [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || [ -z "${PROFILE_RT_TEARDOWN:-}" ]; then
+    if [ "${PROFILE_PRESENT:-0}" != 1 ] || [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] \
+      || [ -z "${PROFILE_RT_TEARDOWN:-}" ]; then
       WT_PRUNE_DETAIL='the profile no longer names a teardown script — re-run the report'
       return 1
     fi
     wt_run_teardown_script "$WT_PRUNE_ROOT" "$wt" "$WT_PRUNE_ROOT" ''
-    case $WT_TD_STATUS in
-      "done") ;;
-      *)
-        [ -n "$entry" ] && wt_settle_ledger_entry "$WT_PRUNE_ROOT" "$entry" 1
-        WT_PRUNE_DETAIL="the teardown script's outcome was $WT_TD_STATUS — the record is kept, and its database or containers may still exist"
-        return 1
-        ;;
-    esac
+    if [ "$WT_TD_STATUS" != "done" ]; then
+      WT_PRUNE_DETAIL="the teardown script's outcome was $WT_TD_STATUS — $record is kept, and its database or containers may still exist"
+      return 1
+    fi
   fi
   if [ -n "$entry" ]; then
     wt_settle_ledger_entry "$WT_PRUNE_ROOT" "$entry" 1
     if [ "$WT_TD_LEDGER" != forgotten ]; then
-      WT_PRUNE_DETAIL="could not forget the ledger entry $entry"
+      WT_PRUNE_DETAIL="could not forget $record"
       return 1
     fi
   else
     # The state file's only remaining purpose was this record; the admin dir around it is its own
     # stale-admin item.
     if ! rm -f -- "${state:?}" 2>/dev/null || [ -e "$state" ]; then
-      WT_PRUNE_DETAIL="could not remove the state file $state"
+      WT_PRUNE_DETAIL="could not remove $record"
       return 1
     fi
   fi
@@ -721,23 +836,54 @@ wt_prune_refuse() {  # $1 = id, $2 = kind, $3 = path, $4 = reason
   wt_log "REFUSED $1${2:+ ($2 ${3})}: $4"
 }
 
-wt_prune_apply() {  # $@ = ids
-  local id i ordered=() requested=() seen applier before after freed applied=0 refusals=0 total=0 fd=8
+# Refuse every id in $2..., adding to the refusal count in WT_PRUNE_REFUSALS.
+wt_prune_refuse_all() {  # $1 = reason, $@ = ids
+  local reason=$1 id
+  shift
+  for id in "$@"; do
+    wt_prune_refuse "$id" '' '' "$reason"
+    WT_PRUNE_REFUSALS=$((WT_PRUNE_REFUSALS + 1))
+  done
+}
+
+WT_PRUNE_REFUSALS=0
+
+# Returns 0 when every id was applied, 1 when one was refused, 2 when the repository could not be
+# surveyed once the lock was held. The summary line closes the output on every path.
+wt_prune_apply() {  # $1 = main checkout, $@ = ids
+  local root=$1 id i ordered=() requested=() seen applier before after freed applied=0 total=0 fd=8
+  local status=0
+  shift
+  WT_PRUNE_REFUSALS=0
   for id in "$@"; do
     case " ${requested[*]-} " in *" $id "*) continue ;; esac
     requested[${#requested[@]}]=$id
   done
 
-  # One sweep at a time: two could otherwise both run one teardown script.
-  if command -v flock >/dev/null 2>&1; then
+  # One sweep at a time: each judges its items against a discovery the other would be changing
+  # under it. Discovery starts only once this is held, so no item is judged on a stale one.
+  if ! WT_PRUNE_COMMON=$(wt_git_common_dir "$root") \
+    || ! WT_PRUNE_COMMON=$(cd -P "$WT_PRUNE_COMMON" 2>/dev/null && pwd -P); then
+    wt_prune_refuse_all "the shared git dir of $root cannot be found" "${requested[@]}"
+    status=2
+  elif command -v flock >/dev/null 2>&1; then
     if ! wt_lock_acquire "$WT_PRUNE_COMMON/worktree-locks/prune.lock" 5 "$fd"; then
-      for id in "${requested[@]}"; do
-        wt_prune_refuse "$id" '' '' 'another prune is applying in this repository, or its lock cannot be taken'
-      done
-      return 1
+      wt_prune_refuse_all 'another prune is applying in this repository, or its lock cannot be taken' \
+        "${requested[@]}"
+      status=1
     fi
   else
     wt_log "flock is not on PATH — not serialising against another prune of this repository"
+  fi
+  if [ "$status" = 0 ] && ! wt_prune_discover "$root"; then
+    wt_log "cannot survey the worktrees of $root — nothing applied"
+    wt_prune_refuse_all 'the repository cannot be surveyed' "${requested[@]}"
+    status=2
+  fi
+  if [ "$status" != 0 ]; then
+    wt_lock_release "$fd"
+    printf '# 0 applied, %d refused, 0 bytes freed by du\n' "$WT_PRUNE_REFUSALS"
+    return "$status"
   fi
 
   # Report order, so an item another waits on goes first.
@@ -746,34 +892,32 @@ wt_prune_apply() {  # $@ = ids
   done
   for id in "${requested[@]}"; do
     case " ${ordered[*]-} " in *" $id "*) continue ;; esac
-    wt_prune_refuse "$id" '' '' 'no such item now — it is gone or changed since the report; re-run the report'
-    refusals=$((refusals + 1))
+    wt_prune_refuse_all 'no such item now — it is gone or changed since the report; re-run the report' "$id"
   done
 
+  # The discovery that ordered the ids is the first item's; every later one gets its own.
   seen=0
   for id in ${ordered[@]+"${ordered[@]}"}; do
-    if [ "$seen" = 1 ] && ! wt_prune_discover "$WT_PRUNE_ROOT"; then
-      wt_prune_refuse "$id" '' '' "the repository can no longer be surveyed"
-      refusals=$((refusals + 1))
+    if [ "$seen" = 1 ] && ! wt_prune_discover "$root"; then
+      wt_prune_refuse_all "the repository can no longer be surveyed" "$id"
       continue
     fi
     seen=1
     if ! i=$(wt_prune_find_item "$id"); then
-      wt_prune_refuse "$id" '' '' 'no such item now — it is gone or changed since the report; re-run the report'
-      refusals=$((refusals + 1))
+      wt_prune_refuse_all 'no such item now — it is gone or changed since the report; re-run the report' "$id"
       continue
     fi
     case ${PRUNE_ACTION[i]} in
       refuse | none)
         wt_prune_refuse "$id" "${PRUNE_KIND[i]}" "${PRUNE_PATH[i]}" "${PRUNE_REASON[i]}"
-        refusals=$((refusals + 1))
+        WT_PRUNE_REFUSALS=$((WT_PRUNE_REFUSALS + 1))
         continue
         ;;
     esac
     applier=wt_apply_${PRUNE_KIND[i]//-/_}
     if ! declare -F "$applier" >/dev/null; then
       wt_prune_refuse "$id" "${PRUNE_KIND[i]}" "${PRUNE_PATH[i]}" 'nothing knows how to apply this kind'
-      refusals=$((refusals + 1))
+      WT_PRUNE_REFUSALS=$((WT_PRUNE_REFUSALS + 1))
       continue
     fi
     before=0
@@ -790,12 +934,12 @@ wt_prune_apply() {  # $@ = ids
       applied=$((applied + 1))
     else
       wt_prune_refuse "$id" "${PRUNE_KIND[i]}" "${PRUNE_PATH[i]}" "$WT_PRUNE_DETAIL"
-      refusals=$((refusals + 1))
+      WT_PRUNE_REFUSALS=$((WT_PRUNE_REFUSALS + 1))
     fi
   done
   wt_lock_release "$fd"
-  printf '# %d applied, %d refused, %d bytes freed by du\n' "$applied" "$refusals" "$total"
-  [ "$refusals" -eq 0 ]
+  printf '# %d applied, %d refused, %d bytes freed by du\n' "$applied" "$WT_PRUNE_REFUSALS" "$total"
+  [ "$WT_PRUNE_REFUSALS" -eq 0 ]
 }
 
 wt_prune_usage() {
@@ -831,18 +975,18 @@ if ! root=$(wt_main_root "$repo") || [ -z "$root" ]; then
   exit 2
 fi
 root=$(cd -P "$root" 2>/dev/null && pwd -P) || exit 2
+
+if [ "$mode" = apply ]; then
+  if [ ${#ids[@]} -eq 0 ]; then
+    wt_prune_usage
+    exit 2
+  fi
+  wt_prune_apply "$root" "${ids[@]}"
+  exit $?
+fi
 if ! wt_prune_discover "$root"; then
   wt_log "cannot survey the worktrees of $root — nothing reported"
   exit 2
 fi
-
-if [ "$mode" = report ]; then
-  wt_prune_report
-  exit 0
-fi
-if [ ${#ids[@]} -eq 0 ]; then
-  wt_prune_usage
-  exit 2
-fi
-wt_prune_apply "${ids[@]}"
-exit $?
+wt_prune_report
+exit 0

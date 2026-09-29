@@ -684,6 +684,7 @@ wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktre
 # worktree's database.
 #
 #   wt_acquire_teardown_lock   keep out of a bootstrap still running in the worktree.
+#   wt_acquire_allocation_lock keep out of another teardown or prune releasing the same entry.
 #   wt_read_allocation         what was allocated, from ONE record: the state file, else the ledger.
 #   wt_run_teardown_script     runtime.teardown, with the environment the seed had.
 #   wt_record_seed_undone      a worktree that outlives its teardown must seed again.
@@ -691,7 +692,7 @@ wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktre
 #   wt_settle_ledger_entry     forget the ledger entry, or keep it for prune.
 #
 # Results, each reset by the function that sets it:
-#   WT_TD_KEEP_REASON  wt_acquire_teardown_lock's reason for keeping the worktree, when it returns 1.
+#   WT_TD_KEEP_REASON  the lock functions' reason for keeping the worktree, when they return 1.
 #   WT_TD_SOURCE       where the allocation was read: the state file's path, `ledger`, or empty
 #                      when nothing records one.
 #   WT_TD_NAME         the name the seed saw: the ledger's, else wt_name_from_path's.
@@ -725,6 +726,44 @@ wt_acquire_teardown_lock() {  # $1 = worktree, $2 = fd number
     0) return 0 ;;
     1) WT_TD_KEEP_REASON='a bootstrap is still running in it' ;;
     *) WT_TD_KEEP_REASON='could not check for a running bootstrap: its lock file cannot be opened' ;;
+  esac
+  return 1
+}
+
+# Where the lock on ledger entry $2's allocation lives, or return 1 for a string that is no entry
+# name. Keyed on the ENTRY, not the worktree: once the worktree is gone the entry is all that
+# teardown.sh and the prune sweep have in common, and both read it, run the teardown script against
+# it and forget it.
+wt_allocation_lock_path() {  # $1 = main checkout, $2 = ledger entry
+  local common
+  wt_ledger_is_entry_name "${2-}" || return 1
+  common=$(wt_git_common_dir "$1") || return 1
+  printf '%s/worktree-locks/rt-%s.lock' "$common" "$2"
+}
+
+# Take the lock on ledger entry $2's allocation on descriptor $3, and keep it until the caller
+# releases it or exits. Held from reading the allocation to settling the entry, so two releases of
+# one allocation cannot both run its teardown script, nor one forget an entry the other is still
+# tearing down. After it is taken the caller re-checks that the entry still exists: the holder it
+# waited on may have forgotten it. Returns 0 when the release may go on, 1 when it must not, with
+# the reason in WT_TD_KEEP_REASON. No flock at all is 0, for wt_acquire_teardown_lock's reason.
+wt_acquire_allocation_lock() {  # $1 = main checkout, $2 = ledger entry, $3 = fd number
+  local lock rc
+  WT_TD_KEEP_REASON=''
+  if ! command -v flock >/dev/null 2>&1; then
+    wt_log "flock is not on PATH — the release of ledger entry $2 is not serialised against another teardown or prune"
+    return 0
+  fi
+  if ! lock=$(wt_allocation_lock_path "$1" "$2"); then
+    WT_TD_KEEP_REASON="could not check for another release of its runtime allocation: ledger entry $2 has no lock path"
+    return 1
+  fi
+  wt_lock_acquire "$lock" 5 "$3"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) WT_TD_KEEP_REASON='another teardown or /worktree-prune is releasing its runtime allocation' ;;
+    *) WT_TD_KEEP_REASON='could not check for another release of its runtime allocation: its lock file cannot be opened' ;;
   esac
   return 1
 }
@@ -773,8 +812,8 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
 }
 
 # Run the loaded profile's runtime.teardown from $1 against the allocation wt_read_allocation read,
-# and set WT_TD_STATUS. Always returns 0: every outcome is a status, and only `none` and `done` let
-# the ledger entry go (wt_settle_ledger_entry).
+# and set WT_TD_STATUS. Always returns 0: every outcome is a status, and only `done`, or `none` for
+# an allocation that was read, let the ledger entry go (wt_settle_ledger_entry).
 #
 # NO RECORD, NO SCRIPT: nothing was allocated, so there is nothing for it to undo, and running it
 # with an invented slug could drop a database some other worktree owns.
@@ -795,6 +834,14 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
 
   WT_TD_STATUS=none
   [ -n "$WT_TD_SOURCE" ] || return 0
+  # A profile that exists but was not loaded says nothing about whether a script must run, and
+  # `none` would let the entry go.
+  if [ "${PROFILE_PRESENT:-0}" != 1 ] && [ -n "${PROFILE_PATH:-}" ] \
+    && { [ -e "$PROFILE_PATH" ] || [ -L "$PROFILE_PATH" ]; }; then
+    WT_TD_STATUS=skipped
+    wt_log "runtime: $PROFILE_PATH could not be loaded, so whether a teardown script must run is unknown — none run"
+    return 0
+  fi
   [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "$rel" ] || return 0
 
   WT_TD_STATUS=skipped
@@ -869,25 +916,27 @@ wt_report_kept() {  # $1 = worktree, $2 = reasons, one per line
 }
 
 # Forget the ledger entry once nothing it records can still exist, or keep it and say so. It goes
-# only when the worktree is gone ($3 = 1) AND the teardown script left nothing behind (WT_TD_STATUS
-# none or done): a kept worktree still owns its allocation, and a failed, stopped or skipped script
-# may have left its database, which the entry is then the only record of.
+# only when the worktree is gone ($3 = 1) AND the teardown script left nothing behind: it ran to
+# `done`, or it was `none` for an allocation wt_read_allocation DID read — a loaded profile with no
+# script to run. A kept worktree still owns its allocation; a failed, stopped or skipped script may
+# have left its database; and an allocation that could not be read was never looked at. In each
+# the entry is the only record of what may still exist.
 wt_settle_ledger_entry() {  # $1 = main checkout, $2 = ledger entry or empty, $3 = 1 if the worktree is gone
-  local root=${1-} entry=${2-} gone=${3:-0}
+  local root=${1-} entry=${2-} gone=${3:-0} released=0
   WT_TD_LEDGER=none
   [ -n "$entry" ] || return 0
-  if [ "$gone" = 1 ]; then
-    case $WT_TD_STATUS in
-      none | "done")
-        if wt_ledger_forget "$root" "$entry"; then
-          WT_TD_LEDGER=forgotten
-          return 0
-        fi
-        WT_TD_LEDGER=kept
-        wt_log "could not remove the runtime ledger entry $entry; /worktree-prune will list it"
-        return 0
-        ;;
-    esac
+  case $WT_TD_STATUS in
+    "done") released=1 ;;
+    none) [ -n "$WT_TD_SOURCE" ] && released=1 ;;
+  esac
+  if [ "$gone" = 1 ] && [ "$released" = 1 ]; then
+    if wt_ledger_forget "$root" "$entry"; then
+      WT_TD_LEDGER=forgotten
+      return 0
+    fi
+    WT_TD_LEDGER=kept
+    wt_log "could not remove the runtime ledger entry $entry; /worktree-prune will list it"
+    return 0
   fi
   WT_TD_LEDGER=kept
   wt_log "the runtime ledger entry $entry is kept; /worktree-prune will list it"

@@ -223,9 +223,12 @@ eq 'report: the parent of a live nested worktree is not an orphan' '' \
 eq 'report: the stale admin dir is deleted' delete "$(field stale-admin "$R/.git/worktrees/gone" 5)"
 eq 'report: with bytes du' "$(du_bytes "$R/.git/worktrees/gone")" \
   "$(field stale-admin "$R/.git/worktrees/gone" 4)"
-eq 'report: its leftover allocation is torn down' teardown "$(field runtime-leftover "$G" 5)"
+# Its admin dir is still registered, and a registered admin dir may belong to a worktree that was
+# moved: the allocation waits until that is settled, and is released in the same apply after it.
+eq 'report: its leftover allocation waits for the admin dir' refuse "$(field runtime-leftover "$G" 5)"
 eq 'report: with bytes unknown' - "$(field runtime-leftover "$G" 4)"
-contains 'report: and says why' 'size unknown' "$(field runtime-leftover "$G" 6)"
+contains 'report: naming the admin dir item' "$(field stale-admin "$R/.git/worktrees/gone" 1)" \
+  "$(field runtime-leftover "$G" 6)"
 
 eq 'report: the state-only allocation is reported as runtime' teardown \
   "$(field runtime-leftover "$S" 5)"
@@ -248,6 +251,16 @@ eq 'report: a fresh temp entry is not listed' '' "$(field ledger-junk "$LEDGER/.
 eq 'report: an unreadable entry is listed, not deleted' none "$(field ledger-junk "$LEDGER/garbage" 5)"
 
 contains 'report: the summary gives the exact command' "--apply" "$report"
+rows=$(grep -v '^#' "$TMP/out")
+eq 'report: distinct items have distinct ids' '' "$(printf '%s\n' "$rows" | cut -f1 | LC_ALL=C sort | uniq -d)"
+applicable_bytes=$(printf '%s\n' "$rows" | awk -F'\t' \
+  '($5 == "delete" || $5 == "teardown" || $5 == "forget") && $4 ~ /^[0-9]+$/ { s += $4 } END { print s + 0 }')
+contains 'report: the bytes to free are the sum of the applicable rows' "frees $applicable_bytes bytes" "$report"
+eq 'report: the counts are the rows' "$(printf '%s\n' "$rows" | awk -F'\t' -v root="$R" '
+  { n++ } $5 == "delete" || $5 == "teardown" || $5 == "forget" { a++ } $5 == "refuse" { r++ }
+  $5 == "none" { h++ }
+  END { printf "# %d item(s) in %s: %d can be applied, %d refused, %d listed only", n, root, a, r, h }')" \
+  "$(grep '^# [0-9]* item' "$TMP/out")"
 contains 'report: which names an applicable id' "$(field orphan-dir "$O" 1)" "$(grep '^# to apply' "$TMP/out")"
 eq 'report: the last line is complete' 1 "$(tail -c1 "$TMP/out" | wc -l | tr -d ' ')"
 lacks 'report: and no held one' "$(field held "$L2" 1)" "$(grep '^# to apply' "$TMP/out")"
@@ -309,6 +322,8 @@ contains 'apply: the forged id is refused' "refused$TAB$forged" "$out"
 contains 'apply: an unknown id is refused' "refused${TAB}p00000000" "$out"
 contains 'apply: refusals are loud on stderr' "REFUSED $held_id" "$err"
 eq 'apply: exactly nine applied' 9 "$(grep -c '^applied' "$TMP/out")"
+eq 'apply: the summary totals are the rows' "# $(grep -c '^applied' "$TMP/out") applied, $(grep -c '^refused' "$TMP/out") refused, $(awk -F'\t' '$1 == "applied" && $5 ~ /^[0-9]+$/ { s += $5 } END { print s + 0 }' "$TMP/out") bytes freed by du" \
+  "$(grep '^# ' "$TMP/out")"
 
 prune "$R" --apply p00000000
 eq 'apply: an unknown id alone exits 1' 1 "$(cat "$TMP/rc")"
@@ -344,7 +359,7 @@ contains 'changed: the relinked one is refused' "refused$TAB$k_id" "$(cat "$TMP/
 RF=$TMP/repo-failing
 make_repo "$RF" 'exit 1'
 F=$(create "$RF" failing)
-rm -rf "$F"
+git -C "$RF" worktree remove --force "$F"
 prune "$RF"
 f_id=$(field runtime-leftover "$F" 1)
 eq 'failing: reported as teardown' teardown "$(field runtime-leftover "$F" 5)"
@@ -359,7 +374,7 @@ eq 'failing: and listed again, with the same id' teardown "$(field runtime-lefto
 RN=$TMP/repo-noscript
 make_repo "$RN"
 NW=$(create "$RN" noscript)
-rm -rf "$NW"
+git -C "$RN" worktree remove --force "$NW"
 sed 's/"teardown": ".claude\/worktree-teardown.sh"/"teardown": ""/' \
   "$RN/.claude/worktree-profile.json" >"$TMP/profile" && mv "$TMP/profile" "$RN/.claude/worktree-profile.json"
 prune "$RN"
@@ -394,6 +409,180 @@ eq 'moved: nothing was applied' 0 "$(grep -c '^applied' "$TMP/out")"
 # The sweep's own lock file is the one thing an apply may create, and it is shared state it keeps.
 eq 'moved: nothing changed but the sweep'\''s lock file' "$before" \
   "$(snapshot "$RM2" "$DB" | grep -v '/worktree-locks/prune\.lock$')"
+
+# ---------------------------------------------------------------------------
+# Never released: a registered or locked worktree, an unloadable profile, a held allocation
+# ---------------------------------------------------------------------------
+
+RS=$TMP/repo-safety
+make_repo "$RS"
+WS=$RS/.claude/worktrees
+LS=$RS/.git/worktree-ledger
+
+# Moved with `git worktree move`: the ledger still names the old path, but the admin dir says where
+# the worktree is now.
+MV=$(create "$RS" movedwt)
+git -C "$RS" worktree move "$MV" "$TMP/movedwt-elsewhere"
+# Locked, and its directory absent: a worktree on a removable disk.
+LK=$(create "$RS" lockedwt)
+git -C "$RS" worktree lock --reason 'on a usb disk' "$LK"
+rm -rf "$LK"
+prune "$RS"
+mv_id=$(field runtime-leftover "$MV" 1)
+lk_id=$(field runtime-leftover "$LK" 1)
+lk_admin_id=$(field stale-admin "$RS/.git/worktrees/lockedwt" 1)
+eq 'moved: its allocation is refused' refuse "$(field runtime-leftover "$MV" 5)"
+contains 'moved: because its admin dir is still registered' 'still registered' \
+  "$(field runtime-leftover "$MV" 6)"
+eq 'locked: its admin dir is refused' refuse "$(field stale-admin "$RS/.git/worktrees/lockedwt" 5)"
+contains 'locked: saying so' 'locked with' "$(field stale-admin "$RS/.git/worktrees/lockedwt" 6)"
+eq 'locked: its allocation is refused' refuse "$(field runtime-leftover "$LK" 5)"
+contains 'locked: because the worktree is locked' 'locked' "$(field runtime-leftover "$LK" 6)"
+prune "$RS" --apply "$mv_id" "$lk_id" "$lk_admin_id"
+eq 'registered: apply exits 1' 1 "$(cat "$TMP/rc")"
+eq 'registered: nothing applied' 0 "$(grep -c '^applied' "$TMP/out")"
+eq 'registered: no teardown ran' 'yes yes' "$(exists "$DB/movedwt") $(exists "$DB/lockedwt")"
+eq 'registered: both ledger entries are kept' 'yes yes' "$(exists "$LS/movedwt") $(exists "$LS/lockedwt")"
+eq 'registered: the locked admin dir is kept' yes "$(exists "$RS/.git/worktrees/lockedwt")"
+eq 'registered: the moved worktree is untouched' yes "$(exists "$TMP/movedwt-elsewhere/app.txt")"
+
+# Every other reason a stale admin dir is kept. Plain `git worktree add`, so no allocation is mixed in.
+git -C "$RS" worktree add -q --detach "$WS/det" 2>/dev/null
+git -C "$WS/det" commit -q --allow-empty -m 'on no branch'
+git -C "$RS" worktree add -q "$WS/mrg" -b mrg 2>/dev/null
+git -C "$RS" worktree add -q "$WS/rbs" -b rbs 2>/dev/null
+git -C "$RS" worktree add -q "$WS/bis" -b bis 2>/dev/null
+git -C "$RS" worktree add -q "$WS/ugd" -b ugd 2>/dev/null
+rm -rf "$WS/det" "$WS/mrg" "$WS/rbs" "$WS/bis" "$WS/ugd"
+touch "$RS/.git/worktrees/mrg/MERGE_HEAD" "$RS/.git/worktrees/bis/BISECT_LOG"
+mkdir "$RS/.git/worktrees/rbs/rebase-merge"
+chmod 000 "$RS/.git/worktrees/ugd/gitdir"
+prune "$RS"
+stale_ids=''
+for spec in 'det:no branch' 'mrg:merge in progress' 'rbs:rebase in progress' \
+  'bis:bisect in progress' 'ugd:cannot be read'; do
+  a=$RS/.git/worktrees/${spec%%:*}
+  eq "stale admin ${spec%%:*}: refused" refuse "$(field stale-admin "$a" 5)"
+  contains "stale admin ${spec%%:*}: saying why" "${spec#*:}" "$(field stale-admin "$a" 6)"
+  stale_ids="$stale_ids $(field stale-admin "$a" 1)"
+done
+# shellcheck disable=SC2086  # a word list
+prune "$RS" --apply $stale_ids
+eq 'stale admin: apply exits 1' 1 "$(cat "$TMP/rc")"
+eq 'stale admin: nothing applied' 0 "$(grep -c '^applied' "$TMP/out")"
+eq 'stale admin: every admin dir survives' 'yes yes yes yes yes' \
+  "$(for a in det mrg rbs bis ugd; do printf '%s ' "$(exists "$RS/.git/worktrees/$a")"; done | sed 's/ $//')"
+chmod 644 "$RS/.git/worktrees/ugd/gitdir"
+
+# Leftover directories whose content cannot be proven committed, and one with hostile characters
+# in its name whose content can.
+mkdir -p "$WS/nested" "$WS/linky" "$WS/nl"
+git init -q "$WS/nested/sub"
+git init -q "$WS/ownrepo"
+printf 'keep me\n' >"$TMP/outside-target"
+ln -s "$TMP/outside-target" "$WS/linky/link"
+printf 'x\n' >"$WS/nl/a"$'\n'"b"
+HN=$WS/tab$'\t'nl$'\n'semi\;x
+mkdir -p "$HN"
+cp "$RS/app.txt" "$HN/app.txt"
+hn_id=$(printf 'p%08x' "$(printf 'orphan-dir\037%s' "$HN" | cksum | cut -d' ' -f1)")
+prune "$RS"
+orphan_ids=''
+for spec in 'nested:a repository of its own' 'ownrepo:its .git is a directory' \
+  'linky:in no commit' 'nl:newline'; do
+  d=$WS/${spec%%:*}
+  eq "orphan ${spec%%:*}: refused" refuse "$(field orphan-dir "$d" 5)"
+  contains "orphan ${spec%%:*}: saying why" "${spec#*:}" "$(field orphan-dir "$d" 6)"
+  orphan_ids="$orphan_ids $(field orphan-dir "$d" 1)"
+done
+eq 'hostile name: listed under its real key, printed flattened' \
+  "orphan-dir$TAB$WS/tab nl semi;x${TAB}delete" \
+  "$(awk -F'\t' -v id="$hn_id" '$1 == id { print $2 "\t" $3 "\t" $5 }' "$TMP/out")"
+# shellcheck disable=SC2086  # a word list
+prune "$RS" --apply $orphan_ids "$hn_id"
+eq 'orphans: apply exits 1' 1 "$(cat "$TMP/rc")"
+eq 'orphans: only the provable one is applied' "applied$TAB$hn_id" "$(grep '^applied' "$TMP/out" | cut -f1-2)"
+eq 'orphans: the hostile-named directory is gone' no "$(exists "$HN")"
+eq 'orphans: every refused one survives' 'yes yes yes yes' \
+  "$(exists "$WS/nested/sub/.git") $(exists "$WS/ownrepo/.git") $(exists "$WS/linky/link") $(exists "$WS/nl/a"$'\n'"b")"
+eq 'orphans: the symlink target is untouched' 'keep me' "$(cat "$TMP/outside-target")"
+
+# A directory registered again between the apply's discovery and its delete: the applier re-checks.
+# A du on PATH that re-registers it on its second call on that directory — the discovery measures it
+# first, the applier's before-size second, just before the delete.
+RR=$WS/rereg
+git -C "$RS" worktree add -q "$RR" -b rereg 2>/dev/null
+mv "$RS/.git/worktrees/rereg" "$TMP/rereg-admin"
+SHIM=$TMP/du-shim
+mkdir -p "$SHIM"
+printf '2\n' >"$TMP/du-calls"
+# shellcheck disable=SC2016  # the $ references belong to the shim, not to this file.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'if [ "${!#}" = %q ] && [ -f %q ]; then\n' "$RR" "$TMP/du-calls"
+  printf '  n=$(( $(cat %q) - 1 )); printf "%%s\\n" "$n" >%q\n' "$TMP/du-calls" "$TMP/du-calls"
+  printf '  [ "$n" -eq 0 ] && rm -f %q && mv %q %q\n' "$TMP/du-calls" "$TMP/rereg-admin" "$RS/.git/worktrees/rereg"
+  printf 'fi\n'
+  printf 'exec %q "$@"\n' "$(command -v du)"
+} >"$SHIM/du"
+chmod +x "$SHIM/du"
+prune "$RS"
+rr_id=$(field orphan-dir "$RR" 1)
+eq 'reregistered: an orphan at report time' delete "$(field orphan-dir "$RR" 5)"
+PATH=$SHIM:$PATH prune "$RS" --apply "$rr_id"
+eq 'reregistered: the shim ran' no "$(exists "$TMP/du-calls")"
+eq 'reregistered: refused' "refused$TAB$rr_id" "$(grep "^refused$TAB$rr_id" "$TMP/out" | cut -f1-2)"
+contains 'reregistered: as live' 'live worktree now' "$(cat "$TMP/out")"
+eq 'reregistered: the worktree survives' yes "$(exists "$RR/app.txt")"
+
+# The main checkout's profile cannot be loaded: whether a teardown script must run is unknown.
+RP=$TMP/repo-badprofile
+make_repo "$RP"
+BP=$(create "$RP" badprof)
+git -C "$RP" worktree remove --force "$BP"
+printf 'not json{' >"$RP/.claude/worktree-profile.json"
+prune "$RP"
+bp_id=$(field runtime-leftover "$BP" 1)
+eq 'bad profile: its allocation is refused' refuse "$(field runtime-leftover "$BP" 5)"
+contains 'bad profile: saying why' 'cannot be loaded' "$(field runtime-leftover "$BP" 6)"
+prune "$RP" --apply "$bp_id"
+eq 'bad profile: apply exits 1' 1 "$(cat "$TMP/rc")"
+eq 'bad profile: the teardown did not run' yes "$(exists "$DB/badprof")"
+eq 'bad profile: the ledger entry is kept' yes "$(exists "$RP/.git/worktree-ledger/badprof")"
+
+if command -v flock >/dev/null 2>&1; then
+  # An allocation teardown.sh is releasing right now: held on its entry's lock, as teardown.sh holds it.
+  HT=$(create "$RS" rtheld)
+  git -C "$RS" worktree remove --force "$HT"
+  prune "$RS"
+  ht_id=$(field runtime-leftover "$HT" 1)
+  eq 'held allocation: applicable when nothing holds it' teardown "$(field runtime-leftover "$HT" 5)"
+  mkdir -p "$RS/.git/worktree-locks"
+  exec 6>"$RS/.git/worktree-locks/rt-rtheld.lock"
+  flock -n 6
+  prune "$RS" --apply "$ht_id"
+  exec 6>&-
+  eq 'held allocation: apply exits 1' 1 "$(cat "$TMP/rc")"
+  contains 'held allocation: refused as in release elsewhere' 'releasing' "$(cat "$TMP/out")"
+  eq 'held allocation: the teardown did not run' yes "$(exists "$DB/rtheld")"
+  eq 'held allocation: the ledger entry is kept' yes "$(exists "$LS/rtheld")"
+  prune "$RS" --apply "$ht_id"
+  eq 'held allocation: released once the lock is free' 0 "$(cat "$TMP/rc")"
+  eq 'held allocation: and torn down then' no "$(exists "$DB/rtheld")"
+
+  # Another prune applying in this repository.
+  exec 6>"$RS/.git/worktree-locks/prune.lock"
+  flock -n 6
+  prune "$RS" --apply "$hn_id" p00000000
+  exec 6>&-
+  eq 'prune lock held: exits 1' 1 "$(cat "$TMP/rc")"
+  eq 'prune lock held: every id refused' 2 "$(grep -c '^refused' "$TMP/out")"
+  contains 'prune lock held: saying why' 'another prune is applying' "$(cat "$TMP/out")"
+  eq 'prune lock held: the summary still closes the output' '# 0 applied, 2 refused, 0 bytes freed by du' \
+    "$(tail -n1 "$TMP/out")"
+else
+  printf 'SKIP no flock to hold the allocation and prune locks with\n' >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Usage

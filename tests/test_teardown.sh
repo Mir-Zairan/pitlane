@@ -390,6 +390,43 @@ eq 'fixture: the create path was the pre-move one' "$RM/.claude/worktrees/moved"
 
 RG=$TMP/repo-gone
 make_repo "$RG"
+
+# An allocation the prune sweep is releasing right now, held on its entry's lock as prune holds it:
+# neither a gone worktree's nor a present one's teardown script runs, and both entries are kept.
+if command -v flock >/dev/null 2>&1; then
+  WH=$(create "$RG" held)
+  WP=$(create "$RG" heldpresent)
+  git -C "$RG" worktree remove --force "$WH"
+  mkdir -p "$RG/.git/worktree-locks"
+  exec 6>"$RG/.git/worktree-locks/rt-held.lock"
+  exec 5>"$RG/.git/worktree-locks/rt-heldpresent.lock"
+  flock -n 6
+  flock -n 5
+  out=$(remove "$(remove_payload "$WH" "$RG")" "$RG")
+  err=$(cat "$TMP/err")
+  eq 'allocation held, gone: exits 0' 0 "$(cat "$TMP/rc")"
+  eq 'allocation held, gone: nothing on stdout' '' "$out"
+  eq 'allocation held, gone: the teardown script did NOT run' yes "$(exists "$DB/held")"
+  eq 'allocation held, gone: the ledger entry is kept' yes "$(exists "$RG/.git/worktree-ledger/held")"
+  contains 'allocation held, gone: stderr says why' 'releasing its runtime allocation' "$err"
+  out=$(remove "$(remove_payload "$WP" "$RG")" "$RG")
+  err=$(cat "$TMP/err")
+  exec 6>&- 5>&-
+  eq 'allocation held, present: exits 0' 0 "$(cat "$TMP/rc")"
+  eq 'allocation held, present: the worktree is kept' yes "$(exists "$WP/.env.worktree.local")"
+  eq 'allocation held, present: the teardown script did NOT run' yes "$(exists "$DB/heldpresent")"
+  eq 'allocation held, present: the ledger entry is kept' yes \
+    "$(exists "$RG/.git/worktree-ledger/heldpresent")"
+  contains 'allocation held, present: stderr says why' 'releasing its runtime allocation' "$err"
+  out=$(remove "$(remove_payload "$WH" "$RG")" "$RG")
+  eq 'allocation free again: the gone one is torn down' no "$(exists "$DB/held")"
+  eq '...and its entry forgotten' no "$(exists "$RG/.git/worktree-ledger/held")"
+  out=$(remove "$(remove_payload "$WP" "$RG")" "$RG")
+  eq 'allocation free again: the present one is removed' no "$(exists "$WP")"
+else
+  printf 'SKIP no flock to hold the allocation lock with\n' >&2
+fi
+
 WG=$(create "$RG" gone)
 port_gone=$(grep '^SERVER_PORT=' "$WG/.env.worktree.local" | cut -d= -f2)
 git -C "$RG" worktree remove --force "$WG"

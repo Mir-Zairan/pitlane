@@ -757,9 +757,55 @@ eq 'ledger: a worktree still there keeps its entry' kept "$WT_TD_LEDGER"
 eq '...on disk' yes "$([ -f "$T/.git/worktree-ledger/$TENTRY" ] && echo yes || echo no)"
 wt_settle_ledger_entry "$T" '' 1 2>/dev/null
 eq 'ledger: no entry, nothing to settle' none "$WT_TD_LEDGER"
+# Nothing was run because nothing could be read: the entry is then the only trace of an allocation.
+WT_TD_STATUS=none WT_TD_SOURCE=''
+wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
+eq 'ledger: an allocation that could not be read keeps the entry' kept "$WT_TD_LEDGER"
+wt_read_allocation '' "$T" "$TENTRY" "$TW"
+WT_TD_STATUS="done"
 wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
 eq 'ledger: a gone worktree whose teardown finished forgets it' forgotten "$WT_TD_LEDGER"
 eq '...on disk' no "$([ -e "$T/.git/worktree-ledger/$TENTRY" ] && echo yes || echo no)"
+wt_runtime_state_set "$TW" bob_fix_7 3911 derived .env.worktree.local ours "done" SCK 2>/dev/null
+wt_read_allocation '' "$T" "$TENTRY" "$TW"
+WT_TD_STATUS=none
+wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
+eq 'ledger: a read allocation with no script to run forgets it' forgotten "$WT_TD_LEDGER"
+
+# A profile that exists but could not be loaded cannot say there is no teardown script.
+wt_runtime_state_set "$TW" bob_fix_7 3911 derived .env.worktree.local ours "done" SCK 2>/dev/null
+wt_read_allocation '' "$T" "$TENTRY" "$TW"
+printf 'not json{' >"$T/broken-profile.json"
+# shellcheck disable=SC2034
+PROFILE_PRESENT=0 PROFILE_PATH=$T/broken-profile.json
+wt_run_teardown_script "$T" "$TW" "$T" '' 2>"$TMP/steps-err"
+eq 'teardown script: an unloadable profile skips it' skipped "$WT_TD_STATUS"
+contains '...saying why' 'could not be loaded' "$(cat "$TMP/steps-err")"
+# shellcheck disable=SC2034
+PROFILE_PATH=$T/no-such-profile.json
+wt_run_teardown_script "$T" "$TW" "$T" '' 2>/dev/null
+eq 'teardown script: no profile at all has none to run' none "$WT_TD_STATUS"
+
+# The allocation lock: one per ledger entry, in the shared git dir, because once the worktree is
+# gone the entry is all teardown.sh and the prune sweep have in common.
+eq 'allocation lock: keyed on the entry' "$T/.git/worktree-locks/rt-$TENTRY.lock" \
+  "$(wt_allocation_lock_path "$T" "$TENTRY")"
+wt_allocation_lock_path "$T" '..' >/dev/null
+eq 'allocation lock: not for a string that is no entry name' 1 $?
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$T/.git/worktree-locks"
+  exec 6>"$T/.git/worktree-locks/rt-$TENTRY.lock"
+  flock -n 6
+  ( wt_acquire_allocation_lock "$T" "$TENTRY" 5 || { printf '%s' "$WT_TD_KEEP_REASON"; exit 1; } ) \
+    >"$TMP/lock-out" 2>/dev/null
+  eq 'allocation lock: held elsewhere, not taken' 1 $?
+  contains '...saying why' 'releasing its runtime allocation' "$(cat "$TMP/lock-out")"
+  exec 6>&-
+  ( wt_acquire_allocation_lock "$T" "$TENTRY" 5 )
+  eq 'allocation lock: free, taken' 0 $?
+else
+  printf 'SKIP no flock to hold the allocation lock with\n' >&2
+fi
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0 PROFILE_RT_TEARDOWN='' PROFILE_SEED_TIMEOUT=''
 
