@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# SC2034: the WT_RM_* globals are this file's RESULTS, read by the script that sources it, where
-# the linter cannot see them used.
+# SC2034: the WT_RM_* and WT_TD_* globals are this file's RESULTS, read by the script that sources
+# it, where the linter cannot see them used.
 # shellcheck disable=SC2034
 #
-# The teardown DECISIONS. Sourced by teardown.sh and the prune sweep, after lib.sh and
-# bootstrap-lib.sh, by nothing else.
+# The teardown DECISIONS, and the teardown STEPS that act on them. Sourced by teardown.sh and the
+# prune sweep, after lib.sh and bootstrap-lib.sh, by nothing else.
 #
 # Two questions every destructive path must answer before it touches anything, answered once here
 # so the hook and the sweep cannot come to different conclusions about the same directory:
@@ -17,7 +17,8 @@
 # The prune sweep calls wt_resolve_worktree_path once per candidate — a ledger entry's recorded path
 # or a `git worktree list` path, with the main checkout as the hint — then wt_worktree_holds_work on
 # each one it resolved as present. Every call starts from empty results, so a loop cannot act on a
-# previous candidate's target after a refusal.
+# previous candidate's target after a refusal. What to do with a worktree that may go is the second
+# half of this file ("Tearing down what was allocated"), which both callers run in the same order.
 #
 # THE ASYMMETRY IS THE DESIGN (docs/phases/phase-5-teardown.md). Creating the wrong thing wastes
 # disk; deleting the wrong thing destroys work. So both functions fail CLOSED: a path that cannot be
@@ -671,4 +672,223 @@ wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktre
     rc=0
   fi
   return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Tearing down what was allocated
+# ---------------------------------------------------------------------------
+#
+# The steps between "this worktree may go" and "it is gone", in the order teardown.sh calls them.
+# Here so the prune sweep runs the SAME steps on a ledger entry with no payload and no hook — a
+# second copy of the environment rebuild that drifted would send a teardown script after another
+# worktree's database.
+#
+#   wt_acquire_teardown_lock   keep out of a bootstrap still running in the worktree.
+#   wt_read_allocation         what was allocated, from ONE record: the state file, else the ledger.
+#   wt_run_teardown_script     runtime.teardown, with the environment the seed had.
+#   wt_record_seed_undone      a worktree that outlives its teardown must seed again.
+#   wt_report_kept             why a worktree was kept, and that nothing was removed.
+#   wt_settle_ledger_entry     forget the ledger entry, or keep it for prune.
+#
+# Results, each reset by the function that sets it:
+#   WT_TD_KEEP_REASON  wt_acquire_teardown_lock's reason for keeping the worktree, when it returns 1.
+#   WT_TD_SOURCE       where the allocation was read: the state file's path, `ledger`, or empty
+#                      when nothing records one.
+#   WT_TD_NAME         the name the seed saw: the ledger's, else wt_name_from_path's.
+#   WT_TD_SLUG, WT_TD_PORT, WT_TD_PORTSOURCE, WT_TD_ENVFILE, WT_TD_ENVSTATE
+#                      the `rt` record's fields, empty when WT_TD_SOURCE is.
+#   WT_TD_STATUS       the teardown script's outcome: none (nothing to run), done, failed, timeout,
+#                      or skipped (a script that could not be run, or no time left to run it).
+#   WT_TD_LEDGER       what became of the ledger entry: forgotten, kept, or none (there was none).
+WT_TD_KEEP_REASON='' WT_TD_SOURCE='' WT_TD_NAME='' WT_TD_SLUG='' WT_TD_PORT='' WT_TD_PORTSOURCE=''
+WT_TD_ENVFILE='' WT_TD_ENVSTATE='' WT_TD_STATUS=none WT_TD_LEDGER=none
+
+# Take the per-worktree lock bootstrap holds while it runs, on descriptor $2, and keep it until the
+# caller releases it (wt_lock_release) or exits. Returns 0 when teardown may go on, 1 when the
+# worktree must be kept, with the reason in WT_TD_KEEP_REASON.
+#
+# A lock that cannot even be TRIED — a symlink, an unopenable path — is a reason to keep: it is no
+# proof that nothing holds it. NO flock AT ALL is not: bootstrap already runs unlocked on such a
+# host (stock macOS), so refusing would make teardown never work there, for a race bootstrap
+# itself does not guard against. The lock file lives in the admin dir and goes with it, which an
+# open descriptor survives.
+wt_acquire_teardown_lock() {  # $1 = worktree, $2 = fd number
+  local wt=${1%/} fd=${2-} rc
+  WT_TD_KEEP_REASON=''
+  if ! command -v flock >/dev/null 2>&1; then
+    wt_log "flock is not on PATH — cannot tell whether a bootstrap is still running in $wt; tearing it down anyway"
+    return 0
+  fi
+  wt_lock_acquire "$(wt_state_path "$wt").lock" 5 "$fd"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) WT_TD_KEEP_REASON='a bootstrap is still running in it' ;;
+    *) WT_TD_KEEP_REASON='could not check for a running bootstrap: its lock file cannot be opened' ;;
+  esac
+  return 1
+}
+
+# Read what was allocated for the worktree at $4 into WT_TD_*. Returns 0 when a record was found,
+# 1 when nothing records an allocation (WT_TD_NAME is set either way).
+#
+# The state file is the record bootstrap reads; the ledger entry is its copy that outlives the admin
+# dir. Both hold the same `rt` record, so ONE source is picked and every field is read from it —
+# mixing them could pair one allocation's slug with another's port. The prune sweep passes an empty
+# state file for a worktree already gone, and the ledger is then the only record.
+wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = ledger entry or empty, $4 = worktree path
+  local state=${1-} root=${2-} entry=${3-} wt=${4-} field value
+
+  WT_TD_SOURCE='' WT_TD_NAME='' WT_TD_SLUG='' WT_TD_PORT='' WT_TD_PORTSOURCE=''
+  WT_TD_ENVFILE='' WT_TD_ENVSTATE=''
+
+  # The ledger recorded the name the seed saw; without an entry it is derived exactly as the
+  # SessionStart branch of bootstrap.sh derives it.
+  [ -n "$entry" ] && { WT_TD_NAME=$(wt_ledger_field "$root" "$entry" name) || WT_TD_NAME=''; }
+  [ -n "$WT_TD_NAME" ] || WT_TD_NAME=$(wt_name_from_path "$wt")
+
+  if [ -n "$state" ] && wt_runtime_state_read "$state" slug >/dev/null; then
+    WT_TD_SOURCE=$state
+  elif [ -n "$entry" ] && wt_ledger_field "$root" "$entry" slug >/dev/null; then
+    WT_TD_SOURCE=ledger
+  else
+    return 1
+  fi
+
+  for field in slug port portsource envfile envstate; do
+    if [ "$WT_TD_SOURCE" = ledger ]; then
+      value=$(wt_ledger_field "$root" "$entry" "$field") || value=''
+    else
+      value=$(wt_runtime_state_read "$WT_TD_SOURCE" "$field") || value=''
+    fi
+    case $field in
+      slug) WT_TD_SLUG=$value ;;
+      port) WT_TD_PORT=$value ;;
+      portsource) WT_TD_PORTSOURCE=$value ;;
+      envfile) WT_TD_ENVFILE=$value ;;
+      envstate) WT_TD_ENVSTATE=$value ;;
+    esac
+  done
+  return 0
+}
+
+# Run the loaded profile's runtime.teardown from $1 against the allocation wt_read_allocation read,
+# and set WT_TD_STATUS. Always returns 0: every outcome is a status, and only `none` and `done` let
+# the ledger entry go (wt_settle_ledger_entry).
+#
+# NO RECORD, NO SCRIPT: nothing was allocated, so there is nothing for it to undo, and running it
+# with an invented slug could drop a database some other worktree owns.
+#
+# BOUNDED BY timeouts.seedSeconds. The profile schema has no teardown key, and undoing a seed is the
+# same order of work as doing it; a new key would be one more number to calibrate for no gain. It
+# is capped by what is left before $4, which the hook measures from its own start so that the
+# platform never kills it mid-removal. An empty deadline leaves only that cap and lib.sh's default.
+#
+# THE ENVIRONMENT IS THE SEED'S, rebuilt from the record rather than re-derived: a profile edited
+# since the seed ran would otherwise send the script after a database it never made.
+#
+# THE SCRIPT IS THE COMMITTED ONE. When the worktree is present the guard has just shown it clean,
+# so the file under it is what its branch committed — the same trust the seed ran under (ADR-008).
+# Once it is gone, $1 is the main checkout. A path that leaves $1 through a symlink is refused.
+wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 = main checkout, $4 = deadline (epoch seconds) or empty
+  local rundir=${1-} wt=${2-} root=${3-} deadline=${4-} rel=${PROFILE_RT_TEARDOWN:-} esc secs left rc
+
+  WT_TD_STATUS=none
+  [ -n "$WT_TD_SOURCE" ] || return 0
+  [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "$rel" ] || return 0
+
+  WT_TD_STATUS=skipped
+  if ! wt_is_safe_relpath "$rel" || wt_has_symlinked_parent "$rundir" "$rel" || [ -L "$rundir/$rel" ]; then
+    wt_log "runtime: refusing to run the teardown script $rel — not a plain file inside $rundir"
+    return 0
+  fi
+  if [ ! -f "$rundir/$rel" ] || [ ! -x "$rundir/$rel" ]; then
+    wt_log "runtime: the teardown script $rel is missing or not executable in $rundir — not run"
+    return 0
+  fi
+
+  secs=${PROFILE_SEED_TIMEOUT:-$WT_DEFAULT_TIMEOUT}
+  wt_is_seconds "$secs" || secs=$WT_DEFAULT_TIMEOUT
+  secs=$((10#$secs))
+  left=$(wt_budget_left "$deadline")
+  [ "$left" -ge "$secs" ] || secs=$left
+  # `timeout 0` means no limit at all, so no time left is a skip, not a zero bound.
+  if [ "$secs" -le 0 ]; then
+    wt_log "runtime: no time left under the hook timeout to run the teardown script $rel — not run"
+    return 0
+  fi
+
+  esc=${rel//\'/\'\\\'\'}
+  wt_log "runtime: tearing down slug=$WT_TD_SLUG${WT_TD_PORT:+ port=$WT_TD_PORT} with $rel (up to ${secs}s)"
+  (
+    WT_NAME=$WT_TD_NAME
+    WT_SLUG=$WT_TD_SLUG
+    WT_PORT=$WT_TD_PORT
+    WT_PATH=$wt
+    WT_ROOT=$root
+    WT_ENV_FILE=$WT_TD_ENVFILE
+    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
+    wt_run_in_shell "./'$esc'" "$rundir" "$secs"
+  )
+  rc=$?
+  case $rc in
+    0) WT_TD_STATUS="done" ;;
+    124)
+      WT_TD_STATUS=timeout
+      wt_log "runtime: the teardown script ran past ${secs}s and was stopped — its database or containers may still exist"
+      ;;
+    *)
+      WT_TD_STATUS=failed
+      wt_log "runtime: the teardown script failed (exit $rc) — its database or containers may still exist"
+      ;;
+  esac
+  return 0
+}
+
+# A worktree that survives a successful teardown script points at an allocation that is gone, and
+# its state still says the seed is done — so the next session would skip the seed and run against
+# a dropped database. Recording the seed as not run makes that session seed again. Only when the
+# allocation was read from the worktree's own state file: a ledger-only record has no state file
+# left to correct.
+wt_record_seed_undone() {  # $1 = worktree
+  [ "$WT_TD_STATUS" = "done" ] && [ -n "$WT_TD_SOURCE" ] && [ "$WT_TD_SOURCE" != ledger ] \
+    || return 0
+  # WT_NAME is what the ledger copy of the record is written under.
+  WT_NAME=$WT_TD_NAME wt_runtime_state_set "$1" "$WT_TD_SLUG" "$WT_TD_PORT" "$WT_TD_PORTSOURCE" \
+    "$WT_TD_ENVFILE" "$WT_TD_ENVSTATE" none '' \
+    || wt_log "runtime: could not record that the seed must run again — delete the database marker by hand if the next session skips it"
+}
+
+wt_report_kept() {  # $1 = worktree, $2 = reasons, one per line
+  local reason
+  wt_log "keeping ${1%/} — it holds work:"
+  while IFS= read -r reason; do
+    [ -n "$reason" ] && wt_log "  - $reason"
+  done <<<"${2-}"
+  wt_log 'nothing was removed; /worktree-prune will list it'
+}
+
+# Forget the ledger entry once nothing it records can still exist, or keep it and say so. It goes
+# only when the worktree is gone ($3 = 1) AND the teardown script left nothing behind (WT_TD_STATUS
+# none or done): a kept worktree still owns its allocation, and a failed, stopped or skipped script
+# may have left its database, which the entry is then the only record of.
+wt_settle_ledger_entry() {  # $1 = main checkout, $2 = ledger entry or empty, $3 = 1 if the worktree is gone
+  local root=${1-} entry=${2-} gone=${3:-0}
+  WT_TD_LEDGER=none
+  [ -n "$entry" ] || return 0
+  if [ "$gone" = 1 ]; then
+    case $WT_TD_STATUS in
+      none | "done")
+        if wt_ledger_forget "$root" "$entry"; then
+          WT_TD_LEDGER=forgotten
+          return 0
+        fi
+        WT_TD_LEDGER=kept
+        wt_log "could not remove the runtime ledger entry $entry; /worktree-prune will list it"
+        return 0
+        ;;
+    esac
+  fi
+  WT_TD_LEDGER=kept
+  wt_log "the runtime ledger entry $entry is kept; /worktree-prune will list it"
 }

@@ -684,5 +684,84 @@ holds 'without it, the outer one is clean again' 1 "$GA"
 holds 'the main checkout is not a linked worktree' 0 "$G"
 contains '...saying so' 'is not a linked worktree' "$reasons"
 
+# ---------------------------------------------------------------------------
+# The teardown steps, called the way the prune sweep calls them: a ledger entry and the main
+# checkout, no payload. No JSON, so they run once.
+# ---------------------------------------------------------------------------
+
+T="$SCRATCH/steps repo"
+git init -q "$T"
+git -C "$T" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+TW=$T/.claude/worktrees/bob/fix-7
+git -C "$T" worktree add -q "$TW" -b bob-fix-7
+unset WT_STATE_PATH_FOR WT_STATE_PATH_IS
+TSTATE=$(wt_state_path "$TW")
+# shellcheck disable=SC2034  # read by the sourced ledger writer
+WT_NAME='bob/fix 7'
+wt_runtime_state_set "$TW" bob_fix_7 3911 derived .env.worktree.local ours "done" SCK 2>/dev/null
+TENTRY=fix-7
+eq 'fixture: the ledger entry is named after the admin id' yes \
+  "$([ -f "$T/.git/worktree-ledger/$TENTRY" ] && echo yes || echo no)"
+
+wt_read_allocation '' "$T" "$TENTRY" "$TW"
+eq 'allocation: with no state file it is read from the ledger' 0 $?
+eq '...saying so' ledger "$WT_TD_SOURCE"
+eq '...with the name the seed saw, not one derived from the path' 'bob/fix 7' "$WT_TD_NAME"
+eq '...and every rt field' 'bob_fix_7|3911|derived|.env.worktree.local|ours' \
+  "$WT_TD_SLUG|$WT_TD_PORT|$WT_TD_PORTSOURCE|$WT_TD_ENVFILE|$WT_TD_ENVSTATE"
+
+wt_read_allocation "$TSTATE" "$T" "$TENTRY" "$TW"
+eq 'allocation: the state file wins when it has a record' "$TSTATE" "$WT_TD_SOURCE"
+
+wt_read_allocation "$TSTATE" "$T" '' "$TW"
+eq 'allocation: with no entry the name comes from the path' 'bob/fix-7' "$WT_TD_NAME"
+
+wt_read_allocation "$SCRATCH/no-such-state" "$T" '' "$TW"
+eq 'allocation: nothing records one' 1 $?
+eq '...and no field survives from the previous call' '' \
+  "$WT_TD_SOURCE$WT_TD_SLUG$WT_TD_PORT$WT_TD_PORTSOURCE$WT_TD_ENVFILE$WT_TD_ENVSTATE"
+
+# PROFILE_* are what wt_load_profile publishes; set by hand so no profile file is needed.
+# shellcheck disable=SC2034
+PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=1 PROFILE_RT_TEARDOWN=down.sh PROFILE_SEED_TIMEOUT=20
+# shellcheck disable=SC2016  # the $WT_* references belong to the script.
+printf '#!/usr/bin/env bash\nprintf "%%s|%%s|%%s|%%s" "$WT_NAME" "$WT_SLUG" "$WT_PORT" "$WT_PATH" > ran\n' \
+  >"$T/down.sh"
+chmod +x "$T/down.sh"
+
+wt_run_teardown_script "$T" "$TW" "$T" '' 2>/dev/null
+eq 'teardown script: no allocation, nothing run' none "$WT_TD_STATUS"
+eq '...really not run' no "$([ -e "$T/ran" ] && echo yes || echo no)"
+
+wt_read_allocation '' "$T" "$TENTRY" "$TW"
+wt_run_teardown_script "$T" "$TW" "$T" "$(( $(date +%s) - 1 ))" 2>"$TMP/steps-err"
+eq 'teardown script: a deadline already passed skips it' skipped "$WT_TD_STATUS"
+eq '...rather than running it unbounded' no "$([ -e "$T/ran" ] && echo yes || echo no)"
+contains '...saying why' 'no time left' "$(cat "$TMP/steps-err")"
+
+wt_run_teardown_script "$T" "$TW" "$T" '' 2>/dev/null
+eq 'teardown script: run from the main checkout with the recorded environment' "done" "$WT_TD_STATUS"
+eq '...seeing the seed'"'"'s name, slug, port and path' "bob/fix 7|bob_fix_7|3911|$TW" \
+  "$(cat "$T/ran" 2>/dev/null)"
+rm -f "$T/ran"
+
+WT_TD_STATUS=failed
+wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
+eq 'ledger: a failed teardown keeps the entry' kept "$WT_TD_LEDGER"
+WT_TD_STATUS=skipped
+wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
+eq 'ledger: so does a skipped one' kept "$WT_TD_LEDGER"
+WT_TD_STATUS="done"
+wt_settle_ledger_entry "$T" "$TENTRY" 0 2>/dev/null
+eq 'ledger: a worktree still there keeps its entry' kept "$WT_TD_LEDGER"
+eq '...on disk' yes "$([ -f "$T/.git/worktree-ledger/$TENTRY" ] && echo yes || echo no)"
+wt_settle_ledger_entry "$T" '' 1 2>/dev/null
+eq 'ledger: no entry, nothing to settle' none "$WT_TD_LEDGER"
+wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
+eq 'ledger: a gone worktree whose teardown finished forgets it' forgotten "$WT_TD_LEDGER"
+eq '...on disk' no "$([ -e "$T/.git/worktree-ledger/$TENTRY" ] && echo yes || echo no)"
+# shellcheck disable=SC2034
+PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0 PROFILE_RT_TEARDOWN='' PROFILE_SEED_TIMEOUT=''
+
 printf '%d passed, %d failed, %d backend(s) exercised\n' "$pass" "$fail" "$backends_run" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$backends_run" -gt 0 ]

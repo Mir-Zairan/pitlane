@@ -12,37 +12,43 @@
 # The seed and teardown scripts stand a marker file OUTSIDE the worktree in for a database, so
 # "the teardown ran" and "the teardown did not run" are both observable after the directory is gone.
 #
+# Both hooks read their payload through the JSON layer, so the whole suite runs once per backend,
+# with the same missing-backend rule as tests/test_lib.sh:
+#
+#   tests/test_teardown.sh                            # every backend present on this machine
+#   nix shell nixpkgs#jq -c tests/test_teardown.sh    # ...including jq, if it isn't installed
+#
 # Deliberately not `set -e`: a failed assertion must not stop the remaining ones.
 set -uo pipefail
 
 SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/../hooks/scripts" && pwd)
 CREATE_HOOK=$SCRIPTS/bootstrap.sh
 REMOVE_HOOK=$SCRIPTS/teardown.sh
-TMP=$(mktemp -d)
-TMP=$(cd -P "$TMP" && pwd -P)
+SCRATCH=$(mktemp -d)
+SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
+TMP=$SCRATCH
 listener_pid=''
-trap '[ -n "$listener_pid" ] && kill "$listener_pid" 2>/dev/null; rm -rf "$TMP"' EXIT
+# A test that makes a directory undeletable restores it itself; the chmod here is for one that
+# was interrupted before it could.
+trap '[ -n "$listener_pid" ] && kill "$listener_pid" 2>/dev/null; chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 unset XDG_CONFIG_HOME
-HOME=$TMP/home
+HOME=$SCRATCH/home
 mkdir -p "$HOME"
 export HOME
 
-DB=$TMP/databases
-LOGS=$TMP/teardown-logs
-mkdir -p "$DB" "$LOGS"
-
-pass=0 fail=0
+pass=0 fail=0 backends_run=0
+BACKEND=none
 
 eq() {  # $1 = label, $2 = expected, $3 = actual
   if [ "$2" = "$3" ]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
-    printf 'FAIL %s\n      expected: %q\n      actual:   %q\n' "$1" "$2" "$3" >&2
+    printf 'FAIL [%s] %s\n      expected: %q\n      actual:   %q\n' "$BACKEND" "$1" "$2" "$3" >&2
   fi
 }
 
@@ -50,19 +56,37 @@ contains() {  # $1 = label, $2 = needle, $3 = haystack
   case $3 in
     *"$2"*) pass=$((pass + 1)) ;;
     *) fail=$((fail + 1))
-       printf 'FAIL %s\n      expected to contain: %q\n      actual: %q\n' "$1" "$2" "$3" >&2 ;;
+       printf 'FAIL [%s] %s\n      expected to contain: %q\n      actual: %q\n' "$BACKEND" "$1" "$2" "$3" >&2 ;;
   esac
 }
 
 lacks() {  # $1 = label, $2 = needle that must NOT appear, $3 = haystack
   case $3 in
     *"$2"*) fail=$((fail + 1))
-            printf 'FAIL %s\n      must not contain: %q\n      actual: %q\n' "$1" "$2" "$3" >&2 ;;
+            printf 'FAIL [%s] %s\n      must not contain: %q\n      actual: %q\n' "$BACKEND" "$1" "$2" "$3" >&2 ;;
     *) pass=$((pass + 1)) ;;
   esac
 }
 
 exists() { [ -e "$1" ] && echo yes || echo no; }
+
+# The hardlink count of $1. `stat -c %h` is GNU-only and BSD stat spells it `-f %l`; the second
+# column of `ls -l` is the same number everywhere. SC2012: one known path, so no name parsing.
+# shellcheck disable=SC2012
+link_count() { ls -ld -- "$1" 2>/dev/null | awk '{ print $2 }'; }
+
+# A PATH with every command of this one except flock, for the stock-macOS case. Symlinks, so each
+# tool still finds its own libraries; the first of a name wins, as it would on PATH.
+NOFLOCK=$SCRATCH/noflock-bin
+mkdir -p "$NOFLOCK"
+IFS=: read -r -a path_dirs <<<"$PATH"
+for d in "${path_dirs[@]}"; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    b=${f##*/}
+    [ "$b" != flock ] && [ -x "$f" ] && [ ! -e "$NOFLOCK/$b" ] && ln -s "$f" "$NOFLOCK/$b"
+  done
+done
 
 # A repository whose profile hardlinks vendor/ from the main checkout and isolates a runtime: a port,
 # an env override file, a seed that creates "$DB/<slug>" and a teardown that logs the environment it
@@ -142,6 +166,12 @@ footprint() {  # $1 = repo
     -e '^\./\.git/index$'
 }
 
+run_suite() {
+TMP=$SCRATCH/$BACKEND
+DB=$TMP/databases
+LOGS=$TMP/teardown-logs
+mkdir -p "$DB" "$LOGS"
+
 # ---------------------------------------------------------------------------
 # The full cycle: create -> bootstrap -> runtime -> remove
 # ---------------------------------------------------------------------------
@@ -156,7 +186,7 @@ eq 'fixture: WorktreeCreate made the worktree' "$R/.claude/worktrees/feat" "$W"
 eq 'fixture: the seed created its database' yes "$(exists "$DB/feat")"
 eq 'fixture: the env override was written' yes "$(exists "$W/.env.worktree.local")"
 eq 'fixture: vendor/ was hardlinked from the main checkout' 2 \
-  "$(stat -c %h "$R/vendor/autoload.php" 2>/dev/null)"
+  "$(link_count "$R/vendor/autoload.php")"
 eq 'fixture: the ledger records the worktree' yes "$(exists "$R/.git/worktree-ledger/feat")"
 port=$(grep '^SERVER_PORT=' "$W/.env.worktree.local" | cut -d= -f2)
 
@@ -196,7 +226,7 @@ contains 'and ran inside the worktree' "PWD=$W" "$log"
 # Disk-neutral apart from what is shared on purpose.
 eq 'the main checkout and its git dir are back to their files' "$before_files" "$(footprint "$R")"
 eq 'the hardlink source is untouched' 'shared' "$(cat "$R/vendor/autoload.php")"
-eq 'and is no longer linked from anywhere' 1 "$(stat -c %h "$R/vendor/autoload.php" 2>/dev/null)"
+eq 'and is no longer linked from anywhere' 1 "$(link_count "$R/vendor/autoload.php")"
 eq 'and takes the same space as before' "$before_vendor_du" "$(du -sk "$R/vendor" | cut -f1)"
 eq 'the ledger directory is empty' '' "$(ls -A "$R/.git/worktree-ledger" 2>/dev/null)"
 
@@ -402,5 +432,230 @@ eq 'no stdin at all: nothing on stdout' '' "$out"
 eq 'no stdin at all: the live worktree is untouched' yes "$(exists "$WK")"
 lacks 'no stdin at all: and nothing was torn down' 'tearing down' "$(cat "$TMP/err")"
 
-printf '%d passed, %d failed\n' "$pass" "$fail" >&2
-[ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]
+# ---------------------------------------------------------------------------
+# A bootstrap still running in the worktree: nothing is torn down under it
+# ---------------------------------------------------------------------------
+#
+# The lock is held from this shell on a descriptor of its own, exactly as bootstrap.sh holds it.
+
+RB=$TMP/repo-busy
+make_repo "$RB"
+WB=$(create "$RB" busy)
+busy_lock=$RB/.git/worktrees/busy/worktree-bootstrap-state.lock
+if command -v flock >/dev/null 2>&1; then
+  exec 7>"$busy_lock"
+  flock -n 7
+  out=$(remove "$(remove_payload "$WB" "$RB")" "$RB")
+  err=$(cat "$TMP/err")
+  exec 7>&-
+  eq 'lock held: exits 0' 0 "$(cat "$TMP/rc")"
+  eq 'lock held: nothing on stdout' '' "$out"
+  eq 'lock held: the worktree is kept' yes "$(exists "$WB/.env.worktree.local")"
+  eq 'lock held: the teardown script did NOT run' yes "$(exists "$DB/busy")"
+  eq 'lock held: the ledger entry is kept' yes "$(exists "$RB/.git/worktree-ledger/busy")"
+  contains 'lock held: stderr says why' 'a bootstrap is still running in it' "$err"
+
+  # A lock that cannot even be tried is no proof that nothing holds it.
+  rm -f "$busy_lock"
+  ln -s "$TMP/lock-target" "$busy_lock"
+  out=$(remove "$(remove_payload "$WB" "$RB")" "$RB")
+  err=$(cat "$TMP/err")
+  rm -f "$busy_lock"
+  eq 'unusable lock: exits 0' 0 "$(cat "$TMP/rc")"
+  eq 'unusable lock: the worktree is kept' yes "$(exists "$WB/.env.worktree.local")"
+  eq 'unusable lock: the teardown script did NOT run' yes "$(exists "$DB/busy")"
+  eq 'unusable lock: the symlink target was not created' no "$(exists "$TMP/lock-target")"
+  contains 'unusable lock: stderr says why' 'could not check for a running bootstrap' "$err"
+else
+  printf 'SKIP no flock to hold the bootstrap lock with\n' >&2
+fi
+
+# Stock macOS has no flock. Bootstrap already runs unlocked there, and refusing would mean teardown
+# never works on that platform, so it proceeds and says so.
+out=$(PATH=$NOFLOCK remove "$(remove_payload "$WB" "$RB")" "$RB")
+err=$(cat "$TMP/err")
+eq 'no flock: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'no flock: nothing on stdout' '' "$out"
+eq 'no flock: the worktree is removed' no "$(exists "$WB")"
+eq 'no flock: the teardown script ran' no "$(exists "$DB/busy")"
+contains 'no flock: stderr says a running bootstrap could not be ruled out' \
+  'cannot tell whether a bootstrap is still running' "$err"
+
+# ---------------------------------------------------------------------------
+# A teardown script that cannot be run: the worktree goes, the ledger entry stays
+# ---------------------------------------------------------------------------
+
+RX=$TMP/repo-noexec
+make_repo "$RX"
+chmod -x "$RX/.claude/worktree-teardown.sh"
+git -C "$RX" commit -qam 'teardown script not executable'
+WX=$(create "$RX" noexec)
+out=$(remove "$(remove_payload "$WX" "$RX")" "$RX")
+err=$(cat "$TMP/err")
+eq 'not executable: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'not executable: nothing on stdout' '' "$out"
+eq 'not executable: the worktree is removed' no "$(exists "$WX")"
+eq 'not executable: its database is still there' yes "$(exists "$DB/noexec")"
+eq 'not executable: so the ledger entry is KEPT' yes "$(exists "$RX/.git/worktree-ledger/noexec")"
+contains 'not executable: stderr says so' 'missing or not executable' "$err"
+
+# A committed symlink to a script outside the checkout is not the branch's script.
+RY=$TMP/repo-outside
+make_repo "$RY"
+printf '#!/usr/bin/env bash\ntouch "%s/outside-ran"\n' "$TMP" >"$TMP/outside.sh"
+chmod +x "$TMP/outside.sh"
+rm -f "$RY/.claude/worktree-teardown.sh"
+ln -s "$TMP/outside.sh" "$RY/.claude/worktree-teardown.sh"
+git -C "$RY" add -A .claude
+git -C "$RY" commit -qm 'teardown script is a symlink out of the repository'
+WY=$(create "$RY" outside)
+out=$(remove "$(remove_payload "$WY" "$RY")" "$RY")
+err=$(cat "$TMP/err")
+eq 'symlinked outside: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'symlinked outside: the outside script did NOT run' no "$(exists "$TMP/outside-ran")"
+eq 'symlinked outside: the worktree is removed' no "$(exists "$WY")"
+eq 'symlinked outside: its database is still there' yes "$(exists "$DB/outside")"
+eq 'symlinked outside: so the ledger entry is KEPT' yes "$(exists "$RY/.git/worktree-ledger/outside")"
+contains 'symlinked outside: stderr says why' 'refusing to run the teardown script' "$err"
+
+# ---------------------------------------------------------------------------
+# What was allocated comes from the record, and only from the record
+# ---------------------------------------------------------------------------
+
+# No rt record anywhere: nothing was allocated, so there is nothing for the script to undo — and a
+# slug invented for it could name another worktree's database.
+WN=$(create "$R" nort)
+rm -f "$R/.git/worktrees/nort/worktree-bootstrap-state" "$R/.git/worktree-ledger/nort"
+logs_before=$(ls -A "$LOGS")
+out=$(remove "$(remove_payload "$WN" "$R")" "$R")
+err=$(cat "$TMP/err")
+eq 'no record: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'no record: the worktree is still removed' no "$(exists "$WN")"
+eq 'no record: the teardown script did NOT run' yes "$(exists "$DB/nort")"
+eq 'no record: and left no log under any slug' "$logs_before" "$(ls -A "$LOGS")"
+lacks 'no record: nothing claims to tear down' 'tearing down' "$err"
+rm -f "$DB/nort"
+
+# The state file lost, the ledger entry kept: the ledger is the same record, so the environment is
+# rebuilt from it.
+WS=$(create "$R" stateless)
+port_stateless=$(grep '^SERVER_PORT=' "$WS/.env.worktree.local" | cut -d= -f2)
+rm -f "$R/.git/worktrees/stateless/worktree-bootstrap-state"
+out=$(remove "$(remove_payload "$WS" "$R")" "$R")
+log=$(cat "$LOGS/stateless.log" 2>/dev/null)
+eq 'ledger only: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'ledger only: the worktree is removed' no "$(exists "$WS")"
+eq 'ledger only: the teardown script dropped the database' no "$(exists "$DB/stateless")"
+contains 'ledger only: WT_NAME from the ledger' 'WT_NAME=stateless' "$log"
+contains 'ledger only: the recorded port' "WT_PORT=$port_stateless" "$log"
+contains 'ledger only: the recorded env file' 'WT_ENV_FILE=.env.worktree.local' "$log"
+eq 'ledger only: the ledger entry is forgotten' no "$(exists "$R/.git/worktree-ledger/stateless")"
+
+# ---------------------------------------------------------------------------
+# A hostile worktree name, through the whole cycle
+# ---------------------------------------------------------------------------
+#
+# git refuses a space in a branch name, so WorktreeCreate cannot make "a b'c;é" at all. A native
+# `claude -w` worktree is named by its DIRECTORY, which can be — so this one is created the native
+# way and bootstrapped through SessionStart, and the name reaches both scripts from the path.
+
+hostile="a b'c;é"
+WHN=$R/.claude/worktrees/$hostile
+ledger_before=$(ls -A "$R/.git/worktree-ledger")
+git -C "$R" worktree add -q "$WHN" -b hostile-name
+( cd "$WHN" && printf '{"hook_event_name":"SessionStart","source":"startup","cwd":"%s"}' "$WHN" \
+  | bash "$CREATE_HOOK" >/dev/null 2>"$TMP/create-err" )
+hostile_slug=$(
+  # shellcheck source=../hooks/scripts/lib.sh
+  # shellcheck disable=SC1091
+  . "$SCRIPTS/lib.sh"
+  wt_slugify "$hostile"
+) 2>/dev/null
+eq 'hostile: fixture: the seed made its database' yes "$(exists "$DB/$hostile_slug")"
+eq 'hostile: fixture: the ledger records it' yes \
+  "$([ "$(ls -A "$R/.git/worktree-ledger")" != "$ledger_before" ] && echo yes || echo no)"
+out=$(remove "$(remove_payload "$WHN" "$R")" "$R")
+err=$(cat "$TMP/err")
+log=$(cat "$LOGS/$hostile_slug.log" 2>/dev/null)
+eq 'hostile: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'hostile: nothing on stdout' '' "$out"
+eq 'hostile: the worktree is removed' no "$(exists "$WHN")"
+eq 'hostile: the teardown script dropped the database the seed made' no "$(exists "$DB/$hostile_slug")"
+contains 'hostile: WT_NAME is the name the seed saw' "WT_NAME=$hostile" "$log"
+contains 'hostile: WT_PATH is the worktree' "WT_PATH=$WHN" "$log"
+eq 'hostile: its ledger entry is forgotten' "$ledger_before" "$(ls -A "$R/.git/worktree-ledger")"
+
+# ---------------------------------------------------------------------------
+# The rm -rf fallback deletes only what was checked, and says when it could not
+# ---------------------------------------------------------------------------
+
+# The teardown script swaps the worktree for a symlink to where it moved it. The second guard
+# follows the link and finds a clean checkout; the fallback must still refuse to delete through it.
+RS=$TMP/repo-swaps
+# shellcheck disable=SC2016  # $WT_PATH belongs to the teardown script.
+make_repo "$RS" 'mv "$WT_PATH" "$WT_PATH.moved" && ln -s "$WT_PATH.moved" "$WT_PATH"'
+WSW=$(create "$RS" swapped)
+out=$(PATH=$TMP/shim:$PATH remove "$(remove_payload "$WSW" "$RS")" "$RS")
+err=$(cat "$TMP/err")
+eq 'swapped for a symlink: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'swapped for a symlink: nothing on stdout' '' "$out"
+eq 'swapped for a symlink: the directory it points at survives' yes "$(exists "$WSW.moved/app.txt")"
+eq 'swapped for a symlink: the ledger entry is kept' yes "$(exists "$RS/.git/worktree-ledger/swapped")"
+contains 'swapped for a symlink: stderr says why' 'no longer resolves to the worktree that was checked' "$err"
+lacks 'swapped for a symlink: and does not claim a removal' 'removed ' "$err"
+
+# A gitignored directory rm cannot empty: the guard is right that it holds no work, and the
+# fallback must say it left the directory behind rather than claim the removal.
+if [ "$(id -u)" != 0 ]; then
+  WU=$(create "$R" undeletable)
+  mkdir -p "$WU/vendor/sealed"
+  printf 'x\n' >"$WU/vendor/sealed/file"
+  chmod 555 "$WU/vendor/sealed"
+  out=$(PATH=$TMP/shim:$PATH remove "$(remove_payload "$WU" "$R")" "$R")
+  err=$(cat "$TMP/err")
+  chmod 755 "$WU/vendor/sealed"
+  eq 'undeletable: exits 0' 0 "$(cat "$TMP/rc")"
+  eq 'undeletable: nothing on stdout' '' "$out"
+  eq 'undeletable: the directory is still there' yes "$(exists "$WU/vendor/sealed/file")"
+  eq 'undeletable: the ledger entry is kept' yes "$(exists "$R/.git/worktree-ledger/undeletable")"
+  contains 'undeletable: stderr says to remove it by hand' 'remove it by hand' "$err"
+  lacks 'undeletable: and does not claim a removal' "removed $WU" "$err"
+else
+  printf 'SKIP running as root, so no directory is undeletable\n' >&2
+fi
+}
+
+for BACKEND in jq python3; do
+  if [ "$BACKEND" = jq ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+      if [ -n "${WT_TEST_ALLOW_MISSING_BACKEND:-}" ]; then
+        printf 'WARNING: jq not on PATH — cross-backend parity NOT verified\n' >&2
+        continue
+      fi
+      printf 'FAIL: jq not on PATH, so backend parity is untested.\n' >&2
+      printf '      Run: nix shell nixpkgs#jq -c tests/test_teardown.sh\n' >&2
+      printf '      Or set WT_TEST_ALLOW_MISSING_BACKEND=1 to accept a one-sided run.\n' >&2
+      fail=$((fail + 1))
+      continue
+    fi
+    unset WT_JSON_BACKEND
+  else
+    if ! command -v python3 >/dev/null 2>&1; then
+      if [ -n "${WT_TEST_ALLOW_MISSING_BACKEND:-}" ]; then
+        printf 'WARNING: python3 not on PATH — cross-backend parity NOT verified\n' >&2
+        continue
+      fi
+      printf 'FAIL: python3 not on PATH, so backend parity is untested.\n' >&2
+      fail=$((fail + 1))
+      continue
+    fi
+    export WT_JSON_BACKEND=python3
+  fi
+  printf -- '--- backend: %s ---\n' "$BACKEND" >&2
+  backends_run=$((backends_run + 1))
+  run_suite
+done
+BACKEND=none
+
+printf '%d passed, %d failed, %d backend(s) exercised\n' "$pass" "$fail" "$backends_run" >&2
+[ "$fail" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$backends_run" -gt 0 ]

@@ -47,6 +47,12 @@ set -uo pipefail
 # budget runs out.
 WT_TEARDOWN_RESERVE=60
 
+# Measured from here, not from when the script starts: the guard, the lock wait and the profile
+# load all come out of the same hook timeout.
+started=$(date +%s 2>/dev/null) || started=''
+deadline=''
+[ -n "$started" ] && deadline=$((started + WT_HOOK_TIMEOUT - WT_TEARDOWN_RESERVE))
+
 wt_read_input
 
 if ! wt_has_json; then
@@ -67,71 +73,23 @@ admin=$WT_RM_ADMIN
 entry=$WT_RM_LEDGER_ENTRY
 present=$WT_RM_PRESENT
 
-# Print why the worktree is being kept and that nothing was removed. $1 = the guard's reasons.
-wt_report_kept() {  # $1 = reasons, one per line
-  local reason
-  wt_log "keeping $worktree — it holds work:"
-  while IFS= read -r reason; do
-    [ -n "$reason" ] && wt_log "  - $reason"
-  done <<<"$1"
-  # shellcheck disable=SC2016  # the backticks are literal text
-  wt_log 'nothing was removed; /worktree-prune will list it'
-}
-
 # --- 1. the guard, before anything is read, run or removed -----------------------------------
+state=''
 if [ "$present" = 1 ]; then
   if reasons=$(wt_worktree_holds_work "$worktree"); then
-    wt_report_kept "$reasons"
+    wt_report_kept "$worktree" "$reasons"
     exit 0
   fi
-  # A bootstrap still running in this worktree holds its per-worktree lock (bootstrap.sh). Tearing
-  # down under it would race an install and a seed. Held until exit; the lock file lives in the
-  # admin dir and goes with it, which an open descriptor survives.
-  if [ -n "$admin" ] && command -v flock >/dev/null 2>&1; then
-    wt_lock_acquire "$admin/worktree-bootstrap-state.lock" 5 8
-    if [ $? = 1 ]; then
-      wt_report_kept 'a bootstrap is still running in it'
-      exit 0
-    fi
+  # Held until exit.
+  if ! wt_acquire_teardown_lock "$worktree" 8; then
+    wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
+    exit 0
   fi
+  state=$(wt_state_path "$worktree")
 fi
 
 # --- 2. what this plugin allocated, read BEFORE anything is deleted ---------------------------
-# The state file in the admin dir is the record bootstrap reads; the ledger entry is its copy that
-# outlives the admin dir. Both hold the same `rt` record, so one source is picked and every field
-# is read from it — mixing them could pair one allocation's slug with another's port.
-allocation_state=''
-if [ -n "$admin" ] && wt_runtime_state_read "$admin/worktree-bootstrap-state" slug >/dev/null; then
-  allocation_state=$admin/worktree-bootstrap-state
-elif [ -n "$entry" ] && wt_ledger_field "$root" "$entry" slug >/dev/null; then
-  allocation_state=ledger
-fi
-
-wt_allocation_field() {  # $1 = rt field name
-  if [ "$allocation_state" = ledger ]; then
-    wt_ledger_field "$root" "$entry" "$1"
-  else
-    wt_runtime_state_read "$allocation_state" "$1"
-  fi
-}
-
-slug='' port='' portsource='' envfile='' envstate=''
-if [ -n "$allocation_state" ]; then
-  slug=$(wt_allocation_field slug) || slug=''
-  port=$(wt_allocation_field port) || port=''
-  portsource=$(wt_allocation_field portsource) || portsource=''
-  envfile=$(wt_allocation_field envfile) || envfile=''
-  envstate=$(wt_allocation_field envstate) || envstate=''
-fi
-
-# The name the seed saw. The ledger recorded it; without an entry it is derived exactly as the
-# SessionStart branch of bootstrap.sh derives it, from the path under the worktrees directory.
-name=''
-[ -n "$entry" ] && { name=$(wt_ledger_field "$root" "$entry" name) || name=''; }
-if [ -z "$name" ]; then
-  name=${worktree##*"$WT_SUBPATH"}
-  [ "$name" != "$worktree" ] || name=${worktree##*/}
-fi
+wt_read_allocation "$state" "$root" "$entry" "$worktree"
 
 # The profile the worktree was set up with: its own committed copy wins (ADR-008). Once the
 # directory is gone, the main checkout's is the only one left.
@@ -144,97 +102,15 @@ else
 fi
 
 # --- 3. runtime.teardown ---------------------------------------------------------------------
-# Sets teardown_status: none (nothing to run), done, failed, timeout, or skipped (the profile names
-# a script that cannot be run). Only `none` and `done` let the ledger entry go.
-#
-# NO rt RECORD, NO SCRIPT: nothing was allocated, so there is nothing for it to undo, and running
-# it with an invented slug could drop a database some other worktree owns.
-#
-# BOUNDED BY timeouts.seedSeconds. The profile schema has no teardown key, and undoing a seed is the
-# same order of work as doing it; a new key would be one more number to calibrate for no gain.
-# Clamped below the hook's own timeout so the platform never kills the hook mid-removal.
-#
-# THE ENVIRONMENT IS THE SEED'S, rebuilt from the record rather than re-derived: a profile edited
-# since the seed ran would otherwise send the script after a database it never made.
-#
-# THE SCRIPT IS THE COMMITTED ONE. When the worktree is present the guard has just shown it clean,
-# so the file under it is what its branch committed — the same trust the seed ran under (ADR-008).
-wt_run_teardown_script() {
-  local rel=${PROFILE_RT_TEARDOWN:-} abs esc secs rc
-
-  teardown_status=none
-  [ -n "$allocation_state" ] || return 0
-  [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "$rel" ] || return 0
-
-  teardown_status=skipped
-  if ! wt_is_safe_relpath "$rel" || wt_has_symlinked_parent "$rundir" "$rel" || [ -L "$rundir/$rel" ]; then
-    wt_log "runtime: refusing to run the teardown script $rel — not a plain file inside $rundir"
-    return 0
-  fi
-  abs=$rundir/$rel
-  if [ ! -f "$abs" ] || [ ! -x "$abs" ]; then
-    wt_log "runtime: the teardown script $rel is missing or not executable in $rundir — not run"
-    return 0
-  fi
-
-  secs=${PROFILE_SEED_TIMEOUT:-$WT_DEFAULT_TIMEOUT}
-  wt_is_seconds "$secs" || secs=$WT_DEFAULT_TIMEOUT
-  if [ "$((10#$secs))" -gt $((WT_HOOK_TIMEOUT - WT_TEARDOWN_RESERVE)) ]; then
-    secs=$((WT_HOOK_TIMEOUT - WT_TEARDOWN_RESERVE))
-  fi
-
-  esc=${rel//\'/\'\\\'\'}
-  wt_log "runtime: tearing down slug=$slug${port:+ port=$port} with $rel (up to ${secs}s)"
-  (
-    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
-    WT_NAME=$name
-    WT_SLUG=$slug
-    WT_PORT=$port
-    WT_PATH=$worktree
-    WT_ROOT=$root
-    WT_ENV_FILE=$envfile
-    wt_run_in_shell "./'$esc'" "$rundir" "$secs"
-  )
-  rc=$?
-  case $rc in
-    0) teardown_status="done" ;;
-    124)
-      teardown_status=timeout
-      wt_log "runtime: the teardown script ran past ${secs}s and was stopped — its database or containers may still exist"
-      ;;
-    *)
-      teardown_status=failed
-      wt_log "runtime: the teardown script failed (exit $rc) — its database or containers may still exist"
-      ;;
-  esac
-  return 0
-}
-wt_run_teardown_script
-
-# A worktree that survives a successful teardown script points at an allocation that is gone, and
-# its state still says the seed is done — so the next session would skip the seed and run against
-# a dropped database. Recording the seed as not run makes that session seed again.
-wt_mark_unseeded() {
-  [ "$teardown_status" = "done" ] && [ "$allocation_state" = "$admin/worktree-bootstrap-state" ] \
-    || return 0
-  WT_NAME=$name
-  export WT_NAME
-  wt_runtime_state_set "$worktree" "$slug" "$port" "$portsource" "$envfile" "$envstate" none '' \
-    || wt_log "runtime: could not record that the seed must run again — delete the database marker by hand if the next session skips it"
-}
-
-wt_report_ledger_kept() {
-  [ -n "$entry" ] || return 0
-  wt_log "the runtime ledger entry $entry is kept; /worktree-prune will list it"
-}
+wt_run_teardown_script "$rundir" "$worktree" "$root" "$deadline"
 
 # --- 4. the directory ------------------------------------------------------------------------
 if [ "$present" = 1 ]; then
   # The script ran IN the worktree and may have left something there — a dump, a log, a commit.
   if reasons=$(wt_worktree_holds_work "$worktree"); then
-    wt_mark_unseeded
-    wt_report_kept "$reasons"
-    wt_report_ledger_kept
+    wt_record_seed_undone "$worktree"
+    wt_report_kept "$worktree" "$reasons"
+    wt_settle_ledger_entry "$root" "$entry" 0
     exit 0
   fi
 
@@ -245,7 +121,8 @@ if [ "$present" = 1 ]; then
   # Nothing else is unlinked first: the state records no symlink this plugin made (dependencies
   # are hardlinked or installed, config is copied), and neither `git worktree remove` nor `rm -rf`
   # follows a symlink out of the tree.
-  if [ "$envstate" = ours ] && [ -n "$envfile" ] && wt_is_safe_relpath "$envfile" \
+  envfile=$WT_TD_ENVFILE
+  if [ "$WT_TD_ENVSTATE" = ours ] && [ -n "$envfile" ] && wt_is_safe_relpath "$envfile" \
     && ! wt_has_symlinked_parent "$worktree" "$envfile" \
     && [ "$(wt_runtime_env_state "$worktree" "$envfile")" = ours ]; then
     rm -f -- "${worktree:?}/${envfile:?}" 2>/dev/null \
@@ -261,15 +138,15 @@ if [ "$present" = 1 ]; then
     # directory the resolver proved is deleted: re-checked here, since the script ran in between.
     if [ -L "$worktree" ] || [ "$(cd -P "$worktree" 2>/dev/null && pwd -P)" != "$worktree" ]; then
       wt_log "not deleting $worktree: it no longer resolves to the worktree that was checked"
-      wt_mark_unseeded
-      wt_report_ledger_kept
+      wt_record_seed_undone "$worktree"
+      wt_settle_ledger_entry "$root" "$entry" 0
       exit 0
     fi
     rm -rf -- "${worktree:?}" 2>/dev/null
     if [ -e "$worktree" ]; then
       wt_log "could not delete $worktree completely — remove it by hand"
-      wt_mark_unseeded
-      wt_report_ledger_kept
+      wt_record_seed_undone "$worktree"
+      wt_settle_ledger_entry "$root" "$entry" 0
       exit 0
     fi
     # Only THIS worktree's registration, and only while it still points here. A repository-wide
@@ -287,13 +164,5 @@ fi
 # guard cannot vouch for it, and `git worktree prune` or /worktree-prune owns that decision.
 
 # --- 5. the ledger ---------------------------------------------------------------------------
-if [ -n "$entry" ]; then
-  case $teardown_status in
-    none | "done")
-      wt_ledger_forget "$root" "$entry" \
-        || wt_log "could not remove the runtime ledger entry $entry; /worktree-prune will list it"
-      ;;
-    *) wt_report_ledger_kept ;;
-  esac
-fi
+wt_settle_ledger_entry "$root" "$entry" 1
 exit 0

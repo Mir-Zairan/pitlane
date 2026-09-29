@@ -48,6 +48,27 @@ WT_BOOTSTRAP_LIB_SOURCED=1
 # shellcheck disable=SC2034
 WT_SUBPATH='/.claude/worktrees/'
 
+# The name of the worktree at $1, for a worktree whose name arrived with no payload: SessionStart
+# carries none, and teardown or prune may have no ledger entry recording it.
+#
+# NOT the basename. A nested name lands at `.claude/worktrees/alice/fix-99/`, so the basename of
+# `alice/fix-99` and of `bob/fix-99` is `fix-99` for both: one slug, one derived port, and — the
+# part that matters — ONE DATABASE for two worktrees that each believe they are isolated. That is
+# exactly the data loss the runtime layer exists to prevent, arriving through the name it is keyed
+# on.
+#
+# The path RELATIVE to the worktrees directory is right for both layouts: nested gives
+# `alice/fix-99`, and the flattened form the WorktreeCreate branch produces gives `alice-fix-99`.
+# wt_slugify maps both to `alice_fix_99`, so a worktree keeps one identity however it was created.
+# A path not under the worktrees directory at all falls back to its basename rather than using the
+# whole absolute path as a name. (A worktree DIRECTLY in the worktrees directory strips fine.)
+wt_name_from_path() {  # $1 = worktree path
+  local wt=${1-} name
+  name=${wt##*"$WT_SUBPATH"}
+  [ "$name" != "$wt" ] || name=${wt##*/}
+  printf '%s' "$name"
+}
+
 # The profile is committed (ADR-008), so a branch that adds a dependency also updates it.
 # The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
 # a worktree gets bootstrapped from whatever main happens to have, while Phase 3 reads its
