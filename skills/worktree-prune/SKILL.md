@@ -61,7 +61,7 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 |---|---|---|
 | `delete` | Remove the path. | Yes |
 | `teardown` | Run the repo's own teardown script with the recorded environment (it may drop a database or stop a container), then forget the ledger entry. | Yes — say what the script will release |
-| `forget` | Forget the ledger entry; nothing runs. | Yes |
+| `forget` | Forget the ledger entry; nothing runs. The entry may be the only record of a database or containers that still exist — forgotten, nothing will ever tear them down. For a `runtime-leftover` whose reason says it is recorded only in a state file, it deletes that state file. | Yes — say both in the option's description |
 | `refuse` | Not safe now; the reason says why. | No |
 | `none` | Kept on purpose, listed so the developer sees why (a live worktree holding work). | No |
 
@@ -97,13 +97,22 @@ here.** Do not ask the question in step 4.
 
 Ask with `AskUserQuestion`. Offer only items whose action is `delete`, `teardown` or `forget`.
 
-- **Four or fewer applicable items:** one `multiSelect` question, one option per item. Label it with
-  the kind and the last path component; put the bytes and, for `teardown`, what the script releases
-  in the description.
+`AskUserQuestion` takes 2–4 options per question; a question with one option is invalid. Label an
+item's option with the kind and the last path component; put the bytes and, for `teardown`, what
+the script releases in the description. A `forget` option's description must say that the entry may
+be the only record of a database or containers that still exist, which nothing will then tear down,
+and — for a `runtime-leftover` recorded only in a state file — that the state file is deleted.
+
+- **One applicable item:** one single-select question with two options, *Remove <label>* and
+  *Keep it*.
+- **Two to four:** one `multiSelect` question, one option per item.
 - **More than four:** first ask *All applicable items / None / Let me pick*. On *Let me pick*, ask
   `multiSelect` questions of up to four items each until every applicable item has been offered.
+  Split so that no question is left with one item (five items: three and two, not four and one);
+  if one item must be asked alone, ask it as *Remove <label>* / *Keep it*.
 
-Nothing selected, *None*, or a cancelled question means **nothing is done**. Say so and stop.
+Nothing selected, *None*, *Keep it*, or a cancelled question means **nothing is done** for those
+items. Say so and stop.
 Never treat silence, an ambiguous reply, or an earlier general "clean it up" as a selection.
 
 ## 5 — Apply exactly the selection
