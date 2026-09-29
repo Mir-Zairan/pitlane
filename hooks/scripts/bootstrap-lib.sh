@@ -461,14 +461,26 @@ WT_LOCK_WAIT=10
 # The repository's SHARED git directory as an absolute path, as seen from $1. Every worktree of one
 # repository gets the same answer, which is what makes it the place for anything the worktrees
 # must agree on — the dependency locks and the runtime ledger. git reports it relative to $1 in
-# the main checkout, so it is anchored there. Prints nothing and returns 1 when git cannot say.
+# the main checkout, so it is anchored there — except that git before 2.13 reported it relative to
+# the top of the checkout even from a subdirectory. Only when the anchored answer is not a
+# directory is the top asked for, so a caller passing the top (every session-start caller) pays no
+# second git. Prints nothing and returns 1 when git cannot say.
 wt_git_common_dir() {  # $1 = any directory inside the repository
-  local dir=${1%/} common
+  local dir=${1%/} common top
   common=$(wt_git "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
   [ -n "$common" ] || return 1
   case $common in
     /*) ;;
-    *) common=$dir/$common ;;
+    *)
+      if [ -d "$dir/$common" ]; then
+        common=$dir/$common
+      elif top=$(wt_git "$dir" rev-parse --show-toplevel 2>/dev/null) && [ -n "$top" ] \
+        && [ -d "$top/$common" ]; then
+        common=$top/$common
+      else
+        common=$dir/$common
+      fi
+      ;;
   esac
   printf '%s' "${common%/}"
 }
@@ -962,7 +974,8 @@ wt_ledger_parse() {  # $1 = entry file
   [ -f "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
-    rest=${rec#*"$WT_US"}
+    rest=${rec#"$kind"}
+    rest=${rest#"$WT_US"}
     if [ "$kind" = wtstate ]; then
       [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
       seen=1
@@ -971,7 +984,13 @@ wt_ledger_parse() {  # $1 = entry file
     [ "$seen" = 1 ] || return 1
     case $kind in
       worktree)
-        IFS=$WT_US read -r WT_LEDGER_PATH WT_LEDGER_ADMIN WT_LEDGER_NAME <<<"$rest" || true
+        WT_LEDGER_PATH=${rest%%"$WT_US"*}
+        rest=${rest#"$WT_LEDGER_PATH"}
+        rest=${rest#"$WT_US"}
+        WT_LEDGER_ADMIN=${rest%%"$WT_US"*}
+        rest=${rest#"$WT_LEDGER_ADMIN"}
+        rest=${rest#"$WT_US"}
+        WT_LEDGER_NAME=${rest%%"$WT_US"*}
         have_wt=1
         ;;
       rt)
@@ -994,8 +1013,15 @@ wt_ledger_parse() {  # $1 = entry file
 # and is not a worktree prune would sweep, so it is skipped rather than guessed at. The `gitdir`
 # file is required as well: git writes one into every linked worktree's admin directory, and it
 # is what stops a checkout that merely sits in a directory called `worktrees` passing for one.
+#
+# THE SET-ASIDE NEVER OVERWRITES. Two sessions in one worktree can both find the old entry and
+# pick the same `<id>.<when>`; a clobbering move would let the second replace the first's preserved
+# copy with the first's new entry, losing the old allocation. A hard link fails rather than
+# replace an existing name, so each session claims a free name or tries the next. The link is not
+# undone if the write after it fails: the copy under the id may meanwhile be another session's,
+# and a duplicate of an old entry costs prune nothing, where a lost one costs it a database.
 wt_ledger_write() {  # $1 = worktree, $2 = the rt record
-  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug
+  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug recorded_wt
 
   wt_state_path "$wt" >/dev/null
   state=${WT_STATE_PATH_IS-}
@@ -1008,6 +1034,10 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
   common=${common%/*}
   ledger=$common/$WT_LEDGER_DIRNAME
   entry=$ledger/$id
+  if ! wt_ledger_is_entry_name "$id"; then
+    wt_log "runtime: worktree id \"$id\" cannot name a ledger entry — /worktree-prune will not know about this worktree's allocation"
+    return 0
+  fi
 
   if [ ! -d "$ledger" ] && ! mkdir -p "$ledger" 2>/dev/null; then
     wt_log "runtime: could not create the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
@@ -1016,23 +1046,27 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
 
   # An entry that does not parse is set aside too: it cannot be shown to be this worktree's, so it
   # is not this worktree's to erase.
+  # The path is compared as the record holds it: folded by wt_state_join, or a path with a newline
+  # would never match its own entry and be set aside again every session.
+  wt_state_join "$wt"
+  recorded_wt=$WT_STATE_REC
   if [ -e "$entry" ]; then
     slug=${rtrec#rt"$WT_US"}
     slug=${slug%%"$WT_US"*}
-    if ! wt_ledger_parse "$entry" || [ "$WT_LEDGER_PATH" != "$wt" ] \
+    if ! wt_ledger_parse "$entry" || [ "$WT_LEDGER_PATH" != "$recorded_wt" ] \
       || [ "${WT_LEDGER_RT%%"$WT_US"*}" != "$slug" ]; then
       when=$(wt_runtime_state_read "$entry" when 2>/dev/null) || when=''
       wt_is_posint "$when" || when=$(date +%s 2>/dev/null) || when=0
       kept=$entry.$when
       n=0
-      while [ -e "$kept" ]; do
+      until ln "$entry" "$kept" 2>/dev/null; do
+        if [ ! -e "$kept" ] || [ "$n" -ge 100 ]; then
+          wt_log "runtime: could not set aside the earlier ledger entry $entry — keeping it, and not recording this worktree's allocation over it"
+          return 0
+        fi
         n=$((n + 1))
         kept=$entry.$when.$n
       done
-      if ! mv -f "$entry" "$kept" 2>/dev/null; then
-        wt_log "runtime: could not set aside the earlier ledger entry $entry — keeping it, and not recording this worktree's allocation over it"
-        return 0
-      fi
     fi
   fi
 
@@ -1062,10 +1096,13 @@ wt_ledger_dir() {  # $1 = any directory inside the repository
 }
 
 # True if $1 may name a ledger entry. The readers join it onto the ledger directory and
-# wt_ledger_forget deletes the result, so a `/` or `..` would let a caller reach outside it.
+# wt_ledger_forget deletes the result, so a `/`, `.` or `..` would let a caller reach outside it or
+# at the directory itself. `..` INSIDE a name is no traversal and must stay legal: older git kept a
+# basename's dots as they were, so `v1..2` is a real admin id, and refusing it would record an
+# entry that no reader could then name. The writer applies this same test to the id.
 wt_ledger_is_entry_name() {  # $1 = candidate
   case ${1-} in
-    '' | */* | *..* | "$WT_LEDGER_TMP_PREFIX"*) return 1 ;;
+    '' | . | .. | */* | "$WT_LEDGER_TMP_PREFIX"*) return 1 ;;
   esac
   return 0
 }

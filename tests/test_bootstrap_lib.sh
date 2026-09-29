@@ -1122,6 +1122,90 @@ eq 'the live entry is untouched' 'bob_renamed' "$(wt_ledger_field "$LREPO" fix-9
 wt_ledger_forget "$LREPO" "$old_entry" 2>/dev/null
 eq 'forgetting an entry that is not there is a failure (1)' 1 $?
 
+# NO PARTIAL TRUST: an entry that is not wholly readable is neither listed nor read — and never
+# deleted, since it may be an allocation a newer build wrote.
+ledger_put() {  # $1 = entry name, $2... = records, each written RS-terminated
+  local name=$1 rec
+  shift
+  : >"$LEDGER/$name"
+  for rec in "$@"; do printf '%s%s' "$rec" "$RS_" >>"$LEDGER/$name"; done
+}
+ledger_names() {  # the entry names the enumeration emits, one line each, sorted
+  wt_ledger_entries "$LREPO" | tr "$RS_" '\n' | cut -d "$US_" -f1 | sort
+}
+listed=$(ledger_names)
+hdr="wtstate${US_}$WT_STATE_VERSION"
+wtrec="worktree${US_}/gone/wt${US_}hand${US_}hand/made"
+rtrec="rt${US_}hand_slug${US_}4000${US_}derived${US_}.e${US_}ours${US_}none${US_}${US_}1"
+ledger_put foreign-version "wtstate${US_}999" "$wtrec" "$rtrec"
+ledger_put headerless "$wtrec" "$rtrec"
+ledger_put record-before-header "$wtrec" "$hdr" "$rtrec"
+ledger_put rt-only "$hdr" "$rtrec"
+ledger_put worktree-only "$hdr" "$wtrec"
+ledger_put "${WT_LEDGER_TMP_PREFIX}half" "$hdr" "$wtrec" "$rtrec"
+before=$(ledger_count)
+eq 'enumeration lists only the entries that parse, never a temporary one' "$listed" "$(ledger_names)"
+for bad in foreign-version headerless record-before-header rt-only worktree-only; do
+  wt_ledger_field "$LREPO" "$bad" slug >/dev/null
+  eq "an unparseable entry ($bad) reads as no entry (1)" 1 $?
+done
+wt_ledger_field "$LREPO" "${WT_LEDGER_TMP_PREFIX}half" slug >/dev/null
+eq 'a half-written entry is not an entry name at all (2)' 2 $?
+if [ "$(id -u)" != 0 ]; then
+  ledger_put unreadable "$hdr" "$wtrec" "$rtrec"
+  chmod 000 "$LEDGER/unreadable"
+  wt_ledger_field "$LREPO" unreadable slug >/dev/null
+  eq 'an unreadable entry reads as no entry (1)' 1 $?
+  eq '...and is not enumerated' "$listed" "$(ledger_names)"
+  chmod 600 "$LEDGER/unreadable"
+  rm -f "$LEDGER/unreadable"
+fi
+eq 'reading the ledger deletes nothing, however little of it parses' "$before" "$(ledger_count)"
+rm -f "$LEDGER"/foreign-version "$LEDGER"/headerless "$LEDGER"/record-before-header \
+  "$LEDGER"/rt-only "$LEDGER"/worktree-only "$LEDGER/${WT_LEDGER_TMP_PREFIX}half"
+
+# ENTRY NAMES: what a caller could use to reach outside the ledger is refused; what git can
+# legitimately name a worktree is not. `..` INSIDE a name is only a traversal as a whole component.
+for bad in '' . .. "${WT_LEDGER_TMP_PREFIX}abc"; do
+  wt_ledger_field "$LREPO" "$bad" slug >/dev/null
+  eq "reading entry name \"$bad\" is a caller error (2)" 2 $?
+  wt_ledger_forget "$LREPO" "$bad" 2>/dev/null
+  eq "forgetting entry name \"$bad\" is refused (2)" 2 $?
+done
+ledger_put 'v1..2' "$hdr" "$wtrec" "$rtrec"
+eq 'an entry whose name merely contains .. reads' 'hand_slug' "$(wt_ledger_field "$LREPO" 'v1..2' slug)"
+contains '...and is enumerated' "v1..2$US_" "$(wt_ledger_entries "$LREPO")"
+wt_ledger_forget "$LREPO" 'v1..2'
+eq '...and can be forgotten once torn down' 0 $?
+wt_ledger_entries "$TMP" >/dev/null
+eq 'enumerating outside any repository is a failure (1), not an empty ledger' 1 $?
+
+# A CORRUPT ENTRY UNDER THIS ID cannot be shown to be this worktree's, so it is set aside, not
+# overwritten.
+ledger_put fix-99 "wtstate${US_}999" "corrupt${US_}bytes"
+corrupt=$(cat "$LEDGER/fix-99")
+before=$(ledger_count)
+wt_runtime_state_set "$LWT2" bob_renamed 3901 derived .env.worktree.local ours none '' 2>/dev/null
+eq 'an rt write over a corrupt entry keeps it' "$((before + 1))" "$(ledger_count)"
+kept_corrupt=''
+for f in "$LEDGER"/fix-99.*; do
+  [ "$(cat "$f")" = "$corrupt" ] && kept_corrupt=$f
+done
+ne '...set aside byte-for-byte as <id>.<when>' '' "$kept_corrupt"
+eq '...while the id records the allocation again' 'bob_renamed' "$(wt_ledger_field "$LREPO" fix-99 slug)"
+rm -f "$kept_corrupt"
+
+# A SET-ASIDE NAME ALREADY TAKEN is never overwritten: the next free suffix is used instead.
+ledger_put fix-99 "$hdr" "worktree${US_}$LWT2${US_}fix-99${US_}bob/fix-99" \
+  "rt${US_}bob_renamed${US_}3901${US_}derived${US_}.e${US_}ours${US_}none${US_}${US_}1234"
+printf 'already here' >"$LEDGER/fix-99.1234"
+wt_runtime_state_set "$LWT2" bob_suffixed 3903 derived .env.worktree.local ours none '' 2>/dev/null
+eq 'a taken set-aside name is left as it was' 'already here' "$(cat "$LEDGER/fix-99.1234")"
+eq '...and the earlier entry goes to the next suffix' 'bob_renamed' \
+  "$(wt_ledger_field "$LREPO" fix-99.1234.1 slug)"
+rm -f "$LEDGER/fix-99.1234" "$LEDGER/fix-99.1234.1"
+unset hdr wtrec rtrec before listed bad corrupt kept_corrupt f
+
 # A ledger that cannot be written warns and costs the rt write nothing.
 if [ "$(id -u)" != 0 ]; then
   chmod 500 "$LEDGER"
@@ -1130,6 +1214,14 @@ if [ "$(id -u)" != 0 ]; then
   eq '...prints nothing on stdout' '' "$out"
   contains '...and warns on stderr' 'ledger' "$(cat "$TMP/ledger-err")"
   eq '...while the state file took the write' '3902' "$(wt_runtime_state_get "$LWT2" port)"
+  # A NEW slug needs the old entry set aside first; when that cannot happen the old entry is the
+  # one kept, because it is the only record of its database.
+  before=$(ledger_count)
+  wt_runtime_state_set "$LWT2" carol_new_slug 3904 derived .env.worktree.local ours none '' 2>"$TMP/ledger-err"
+  eq 'a set-aside that fails keeps the earlier entry under the id' 'bob_suffixed' \
+    "$(wt_ledger_field "$LREPO" fix-99 slug)"
+  eq '...writes nothing else' "$before" "$(ledger_count)"
+  contains '...and says it could not set it aside' 'set aside' "$(cat "$TMP/ledger-err")"
   chmod 700 "$LEDGER"
 fi
 
@@ -1138,6 +1230,63 @@ rm -rf "${LEDGER:?}"
 wt_runtime_state_set "$LREPO" main_slug 3999 derived .e ours none '' 2>/dev/null
 eq 'an rt write in the main checkout records no ledger entry' 0 "$(ledger_count)"
 eq 'an absent ledger enumerates as no entries' '' "$(wt_ledger_entries "$LREPO")"
+
+# ONLY A LINKED WORKTREE IS KEYED. Neither the `.claude/` fallback nor a git dir that merely sits
+# in a directory called `worktrees` (no `gitdir` file) has an admin id to key on.
+PLAINLWT=$TMP/plainlwt; mkdir -p "$PLAINLWT"
+wt_runtime_state_set "$PLAINLWT" plain_slug 3998 derived .e ours none '' 2>/dev/null
+eq 'an rt write outside git records no ledger entry' '' \
+  "$(find "$PLAINLWT" -name "$WT_LEDGER_DIRNAME" 2>/dev/null)"
+FAKECOMMON=$TMP/fakecommon
+mkdir -p "$FAKECOMMON/worktrees"
+git init -q --separate-git-dir "$FAKECOMMON/worktrees/lookalike" "$TMP/lookalike"
+wt_runtime_state_set "$TMP/lookalike" lookalike_slug 3997 derived .e ours none '' 2>/dev/null
+eq 'a git dir inside a worktrees directory but with no gitdir file records nothing' 1 \
+  "$([ -e "$FAKECOMMON/$WT_LEDGER_DIRNAME" ] && echo 0 || echo 1)"
+
+# An admin id is keyed on as git made it. `..` inside one is legitimate (older git kept a
+# basename's dots as they were), so it is recorded; an id the readers could never name is warned
+# about rather than written where nothing will look.
+git init -q --separate-git-dir "$FAKECOMMON/worktrees/v1..2" "$TMP/dotted"
+: >"$FAKECOMMON/worktrees/v1..2/gitdir"
+wt_runtime_state_set "$TMP/dotted" dotted_slug 3996 derived .e ours none '' 2>/dev/null
+eq 'an admin id containing .. is still recorded' 1 \
+  "$([ -f "$FAKECOMMON/$WT_LEDGER_DIRNAME/v1..2" ] && echo 1 || echo 0)"
+git init -q --separate-git-dir "$FAKECOMMON/worktrees/${WT_LEDGER_TMP_PREFIX}id" "$TMP/tmpnamed"
+: >"$FAKECOMMON/worktrees/${WT_LEDGER_TMP_PREFIX}id/gitdir"
+wt_runtime_state_set "$TMP/tmpnamed" tmpnamed_slug 3995 derived .e ours none '' 2>"$TMP/ledger-err"
+eq 'an admin id that is not an entry name is not recorded' 1 \
+  "$([ -e "$FAKECOMMON/$WT_LEDGER_DIRNAME/${WT_LEDGER_TMP_PREFIX}id" ] && echo 0 || echo 1)"
+contains '...and says so' 'ledger' "$(cat "$TMP/ledger-err")"
+
+# A PATH OR NAME THE RECORD FORMAT FOLDS — a space and non-ASCII survive, a newline becomes a
+# space. Folding must not make a worktree look like someone else on its next session.
+NLWT="$LREPO/.claude/worktrees/sp ace/né${NL_}wx"
+git -C "$LREPO" worktree add -q "$NLWT" -b wt-nl 2>/dev/null
+nlid=$(basename "$(wt_git "$NLWT" rev-parse --git-dir)")
+WT_NAME="sp ace/né${NL_}wx"
+wt_runtime_state_set "$NLWT" nl_slug 3994 derived .e ours none '' 2>/dev/null
+eq 'a path with a space, non-ASCII and a newline is recorded, the newline folded' \
+  "$LREPO/.claude/worktrees/sp ace/né wx" "$(wt_ledger_field "$LREPO" "$nlid" path)"
+eq '...and so is the name' 'sp ace/né wx' "$(wt_ledger_field "$LREPO" "$nlid" name)"
+wt_runtime_state_set "$NLWT" nl_slug 3993 derived .e ours none '' 2>/dev/null
+eq '...and the next session replaces its entry instead of setting it aside' 1 "$(ledger_count)"
+eq '...with the new allocation' 3993 "$(wt_ledger_field "$LREPO" "$nlid" port)"
+git -C "$LREPO" worktree remove --force "$NLWT" 2>/dev/null
+unset nlid
+
+# git before 2.13 reported --git-common-dir relative to the TOP of the checkout even from a
+# subdirectory; the ledger must still be found there.
+mkdir -p "$LREPO/sub/dir"
+eval "real_wt_git() $(declare -f wt_git | tail -n +2)"
+wt_git() {
+  if [ "${2-}" = rev-parse ] && [ "${3-}" = --git-common-dir ]; then printf '.git\n'; return 0; fi
+  real_wt_git "$@"
+}
+eq 'the ledger is found from a subdirectory under old git too' "$LREPO/.git/$WT_LEDGER_DIRNAME" \
+  "$(wt_ledger_dir "$LREPO/sub/dir")"
+eval "wt_git() $(declare -f real_wt_git | tail -n +2)"
+unset -f real_wt_git
 unset WT_NAME old_entry
 
 # The non-git fallback location, and a write that cannot succeed.
