@@ -310,10 +310,16 @@ case $event in
       wt_log "no usable profile at $PROFILE_PATH — run /worktree-calibrate to write one; doing the safe minimum"
     fi
 
-    # own_include=0: creation stayed native here (ADR-009), so `.worktreeinclude` has already been
-    # honoured. Redoing it could only ever disagree with what native did. The profile's copy[] is
-    # still applied, because native knows nothing about it.
-    wt_bootstrap_worktree "$root" "$worktree" 0
+    # `.worktreeinclude` ON THE FIRST BOOTSTRAP ONLY. Native `claude -w` has already honoured it —
+    # but a worktree made with plain `git worktree add` (the only way to check out an existing
+    # branch, ADR-013) never had it applied by anyone, and measured on the reference repo it arrived
+    # with neither `.env.local` nor the developer's `.env.dev.local`. The copier only ever fills
+    # gaps, so where native did the work this is a no-op; and once the worktree has a state file it
+    # is skipped, so later sessions do not pay for the walk over the main checkout. The profile's
+    # copy[] is applied every session regardless, because native knows nothing about it.
+    own_include=0
+    [ -f "$(wt_state_path "$worktree")" ] || own_include=1
+    wt_bootstrap_worktree "$root" "$worktree" "$own_include"
 
     # NOTHING to stdout: for SessionStart, stdout becomes model context.
     exit 0

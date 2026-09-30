@@ -121,12 +121,11 @@ eq 'the dependency was installed' 'ok' "$(cat "$W1/vendor/marker" 2>/dev/null)"
 contains 'and progress went to stderr' 'installing' "$err"
 contains 'with a total time at the end' 'bootstrap finished in' "$err"
 
-# The two copy mechanisms are split by event, and BOTH halves matter. On this path native already
-# honoured .worktreeinclude, so the hook must NOT redo it; the profile's copy[] is the only list
-# it owes, because native knows nothing about that one.
+# The profile's copy[] is applied every session, because native knows nothing about it. And on a
+# worktree's FIRST bootstrap .worktreeinclude is applied too, copy-if-missing: this fixture was made
+# with plain `git worktree add`, which no native copying ever touched.
 eq 'SessionStart applies the profile copy[] list' 'EXTRA=1' "$(cat "$W1/.env.extra" 2>/dev/null)"
-eq 'SessionStart does NOT re-run .worktreeinclude, which native already did' '' \
-  "$([ -e "$W1/.env" ] && echo copied)"
+eq 'the first SessionStart fills in .worktreeinclude where nothing did' 'SECRET=1' "$(cat "$W1/.env" 2>/dev/null)"
 
 # Drift, end to end: the entrypoint must feed wt_report_drift the right evidence fields. The unit
 # tests pass those directly, so only this proves the entrypoint reads them out correctly.
@@ -542,6 +541,27 @@ contains 'verify on host: the install ran through the toolchain wrapper' 'printf
 lacks 'verify on host: the verify did not' 'test -r vendor/marker' "$(cat "$TMP/wrapper.log")"
 eq 'verify on host: and the entry is still recorded done' 'ok' "$(cat "$WWV/vendor/marker" 2>/dev/null)"
 lacks 'verify on host: with no verify failure reported' 'verify command failed' "$(cat "$TMP/err")"
+
+# A WORKTREE MADE WITH PLAIN `git worktree add` never had .worktreeinclude applied — native only does
+# it for `claude -w`. Its first SessionStart applies it (copy-if-missing); later ones do not re-walk.
+RGA=$TMP/gitadd
+make_repo "$RGA" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+WGA=$RGA/.claude/worktrees/existing-branch
+git -C "$RGA" worktree add -q "$WGA" -b some-branch 2>/dev/null
+eq 'git worktree add: fixture — the gitignored .env is not there' no "$([ -e "$WGA/.env" ] && echo yes || echo no)"
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WGA\"}" "$WGA" >/dev/null
+eq 'git worktree add: the first session copies .worktreeinclude in' 'SECRET=1' "$(cat "$WGA/.env" 2>/dev/null)"
+rm -f "$WGA/.env"
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WGA\"}" "$WGA" >/dev/null
+eq 'git worktree add: a later session does not re-copy what the developer deleted' no \
+  "$([ -e "$WGA/.env" ] && echo yes || echo no)"
+
+# Where native creation already placed a file, the first session leaves it exactly as it is.
+WNA=$RGA/.claude/worktrees/native-copied
+git -C "$RGA" worktree add -q "$WNA" -b other-branch 2>/dev/null
+printf 'SECRET=native-put-this\n' > "$WNA/.env"
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WNA\"}" "$WNA" >/dev/null
+eq 'first session: a file native already copied is not overwritten' 'SECRET=native-put-this' "$(cat "$WNA/.env")"
 
 # A NAME THAT IS A LEGAL DIRECTORY BUT NOT A LEGAL BRANCH. `worktree-my fix` used to fail
 # `git worktree add -b`, so the hook printed no path and creation failed (a Phase 3 carry-over).
