@@ -152,3 +152,15 @@ Exit status:
 Some `refuse` items wait on another item — a runtime leftover whose directory still exists becomes
 applicable once that directory is gone. If the report had such items and the apply succeeded, you
 may offer to re-run the report once. That starts again at step 1, with a fresh question.
+
+## When an item refuses
+
+- **An orphan directory refuses although it looks clean.** Its files are hashed without git's
+  filters, so a file whose working bytes differ from what was committed does not prove itself. Line-
+  ending normalisation with LF working files (`* text=auto eol=lf`) is fine — measured; a working copy
+  with CRLF endings, or LFS pointers, refuses. Delete such a directory by hand once you have checked it.
+- **`abandoned` is not offered for a subagent worktree you expected.** It must be unlocked, hold no
+  work, and have had nothing change in it for an hour. A running subagent keeps writing, so a recent
+  one is left until it has been quiet that long.
+- **An item names a database you made by hand.** It cannot: prune only ever releases allocations the
+  plugin's own ledger records, so a hand-cloned database is invisible to it and stays yours to drop.
