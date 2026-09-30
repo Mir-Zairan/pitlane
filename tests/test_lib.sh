@@ -1498,6 +1498,13 @@ JSON
     'runtime.env.file: must be a path or a list of path strings, got [".a",{"x":1}]' "$(vv)"
   vw '{"schemaVersion":1,"runtime":{"env":{"file":{"dev":".a"},"vars":{"A":"1"}}}}'
   contains 'validate: an object instead of a path is refused' 'must be a path or a list of paths' "$(vv)"
+  # A `<file>:<VAR>` key scopes a value to one listed env file.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".env.dev.local",".env.test.local"],"vars":{"A":"1",".env.test.local:A":"2"}}}}'
+  eq 'validate: a key scoped to a listed file is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".env.dev.local"],"vars":{"A":"1",".env.test.local:A":"2"}}}}'
+  contains 'validate: a key scoped to an unlisted file is refused' 'which runtime.env.file does not list' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".env.a","vars":{".env.a:BAD KEY":"2"}}}}'
+  contains 'validate: a scoped key still needs a legal variable name' '"BAD KEY" is not a legal' "$(vv)"
   # `:` joins the list in the state record, so a path containing one would read back as two.
   for hp in 'a:b' 'with space' 'x/'; do
     vw '{"schemaVersion":1,"runtime":{"env":{"file":"'"$hp"'","vars":{"A":"1"}}}}'

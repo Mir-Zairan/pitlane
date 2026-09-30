@@ -2312,6 +2312,18 @@ eq 'a line break in the worktree name is folded out of the comment line' 0 \
   "$(grep -c '^FORGED=' "$EW/$EF" | tr -d ' ')"
 rm -f "$EW/$EF"
 
+# A `<file>:<VAR>` key applies to that one file, in place of the shared VAR there; a key scoped to
+# another file is not written here at all. Every VAR appears once.
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' \
+  "$(mk_pairs 'CENTRAL=central_{slug}' "$EF:CENTRAL=central_{slug}_test" 'SHARED=1' 'other.env:ONLY_THERE=1')"
+eq 'scoped: the file-scoped value replaces the shared one' 'CENTRAL=central_alice_fix_99_test' \
+  "$(grep '^CENTRAL=' "$EW/$EF")"
+eq 'scoped: and the var is written once' 1 "$(grep -c '^CENTRAL=' "$EW/$EF" | tr -d ' ')"
+eq 'scoped: shared vars are still written' 'SHARED=1' "$(grep '^SHARED=' "$EW/$EF")"
+eq 'scoped: a key scoped to another file is not written here' 0 "$(grep -c 'ONLY_THERE' "$EW/$EF" | tr -d ' ')"
+rm -f "$EW/$EF"
+
 # An EMPTY existing file has no block either, so the same rule applies to it.
 : >"$EW/$EF"
 eq 'an empty existing file reads as unmarked' 'unmarked' "$(wt_runtime_env_state "$EW" "$EF")"

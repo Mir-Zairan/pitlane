@@ -1518,10 +1518,31 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
             body=${rec#*"$WT_US"}
             IFS=$WT_US read -r ekey eval_ <<<"$body" || true
             nkeys=$((nkeys + 1))
-            if ! wt_is_safe_envkey "$ekey"; then
-              printf 'runtime.env.vars: "%s" is not a legal environment variable name\n' "$ekey"
-              bad=1
-            fi
+            # A `<file>:<VAR>` key applies to that ONE env file only, overriding a shared VAR there —
+            # for the value that must differ per environment (a test database the app does not
+            # derive for itself). The file must be one runtime.env.file lists: a key scoped to a
+            # file the plugin never writes would be a value that silently goes nowhere.
+            case $ekey in
+              *:*)
+                if ! wt_is_safe_envkey "${ekey##*:}"; then
+                  printf 'runtime.env.vars: "%s" is not a legal environment variable name\n' "${ekey##*:}"
+                  bad=1
+                fi
+                case ":$WT_PS_ENVFILES:" in
+                  *":${ekey%:*}:"*) ;;
+                  *)
+                    printf 'runtime.env.vars: "%s" is scoped to %s, which runtime.env.file does not list\n' "$ekey" "${ekey%:*}"
+                    bad=1
+                    ;;
+                esac
+                ;;
+              *)
+                if ! wt_is_safe_envkey "$ekey"; then
+                  printf 'runtime.env.vars: "%s" is not a legal environment variable name\n' "$ekey"
+                  bad=1
+                fi
+                ;;
+            esac
             # A value is not shape-checked — it is data, and the writer quotes nothing by design
             # (dotenv dialects disagree about quoting, so the profile author's own text is used
             # verbatim). But a value carrying a newline would still write a second line, and that

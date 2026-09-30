@@ -155,6 +155,8 @@
     "            LAST assignment of a variable; confirm that for the repo's parser. Each path must be",
     "            gitignored and use only letters, digits and . _ - @ + /. A developer takes a file over",
     "            by deleting the block, and hands it back by putting the block's first line back.",
+    "            A var whose value must differ per file is keyed `<file>:<VAR>` in `vars`: it applies to",
+    "            that one listed file, in place of the shared VAR there.",
     "  seed      repo-owned escape hatch — see reference/seed-example.sh for the full contract and a",
     "            template. Calibration scaffolds a COMMENTED STUB and never invents its contents: a",
     "            database-cloning command is the target repo's business, not this plugin's. It runs",

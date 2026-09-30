@@ -2235,7 +2235,7 @@ wt_runtime_env_put() {  # $1 = destination, $2 = content
 # because that is the .gitignore that governs the file and a branch can legitimately differ.
 wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream, $6 = recorded disposition
   local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-} recorded=${6-}
-  local dest parent state rec body key val block before='' after='' n=0 irc verb unsafe wtname
+  local dest parent state rec body key val block before='' after='' n=0 irc verb unsafe wtname scoped
 
   # SC2034: WT_ENV_WROTE is this function's result — the caller records it in the state file so
   # the developer-managed warning is said once rather than on every session.
@@ -2356,6 +2356,22 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     pvar=''
   fi
 
+  # SCOPED KEYS: `<file>:<VAR>` sets VAR in that one file only, in place of the shared VAR there. So
+  # the pass below first collects which VARs this file scopes, then writes each shared VAR this
+  # file does not scope, then this file's scoped ones — every VAR once, with the right value.
+  scoped=' '
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      3"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    key=${body%%"$WT_US"*}
+    case $key in
+      "$rel":*) scoped="$scoped${key#"$rel":} " ;;
+    esac
+  done < <(printf '%s' "$pairs")
+
   while IFS= read -r -d "$WT_RS" rec; do
     # Group 3 of the profile scan is runtime.env.vars.
     case $rec in
@@ -2365,6 +2381,15 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     body=${rec#*"$WT_US"}
     key=${body%%"$WT_US"*}
     val=${body#*"$WT_US"}
+    case $key in
+      "$rel":*) key=${key#"$rel":} ;;
+      *:*) continue ;;
+      *)
+        case $scoped in
+          *" $key "*) continue ;;
+        esac
+        ;;
+    esac
     # Re-checked here rather than trusted from validation: this is a public entry point, and the
     # validator can be bypassed with WT_SKIP_VALIDATION. A bad key is skipped, not fatal — the
     # other variables are still worth writing.
