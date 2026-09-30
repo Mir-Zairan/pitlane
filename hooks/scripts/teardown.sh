@@ -23,9 +23,14 @@
 #   * no `git worktree remove -f -f`. A locked worktree is someone saying "not this one", and the
 #     guard already counts it as work.
 #
-# ADR-003 governs everything below: on any internal failure warn on stderr and exit 0. A nonzero
-# exit would fail the removal, which helps nobody. `set -e` is deliberately NOT used, as in
-# bootstrap.sh. stdout stays EMPTY: nothing here has anything to say to the protocol channel.
+# THE EXIT STATUS SAYS WHETHER THE DIRECTORY IS GONE (ADR-014). A worktree this hook KEEPS — it
+# holds work, a bootstrap or a release is still running, the directory could not be deleted — exits
+# 1. Measured on Claude Code 2.1.286: with exit 0 and the directory still there, Claude Code told
+# the session "Exited and removed worktree", and the model reported the user's uncommitted file as
+# deleted; with exit 1 it says "could not remove it — kept at <path>", and reopening that name
+# later works (it reopens the kept worktree). stderr reaches nobody, so the status is the only
+# honest channel. Everything else follows ADR-003: an internal failure warns on stderr and exits 0.
+# `set -e` is deliberately NOT used, as in bootstrap.sh. stdout stays EMPTY.
 set -uo pipefail
 
 # SC1091: see bootstrap.sh — the gate lints each file on its own; `shellcheck -x` follows these.
@@ -62,6 +67,9 @@ fi
 
 # The resolver has already said why on stderr for both non-zero codes: 1 is a refusal, 2 is a
 # worktree already gone that nothing of ours records.
+# The directory is still there and this hook is leaving it: say so through the status.
+wt_exit_kept() { exit 1; }
+
 wt_resolve_removal_target
 case $? in
   0) ;;
@@ -78,12 +86,12 @@ state=''
 if [ "$present" = 1 ]; then
   if reasons=$(wt_worktree_holds_work "$worktree"); then
     wt_report_kept "$worktree" "$reasons"
-    exit 0
+    wt_exit_kept
   fi
   # Held until exit.
   if ! wt_acquire_teardown_lock "$worktree" 8; then
     wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
-    exit 0
+    wt_exit_kept
   fi
   state=$(wt_state_path "$worktree")
 fi
@@ -94,9 +102,9 @@ if [ -n "$entry" ]; then
   if ! wt_acquire_allocation_lock "$root" "$entry" 9; then
     if [ "$present" = 1 ]; then
       wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
-    else
-      wt_log "not tearing down $worktree: $WT_TD_KEEP_REASON; /worktree-prune will list it"
+      wt_exit_kept
     fi
+    wt_log "not tearing down $worktree: $WT_TD_KEEP_REASON; /worktree-prune will list it"
     exit 0
   fi
   # The release it waited on may have finished, and forgotten the entry.
@@ -124,7 +132,7 @@ if [ "$present" = 1 ]; then
     wt_record_seed_undone "$worktree"
     wt_report_kept "$worktree" "$reasons"
     wt_settle_ledger_entry "$root" "$entry" 0
-    exit 0
+    wt_exit_kept
   fi
 
   # Only the plugin's BLOCK, and only in a file recorded `ours` that still carries it (ADR-012):
@@ -150,14 +158,14 @@ if [ "$present" = 1 ]; then
       wt_log "not deleting $worktree: it no longer resolves to the worktree that was checked"
       wt_record_seed_undone "$worktree"
       wt_settle_ledger_entry "$root" "$entry" 0
-      exit 0
+      wt_exit_kept
     fi
     rm -rf -- "${worktree:?}" 2>/dev/null
     if [ -e "$worktree" ]; then
       wt_log "could not delete $worktree completely — remove it by hand"
       wt_record_seed_undone "$worktree"
       wt_settle_ledger_entry "$root" "$entry" 0
-      exit 0
+      wt_exit_kept
     fi
     # Only THIS worktree's registration, and only while it still points here. A repository-wide
     # `git worktree prune` would also erase every other missing worktree's admin dir, and the state

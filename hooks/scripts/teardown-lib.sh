@@ -48,10 +48,11 @@ WT_TEARDOWN_LIB_SOURCED=1
 # Which worktree a removal names
 # ---------------------------------------------------------------------------
 #
-# THE PAYLOAD IS NOT MEASURED. The platform documents `worktree_path` (absolute) on WorktreeRemove,
-# the source conversation's scripts read `path`, and the documented example points INTO
-# `<repo>/.git/worktrees/<id>` — the admin directory, not the checkout. All three shapes are
-# accepted, and each is proven against git before it is believed.
+# THE PAYLOAD, AS MEASURED (Phase 6, Claude Code 2.1.286 — ADR-014): `worktree_path` is the absolute
+# checkout path, and `cwd` is that same worktree; there is no `reason` on the ExitWorktree path. The
+# source conversation's scripts read `path`, and an older docs example pointed into
+# `<repo>/.git/worktrees/<id>` — both are still accepted, and every shape is proven against git
+# before it is believed.
 #
 # THE DIRECTORY MAY ALREADY BE GONE. A launch-time `claude -w` worktree is created natively, and
 # there is no evidence either way on whether native removal runs before or after this hook. So a

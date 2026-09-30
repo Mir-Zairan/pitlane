@@ -17,13 +17,14 @@
 #   id  kind  path  bytes  action  reason
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
-#   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | held; `store` is reserved
+#   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | abandoned | held; `store` is reserved
 #           for Phase 7's unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
 #   action  delete    remove the path.
 #           teardown  run the main checkout's runtime.teardown with the recorded environment, then
-#                     forget the ledger entry.
+#                     forget the ledger entry. For an `abandoned` worktree: run teardown.sh on it,
+#                     exactly as Claude Code would have — guard, release, remove.
 #           forget    forget the entry without running anything: the profile has no teardown script.
 #           refuse    not safe now, and the reason says why. Still accepted by --apply, which
 #                     re-judges it — an item waiting on another (a leftover whose directory is
@@ -46,7 +47,13 @@
 #
 # WHAT IS NEVER DONE, whatever an item says:
 #   * no live registered worktree is touched — the ones Claude Code created natively and the
-#     developer's own `--worktree` ones included. One that holds work is listed as `held`.
+#     developer's own `--worktree` ones included. One that holds work is listed as `held`. THE ONE
+#     EXCEPTION is `abandoned` (ADR-014): a subagent worktree — `agent-<hex>`, the name Claude Code
+#     gives them — that is unlocked, holds no work, and that nothing has touched for
+#     WT_PRUNE_ABANDONED_MINUTES. Claude Code removes the subagent worktrees it creates, but not the
+#     ones a WorktreeCreate hook created, and fires no WorktreeRemove for them (measured, 2.1.286);
+#     its periodic sweep skips them too. Nothing else would ever reap them, or the database a seed
+#     made for each. Applying one runs teardown.sh on it, so the guard is the teardown hook's own.
 #   * no process is killed; the repo's teardown script is the only thing that may stop what its
 #     seed started.
 #   * no shared state is removed: the main checkout a dependency was hardlinked from, package
@@ -92,6 +99,11 @@ set -uo pipefail
 # temp file for milliseconds; minutes is room for a stalled one without guessing at seconds.
 WT_PRUNE_TEMP_MINUTES=10
 
+# How long a subagent worktree must have gone untouched before it counts as abandoned. A subagent
+# that is still running writes, or at least has its session open, within minutes; an hour leaves
+# room for one that is thinking. Overridable for tests and for a developer who wants it sooner.
+WT_PRUNE_ABANDONED_MINUTES=${WT_PRUNE_ABANDONED_MINUTES:-60}
+
 # The finders, in report order, which is also the order --apply works in. Each one adds items with
 # wt_prune_add, and each kind an item can be applied as has a `wt_apply_<kind>` function (dashes as
 # underscores) that performs it. Order matters where one item waits on another: a leftover's
@@ -102,6 +114,7 @@ WT_PRUNE_FINDERS=(
   wt_find_stale_admin_dirs
   wt_find_runtime_leftovers
   wt_find_ledger_junk
+  wt_find_abandoned_worktrees
   wt_find_held_worktrees
   # TODO(phase-7): wt_find_unreferenced_stores — dependency stores under the store root that no live
   # worktree's links resolve into, kind `store`, applied by a wt_apply_store that re-counts the
@@ -196,11 +209,11 @@ wt_prune_shared_note() {  # $1 = path
 #   WT_PRUNE_TEARDOWN  what a runtime leftover would be applied as: teardown, forget, or refuse
 #                      with WT_PRUNE_TEARDOWN_WHY
 WT_PRUNE_ROOT='' WT_PRUNE_COMMON='' WT_PRUNE_WTDIR='' WT_PRUNE_TEARDOWN='' WT_PRUNE_TEARDOWN_WHY=''
-WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=() WT_PRUNE_ORPHANS=()
+WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=() WT_PRUNE_ORPHANS=() WT_PRUNE_LIVE_LOCKED=()
 
 wt_prune_list_live() {
   local listed line wt='' physical n=0
-  WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=()
+  WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=() WT_PRUNE_LIVE_LOCKED=()
   listed=$(wt_git "$WT_PRUNE_ROOT" worktree list --porcelain 2>/dev/null) || return 1
   while IFS= read -r line; do
     case $line in
@@ -213,7 +226,13 @@ wt_prune_list_live() {
         WT_PRUNE_LIVE[${#WT_PRUNE_LIVE[@]}]=$physical
         ;;
       locked | 'locked '*)
-        [ "$n" -gt 1 ] && [ ! -d "$wt" ] && WT_PRUNE_LOCKED[${#WT_PRUNE_LOCKED[@]}]=$wt
+        [ "$n" -gt 1 ] || continue
+        if [ -d "$wt" ]; then
+          physical=$(cd -P "$wt" 2>/dev/null && pwd -P) \
+            && WT_PRUNE_LIVE_LOCKED[${#WT_PRUNE_LIVE_LOCKED[@]}]=$physical
+        else
+          WT_PRUNE_LOCKED[${#WT_PRUNE_LOCKED[@]}]=$wt
+        fi
         ;;
     esac
   done <<<"$listed"
@@ -589,6 +608,38 @@ wt_find_ledger_junk() {
   done
 }
 
+# Why the live worktree at $1 is NOT an abandoned subagent worktree, or nothing when it is one.
+# Staleness is judged on the checkout, not its admin dir: the guard's own `git status` refreshes
+# the index, so asking about the admin dir after the guard would always answer "just touched".
+wt_prune_not_abandoned() {  # $1 = physical worktree path
+  local wt=$1 live recent
+  case ${wt#"$WT_PRUNE_WTDIR"/} in
+    agent-[0-9a-f]*) ;;
+    *) printf 'not a subagent worktree\n'; return 0 ;;
+  esac
+  case ${wt#"$WT_PRUNE_WTDIR"/} in
+    */* | *[!a-z0-9-]*) printf 'not a subagent worktree\n'; return 0 ;;
+  esac
+  for live in ${WT_PRUNE_LIVE_LOCKED[@]+"${WT_PRUNE_LIVE_LOCKED[@]}"}; do
+    [ "$live" = "$wt" ] && { printf 'it is locked\n'; return 0; }
+  done
+  recent=$(find "$wt" -path "$wt/.git" -prune -o -mmin "-$WT_PRUNE_ABANDONED_MINUTES" -print 2>/dev/null | head -1)
+  [ -z "$recent" ] || { printf 'touched in the last %s minutes\n' "$WT_PRUNE_ABANDONED_MINUTES"; return 0; }
+  wt_worktree_holds_work "$wt" >/dev/null && { printf 'it holds work\n'; return 0; }
+  return 1
+}
+
+wt_find_abandoned_worktrees() {
+  local wt
+  [ -n "$WT_PRUNE_WTDIR" ] || return 0
+  for wt in ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
+    case $wt in "$WT_PRUNE_WTDIR"/*) ;; *) continue ;; esac
+    wt_prune_not_abandoned "$wt" >/dev/null && continue
+    wt_prune_add abandoned "$wt" "$wt" "$(wt_prune_bytes "$wt")" teardown \
+      "$(wt_prune_join_reasons "a subagent worktree, unlocked, holding no work and untouched for ${WT_PRUNE_ABANDONED_MINUTES}+ minutes — Claude Code leaves subagent worktrees a WorktreeCreate hook made, and fires no WorktreeRemove for them"$'\n'"applying runs the teardown hook on it: its runtime allocation is released and the directory removed; its branch is kept"$'\n'"$(wt_prune_shared_note "$wt")")" "$wt"
+  done
+}
+
 wt_find_held_worktrees() {
   local wt reasons
   [ -n "$WT_PRUNE_WTDIR" ] || return 0
@@ -638,6 +689,41 @@ wt_apply_orphan_dir() {  # $1 = item index
   fi
   wt_prune_remove_dir "$dir" || return 1
   WT_PRUNE_DETAIL='deleted'
+}
+
+# Run the teardown hook itself on an abandoned subagent worktree, re-judged first. Same payload
+# shape Claude Code sends (measured): worktree_path, and cwd. The hook's exit status says whether the
+# directory is gone (ADR-014); the directory is checked as well, since that is the fact that counts.
+wt_apply_abandoned() {  # $1 = item index
+  local wt=${PRUNE_KEY[$1]} why rc
+  case $wt in
+    "$WT_PRUNE_WTDIR"/*) ;;
+    *) WT_PRUNE_DETAIL="$wt is not under $WT_PRUNE_ROOT/.claude/worktrees"; return 1 ;;
+  esac
+  if ! wt_prune_still_itself "$wt" || ! wt_prune_list_live || ! wt_prune_is_live "$wt"; then
+    WT_PRUNE_DETAIL="$wt is no longer the live worktree that was checked"
+    return 1
+  fi
+  if why=$(wt_prune_not_abandoned "$wt"); then
+    WT_PRUNE_DETAIL="not abandoned now: $why"
+    return 1
+  fi
+  ( cd "$WT_PRUNE_ROOT" && printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s","cwd":"%s"}' \
+      "$(wt_prune_json_escape "$wt")" "$(wt_prune_json_escape "$WT_PRUNE_ROOT")" \
+      | bash "$(dirname "${BASH_SOURCE[0]}")/teardown.sh" >/dev/null )
+  rc=$?
+  if [ -e "$wt" ]; then
+    WT_PRUNE_DETAIL="the teardown hook kept it (exit $rc) — see its reasons above"
+    return 1
+  fi
+  WT_PRUNE_DETAIL='torn down by the teardown hook; its branch is kept'
+}
+
+# A path as a JSON string body: backslash and quote escaped. Control characters never reach here —
+# a live worktree path containing one is refused by the teardown resolver anyway.
+wt_prune_json_escape() {  # $1 = text
+  local t=${1//\\/\\\\}
+  printf '%s' "${t//\"/\\\"}"
 }
 
 wt_apply_stale_admin() {  # $1 = item index

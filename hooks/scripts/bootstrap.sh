@@ -196,7 +196,20 @@ case $event in
     esac
 
     worktree="$root/.claude/worktrees/$dir"
+    # A BRANCH NAME HAS STRICTER RULES THAN A DIRECTORY. `worktree-my fix` is not a legal ref, so
+    # `git worktree add -b` failed and the hook printed no path — the creation failed outright for a
+    # name the directory itself would have taken. git decides what is legal; anything it refuses has
+    # its characters outside a plain set turned into `-`, and if even that is refused (a `..`, a
+    # trailing `.lock`) the slug is used, which is [a-z0-9_] by construction. The directory keeps
+    # the name as given.
     branch="worktree-$dir"
+    if ! wt_git "$root" check-ref-format --branch "$branch" >/dev/null 2>&1; then
+      branch="worktree-$(printf '%s' "$dir" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-')"
+      if ! wt_git "$root" check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        branch="worktree-$(wt_slugify "$name" 2>/dev/null || printf 'wt')"
+      fi
+      wt_log "\"worktree-$dir\" is not a legal branch name — using $branch"
+    fi
 
     # BEFORE ANY SIDE EFFECT. See wt_symlink_refuses: on this path Claude Code's own refusal
     # arrives too late to matter, so it has to happen here or not at all.

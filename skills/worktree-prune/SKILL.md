@@ -67,7 +67,10 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 
 Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `stale-admin` (git's
 registration of a worktree that is gone), `runtime-leftover` (a runtime allocation nothing uses),
-`ledger-junk` (a broken or abandoned ledger entry), `held` (a live worktree with work in it).
+`ledger-junk` (a broken or abandoned ledger entry), `abandoned` (a subagent worktree — `agent-<hex>` — that is
+unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
+`WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live
+worktree with work in it).
 **A kind you do not recognise — `store` is reserved for a later phase — is shown as reported, under
 its own name.** What decides whether an item can be offered is its `action`, never its kind.
 

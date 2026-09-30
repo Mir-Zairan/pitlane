@@ -585,6 +585,56 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Abandoned subagent worktrees (ADR-014)
+# ---------------------------------------------------------------------------
+# Claude Code leaves a subagent worktree that a WorktreeCreate hook made, and fires no WorktreeRemove
+# for it (measured, 2.1.286). Only an `agent-<hex>` worktree that is unlocked, holds no work and has
+# been untouched for the threshold is offered — and applying it runs the teardown hook itself.
+RB=$TMP/abandon
+make_repo "$RB"
+backdate() { find "$1" -exec touch -h -t 202001010000 {} + 2>/dev/null; }
+WAB=$(create "$RB" agent-a1b2c3)
+WRC=$(create "$RB" agent-d4e5f6)          # recent
+WDY=$(create "$RB" agent-0a0b0c)          # stale, but holds work
+WLK=$(create "$RB" agent-9f9f9f)          # stale, but locked (a running agent)
+WNM=$(create "$RB" feature-x)             # stale and clean, but not a subagent worktree
+eq 'abandoned: fixture — the seed made a database for the subagent worktree' yes "$(exists "$DB/agent_a1b2c3")"
+printf 'edited\n' >>"$WDY/app.txt"
+git -C "$RB" worktree lock "$WLK"
+for w in "$WAB" "$WDY" "$WLK" "$WNM"; do backdate "$w"; done
+prune "$RB"
+id_ab=$(field abandoned "$WAB" 1)
+eq 'abandoned: a stale, clean, unlocked subagent worktree is offered for teardown' teardown \
+  "$(field abandoned "$WAB" 5)"
+contains 'abandoned: saying why nothing else would remove it' 'fires no WorktreeRemove' "$(field abandoned "$WAB" 6)"
+eq 'abandoned: a recently touched one is not offered' '' "$(field abandoned "$WRC" 5)"
+eq 'abandoned: one holding work is held, never abandoned' 'none' "$(field held "$WDY" 5)"
+eq 'abandoned: and is not offered as abandoned' '' "$(field abandoned "$WDY" 5)"
+eq 'abandoned: a locked one is not offered' '' "$(field abandoned "$WLK" 5)"
+eq 'abandoned: a worktree not named like a subagent one is not offered' '' "$(field abandoned "$WNM" 5)"
+prune "$RB" --apply "$id_ab"
+eq 'abandoned: apply exits 0' 0 "$(cat "$TMP/rc")"
+eq 'abandoned: the worktree is gone' no "$(exists "$WAB")"
+eq 'abandoned: its seeded database was released by the teardown script' no "$(exists "$DB/agent_a1b2c3")"
+eq 'abandoned: its ledger entry is forgotten' no "$(exists "$RB/.git/worktree-ledger/agent-a1b2c3")"
+eq 'abandoned: its branch is kept' yes \
+  "$(git -C "$RB" show-ref --verify --quiet refs/heads/worktree-agent-a1b2c3 && echo yes || echo no)"
+# Re-judged at apply: a worktree that picked up work since the report is refused, and kept.
+WRJ=$(create "$RB" agent-777777)
+backdate "$WRJ"
+prune "$RB"
+id_rj=$(field abandoned "$WRJ" 1)
+printf 'late work\n' >"$WRJ/new-file.txt"
+touch -h -t 202001010000 "$WRJ/new-file.txt" "$WRJ"
+prune "$RB" --apply "$id_rj"
+eq 'abandoned: work since the report refuses the item' 1 "$(cat "$TMP/rc")"
+contains 'abandoned: refused, because discovery now lists it as held' 'refused' "$(cat "$TMP/out")"
+prune "$RB"
+eq 'abandoned: which the next report shows' 'none' "$(field held "$WRJ" 5)"
+eq 'abandoned: and the worktree is still there' yes "$(exists "$WRJ/new-file.txt")"
+git -C "$RB" worktree unlock "$WLK" 2>/dev/null
+
+# ---------------------------------------------------------------------------
 # Adoption: worktrees that predate the plugin (ADR-013)
 # ---------------------------------------------------------------------------
 # Made with plain git, set up by hand, never bootstrapped: no state file, no ledger entry. A report

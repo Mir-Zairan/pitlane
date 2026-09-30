@@ -19,6 +19,14 @@ GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 unset XDG_CONFIG_HOME
+# A corepack-managed pnpm keeps ITSELF in $HOME/.cache/node/corepack. Moving HOME makes corepack
+# think pnpm is not installed and try to download it, which fails offline and read as "pnpm cannot
+# produce a lockfile" — the long-standing failure of this suite. Only the tool's own cache is kept;
+# git and pnpm's store still see the scratch HOME.
+if [ -z "${COREPACK_HOME:-}" ] && [ -d "$HOME/.cache/node/corepack" ]; then
+  COREPACK_HOME=$HOME/.cache/node/corepack
+  export COREPACK_HOME
+fi
 HOME=$TMP/home
 mkdir -p "$HOME"
 export HOME
@@ -511,6 +519,18 @@ contains '...and the next run sees a finished dependency, not a frozen partial o
 # only the development database is the "looks right, is subtly wrong" failure the phase names: a
 # test runner that recreates its databases wholesale destroys a parallel session's test run
 # regardless of how well the dev database is separated.
+# A NAME THAT IS A LEGAL DIRECTORY BUT NOT A LEGAL BRANCH. `worktree-my fix` used to fail
+# `git worktree add -b`, so the hook printed no path and creation failed (a Phase 3 carry-over).
+RSP=$TMP/spaced
+make_repo "$RSP" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+outSP=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"my fix\",\"cwd\":\"$RSP\"}" "$RSP")
+eq 'spaced name: WorktreeCreate prints the worktree path' "$RSP/.claude/worktrees/my fix" "$outSP"
+eq 'spaced name: on a legal branch' 'worktree-my-fix' \
+  "$(git -C "$RSP/.claude/worktrees/my fix" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+contains 'spaced name: and it says which branch it used' 'using worktree-my-fix' "$(cat "$TMP/err")"
+eq 'spaced name: reopening it prints the same path' "$RSP/.claude/worktrees/my fix" \
+  "$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"my fix\",\"cwd\":\"$RSP\"}" "$RSP")"
+
 # A NESTED PROJECT WITH ITS OWN LOCKFILE — what detect.sh now proposes (Phase 6 pre-flight): its
 # dir and lock carry the directory, and its commands `cd` into it from the worktree root. The
 # engine has to be able to hardlink it and, when the lockfile differs, install it there.
