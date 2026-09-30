@@ -511,6 +511,37 @@ contains '...and the next run sees a finished dependency, not a frozen partial o
 # only the development database is the "looks right, is subtly wrong" failure the phase names: a
 # test runner that recreates its databases wholesale destroys a parallel session's test run
 # regardless of how well the dev database is separated.
+# A NESTED PROJECT WITH ITS OWN LOCKFILE — what detect.sh now proposes (Phase 6 pre-flight): its
+# dir and lock carry the directory, and its commands `cd` into it from the worktree root. The
+# engine has to be able to hardlink it and, when the lockfile differs, install it there.
+RN=$TMP/nested
+make_repo "$RN" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"},
+  {"dir":"tools/lint/vendor","lock":"tools/lint/composer.lock","strategy":"hardlink",
+   "install":"cd '"'"'tools/lint'"'"' && mkdir -p vendor && printf installed > vendor/autoload.php",
+   "verify":"cd '"'"'tools/lint'"'"' && test -r vendor/autoload.php"}'
+mkdir -p "$RN/tools/lint/vendor"
+printf 'NESTEDLOCK\n' > "$RN/tools/lint/composer.lock"
+printf '{}\n' > "$RN/tools/lint/composer.json"
+printf 'from-main\n' > "$RN/tools/lint/vendor/autoload.php"
+git -C "$RN" add tools/lint/composer.lock tools/lint/composer.json; git -C "$RN" commit -qm nested
+WN1=$RN/.claude/worktrees/n1
+git -C "$RN" worktree add -q "$WN1" -b worktree-n1 2>/dev/null
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WN1\"}" "$WN1" >/dev/null
+eq 'nested: the nested tree is hardlinked from the main checkout' 'from-main' \
+  "$(cat "$WN1/tools/lint/vendor/autoload.php" 2>/dev/null)"
+# shellcheck disable=SC2012  # ls -ld for the link count, portable where stat -c is not
+eq 'nested: a hardlink, not a copy' 2 \
+  "$(ls -ld "$RN/tools/lint/vendor/autoload.php" | awk '{print $2}')"
+# A branch that changes the nested lockfile installs it instead, from its own directory.
+WN2=$RN/.claude/worktrees/n2
+git -C "$RN" worktree add -q "$WN2" -b worktree-n2 2>/dev/null
+printf 'CHANGED\n' > "$WN2/tools/lint/composer.lock"
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WN2\"}" "$WN2" >/dev/null
+eq 'nested: a changed nested lockfile installs in its own directory' 'installed' \
+  "$(cat "$WN2/tools/lint/vendor/autoload.php" 2>/dev/null)"
+eq 'nested: and nothing was installed at the root by mistake' 0 \
+  "$([ -e "$WN2/vendor/autoload.php" ] && echo 1 || echo 0)"
+
 make_rt_repo() {  # $1 = dir, $2 = extra runtime JSON keys
   local dir=$1 extra=${2-}
   mkdir -p "$dir/.claude"

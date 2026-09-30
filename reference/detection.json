@@ -39,7 +39,7 @@
     "NO TAB CHARACTERS ANYWHERE IN THIS FILE'S VALUES. detect.sh emits tab-separated records, and it",
     "strips tabs defensively, but a tab here would be a silent field split at the source."
   ],
-  "detectionVersion": 1,
+  "detectionVersion": 2,
   "_comment_sameDirPolicy": [
     "Several markers can resolve to the same `dir` — a repo mid-migration with both pnpm-lock.yaml and",
     "package-lock.json, or both bun.lock and bun.lockb, all claim node_modules. Two profile entries for",
@@ -562,7 +562,36 @@
       "compose.yml",
       "compose.yaml"
     ],
-    "neverHintPattern": "(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SALT|CERT|DSN_PASS|AUTH)"
+    "neverHintPattern": "(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SALT|CERT|DSN_PASS|AUTH)",
+    "_comment_assignSources": [
+      "Files where a repo's own COMMANDS are written down — agent guides, READMEs, task runners, manifests.",
+      "A `NAME=value command` prefix here, for a variable that is also a port or database hint, sets the",
+      "variable in the PROCESS environment, which beats every dotenv file — so a session following the repo's",
+      "own instructions inside a worktree would bypass the plugin's overrides and hit the shared state. Found",
+      "on a real repository whose every database command was documented with the tenant pinned inline.",
+      "Reported as `assign` records for the skill to raise; never acted on."
+    ],
+    "assignSources": [
+      "AGENTS.md",
+      "CLAUDE.md",
+      "README.md",
+      "CONTRIBUTING.md",
+      "docs/README.md",
+      "Makefile",
+      "justfile",
+      "Taskfile.yml",
+      "package.json",
+      "composer.json"
+    ],
+    "_comment_pluginPaths": [
+      "Paths the plugin itself may create INSIDE a checkout. Each must be gitignored: an untracked file",
+      "there is work to the teardown guard (ADR-011), so the worktree would never be torn down, and a",
+      "committed opt-out marker would switch layer 3 off for the whole team. Reported as `ignore` records."
+    ],
+    "pluginPaths": [
+      ".claude/worktrees/",
+      ".claude/worktree-no-runtime"
+    ]
   },
   "chainMaxDepth": 5,
   "_comment_chainMaxDepth": [

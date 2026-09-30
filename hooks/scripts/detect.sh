@@ -36,6 +36,8 @@
 #   shellWarn        <warning>                  (only when the matched rule carries one)
 #   probe            <tool>  ok|fail|timeout  <version line, or why it did not run>
 #   dep              <n> <dir> <lock> <strategy> <install> <verify>
+#                    (a NESTED project's dir and lock carry its directory, and its commands
+#                    start with `cd '<dir>' &&` — they run from the worktree root like the rest)
 #   depReason        <n> <why this strategy>
 #   depNote          <n> <caveat worth reading>
 #   depDowngrade     <n> <from> <to> <why>
@@ -47,6 +49,11 @@
 #   corroborate      <n> <file> <what it independently confirms>
 #   config           <repo-relative path>
 #   hint             port|db|service <name> <where it was seen>
+#   compose          <file> explicit:<name>|env|directory <published host ports>
+#                    (`directory`: each worktree gets its own stack, and its host ports collide)
+#   assign           <name> <file> <count> <first line:text>   (an inline NAME=value for a hinted
+#                    variable: it beats every env file, so it bypasses the overrides)
+#   ignore           <path> ok|missing           (a path the plugin creates in a checkout)
 #   warn             <message>
 #
 # WT_SKIP_PROBES=1 skips the toolchain version probes. They are the only part of detection
@@ -452,112 +459,227 @@ claimed() {  # $1 = list, $2 = needle
   return 1
 }
 
-while IFS=$WT_US read -r -d "$WT_RS" \
-      d_markers d_dir d_strategy d_install d_verify d_reason d_hazards \
-      d_when d_requires d_fallback d_notes; do
-
-  marker=''
-  while IFS= read -r m; do
-    [ -n "$m" ] || continue
-    [ -e "$ROOT/$m" ] || continue
-    claimed "$CLAIMED_MARKERS" "$m" && continue
-    marker=$m
-    break
-  done < <(json_array_items "$d_markers")
-  [ -n "$marker" ] || continue
-
-  # A guarded rule — Yarn Berry — only applies when its witness file is present. It sits
-  # before the classic rule, so a Berry repo takes it and a classic repo falls through.
-  if [ -n "$d_when" ] && [ ! -e "$ROOT/$d_when" ]; then
-    continue
-  fi
-
-  # At most one entry per target directory. Two rules claiming node_modules with opposite
-  # strategies would make bootstrap hardlink a tree and then reinstall over it.
-  if [ -n "$d_dir" ] && claimed "$CLAIMED_DIRS" "$d_dir"; then
-    emit dropped "$marker" "$d_dir" \
-      "another lockfile already claims $d_dir; two entries for one directory would conflict, so this repo appears to have more than one live lockfile for it"
-    CLAIMED_MARKERS="$CLAIMED_MARKERS$marker "
-    continue
-  fi
-
-  strategy=$d_strategy
-  # `hardlink` only means anything when the directory really exists here. For poetry, pipenv
-  # and bundler an in-project directory is OPT-IN rather than the default, so proposing
-  # hardlink unconditionally would name a directory that is not there.
-  if [ "$d_requires" = true ] && [ -n "$d_dir" ] && [ ! -d "$ROOT/$d_dir" ]; then
-    fallback=${d_fallback:-install}
-    emit depDowngrade "$N" "$d_strategy" "$fallback" \
-      "$d_dir does not exist in this checkout, so there is nothing to hardlink — this tool only creates it in-project when explicitly configured to"
-    strategy=$fallback
-  fi
-
-  CLAIMED_MARKERS="$CLAIMED_MARKERS$marker "
-  [ -n "$d_dir" ] && CLAIMED_DIRS="$CLAIMED_DIRS$d_dir "
-  MATCHED_MARKERS="$MATCHED_MARKERS$marker "
-
-  # Hazards are applied to the install command BEFORE it is emitted, so what the developer
-  # sees proposed is what would actually run.
-  install=$d_install
-  while IFS= read -r hid; do
-    [ -n "$hid" ] || continue
-    h_manifest='' h_probes='' h_action='' h_flag='' h_why=''
-    while IFS=$WT_US read -r -d "$WT_RS" x_id x_manifest x_probes x_action x_flag x_why; do
-      [ "$x_id" = "$hid" ] || continue
-      h_manifest=$x_manifest; h_probes=$x_probes; h_action=$x_action
-      h_flag=$x_flag; h_why=$x_why
+# One pass of the dependency rules over the directory $1 — '' for the repository root, or a
+# repo-relative directory ending in `/` for a nested project with its own lockfile. Every path the
+# rules name is taken relative to it, so a nested composer project is judged exactly as the root one
+# is: same strategy, same hazards, same escalations.
+detect_deps_in() {  # $1 = directory prefix
+  local pre=${1-} d_markers d_dir d_strategy d_install d_verify d_reason d_hazards d_when d_requires
+  local d_fallback d_notes marker m strategy fallback install verify hid h_manifest h_probes h_action
+  local h_flag h_why x_id x_manifest x_probes x_action x_flag x_why hit probed pkey
+  while IFS=$WT_US read -r -d "$WT_RS" \
+        d_markers d_dir d_strategy d_install d_verify d_reason d_hazards \
+        d_when d_requires d_fallback d_notes; do
+  
+    marker=''
+    while IFS= read -r m; do
+      [ -n "$m" ] || continue
+      [ -e "$ROOT/$pre$m" ] || continue
+      claimed "$CLAIMED_MARKERS" "$pre$m" && continue
+      marker=$m
       break
-    done < <(wt_json_records hazards id manifest probes action neutralise reason <"$WT_DETECTION_JSON")
-    [ -n "$h_action" ] || continue
-    [ -n "$h_manifest" ] && [ ! -e "$ROOT/$h_manifest" ] && continue
-
-    # EVERY probe key, not one. `composer install` fires pre-install-cmd,
-    # post-install-cmd, post-autoload-dump and the post-package-* hooks, and a framework repo
-    # conventionally hangs its migration off post-autoload-dump — so probing a single key
-    # reported such a repo as clean and proposed a plain install that would migrate the
-    # shared database.
-    # An EMPTY probes list means "this hazard needs no probing" — its mere manifest being
-    # present is the finding, which is how a Rakefile-based rule works. Requiring a probe hit
-    # unconditionally dropped such a rule entirely, so it was unreachable and the developer was
-    # never told the install command may wrap a schema load.
-    hit=0 probed=0
-    while IFS= read -r pkey; do
-      [ -n "$pkey" ] || continue
-      probed=1
-      [ -n "$h_manifest" ] || continue
-      resolve_chain "$ROOT/$h_manifest" "$pkey" || continue
-      [ -n "$CHAIN_TEXT" ] || continue
-      hit=1
-      emit hazardChain "$N" "$pkey: $CHAIN_TEXT"
-      check_escalations "$N" "$hid" "$CHAIN_TEXT"
-    done < <(json_array_items "$h_probes")
-    if [ "$probed" = 1 ] && [ "$hit" = 0 ]; then
-      # Keys were probed and none of them exist in this manifest: nothing to report.
+    done < <(json_array_items "$d_markers")
+    [ -n "$marker" ] || continue
+  
+    # A guarded rule — Yarn Berry — only applies when its witness file is present. It sits
+    # before the classic rule, so a Berry repo takes it and a classic repo falls through.
+    if [ -n "$d_when" ] && [ ! -e "$ROOT/$pre$d_when" ]; then
       continue
     fi
+  
+    # A NESTED lockfile is proposed only on evidence that someone installs it there: its
+    # directory exists in this checkout AND is gitignored, so a fresh worktree would lack it. A
+    # tracked lockfile with no installed tree beside it is usually a test fixture, and a committed
+    # dependency directory needs nothing from the plugin. Rules that populate a shared cache
+    # outside the project (no `dir`) have nothing nested to provide.
+    if [ -n "$pre" ]; then
+      [ -n "$d_dir" ] || continue
+      if [ ! -d "$ROOT/$pre$d_dir" ]; then
+        NESTED_SKIPPED=$((NESTED_SKIPPED + 1))
+        [ "$NESTED_SKIPPED" -le "$WT_NESTED_REPORT_MAX" ] && emit dropped "$pre$marker" "$pre$d_dir" \
+          "a nested lockfile, but $pre$d_dir is not installed in this checkout — a fixture, or a tree nobody installs; not proposed"
+        CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
+        continue
+      fi
+      # A JS WORKSPACE MEMBER is the root install's, even with a stray lockfile of its own: the root
+      # install creates its node_modules, so a second entry would install over the root's tree —
+      # the conflicting-owner case CLAIMED_DIRS exists to prevent. Which directories a workspace
+      # covers is a glob list; rather than evaluate it, any nested JS tree in a repo that declares a
+      # workspace is dropped, with the reason, for the developer to overrule.
+      case ${d_dir##*/} in
+        node_modules | cache)
+          if [ "$JS_WORKSPACE" = 1 ]; then
+            emit dropped "$pre$marker" "$pre$d_dir" \
+              "the repository declares a JS workspace, whose root install may already populate $pre$d_dir — not proposed; add it by hand if it really is a separate project"
+            CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
+            continue
+          fi
+          ;;
+      esac
+      if ! wt_git "$ROOT" check-ignore -q -- "$pre$d_dir" 2>/dev/null; then
+        emit dropped "$pre$marker" "$pre$d_dir" \
+          "a nested lockfile whose $pre$d_dir is not gitignored — it arrives with the checkout, so there is nothing to provide"
+        CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
+        continue
+      fi
+    fi
+  
+    # At most one entry per target directory. Two rules claiming node_modules with opposite
+    # strategies would make bootstrap hardlink a tree and then reinstall over it.
+    if [ -n "$d_dir" ] && claimed "$CLAIMED_DIRS" "$pre$d_dir"; then
+      emit dropped "$pre$marker" "$pre$d_dir" \
+        "another lockfile already claims $pre$d_dir; two entries for one directory would conflict, so this repo appears to have more than one live lockfile for it"
+      CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
+      continue
+    fi
+  
+    strategy=$d_strategy
+    # `hardlink` only means anything when the directory really exists here. For poetry, pipenv
+    # and bundler an in-project directory is OPT-IN rather than the default, so proposing
+    # hardlink unconditionally would name a directory that is not there.
+    if [ "$d_requires" = true ] && [ -n "$d_dir" ] && [ ! -d "$ROOT/$pre$d_dir" ]; then
+      fallback=${d_fallback:-install}
+      emit depDowngrade "$N" "$d_strategy" "$fallback" \
+        "$d_dir does not exist in this checkout, so there is nothing to hardlink — this tool only creates it in-project when explicitly configured to"
+      strategy=$fallback
+    fi
+  
+    CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
+    [ -n "$d_dir" ] && CLAIMED_DIRS="$CLAIMED_DIRS$pre$d_dir "
+    # The toolchain probes key on the BARE marker, so a tool whose only lockfile is nested is still
+    # probed — an install that fails in every worktree must not go unwarned just because it is not at
+    # the root. The probe loop runs each tool once however many entries matched it.
+    claimed "$MATCHED_MARKERS" "$marker" || MATCHED_MARKERS="$MATCHED_MARKERS$marker "
+  
+    # Hazards are applied to the install command BEFORE it is emitted, so what the developer
+    # sees proposed is what would actually run.
+    install=$d_install
+    while IFS= read -r hid; do
+      [ -n "$hid" ] || continue
+      h_manifest='' h_probes='' h_action='' h_flag='' h_why=''
+      while IFS=$WT_US read -r -d "$WT_RS" x_id x_manifest x_probes x_action x_flag x_why; do
+        [ "$x_id" = "$hid" ] || continue
+        h_manifest=$x_manifest; h_probes=$x_probes; h_action=$x_action
+        h_flag=$x_flag; h_why=$x_why
+        break
+      done < <(wt_json_records hazards id manifest probes action neutralise reason <"$WT_DETECTION_JSON")
+      [ -n "$h_action" ] || continue
+      [ -n "$h_manifest" ] && h_manifest=$pre$h_manifest
+      [ -n "$h_manifest" ] && [ ! -e "$ROOT/$h_manifest" ] && continue
+  
+      # EVERY probe key, not one. `composer install` fires pre-install-cmd,
+      # post-install-cmd, post-autoload-dump and the post-package-* hooks, and a framework repo
+      # conventionally hangs its migration off post-autoload-dump — so probing a single key
+      # reported such a repo as clean and proposed a plain install that would migrate the
+      # shared database.
+      # An EMPTY probes list means "this hazard needs no probing" — its mere manifest being
+      # present is the finding, which is how a Rakefile-based rule works. Requiring a probe hit
+      # unconditionally dropped such a rule entirely, so it was unreachable and the developer was
+      # never told the install command may wrap a schema load.
+      hit=0 probed=0
+      while IFS= read -r pkey; do
+        [ -n "$pkey" ] || continue
+        probed=1
+        [ -n "$h_manifest" ] || continue
+        resolve_chain "$ROOT/$h_manifest" "$pkey" || continue
+        [ -n "$CHAIN_TEXT" ] || continue
+        hit=1
+        emit hazardChain "$N" "$pkey: $CHAIN_TEXT"
+        check_escalations "$N" "$hid" "$CHAIN_TEXT"
+      done < <(json_array_items "$h_probes")
+      if [ "$probed" = 1 ] && [ "$hit" = 0 ]; then
+        # Keys were probed and none of them exist in this manifest: nothing to report.
+        continue
+      fi
+  
+      case $h_action in
+        neutralise)
+          if [ -n "$h_flag" ]; then
+            case " $install " in
+              *" $h_flag "*) ;;
+              *) install="$install $h_flag" ;;
+            esac
+          fi
+          emit hazard "$N" "$hid" neutralise "$h_flag" "$h_why"
+          ;;
+        *) emit hazard "$N" "$hid" "$h_action" "$h_flag" "$h_why" ;;
+      esac
+    done < <(json_array_items "$d_hazards")
+  
+    # A nested entry's commands run from the worktree ROOT, like every other entry's, so they are
+    # prefixed with a `cd` into their own directory. The prefix passed a conservative character set
+    # before it got here, so single-quoting it is exact.
+    verify=$d_verify
+    if [ -n "$pre" ]; then
+      install="cd '${pre%/}' && $install"
+      [ -n "$verify" ] && verify="cd '${pre%/}' && $verify"
+    fi
+    emit dep "$N" "$pre$d_dir" "$pre$marker" "$strategy" "$install" "$verify"
+    emit depReason "$N" "$d_reason"
+    [ -n "$d_notes" ] && emit depNote "$N" "$d_notes"
+    if [ -n "$pre" ]; then
+      emit depNote "$N" "nested: ${pre%/} has its own lockfile and an installed, gitignored $d_dir, so a root install does not provide it"
+    else
+      # Corroboration cites CI lines that invoke the ROOT install; a nested project's install line
+      # would be credited with the root's flags.
+      corroborate "$N" "$install"
+    fi
+  
+    N=$((N + 1))
+  done < <(wt_json_records deps markers dir strategy install verify reason hazards \
+           when.exists requiresDir fallbackStrategy notes <"$WT_DETECTION_JSON")
+}
 
-    case $h_action in
-      neutralise)
-        if [ -n "$h_flag" ]; then
-          case " $install " in
-            *" $h_flag "*) ;;
-            *) install="$install $h_flag" ;;
-          esac
-        fi
-        emit hazard "$N" "$hid" neutralise "$h_flag" "$h_why"
+detect_deps_in ''
+
+# ---------------------------------------------------------------------------
+# Nested projects with their own lockfile
+# ---------------------------------------------------------------------------
+# Detection used to match root markers only, on the assumption that a root install populates the
+# nested trees. That holds for a workspace — one root lockfile, installed once — and fails for a
+# nested project that keeps its OWN lockfile outside any workspace, which a root install does not
+# touch (a tool-per-
+# directory composer layout, a sub-project with its own package-lock). Such projects are found
+# through `git ls-files`, so an ignored tree — a node_modules full of other people's lockfiles —
+# is never walked and an untracked scratch directory is never proposed.
+
+WT_NESTED_MAX=${WT_NESTED_MAX:-32}
+JS_WORKSPACE=0
+if [ -e "$ROOT/pnpm-workspace.yaml" ] || grep -qs '"workspaces"[[:space:]]*:' "$ROOT/package.json"; then
+  JS_WORKSPACE=1
+fi
+WT_NESTED_REPORT_MAX=10
+NESTED_SKIPPED=0
+if [ "$IS_GIT" = 1 ]; then
+  ALL_MARKERS=' '
+  while IFS=$WT_US read -r -d "$WT_RS" d_markers; do
+    while IFS= read -r m; do
+      [ -n "$m" ] && ALL_MARKERS="$ALL_MARKERS$m "
+    done < <(json_array_items "$d_markers")
+  done < <(wt_json_records deps markers <"$WT_DETECTION_JSON")
+  nested=0
+  while IFS= read -r pre; do
+    [ -n "$pre" ] || continue
+    nested=$((nested + 1))
+    if [ "$nested" -gt "$WT_NESTED_MAX" ]; then
+      warn "more than $WT_NESTED_MAX nested directories carry their own lockfile — only the first $WT_NESTED_MAX were considered; list any others in deps[] by hand"
+      break
+    fi
+    case $pre in
+      -* | *[!A-Za-z0-9._/@+-]*)
+        warn "the nested lockfile directory \"$pre\" has characters this detection will not put in a command — add it to deps[] by hand if it needs installing"
+        continue
         ;;
-      *) emit hazard "$N" "$hid" "$h_action" "$h_flag" "$h_why" ;;
     esac
-  done < <(json_array_items "$d_hazards")
-
-  emit dep "$N" "$d_dir" "$marker" "$strategy" "$install" "$d_verify"
-  emit depReason "$N" "$d_reason"
-  [ -n "$d_notes" ] && emit depNote "$N" "$d_notes"
-  corroborate "$N" "$install"
-
-  N=$((N + 1))
-done < <(wt_json_records deps markers dir strategy install verify reason hazards \
-         when.exists requiresDir fallbackStrategy notes <"$WT_DETECTION_JSON")
+    detect_deps_in "$pre/"
+  done < <(wt_git "$ROOT" ls-files -z 2>/dev/null | tr '\0' '\n' | while IFS= read -r f; do
+             case $f in */*) ;; *) continue ;; esac
+             claimed "$ALL_MARKERS" "${f##*/}" && printf '%s\n' "${f%/*}"
+           done | LC_ALL=C sort -u)
+  if [ "$NESTED_SKIPPED" -gt "$WT_NESTED_REPORT_MAX" ]; then
+    warn "$NESTED_SKIPPED nested lockfiles have no installed tree beside them (fixtures, most likely); only the first $WT_NESTED_REPORT_MAX are listed"
+  fi
+fi
 
 if [ "$N" = 0 ]; then
   warn "no dependency lockfile recognised in $ROOT — the profile will have no deps[], which is valid"
@@ -681,10 +803,12 @@ scan_hints() {  # $1 = kind, $2 = ERE, $3 = dotted path to the source list
         continue
       fi
       emit hint "$kind" "$name" "$f"
+      claimed "$HINT_NAMES" "$name" || HINT_NAMES="$HINT_NAMES$name "
     done < <(grep -ohE "$pat" "$ROOT/$f" 2>/dev/null | sort -u)
   done < <(json_array_items "$(wt_json_get "$listpath" <"$WT_DETECTION_JSON")")
 }
 
+HINT_NAMES=' '
 scan_hints port "$(wt_json_get runtimeHints.portVarPattern <"$WT_DETECTION_JSON")" runtimeHints.portSources
 scan_hints db   "$(wt_json_get runtimeHints.dbVarPattern   <"$WT_DETECTION_JSON")" runtimeHints.portSources
 
@@ -696,6 +820,80 @@ while IFS= read -r f; do
     [ -n "$svc" ] || continue
     emit hint service "$svc" "$f"
   done < <(sed -n 's/^  \([a-zA-Z0-9_.-]*\):[[:space:]]*$/\1/p' "$ROOT/$f" 2>/dev/null | sort -u)
+
+  # WHAT NAMES THIS STACK, which decides whether two worktrees share it. With no top-level `name:`
+  # and no COMPOSE_PROJECT_NAME, compose names the project after the DIRECTORY — so each worktree
+  # starts a stack of its own, and every published host port collides with the main checkout's.
+  # Whether that is wanted is the developer's call; this only says which case applies. The .env
+  # files are asked only whether the variable is SET, never for its value.
+  # Compose reads its own settings from the .env beside the compose file (or --env-file) and from
+  # nothing else — not .env.local — so only that file is asked. A `name:` that interpolates a
+  # variable is controllable from the environment, not fixed, so it reads as `env` too.
+  cname=$(sed -n 's/^name:[[:space:]]*\([^#]*\).*/\1/p' "$ROOT/$f" 2>/dev/null | head -1)
+  cname=$(printf '%s' "$cname" | sed 's/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')
+  fdir=$(dirname "$ROOT/$f")
+  # SC2016: the `${` is a literal compose interpolation being looked for, not shell expansion.
+  # shellcheck disable=SC2016
+  case $cname in
+    *'${'*) project='env' ;;
+    ?*) project="explicit:$cname" ;;
+    *)
+      if grep -qsE '^[[:space:]]*(export[[:space:]]+)?COMPOSE_PROJECT_NAME=' "$fdir/.env"; then
+        project='env'
+      else
+        project='directory'
+      fi
+      ;;
+  esac
+  # PUBLISHED HOST PORTS, counted only inside a `ports:` block — an environment entry like
+  # `- REDIS_URL=redis://cache:6379` also ends in `:<digits>` and publishes nothing. Short syntax
+  # counts an item that names a host side (`"8080:8080"`, `"127.0.0.1:${APP_PORT:-8080}:8080"`;
+  # a bare `"3000"` gets a random host port and cannot collide); long syntax counts `published:`.
+  published=$(awk '
+    function indent(l) { match(l, /^[ ]*/); return RLENGTH }
+    /^[ ]*#/ || /^[ ]*$/ { next }
+    inblock && indent($0) <= bindent { inblock = 0 }
+    /^[ ]*ports:[ ]*$/ { inblock = 1; bindent = indent($0); next }
+    inblock && /^[ ]*-[ ]*"?[^"# ]*[0-9}]:[0-9]+(\/[a-z]+)?"?[ ]*(#.*)?$/ && $0 !~ /=/ { n++ ; next }
+    inblock && /^[ ]*(- )?published:/ { n++ }
+    END { print n + 0 }' "$ROOT/$f" 2>/dev/null)
+  emit compose "$f" "$project" "${published:-0}"
 done < <(json_array_items "$(wt_json_get runtimeHints.serviceSources <"$WT_DETECTION_JSON")")
+
+# ---------------------------------------------------------------------------
+# Inline assignments that would bypass the overrides
+# ---------------------------------------------------------------------------
+# A `NAME=value` written into the repo's own commands — its agent guide, README, Makefile, manifest
+# scripts — sets NAME in the PROCESS environment, which beats every dotenv file the plugin writes
+# into. A session that follows those instructions inside a worktree then runs against whatever the
+# instructions pinned, usually the shared state. Only names already offered as a port or database
+# hint are looked for, so this reports on the variables calibration is about to ask about and on
+# nothing else. One record per name and file: how often, and the first place it appears.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$ROOT/$f" ] || continue
+  for name in $HINT_NAMES; do
+    hits=$(grep -nE "(^|[^A-Za-z0-9_])$name=[^[:space:]=]" "$ROOT/$f" 2>/dev/null) || continue
+    count=$(printf '%s\n' "$hits" | grep -c .)
+    first=$(printf '%s\n' "$hits" | head -1 | cut -c1-160)
+    emit assign "$name" "$f" "$count" "$first"
+  done
+done < <(json_array_items "$(wt_json_get runtimeHints.assignSources <"$WT_DETECTION_JSON")")
+
+# ---------------------------------------------------------------------------
+# The plugin's own paths inside a checkout
+# ---------------------------------------------------------------------------
+# Each must be gitignored. An untracked one is work to the teardown guard, so the worktree it sits
+# in is never torn down; a committed opt-out marker turns layer 3 off for everyone.
+if [ "$IS_GIT" = 1 ]; then
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if wt_git "$ROOT" check-ignore -q -- "$p" 2>/dev/null; then
+      emit ignore "$p" ok
+    else
+      emit ignore "$p" missing
+    fi
+  done < <(json_array_items "$(wt_json_get runtimeHints.pluginPaths <"$WT_DETECTION_JSON")")
+fi
 
 exit 0

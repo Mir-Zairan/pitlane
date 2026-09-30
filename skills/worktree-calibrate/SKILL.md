@@ -50,7 +50,7 @@ human-readable companion to the table the script used.
 | `shell` `shellArgs` `shellMarker` `shellReason` | The toolchain wrapper. Present with its reason. |
 | `shellWarn` | Show it. It means installs would run somewhere the repo does not expect. |
 | `probe` | `ok` = the wrapper works. `fail` = show it prominently. `timeout` = **inconclusive**, not a failure; say so. |
-| `dep` `depReason` | One proposed dependency entry and why that strategy. |
+| `dep` `depReason` | One proposed dependency entry and why that strategy. A **nested** entry (its `dir` has a directory in front, its commands start `cd '<dir>' &&`, and a `depNote` says `nested:`) is a sub-project with its own lockfile, outside any JS workspace, that a root install does not populate. Present it as its own entry; the developer may know it is not needed in a worktree. (A nested JS tree in a repo that declares a workspace comes back as `dropped` instead — the root install may own it.) |
 | `depNote` | A caveat about this ecosystem. Worth showing. |
 | `depDowngrade` | The strategy changed because a directory is not there. Show the reason. |
 | `dropped` | A lockfile was NOT used. Always surface this — two live lockfiles for one directory is usually a mistake the developer wants to know about. |
@@ -61,6 +61,9 @@ human-readable companion to the table the script used.
 | `corroborate` | The repo already answers this elsewhere. Cite it — it is evidence, not decoration. |
 | `config` | Gitignored config a fresh checkout would miss. |
 | `hint` | Layer-3 candidates. **Hints beside a question, never defaults.** |
+| `compose` | What names each compose project, and how many host ports it publishes. Raise it in step 5. |
+| `assign` | A `NAME=value` for a hinted variable in the repo's own docs or scripts — *possibly* an inline pin. Read the line: a command prefix, an `export`, or a `-e NAME=…` passed to a container sets the process environment and beats every env file; a code block showing `.env` contents does not. Raise the real ones in step 5 and in the agent note. |
+| `ignore` | Whether a path the plugin creates in a checkout is gitignored. `missing` — offer the `.gitignore` line in step 4. |
 | `warn` | Show it. |
 
 If detection exits non-zero it could not run at all — no such directory, no detection table, no
@@ -138,6 +141,13 @@ repeating if a developer asks you to add one:
 The separate rule, which is about the profile and not about `.worktreeinclude`, is that no secret
 *value* may be written into the committed profile.
 
+**The plugin's own paths must be gitignored.** For every `ignore … missing` record, offer the line
+for the repo's `.gitignore`. Say why, because it is not obvious: an untracked file inside a worktree
+is *work* to the teardown guard, so a worktree holding an unignored `.claude/worktree-no-runtime`
+is never torn down; committed, that marker switches layer 3 off for the whole team. The same goes for
+every `runtime.env.file` chosen in step 5 — check each with `git check-ignore` before writing the
+profile; the engine refuses to write one that is not ignored.
+
 ## 5 — Layer 3: ask, with `AskUserQuestion`
 
 This is the part that needs a human, and the part where being wrong is worst.
@@ -149,8 +159,16 @@ genuinely is not, and `no runtime isolation` is the right answer.
 Then, only if they want isolation, ask what identifies the collidable state — using `hint` records
 as **options to choose from, never as pre-filled defaults**. Ask about:
 
-- **the environment variable that selects the database**, if there is one;
-- **the port variable**, a sensible base to derive from, and how wide a span to spread across;
+- **the environment variable that selects the database**, if there is one — and then **whether that
+  variable also names something the app keys behaviour on**: a tenant whose configuration, feature
+  flags or group membership are looked up by that name. Overriding such a variable moves the storage
+  *and* changes who the app thinks it is. If there is a narrower knob that moves only the storage (a
+  database-name variable the app honours), prefer it. If there is none, say so plainly: the repo may
+  need a small change of its own to honour one, and that change is the developer's, not yours;
+- **the port variable, and how the dev server actually takes its port** — a variable the app reads,
+  a command-line flag, or a compose port mapping. A variable nothing reads isolates nothing. When it
+  is a flag, the variable only helps if the start command uses it, so record that command for the
+  agent note below. Then a sensible base to derive from, and how wide a span to spread across;
 - **which env files the app actually loads, per environment** — these become `runtime.env.file`, a
   path or a list of paths ([ADR-012](../../docs/01-decisions.md#adr-012)), and nothing else can
   supply them: the engine has nowhere to write the overrides without them. Find out from the app's
@@ -163,6 +181,20 @@ as **options to choose from, never as pre-filled defaults**. Ask about:
   the app's dotenv parser must honour the **last** assignment of a variable, and nothing the app
   runs may set the same variable in the **process** environment first — a `VAR=value` prefix in the
   repo's own docs or scripts beats every file;
+- **whether worktrees share the compose stack**, when there is a `compose` record. `explicit:` means
+  every worktree drives the *same* containers — a `compose up` in one rebuilds them with that
+  worktree's bind mounts, under the main checkout's feet. `directory` means each worktree starts its
+  own stack, and every published host port collides with the main checkout's. `env` means
+  `COMPOSE_PROJECT_NAME` is set in `.env`. Ask which is wanted. Be accurate about what the plugin can
+  do: compose reads its own settings only from the project directory's `.env` (or `--env-file`), so
+  if that file is tracked the plugin cannot set `COMPOSE_PROJECT_NAME` for it, and a per-worktree
+  stack needs the start command to pass `-p`. Sharing one database server between worktrees is
+  normal — isolation is then the seed's job, one database per slug;
+- **the `assign` records for the variables chosen above.** Read each line before claiming anything:
+  when the repo's own instructions pin the variable as a command prefix, an `export` or a value
+  passed into a container, that sets it in the process environment and beats every env file — so a
+  session following them inside a worktree runs against the shared state. The fix is in the agent
+  note below, not in the profile;
 - **whether a seed step is needed** — does a fresh database need populating before the app runs?
 - **whether a teardown step is needed** — see the rule about it below.
 
@@ -247,6 +279,27 @@ get hardlinked and which get installed, what shell that runs inside, roughly how
 bootstrap will take, and what — if anything — will be isolated. Recommend committing the profile: it
 is meant to be shared, so a teammate who installs the plugin gets a working setup with no
 calibration run of their own ([ADR-008](../../docs/01-decisions.md#adr-008)).
+
+### Propose a note for the repo's agent instructions
+
+A session cannot tell a bootstrapped worktree from a bare one — the hooks print nothing into its
+context by design — so without being told it reinstalls dependencies, re-clones the database and
+hunts for a port out of habit. Offer a short section for the repo's `CLAUDE.md` (or `AGENTS.md`, if
+`CLAUDE.md` only imports it), **filled from the profile you just wrote**, and write it only if the
+developer confirms. Neutral wording; nothing about this plugin's internals. It says:
+
+- worktrees under `.claude/worktrees/` arrive bootstrapped: name the dependency directories that are
+  provided, and say not to reinstall them or re-seed;
+- the env files named in `runtime.env.file` already point this worktree at its own database and
+  port — and, from every `assign` record, which documented commands pin a variable inline and must
+  be run **without** that prefix inside a worktree;
+- how to start the dev server on the worktree's port, when the port is taken by a flag;
+- to make another worktree, use `EnterWorktree` or a subagent with `isolation: "worktree"` — not a
+  raw `git worktree add` from inside a session, which no hook sees. The exception is checking out an
+  *existing* branch, which neither can do: `git worktree add` it, then start a new session inside it.
+
+If there is no `runtime` block, leave out the database and port lines rather than writing them as
+"not isolated" — say that in the confirmation instead.
 
 ## What you must not do
 

@@ -87,10 +87,19 @@ into an array. Ordering plus a guard expresses the same thing with no nesting.
 - **`Cargo.lock` gets `dir: null`, not `dir: target`.** `install` is documented as the command that
   populates `dir`, and `cargo fetch` populates `CARGO_HOME`, not `target/`. Naming a directory the
   entry then skips would be a claim it doesn't honour. Nothing per-project is managed for Rust.
-- **Nested workspaces are not detected.** Only root-level markers are matched. A pnpm workspace with
-  `assets/node_modules` gets one entry for the root; the nested trees are the root install's business.
-  This is a known limitation, not an oversight — recording every nested `node_modules` would make the
-  profile a mirror of the workspace layout, which the workspace tool already owns.
+- **A workspace is one entry; a nested project with its own lockfile is its own entry.** A pnpm (or
+  npm, yarn, bun) workspace has one root lockfile, and its members' `node_modules` are the root
+  install's business — recording each would make the profile a mirror of the workspace layout. A
+  nested directory that keeps its **own** lockfile is different: no root install touches it (a
+  tool-per-directory composer layout is the common case). Since detection version 2 such directories
+  are found through `git ls-files` — so ignored trees are never walked and untracked scratch is never
+  proposed — and each is judged by the same rules as the root: strategy, hazards from its own
+  manifest, escalations. It is proposed only when its dependency directory **exists and is
+  gitignored** in the checkout, which is the evidence that somebody installs it there; a tracked
+  lockfile without an installed tree is usually a test fixture and is reported as `dropped`. Its
+  commands begin `cd '<dir>' &&`, because every entry's commands run from the worktree root. At most
+  32 directories are considered, and one whose name has characters outside a conservative set is
+  warned about rather than put in a command.
 
 ## The toolchain shell
 
@@ -308,6 +317,22 @@ The reason is [ADR-006](../docs/01-decisions.md#adr-006), and it is worth restat
 is the rule most tempting to shave: nothing in a repository states that `INSTALLATION_NAME=demo`
 selects a tenant database, or that `demo_test` gets dropped wholesale by an env var. A wrong guess here
 does not produce a broken worktree. It corrupts a colleague's data.
+
+### Three more things detection reports for layer 3 — still facts, not conclusions
+
+- **`compose`** — for each compose file, what names its project: an explicit top-level `name:`
+  (every worktree then drives the *same* containers, rebuilt with whichever checkout's bind mounts ran
+  last), `COMPOSE_PROJECT_NAME` set in `.env` (asked whether it is set, never for its value), or the
+  directory (each worktree starts its own stack, and every published host port collides with the main
+  checkout's). The count of published host ports goes with it. Which of those is wanted is a question.
+- **`assign`** — an inline `NAME=value` for a variable already offered as a port or database hint,
+  found in the repo's own commands: agent guides, README, task runners, manifest scripts. That sets the
+  variable in the **process** environment, which beats every env file the plugin writes into, so a
+  session following those instructions inside a worktree runs against the shared state. The agent
+  note calibration proposes must say not to copy the prefix.
+- **`ignore`** — whether each path the plugin itself creates inside a checkout
+  (`.claude/worktrees/`, `.claude/worktree-no-runtime`) is gitignored. An untracked one is work to the
+  teardown guard, so the worktree it sits in is never torn down.
 
 ## Drift, and what the profile records about itself
 

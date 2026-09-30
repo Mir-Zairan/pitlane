@@ -287,7 +287,7 @@ run_suite() {
   has 'hints: a port variable is offered as a hint' 'hint|port|APP_PORT' "$out"
   has 'hints: a database variable is offered as a hint' 'hint|db|DATABASE_URL' "$out"
   has 'hints: compose service names are offered as hints' 'hint|service|db' "$out"
-  hasnt 'hints: NOTHING is emitted as a runtime decision' 'runtime|' "$out"
+  eq 'hints: NOTHING is emitted as a runtime decision' 0 "$(printf '%s\n' "$out" | grep -c '^runtime|')"
 
   # --- an unrecognised repository ----------------------------------------------
   # No deps is a valid outcome, not a failure.
@@ -325,6 +325,135 @@ run_suite() {
   eq 'hostile filenames: detection still produces one dep' 1 "$(printf '%s\n' "$out" | grep -c '^dep|')"
   eq 'hostile filenames: and every record has its label in field 1' 0 \
     "$(printf '%s\n' "$out" | grep -cv '^[a-zA-Z]')"
+
+  # --- NESTED PROJECTS WITH THEIR OWN LOCKFILE ---------------------------------
+  # Root markers alone missed a nested project that keeps its own lockfile, which a root install
+  # never populates (a tool-per-directory composer layout). Found through git, proposed only when
+  # its tree is installed in this checkout and gitignored.
+  r=$(mkrepo nested composer.lock composer.json tools/lint/composer.lock tools/lint/composer.json \
+        tests/fixtures/app/composer.lock tests/fixtures/app/composer.json \
+        packages/web/package.json package.json pnpm-lock.yaml pnpm-workspace.yaml)
+  printf '{"scripts":{"post-install-cmd":["@db"],"db":"doctrine:migrations:migrate"}}' >"$r/tools/lint/composer.json"
+  mkdir -p "$r/tools/lint/vendor" "$r/untracked/vendor" "$r/node_modules/dep"
+  : >"$r/tools/lint/vendor/autoload.php"
+  : >"$r/node_modules/dep/package-lock.json"           # inside an ignored tree
+  commit_all "$r"
+  : >"$r/untracked/composer.lock"                      # created AFTER the commit: never tracked
+  out=$(det "$r")
+  has 'nested: the nested project is proposed as its own entry' \
+    'dep|2|tools/lint/vendor|tools/lint/composer.lock|hardlink|' "$out"
+  has 'nested: its install runs from its own directory' \
+    "|cd 'tools/lint' && composer install --no-interaction --no-progress" "$out"
+  has 'nested: its verify does too' "|cd 'tools/lint' && test -r vendor/autoload.php" "$out"
+  has 'nested: and says why the root install does not cover it' 'depNote|2|nested: tools/lint' "$out"
+  has 'nested: its OWN manifest is probed for hazards, and neutralised' 'hazard|2|composer-post-install|neutralise|--no-scripts' "$out"
+  has 'nested: and its migration is escalated like the root one would be' 'escalate|2|' "$out"
+  has 'nested: a lockfile with no installed tree (a fixture) is dropped, saying so' \
+    'dropped|tests/fixtures/app/composer.lock|tests/fixtures/app/vendor|a nested lockfile, but' "$out"
+  hasnt 'nested: and is not proposed' 'dep|3|tests/fixtures' "$out"
+  hasnt 'nested: an untracked lockfile is never considered' 'untracked/' "$out"
+  hasnt 'nested: nor one inside an ignored tree' 'node_modules/dep' "$out"
+  hasnt 'nested: a workspace member without its own lockfile is the root install'"'"'s business' \
+    'packages/web' "$out"
+  eq 'nested: exactly three entries — two roots and one nested project' 3 \
+    "$(printf '%s\n' "$out" | grep -c '^dep|')"
+  eq 'nested: detection is still idempotent' "$out" "$(det "$r")"
+
+  # A nested tree that is COMMITTED needs nothing from the plugin.
+  r=$(mkrepo nestedcommitted composer.lock sub/composer.lock sub/composer.json sub/vendor/autoload.php)
+  printf '!sub/vendor/\n' >>"$r/.gitignore"
+  commit_all "$r"
+  out=$(det "$r")
+  has 'nested: a committed nested vendor is dropped as not gitignored' \
+    'dropped|sub/composer.lock|sub/vendor|a nested lockfile whose sub/vendor is not gitignored' "$out"
+
+  # A directory name outside the conservative set is never put in a command.
+  r=$(mkrepo nestedodd composer.lock "we ird/composer.lock")
+  mkdir -p "$r/we ird/vendor"
+  out=$(det "$r")
+  has 'nested: an odd directory name is warned about, not proposed' 'warn|the nested lockfile directory "we ird"' "$out"
+
+  # --- COMPOSE: which project a worktree's stack would be ------------------------
+  r=$(mkrepo composedir composer.lock)
+  # shellcheck disable=SC2016  # the ${...} is compose syntax under test, not shell
+  printf 'services:\n  app:\n    ports:\n      - "127.0.0.1:${APP_PORT:-8080}:8080"\n      - "5173:5173"\n  db:\n    image: mysql\n' >"$r/docker-compose.yml"
+  commit_all "$r"
+  out=$(det "$r")
+  has 'compose: no name anywhere means one stack per directory, with its published ports counted' \
+    'compose|docker-compose.yml|directory|2' "$out"
+  printf 'name: shared-stack\n' | cat - "$r/docker-compose.yml" >"$r/c.tmp" && mv "$r/c.tmp" "$r/docker-compose.yml"
+  out=$(det "$r")
+  has 'compose: a top-level name means every worktree drives the SAME stack' \
+    'compose|docker-compose.yml|explicit:shared-stack|2' "$out"
+  r=$(mkrepo composeenv composer.lock)
+  printf 'services:\n  app:\n    image: x\n' >"$r/compose.yaml"
+  printf 'COMPOSE_PROJECT_NAME=secretly-named\n' >"$r/.env"
+  out=$(det "$r")
+  has 'compose: COMPOSE_PROJECT_NAME in .env is reported as set' 'compose|compose.yaml|env|0' "$out"
+  hasnt 'compose: without reading its value' 'secretly-named' "$out"
+
+  # Only a `ports:` block publishes; an environment entry ending in `:<digits>` does not. Long
+  # syntax counts `published:`; a bare container port gets a random host port and cannot collide.
+  r=$(mkrepo composeports composer.lock)
+  printf 'services:\n  app:\n    environment:\n      - REDIS_URL=redis://cache:6379\n    ports:\n      - "3000"\n      - target: 80\n        published: "8080"\n  db:\n    ports:\n      - 3306:3306\n' >"$r/compose.yml"
+  out=$(det "$r")
+  has 'compose: environment entries are not ports; long syntax and bare container ports are right' \
+    'compose|compose.yml|directory|2' "$out"
+  # A quoted name is the name; an interpolated one is controllable from the environment.
+  printf 'name: "quoted"\nservices:\n  a:\n    image: x\n' >"$r/compose.yml"
+  has 'compose: a quoted name loses its quotes' 'compose|compose.yml|explicit:quoted|0' "$(det "$r")"
+  # shellcheck disable=SC2016  # compose interpolation under test
+  printf 'name: ${STACK:-app}\nservices:\n  a:\n    image: x\n' >"$r/compose.yml"
+  has 'compose: an interpolated name is env-controlled, not fixed' 'compose|compose.yml|env|0' "$(det "$r")"
+  # Compose never reads .env.local, so a name set only there does not name the project.
+  printf 'services:\n  a:\n    image: x\n' >"$r/compose.yml"
+  printf 'COMPOSE_PROJECT_NAME=x\n' >"$r/.env.local"
+  has 'compose: .env.local is not where compose looks' 'compose|compose.yml|directory|0' "$(det "$r")"
+
+  # A nested JS tree in a repo that declares a workspace is the root install's to populate.
+  r=$(mkrepo nestedws package.json pnpm-lock.yaml pnpm-workspace.yaml packages/a/package.json packages/a/package-lock.json)
+  mkdir -p "$r/packages/a/node_modules"
+  out=$(det "$r")
+  has 'nested: a workspace member with a stray lockfile is dropped, saying why' \
+    'dropped|packages/a/package-lock.json|packages/a/node_modules|the repository declares a JS workspace' "$out"
+  eq 'nested: and only the root entry is proposed' 1 "$(printf '%s\n' "$out" | grep -c '^dep|')"
+
+  # A directory starting with `-` would be read by `cd` as an option.
+  r=$(mkrepo nesteddash composer.lock -legacy/composer.lock)
+  mkdir -p "$r/-legacy/vendor"
+  has 'nested: a leading-dash directory is warned about, not put in a command' \
+    'warn|the nested lockfile directory "-legacy"' "$(det "$r")"
+
+  # A tool whose ONLY lockfile is nested is still probed. A stub on PATH stands in for the tool.
+  r=$(mkrepo nestedprobe tools/x/composer.lock tools/x/composer.json)
+  mkdir -p "$r/tools/x/vendor" "$TMP/$BACKEND/stubbin"
+  printf '#!/bin/sh\necho "Composer version 9.9.9"\n' >"$TMP/$BACKEND/stubbin/composer"
+  chmod +x "$TMP/$BACKEND/stubbin/composer"
+  out=$(PATH="$TMP/$BACKEND/stubbin:$PATH" WT_SKIP_PROBES='' bash "$DETECT" "$r" 2>/dev/null | tr '\t' '|')
+  has 'nested: a nested-only tool is still probed' 'probe|composer|ok|Composer version 9.9.9' "$out"
+
+  # --- INLINE ASSIGNMENTS that would beat every env file ------------------------
+  r=$(mkrepo assigns package.json package-lock.json .env)
+  printf 'TENANT_ID=local\n' >"$r/.env"
+  # shellcheck disable=SC2016  # the backticks are markdown under test, not command substitution
+  printf '# Dev\n\nRun `TENANT_ID=acme npm run migrate` first.\nAlso OTHER_THING=1 npm test\n' >"$r/README.md"
+  commit_all "$r"
+  out=$(det "$r")
+  # shellcheck disable=SC2016  # same markdown backticks
+  has 'assign: an inline NAME=value for a hinted variable is reported, with count and first line' \
+    'assign|TENANT_ID|README.md|1|3:Run `TENANT_ID=acme npm run migrate` first.' "$out"
+  hasnt 'assign: a variable that is not a hint is not' 'assign|OTHER_THING' "$out"
+  hasnt 'assign: a dotenv file is not a source of inline assignments' 'assign|TENANT_ID|.env|' "$out"
+
+  # --- THE PLUGIN'S OWN PATHS must be gitignored --------------------------------
+  r=$(mkrepo ignores composer.lock)
+  out=$(det "$r")
+  has 'ignore: an unignored worktrees directory is reported missing' 'ignore|.claude/worktrees/|missing' "$out"
+  has 'ignore: and so is the opt-out marker' 'ignore|.claude/worktree-no-runtime|missing' "$out"
+  printf '.claude/worktrees/\n.claude/worktree-no-runtime\n' >>"$r/.gitignore"
+  out=$(det "$r")
+  has 'ignore: once ignored, both are ok' 'ignore|.claude/worktrees/|ok' "$out"
+  has 'ignore: including the marker' 'ignore|.claude/worktree-no-runtime|ok' "$out"
 
   # --- IDEMPOTENCE -------------------------------------------------------------
   # The acceptance criterion "a second run changes nothing" — an assertion rather than a
