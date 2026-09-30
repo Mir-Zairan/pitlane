@@ -438,27 +438,18 @@ wt_copy_paths() {  # $1 = main checkout, $2 = worktree
 
 # The whole config step: `.worktreeinclude` (only where native did not already do it) merged with
 # the profile's copy[], through one copier.
-# Drop the runtime override file from a NUL-separated path stream. See wt_copy_config for why.
-wt_drop_env_override() {
-  local p
-  while IFS= read -r -d '' p; do
-    [ "$p" = "${PROFILE_RT_ENVFILE:-}" ] && continue
-    printf '%s\0' "$p"
-  done
-}
-
-# THE OVERRIDE FILE IS NEVER COPIED IN, however it is listed. `copy[]` and `.worktreeinclude` both
-# draw from the gitignored files of the main checkout, which is the same set `runtime.env.file` must
-# belong to — so a profile naming `.env` in both (plausible for an app that loads only `.env`) would
-# have the copier place the main checkout's file first, layer 3 then find no marker line in it,
-# record the worktree as developer-managed FOREVER, and refuse both the overrides and the seed. The
-# worktree would run on the shared database while the plugin blamed the developer for a file it had
-# put there itself. Skipping it here breaks that chain at the only point where the two lists meet.
+#
+# AN OVERRIDE FILE IS COPIED LIKE ANY OTHER, and that is deliberate since ADR-012. The file an app
+# loads is usually the one holding the developer's real configuration, so it SHOULD arrive first;
+# layer 3 then appends its managed block to that copy. This used to skip the override file, because
+# a copied file without the plugin's marker read as developer-owned forever — but that skip only
+# ever covered this path, never native `claude -w`, where Claude Code copies `.worktreeinclude`
+# before any hook runs. Ownership now belongs to a block inside the file, so both paths agree.
 wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .worktreeinclude
   local root=${1%/} worktree=${2%/} own_include=${3:-0} rec body
 
   {
-    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root" | wt_drop_env_override
+    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root"
     # copy[] comes out of the scan wt_load_profile already made — group 2 — so honouring it costs
     # no interpreter start at all. PROFILE_RAW is empty unless the profile validated, so an
     # unusable profile contributes nothing here rather than contributing half its list.
@@ -470,7 +461,6 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
         esac
         body=${rec#*"$WT_US"}
         [ -n "$body" ] || continue
-        [ "$body" = "${PROFILE_RT_ENVFILE:-}" ] && continue
         printf '%s\0' "$body"
       done < <(printf '%s' "$PROFILE_RAW")
     fi
@@ -861,13 +851,17 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
 #   2 port         the allocated port, or empty when none was derived
 #   3 portsource   `derived` or `probed` — whether the port is the one the slug hashes to, or one
 #                  found by stepping past a sibling's claim. Phase 5 wants to know which.
-#   4 envfile      the override file's path relative to THE WORKTREE, resolving as
+#   4 envfile      every override file, `:`-joined, each relative to THE WORKTREE, resolving as
 #                  <worktree>/<envfile> — stated exactly because the consumer of this field
-#                  deletes it, and `wt_copy_paths` already uses "repo-relative" for paths resolved
-#                  against the MAIN CHECKOUT. Recorded so teardown removes the file by name rather
-#                  than by re-expanding a template that may have changed underneath it.
-#   5 envstate     `ours` or `theirs` — whether this plugin wrote that file or a developer owns it.
-#                  Recorded so the warning fires ONCE rather than on every session.
+#                  rewrites those files, and `wt_copy_paths` already uses "repo-relative" for paths
+#                  resolved against the MAIN CHECKOUT. Recorded so teardown takes the plugin's
+#                  block out of the files by name rather than by re-expanding a profile that may
+#                  have changed underneath it (ADR-012). A record from before ADR-012 holds one.
+#   5 envstate     one disposition per file in field 4, `:`-joined and aligned with it: `ours`
+#                  (the plugin has written its block there), `theirs` (the developer took the file
+#                  over by deleting the block), or EMPTY (never written yet). Recorded so the
+#                  warning fires ONCE rather than on every session, and so a file without a block
+#                  can be told apart as "taken over" versus "not written yet".
 #   6 seedstatus   `none` | `done` | `failed` | `timeout` | `skipped`
 #   7 seedcksum    cksum of the seed SCRIPT'S CONTENT at the last attempt, which is what lets an
 #                  edited script retry automatically while an unedited failing one does not re-pay
@@ -2109,22 +2103,67 @@ EOF
 # shape-checked, because a key of `A=1` writes a line setting a variable the profile never names,
 # and no care on the value side can defend against damage done before the `=`.
 
-# The first line of every file this writes. Its presence is the whole ownership protocol.
-WT_ENV_MARKER='# managed by the worktree plugin — delete this line to take ownership of this file'
+# THE PLUGIN OWNS A BLOCK, NOT A FILE (ADR-012). Frameworks load env files by fixed name, and the
+# file an app loads is usually the one holding the developer's real configuration — copied in by
+# `.worktreeinclude` before any hook runs. So the overrides go into THAT file, between two marker
+# lines, appended after the developer's own assignments so that dotenv's last-assignment-wins
+# resolves them in the plugin's favour. Everything outside the block is the developer's and is
+# carried through byte for byte.
+#
+# WT_ENV_MARKER is the begin line's PREFIX, and the ownership check matches it as a prefix so a
+# later version can extend the line. A file written before ADR-012 began with a longer line that
+# has this same prefix and had no end line; it reads as a block running to end of file, which is
+# exactly the whole file it was.
+WT_ENV_MARKER='# managed by the worktree plugin'
+WT_ENV_BEGIN="$WT_ENV_MARKER — begin. Rewritten every session: to override a value, set it below the end line; to take this file over, delete the whole block."
+WT_ENV_END='# end of the block managed by the worktree plugin'
 
-# Who owns the override file at $1/$2: `absent`, `ours`, or `theirs`.
+# Split the file at $1 around its managed block(s). Sets WT_ENV_BEFORE (every line before the first
+# block), WT_ENV_AFTER (every line after it that is not itself inside a block) and WT_ENV_HAS_BLOCK.
+# Every line is kept newline-terminated, including a last line that had none, so the pieces can be
+# concatenated with a block between them. A second block — two sessions' worth, pasted by hand — is
+# dropped rather than kept, so a rewrite always leaves exactly one. Returns 1 if the file cannot be
+# read, which callers treat as "not ours".
 #
-# THE MARKER IS MATCHED AS A PREFIX so a later version can append to that line — a version stamp,
-# say — without every previously written file suddenly reading as developer-owned and freezing
-# itself. An existing file with no first line at all counts as `theirs`: it is not one we wrote, and
-# the rule for anything we did not write is the same.
-#
-# Read with a plain `read` and no subprocess: this runs on the session-start path, and the answer is
-# one line of one small file.
+# Read with bash's own `read`, not a subprocess: this runs on the session-start path, and the files
+# it reads are a few dozen lines.
+wt_runtime_env_split() {  # $1 = file
+  local f=${1-} line inblock=0
+  WT_ENV_BEFORE='' WT_ENV_AFTER='' WT_ENV_HAS_BLOCK=0
+  [ -f "$f" ] && [ -r "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$inblock" = 1 ]; then
+      case $line in
+        "$WT_ENV_END"*) inblock=0 ;;
+      esac
+      continue
+    fi
+    case $line in
+      "$WT_ENV_MARKER"*)
+        inblock=1
+        WT_ENV_HAS_BLOCK=1
+        continue
+        ;;
+    esac
+    if [ "$WT_ENV_HAS_BLOCK" = 1 ]; then
+      WT_ENV_AFTER=$WT_ENV_AFTER$line$WT_NL
+    else
+      WT_ENV_BEFORE=$WT_ENV_BEFORE$line$WT_NL
+    fi
+  done <"$f"
+  return 0
+}
+
+# What is at $1/$2, as far as the override protocol is concerned:
+#   absent    nothing there
+#   ours      a regular, readable file that contains a managed block
+#   unmarked  a regular, readable file with no block — the developer's, or a copy of the main
+#             checkout's; whether the plugin may append to it is the WRITER's call, from state
+#   theirs    something the plugin must never write through: a symlink (dangling or not), a
+#             directory, an unreadable file
 wt_runtime_env_state() {  # $1 = worktree, $2 = relative path
-  local worktree=${1%/} rel=${2-} f line
+  local worktree=${1%/} rel=${2-} f
   f=$worktree/$rel
-  # A dangling symlink is not `absent` — something is there, and it is not ours.
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
     printf 'absent'
     return 0
@@ -2133,22 +2172,57 @@ wt_runtime_env_state() {  # $1 = worktree, $2 = relative path
     printf 'theirs'
     return 0
   fi
-  line=''
-  IFS= read -r line <"$f" 2>/dev/null || line=''
-  case $line in
-    "$WT_ENV_MARKER"*) printf 'ours' ;;
-    *) printf 'theirs' ;;
-  esac
+  if ! wt_runtime_env_split "$f"; then
+    printf 'theirs'
+    return 0
+  fi
+  if [ "$WT_ENV_HAS_BLOCK" = 1 ]; then
+    printf 'ours'
+  else
+    printf 'unmarked'
+  fi
   return 0
 }
 
-# Write the override file. Sets WT_ENV_WROTE to `written`, `developer`, or `skipped`.
+# Put $2 in place at $1, atomically: a temp file in the same directory, so `mv` is a rename rather
+# than a copy, and one write command, so a failed write is visible. A half-written env file is worse
+# than none: the app reads it and points at half a configuration.
 #
-# NEVER OVERWRITES A FILE THIS PLUGIN DID NOT WRITE. Editing that file is the SUPPORTED way to point
-# a worktree somewhere else — a shared database, a colleague's, a restored snapshot — so a
-# developer-managed file is left exactly as it is. The caller records that in the state file so the
-# warning is said once rather than on every session, which is the difference between a useful
-# notice and one people learn to scroll past.
+# THE MODE: a file the plugin creates is 0600 before anything is in it — these files hold database
+# names and, in a repo that puts one there, a connection string. A file that ALREADY EXISTS is the
+# developer's, and keeps its own mode: `cp -p` puts it on the temp file first, so a container whose
+# user differs from the host's (a web server reading a bind-mounted env file) does not lose read
+# access because a hook rewrote the file. Its mode is not the plugin's to tighten or loosen.
+wt_runtime_env_put() {  # $1 = destination, $2 = content
+  local dest=${1-} content=${2-} parent tmp
+  parent=${dest%/*}
+  [ "$parent" != "$dest" ] || parent=.
+  tmp=$(mktemp "${parent}/.wtenv.XXXXXX" 2>/dev/null) || return 1
+  if [ -f "$dest" ] && [ ! -L "$dest" ]; then
+    cp -p -- "$dest" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
+  else
+    chmod 600 "$tmp" 2>/dev/null || true
+  fi
+  if ! printf '%s' "$content" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+# Write the managed block into one override file. Sets WT_ENV_WROTE to `written`, `developer`, or
+# `skipped`.
+#
+# $6 is what the state file recorded for THIS file last time — `ours`, `theirs`, or empty — and it
+# is what separates the two kinds of file without a block. One the plugin has never written is
+# appended to: it is the developer's configuration, copied in, and the block goes after it. One the
+# plugin HAS written, whose block is now gone, is one the developer took over by deleting the block
+# — the supported way to point a worktree at a shared database, a colleague's, a restored snapshot —
+# and it is left exactly as it is. Putting the begin line back hands it back.
 #
 # It refuses rather than follows a symlink, at the leaf and at every parent. `runtime.env.file`
 # comes out of a committed profile, so it arrives with anyone's branch, and the write below would
@@ -2159,9 +2233,9 @@ wt_runtime_env_state() {  # $1 = worktree, $2 = relative path
 # override file that shows up as an untracked change is a bug — a developer commits it by accident
 # and every teammate's worktree then points at one database. The question is asked IN THE WORKTREE,
 # because that is the .gitignore that governs the file and a branch can legitimately differ.
-wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream
-  local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-}
-  local dest tmp parent state rec body key val out n=0 irc
+wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream, $6 = recorded disposition
+  local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-} recorded=${6-}
+  local dest parent state rec body key val block before='' after='' n=0 irc verb unsafe wtname
 
   # SC2034: WT_ENV_WROTE is this function's result — the caller records it in the state file so
   # the developer-managed warning is said once rather than on every session.
@@ -2191,14 +2265,27 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
   fi
 
   state=$(wt_runtime_env_state "$worktree" "$rel")
-  if [ "$state" = theirs ]; then
-    # SILENT HERE, deliberately. The caller says this once, from the state record — saying it from
-    # inside a function that runs every session is how a useful notice becomes noise people scroll
-    # past, and this is the escape hatch the design most wants a developer to keep trusting.
-    # shellcheck disable=SC2034
-    WT_ENV_WROTE=developer
-    return 0
-  fi
+  # A TAKEN-OVER FILE IS SILENT HERE, deliberately. The caller says it once, from the state record —
+  # saying it from inside a function that runs every session is how a useful notice becomes noise
+  # people scroll past, and this is the escape hatch the design most wants a developer to trust.
+  case $state in
+    theirs)
+      # Not a regular, readable file — a directory, or one this user cannot read. Nothing can be
+      # written there and no developer "took it over", so it is reported as a refusal: the seed
+      # then refuses too, and the recorded disposition carries through unchanged.
+      wt_log "  runtime: refusing to write $rel — it is not a regular file this user can read"
+      return 0
+      ;;
+    unmarked)
+      case $recorded in
+        ours | theirs)
+          # shellcheck disable=SC2034
+          WT_ENV_WROTE=developer
+          return 0
+          ;;
+      esac
+      ;;
+  esac
 
   # GITIGNORED OR NOTHING. Asked before the write, and a git that cannot answer is treated as a
   # refusal rather than as a yes: exit 0 means ignored, 1 means not, anything else is a real
@@ -2225,15 +2312,33 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     }
   fi
 
-  # THE CONTENT IS BUILT FIRST, IN MEMORY, AND WRITTEN BY ONE COMMAND. The obvious shape —
+  # The developer's lines, read BEFORE the block is built so that a file which cannot be read is
+  # never replaced by one holding only the block — that would delete their configuration.
+  verb=wrote
+  case $state in
+    ours | unmarked)
+      if ! wt_runtime_env_split "$dest"; then
+        wt_log "  runtime: could not read $rel — not writing it"
+        return 0
+      fi
+      before=$WT_ENV_BEFORE
+      after=$WT_ENV_AFTER
+      [ "$state" = unmarked ] && verb='added the block to'
+      ;;
+  esac
+
+  # THE BLOCK IS BUILT FIRST, IN MEMORY, AND WRITTEN BY ONE COMMAND. The obvious shape —
   # `{ printf; printf; while ...; } >"$tmp" || cleanup` — cannot detect a failed write: a brace
   # group reports the status of its LAST command, which here is the loop, so a printf that failed
   # on a full disk was invisible and the truncated file was promoted into place anyway. Worse, if
-  # the line lost was the MARKER, every later session reads the file as developer-owned and never
-  # touches it again. Building the text first makes the write one checkable command, and shrinks
-  # the window in which a killed hook can leave a temp file behind to almost nothing.
-  out=$WT_ENV_MARKER$WT_NL
-  out=$out"# Regenerated on every session while the line above is present. worktree=${WT_NAME-} slug=${WT_SLUG-}$WT_NL"
+  # the line lost was the MARKER, every later session would read the file as the developer's.
+  block=$WT_ENV_BEGIN$WT_NL
+  # WT_NAME is folded like a value: a directory name can hold a line break, and one here would end
+  # the comment and start an assignment the profile never named.
+  wtname=${WT_NAME-}
+  wtname=${wtname//"$WT_CR"/ }
+  wtname=${wtname//"$WT_NL"/ }
+  block=$block"# worktree=$wtname slug=${WT_SLUG-}$WT_NL"
 
   # THE PORT VARIABLE IS SHAPE-CHECKED LIKE ANY OTHER KEY, and it was not at first. It becomes the
   # left-hand side of a `KEY=value` line exactly as an env.vars key does, and it is only WARNED
@@ -2242,7 +2347,7 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
   # precisely the damage checking the other keys exists to prevent.
   if [ -n "$pvar" ] && [ -n "$port" ]; then
     if wt_is_safe_envkey "$pvar"; then
-      out=$out"$pvar=$port$WT_NL"
+      block=$block"$pvar=$port$WT_NL"
     else
       wt_log "  runtime: skipping the port line — \"$pvar\" is not a legal environment variable name"
       pvar=''
@@ -2271,37 +2376,52 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     # — the same damage as a bad key, arriving from the other side of the `=`. dotenv is
     # line-oriented, so the writer folds line breaks rather than trusting its input not to have
     # any. The JSON layer folds these already; this is the backstop for a stream built another way.
+    # AN UNCONSTRAINED PLACEHOLDER MUST NOT CARRY SHELL SYNTAX INTO A FILE THE APP PARSES. Since
+    # ADR-012 the block goes into the file the framework really loads, and several dotenv dialects
+    # (Symfony's, Ruby's) run `$(...)` in an unquoted value — so `DB=app_{name}` plus a colleague's
+    # branch named `x$(cmd)` would run `cmd` on every boot of the app. {name}, {worktree} and {root}
+    # are raw text from a less trusted party than the committed profile; the same refusal the
+    # install commands get applies here, and for the same reason quoting is not attempted instead.
+    unsafe=$(wt_unsafe_command_placeholder "$val")
+    if [ -n "$unsafe" ]; then
+      wt_log "  runtime: skipping \"$key\" — its {$unsafe} expands to text with shell syntax in it, which a dotenv parser may execute"
+      continue
+    fi
     val=$(wt_expand "$val")
     val=${val//"$WT_CR"/ }
     val=${val//"$WT_NL"/ }
-    out=$out"$key=$val$WT_NL"
+    block=$block"$key=$val$WT_NL"
     n=$((n + 1))
   done < <(printf '%s' "$pairs")
+  block=$block$WT_ENV_END$WT_NL
 
-  # Atomic, and in the same directory so `mv` is a rename rather than a copy. A half-written
-  # override file is worse than none: the app reads it and points at half a configuration.
-  tmp=$(mktemp "${parent}/.wtenv.XXXXXX" 2>/dev/null) || {
-    wt_log "  runtime: could not create a temporary file beside $rel — not writing it"
-    return 0
-  }
-  # 0600 before anything is in it. These files hold the names of databases and, in a repo that puts
-  # one there, a connection string.
-  chmod 600 "$tmp" 2>/dev/null || true
-  if ! printf '%s' "$out" >"$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    wt_log "  runtime: could not write $rel"
-    return 0
-  fi
-
-  if mv -f "$tmp" "$dest" 2>/dev/null; then
+  if wt_runtime_env_put "$dest" "$before$block$after"; then
     # shellcheck disable=SC2034
     WT_ENV_WROTE=written
-    wt_log "  runtime: wrote $rel${pvar:+ ($pvar=$port)}, $n variable(s)"
+    wt_log "  runtime: $verb $rel${pvar:+ ($pvar=$port)}, $n variable(s)"
   else
-    rm -f "$tmp"
-    wt_log "  runtime: could not put $rel in place"
+    wt_log "  runtime: could not write $rel"
   fi
   return 0
+}
+
+# Take the managed block back out of one override file — teardown's half of the protocol. The
+# developer's lines stay; a file left holding nothing but blank lines was only ever the block, so
+# it goes. A file without a block, or one this refuses to write through, is not touched. Returns 1
+# only when there was a block and it could not be removed.
+wt_runtime_env_release() {  # $1 = worktree, $2 = relative path
+  local worktree=${1%/} rel=${2-} dest rest
+  [ -n "$rel" ] && wt_is_safe_relpath "$rel" || return 0
+  case $rel in */) return 0 ;; esac
+  wt_has_symlinked_parent "$worktree" "$rel" && return 0
+  [ "$(wt_runtime_env_state "$worktree" "$rel")" = ours ] || return 0
+  dest=$worktree/$rel
+  wt_runtime_env_split "$dest" || return 1
+  rest=$WT_ENV_BEFORE$WT_ENV_AFTER
+  case $rest in
+    *[![:space:]]*) wt_runtime_env_put "$dest" "$rest" ;;
+    *) rm -f -- "$dest" 2>/dev/null ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -2312,7 +2432,8 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
 # repo-owned script is written against:
 #
 #   * it runs INSIDE the profile's `shell`, with the WORKTREE as its working directory;
-#   * it receives WT_NAME, WT_SLUG, WT_PORT, WT_PATH, WT_ROOT and WT_ENV_FILE in the environment —
+#   * it receives WT_NAME, WT_SLUG, WT_PORT, WT_PATH, WT_ROOT, WT_ENV_FILE (the first override file)
+#     and WT_ENV_FILES (all of them, one per line — ADR-012) in the environment —
 #     never as arguments and never interpolated into a command line;
 #   * a non-zero exit warns and the session continues (ADR-003); the state file records the
 #     failure so a re-entry can retry;
@@ -2333,9 +2454,11 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
 # prove three things, and says which one it could not.
 
 # Run the seed. Sets WT_SEED_STATUS to one of: done, failed, timeout, skipped, refused, none.
-wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env state $7=seed rel $8=deadline
-  # $6 carries the env file's DISPOSITION, which is `ours`, `theirs`, or — when the profile asked
-  # for a file this session could not write — `unwritten`.
+wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env files $6=env state $7=seed rel $8=deadline
+  # $5 is every override file, `:`-joined (ADR-012). $6 carries their COMBINED disposition — `ours`,
+  # `theirs` if any file is the developer's, or `unwritten` if the profile asked for a file this
+  # session could not write. The per-file dispositions live in the state record, which this
+  # function carries through rather than overwriting with the combined one.
   local root=${1%/} worktree=${2%/} slug=${3-} port=${4-} envrel=${5-} envstate=${6-}
   local rel=${7-} deadline=${8-} abs esc cksum prev prevck prevslug left secs full rc started elapsed
   local sibslug sibport
@@ -2396,7 +2519,7 @@ wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env sta
   # database, a colleague's, a restored snapshot. Seeding WT_SLUG then creates or clones something
   # the app will never read, and in the worst case does it to a name someone else is using.
   if [ "$envstate" = theirs ]; then
-    wt_log "  runtime: not seeding — $envrel is managed by you, so this worktree is pointed somewhere the seed's WT_SLUG=$slug does not describe. Delete that file to hand it back."
+    wt_log "  runtime: not seeding — ${envrel//:/ or } is managed by you, so this worktree is pointed somewhere the seed's WT_SLUG=$slug does not describe. Put the plugin's block back to hand it back."
     WT_SEED_STATUS=refused
     return 0
   fi
@@ -2407,7 +2530,7 @@ wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env rel $6=env sta
   # at, while the session quietly works against the shared one. Refusal 1 exists for exactly this
   # state; it just could not see it until the outcome was passed in.
   if [ "$envstate" = unwritten ]; then
-    wt_log "  runtime: not seeding — $envrel could not be written, so this worktree is not pointed at anything named $slug yet"
+    wt_log "  runtime: not seeding — ${envrel//:/ or } could not be written, so this worktree is not pointed at anything named $slug yet"
     WT_SEED_STATUS=refused
     return 0
   fi
@@ -2484,7 +2607,8 @@ EOF
     wt_log "  runtime: no time left in the bootstrap budget to run the seed — leaving it for the next session"
     wt_runtime_state_set "$worktree" "$slug" "$port" \
       "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
-      "$envrel" "$envstate" failed "" || true
+      "$(wt_runtime_state_get "$worktree" envfile || printf '%s' "$envrel")" \
+      "$(wt_runtime_state_get "$worktree" envstate || printf '%s' "$envstate")" failed "" || true
     WT_SEED_STATUS=failed
     return 0
   fi
@@ -2498,14 +2622,15 @@ EOF
   # values belong to the seed child and must not leak back into the hook, whose own WT_SLUG/WT_PORT
   # describe the same worktree but are set by the handoff, not by this function.
   (
-    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
+    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE WT_ENV_FILES
     # shellcheck disable=SC2030
     WT_SLUG=$slug
     # shellcheck disable=SC2030
     WT_PORT=$port
     WT_PATH=$worktree
     WT_ROOT=$root
-    WT_ENV_FILE=$envrel
+    WT_ENV_FILE=${envrel%%:*}
+    WT_ENV_FILES=${envrel//:/$WT_NL}
     wt_run_in_shell "./'$esc'" "$worktree" "$secs"
   )
   rc=$?
@@ -2539,7 +2664,9 @@ EOF
 
   wt_runtime_state_set "$worktree" "$slug" "$port" \
     "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
-    "$envrel" "$envstate" "$WT_SEED_STATUS" "$cksum" || \
+    "$(wt_runtime_state_get "$worktree" envfile || printf '%s' "$envrel")" \
+    "$(wt_runtime_state_get "$worktree" envstate || printf '%s' "$envstate")" \
+    "$WT_SEED_STATUS" "$cksum" || \
     wt_log "  runtime: could not record the seed outcome — it will run again next session"
   return 0
 }
@@ -2565,9 +2692,29 @@ EOF
 # still works; only isolation is skipped.
 WT_NO_RUNTIME_MARKER='.claude/worktree-no-runtime'
 
+# The disposition recorded for env file $3, given the recorded `:`-joined file list $1 and the
+# aligned `:`-joined dispositions $2. Prints `ours`, `theirs`, or nothing. A record from before
+# ADR-012 holds one file and one disposition, which is the same shape with a single element.
+wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, $3 = file
+  local files=${1-} states=${2-} want=${3-} f st
+  [ -n "$files" ] && [ -n "$want" ] || return 0
+  while :; do
+    f=${files%%:*}
+    st=${states%%:*}
+    if [ "$f" = "$want" ]; then
+      case $st in ours | theirs) printf '%s' "$st" ;; esac
+      return 0
+    fi
+    [ "$f" != "$files" ] || return 0
+    files=${files#*:}
+    if [ "$st" = "$states" ]; then states=''; else states=${states#*:}; fi
+  done
+}
+
 wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
-  local slug tpl envrel envstate oldenv recenv port psrc oldslug oldseed oldcksum sslug sport
+  local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport
+  local rest f prior fstate shown nfiles
 
   [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
 
@@ -2639,39 +2786,64 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
   WT_PORT=$port
   export WT_PORT
 
-  # --- the env override file -------------------------------------------------------------------
-  envrel=${PROFILE_RT_ENVFILE:-}
-  envstate=$(wt_runtime_state_get "$worktree" envstate) || envstate=''
-  # A CHANGED `runtime.env.file` makes the recorded disposition meaningless: it described a
-  # different file. Carrying `ours` across would claim we wrote a file we have never touched.
-  oldenv=$(wt_runtime_state_get "$worktree" envfile) || oldenv=''
-  [ "$oldenv" = "$envrel" ] || envstate=''
-  if [ -n "$envrel" ]; then
-    wt_runtime_env_write "$worktree" "$envrel" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}"
-    case $WT_ENV_WROTE in
-      written) envstate=ours ;;
-      developer)
-        # SAID ONCE, not every session. The state record is what makes that possible: editing this
-        # file is the supported way to point a worktree at a shared database or a colleague's, and
-        # a warning repeated on every start is one a developer learns to scroll past — at which
-        # point it stops protecting the thing it is about.
-        if [ "$envstate" != theirs ]; then
-          wt_log "runtime: $envrel is yours — it has no plugin marker line, so it will be left alone from now on. Delete it to hand it back."
-        fi
-        envstate=theirs
-        ;;
-      # The profile asked for a file and we could not write it — a state of its own, because the
-      # seed must refuse on it just as it refuses on a developer-managed file.
-      *) envstate=unwritten ;;
-    esac
-    # `unwritten` is this session's outcome, not a durable fact about the file — recording it
-    # would make a later successful write look like a change of ownership. Only `ours`/`theirs`
-    # persist.
-    case $envstate in
-      ours | theirs) recenv=$envstate ;;
-      *) recenv='' ;;
-    esac
-    wt_runtime_state_set "$worktree" "$slug" "$port" "$psrc" "$envrel" "$recenv" \
+  # --- the env override files ------------------------------------------------------------------
+  # One managed block per file the app loads (ADR-012), each with its OWN recorded disposition: a
+  # developer can take over the test env's file and leave the dev env's to the plugin. The record
+  # keeps the list and the dispositions `:`-joined and aligned, and a file's prior disposition is
+  # looked up BY NAME, so reordering the list or adding a file cannot hand one file's `ours` to
+  # another — which would claim a block was deleted from a file the plugin never wrote.
+  envfiles=${PROFILE_RT_ENVFILES:-}
+  envstate=''
+  shown=''
+  if [ -n "$envfiles" ]; then
+    oldenv=$(wt_runtime_state_get "$worktree" envfile) || oldenv=''
+    oldstates=$(wt_runtime_state_get "$worktree" envstate) || oldstates=''
+    envstate=ours
+    recenv=''
+    nfiles=0
+    rest=$envfiles
+    while [ -n "$rest" ]; do
+      f=${rest%%:*}
+      if [ "$f" = "$rest" ]; then rest=''; else rest=${rest#*:}; fi
+      prior=$(wt_runtime_env_recorded "$oldenv" "$oldstates" "$f")
+      wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}" "$prior"
+      case $WT_ENV_WROTE in
+        written) fstate=ours ;;
+        developer)
+          # SAID ONCE, not every session. The state record is what makes that possible: taking a
+          # file over is the supported way to point a worktree at a shared database or a
+          # colleague's, and a warning repeated on every start is one a developer learns to scroll
+          # past — at which point it stops protecting the thing it is about.
+          if [ "$prior" != theirs ]; then
+            wt_log "runtime: $f is yours — it has no block from the plugin, so it will be left alone from now on. To hand it back, add this line at its end: $WT_ENV_MARKER"
+          fi
+          fstate=theirs
+          ;;
+        # The profile asked for a file and we could not write it — a state of its own, because the
+        # seed must refuse on it just as it refuses on a developer-managed file.
+        *) fstate=unwritten ;;
+      esac
+      # The seed's view is the WORST file: one environment pointed elsewhere, or not pointed at
+      # all, is enough to make a database named after this slug unsafe to create.
+      case $fstate in
+        unwritten) envstate=unwritten ;;
+        theirs) [ "$envstate" = unwritten ] || envstate=theirs ;;
+      esac
+      case $fstate in
+        written | ours | theirs) shown=${shown:+$shown, }$f ;;
+      esac
+      # `unwritten` is this session's outcome, not a durable fact about the file — so the fact
+      # recorded BEFORE it carries through. Recording an empty slot instead would forget that the
+      # plugin had written here, and a developer who later deletes the block to take the file over
+      # would get it appended again, silently re-pointing a worktree they had pointed elsewhere.
+      case $fstate in
+        ours | theirs) ;;
+        *) fstate=$prior ;;
+      esac
+      if [ "$nfiles" -eq 0 ]; then recenv=$fstate; else recenv=$recenv:$fstate; fi
+      nfiles=$((nfiles + 1))
+    done
+    wt_runtime_state_set "$worktree" "$slug" "$port" "$psrc" "$envfiles" "$recenv" \
       "${oldseed:-none}" "$oldcksum" || true
   fi
 
@@ -2692,18 +2864,15 @@ EOF
 
   # --- the seed ----------------------------------------------------------------------------------
   if [ -n "${PROFILE_RT_SEED:-}" ]; then
-    wt_runtime_seed "$root" "$worktree" "$slug" "$port" "$envrel" "$envstate" \
+    wt_runtime_seed "$root" "$worktree" "$slug" "$port" "$envfiles" "$envstate" \
       "${PROFILE_RT_SEED}" "$deadline"
   fi
 
   # ONE honest summary line, naming what this worktree actually got. It is the sentence in which a
   # wrong mapping becomes obvious — and the only feedback a developer sees before the TUI renders.
-  # `env=` only when there IS one: wt_runtime_env_write refuses a symlink, a non-gitignored path
-  # and a failed write, and naming the file anyway would report isolation that did not happen.
-  case ${WT_ENV_WROTE:-} in
-    written | developer) ;;
-    *) envrel='' ;;
-  esac
-  wt_log "runtime: slug=$slug${port:+ port=$port}${envrel:+ env=$envrel}"
+  # `env=` names only the files that ARE there: wt_runtime_env_write refuses a symlink, a
+  # non-gitignored path and a failed write, and naming such a file would report isolation that did
+  # not happen.
+  wt_log "runtime: slug=$slug${port:+ port=$port}${shown:+ env=$shown}"
   return 0
 }

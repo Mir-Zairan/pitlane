@@ -2215,9 +2215,18 @@ eq 'and it is not world-readable' '600' \
   "$(stat -c '%a' "$EW/$EF" 2>/dev/null || stat -f '%Lp' "$EW/$EF" 2>/dev/null)"
 eq 'no temporary file is left beside it' 0 \
   "$(find "$EW" -maxdepth 1 -name '.wtenv.*' 2>/dev/null | wc -l | tr -d ' ')"
-# The whole file, so nothing unexpected is in it and the marker really is first.
-eq 'the marker is the FIRST line, which is what the ownership check reads' "$WT_ENV_MARKER" \
-  "$(head -1 "$EW/$EF")"
+# A file the plugin CREATED is the block and nothing else: begin line first, end line last.
+eq 'a created file starts with the block begin line' "$WT_ENV_BEGIN" "$(head -1 "$EW/$EF")"
+eq 'and ends with its end line' "$WT_ENV_END" "$(tail -1 "$EW/$EF")"
+case $WT_ENV_BEGIN in
+  "$WT_ENV_MARKER"*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL the begin line does not start with the ownership marker\n' >&2 ;;
+esac
+case $WT_ENV_END in
+  "$WT_ENV_MARKER"*) fail=$((fail + 1)); printf 'FAIL the end line would read as a second begin line\n' >&2 ;;
+  '#'*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL the end line is not a comment\n' >&2 ;;
+esac
 
 # REWRITING keeps values in sync when the profile changes.
 wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
@@ -2225,22 +2234,144 @@ eq 'a rewrite updates the port' 'SERVER_PORT=3999' "$(grep '^SERVER_PORT=' "$EW/
 eq 'and drops a variable the profile no longer names' 0 \
   "$(grep -c '^APP_ENV=' "$EW/$EF" | tr -d ' ')"
 
-# A DEVELOPER-EDITED FILE IS NEVER TOUCHED. Editing it is the supported way to point a worktree at
-# a shared database, a colleague's, or a restored snapshot — so losing those edits on the next
-# session would destroy the one escape hatch the design offers.
+# A FILE THE PLUGIN HAS NEVER WRITTEN GETS THE BLOCK APPENDED (ADR-012). It is the developer's
+# configuration, copied in, and the app loads it by name — so the overrides have to go INTO it,
+# after the developer's lines, where dotenv's last-assignment-wins resolves them for the plugin.
+printf 'SECRET=keep-me\nINSTALLATION_NAME=shared_db\n' >"$EW/$EF"
+eq 'a file without a block reads as unmarked' 'unmarked' "$(wt_runtime_env_state "$EW" "$EF")"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+eq 'an unmarked file with nothing recorded is written' 'written' "$WT_ENV_WROTE"
+eq 'the developer lines stay first, untouched' 'SECRET=keep-me|INSTALLATION_NAME=shared_db' \
+  "$(head -2 "$EW/$EF" | paste -sd '|' -)"
+eq 'the block follows them' "$WT_ENV_BEGIN" "$(sed -n 3p "$EW/$EF")"
+eq 'so the plugin assignment is the LAST one, which dotenv honours' 'INSTALLATION_NAME=demo_alice_fix_99' \
+  "$(grep '^INSTALLATION_NAME=' "$EW/$EF" | tail -1)"
+eq 'and the file now reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
+
+# A LINE BELOW THE BLOCK KEEPS WINNING: a rewrite replaces the block IN PLACE, never moves it.
+printf 'SERVER_PORT=9999\n' >>"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3813 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" "ours"
+eq 'a rewrite updates the block' 'SERVER_PORT=3813' "$(grep '^SERVER_PORT=' "$EW/$EF" | head -1)"
+eq 'and the developer override below it is still last' 'SERVER_PORT=9999' \
+  "$(tail -1 "$EW/$EF")"
+eq 'and the lines above it survive the rewrite' 'SECRET=keep-me' "$(head -1 "$EW/$EF")"
+eq 'and there is still exactly one block' 1 "$(grep -c "^$WT_ENV_MARKER" "$EW/$EF" | tr -d ' ')"
+
+# A BLOCK THE DEVELOPER DELETED IS A FILE THEY TOOK OVER — but only the state record can tell that
+# apart from a file never written, so the recorded disposition is what decides.
 printf 'INSTALLATION_NAME=someone_elses_db\n' >"$EW/$EF"
-eq 'a file without the marker reads as theirs' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
-eq 'and is reported as developer-managed' 'developer' "$WT_ENV_WROTE"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" ours
+eq 'a recorded-ours file whose block is gone is developer-managed' 'developer' "$WT_ENV_WROTE"
 eq 'and is left byte for byte alone' 'INSTALLATION_NAME=someone_elses_db' "$(cat "$EW/$EF")"
-# Deleting the file hands ownership back, which is how a developer undoes that.
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
+eq 'and so is one already recorded as theirs' 'developer' "$WT_ENV_WROTE"
+eq 'still byte for byte' 'INSTALLATION_NAME=someone_elses_db' "$(cat "$EW/$EF")"
+# Putting the begin line back hands it back.
+printf '%s\n' "$WT_ENV_MARKER" >>"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
+eq 'a restored marker line hands the file back' 'written' "$WT_ENV_WROTE"
+eq 'keeping the developer line above the block' 'INSTALLATION_NAME=someone_elses_db' "$(head -1 "$EW/$EF")"
+# Deleting a file the plugin created hands it back too.
 rm -f "$EW/$EF"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
 eq 'deleting the file hands ownership back to the plugin' 'written' "$WT_ENV_WROTE"
 
-# An EMPTY existing file is not ours either — it has no marker, so the same rule applies.
+# A path that is not a regular readable file is a REFUSAL, not a developer take-over: nothing can
+# be written there, and advice about deleting a block from a directory would be nonsense.
+rm -f "$EW/$EF"; mkdir -p "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>/dev/null
+eq 'a directory at the path is skipped, not developer-managed' 'skipped' "$WT_ENV_WROTE"
+contains 'and says what is wrong with it' 'not a regular file' \
+  "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
+rmdir "$EW/$EF"
+
+# A DEVELOPER FILE KEEPS ITS OWN MODE through a write and a release; only a file the plugin
+# creates is 0600. A container user reading a bind-mounted env file would otherwise lose access.
+rm -f "$EW/$EF"
+printf 'SECRET=1\n' >"$EW/$EF"; chmod 644 "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+eq 'an existing file keeps its mode through a write' '644' \
+  "$(stat -c '%a' "$EW/$EF" 2>/dev/null || stat -f '%Lp' "$EW/$EF" 2>/dev/null)"
+wt_runtime_env_release "$EW" "$EF"
+eq 'and through a release' '644' \
+  "$(stat -c '%a' "$EW/$EF" 2>/dev/null || stat -f '%Lp' "$EW/$EF" 2>/dev/null)"
+rm -f "$EW/$EF"
+
+# AN UNCONSTRAINED PLACEHOLDER CARRYING SHELL SYNTAX IS REFUSED, per variable. The file is one the
+# app's dotenv parser reads, and some dialects run `$(...)` in an unquoted value.
+# shellcheck disable=SC2016  # the $(...) is the hostile TEXT under test, never to be expanded here.
+out=$(WT_NAME='x$(touch pwned)' wt_runtime_env_write "$EW" "$EF" '' '' \
+  "$(mk_pairs 'DB=app_{name}' 'SAFE=demo_{slug}')" 2>&1)
+contains 'a {name} value with shell syntax is skipped, saying why' 'its {name} expands to text with shell syntax' "$out"
+eq 'and is not written' 0 "$(grep -c '^DB=' "$EW/$EF" | tr -d ' ')"
+eq 'while the other variables still are' 'SAFE=demo_alice_fix_99' "$(grep '^SAFE=' "$EW/$EF")"
+rm -f "$EW/$EF"
+# A LINE BREAK IN THE NAME cannot forge an assignment through the block's comment line.
+WT_NAME="$(printf 'a\nFORGED=1')" wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'A=1')"
+eq 'a line break in the worktree name is folded out of the comment line' 0 \
+  "$(grep -c '^FORGED=' "$EW/$EF" | tr -d ' ')"
+rm -f "$EW/$EF"
+
+# An EMPTY existing file has no block either, so the same rule applies to it.
 : >"$EW/$EF"
-eq 'an empty existing file reads as theirs' 'theirs' "$(wt_runtime_env_state "$EW" "$EF")"
+eq 'an empty existing file reads as unmarked' 'unmarked' "$(wt_runtime_env_state "$EW" "$EF")"
+rm -f "$EW/$EF"
+
+# A LAST LINE WITH NO NEWLINE must not be glued onto the begin line, which would turn the
+# developer's assignment into part of a comment and the begin line into part of a value.
+printf 'LAST=1' >"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'A=1')"
+eq 'an unterminated last line keeps its own line' 'LAST=1' "$(head -1 "$EW/$EF")"
+eq 'and the begin line starts the next one' "$WT_ENV_BEGIN" "$(sed -n 2p "$EW/$EF")"
+rm -f "$EW/$EF"
+
+# CRLF files keep their line endings outside the block; the block is found through them.
+printf 'WIN=1\r\n' >"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'A=1')"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'A=2')" ours
+eq 'a CRLF line outside the block is carried through byte for byte' "WIN=1$CR_" "$(head -1 "$EW/$EF")"
+eq 'and a rewrite through CRLF content still leaves one block' 1 \
+  "$(grep -c "^$WT_ENV_MARKER" "$EW/$EF" | tr -d ' ')"
+rm -f "$EW/$EF"
+
+# A FILE FROM BEFORE ADR-012 began with a longer marker line and had no end line. It is a block
+# running to end of file, so a rewrite replaces all of it rather than keeping its old values.
+printf '%s — delete this line to take ownership of this file\nOLD=1\n' "$WT_ENV_MARKER" >"$EW/$EF"
+eq 'an old whole-file marker reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'NEW=1')" ours
+eq 'and a rewrite drops the old values' 0 "$(grep -c '^OLD=' "$EW/$EF" | tr -d ' ')"
+eq 'leaving a file that is only the new block' "$WT_ENV_BEGIN" "$(head -1 "$EW/$EF")"
+rm -f "$EW/$EF"
+
+# TWO BLOCKS — pasted by hand — collapse into one on the next rewrite.
+{ printf 'A=0\n'; printf '%s\nX=1\n%s\n' "$WT_ENV_BEGIN" "$WT_ENV_END"; printf 'B=0\n'
+  printf '%s\nY=1\n%s\n' "$WT_ENV_BEGIN" "$WT_ENV_END"; printf 'C=0\n'; } >"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" '' '' "$(mk_pairs 'Z=1')" ours
+eq 'two blocks become one' 1 "$(grep -c "^$WT_ENV_MARKER" "$EW/$EF" | tr -d ' ')"
+eq 'with every line outside them kept, in order' 'A=0|B=0|C=0' \
+  "$(grep -E '^[ABC]=' "$EW/$EF" | paste -sd '|' -)"
+eq 'and neither old block values survive' 0 "$(grep -cE '^[XY]=' "$EW/$EF" | tr -d ' ')"
+rm -f "$EW/$EF"
+
+# --- wt_runtime_env_release: teardown's half ---
+printf 'SECRET=keep-me\n' >"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+wt_runtime_env_release "$EW" "$EF"
+eq 'releasing removes the block and keeps the developer lines' 'SECRET=keep-me' "$(cat "$EW/$EF")"
+eq 'and the file no longer reads as ours' 'unmarked' "$(wt_runtime_env_state "$EW" "$EF")"
+wt_runtime_env_release "$EW" "$EF"
+eq 'releasing a file with no block leaves it alone' 'SECRET=keep-me' "$(cat "$EW/$EF")"
+rm -f "$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+printf '\n\n' >>"$EW/$EF"
+wt_runtime_env_release "$EW" "$EF"
+eq 'a file that was only the block (and blank lines) is removed' 0 \
+  "$([ -e "$EW/$EF" ] && echo 1 || echo 0)"
+ln -sf "$TMP/marker-bearing-release" "$EW/$EF"
+printf '%s\nX=1\n' "$WT_ENV_MARKER" >"$TMP/marker-bearing-release"
+wt_runtime_env_release "$EW" "$EF"
+eq 'release never writes through a symlink' "$WT_ENV_MARKER|X=1" \
+  "$(paste -sd '|' - <"$TMP/marker-bearing-release")"
 rm -f "$EW/$EF"
 
 # THE MARKER IS PREFIX-MATCHED, so a future version can extend that line without every file
@@ -2424,7 +2555,7 @@ eq 'a mktemp that fails is reported, not ignored' 'skipped' \
      mktemp() { return 1; }
      wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
      printf '%s' "$WT_ENV_WROTE")"
-contains 'and it says so' 'could not create a temporary file' \
+contains 'and it says so' 'could not write' \
   "$(# shellcheck disable=SC2329
      mktemp() { return 1; }
      wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" 2>&1)"
@@ -2433,7 +2564,7 @@ eq 'a failed mv leaves no temporary file behind' 0 \
      mv() { return 1; }
      wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" >/dev/null 2>&1
      find "$EW" -maxdepth 1 -name '.wtenv.*' 2>/dev/null | wc -l | tr -d ' ')"
-contains 'and a failed mv is reported rather than claimed as success' 'could not put' \
+contains 'and a failed mv is reported rather than claimed as success' 'could not write' \
   "$(# shellcheck disable=SC2329
      mv() { return 1; }
      wt_runtime_env_write "$EW" "$EF" P 1 "$(mk_pairs 'A=1')" 2>&1)"
@@ -2467,15 +2598,15 @@ contains 'and a trailing slash is refused as a directory' 'names a directory' \
 eq 'nothing escaped into the worktrees directory' 0 \
   "$([ -e "$EREPO/.claude/worktrees/escape.env" ] && echo 1 || echo 0)"
 
-# THE ACCEPTANCE CRITERION IN FULL: a hand-edited file survives a re-bootstrap AND is not
-# re-announced. The once-ness lives in the caller's state record, so what this function owes is
+# THE ACCEPTANCE CRITERION IN FULL: a file the developer took over survives a re-bootstrap AND is
+# not re-announced. The once-ness lives in the caller's state record, so what this function owes is
 # SILENCE — a wt_log added here would make every session warn, and nothing pinned that.
 rm -f "$EW/$EF"
 printf 'INSTALLATION_NAME=colleagues_db\n' >"$EW/$EF"
 before=$(cat "$EW/$EF")
 eq 'the developer path says nothing itself' '' \
-  "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" 2>&1)"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')"
+  "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" ours 2>&1)"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" theirs
 eq 'a second consecutive run still reports developer-managed' 'developer' "$WT_ENV_WROTE"
 eq 'and the file is byte-identical after both runs' "$before" "$(cat "$EW/$EF")"
 
@@ -2634,7 +2765,7 @@ rm -f "$SW/seed-refuse.txt"
 # 1. The env file is the developer's, so the app is pointed somewhere WT_SLUG does not describe.
 wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)" 2>/dev/null
 eq 'a developer-managed env file refuses the seed' 'refused' "$WT_SEED_STATUS"
-contains 'and explains how to hand it back' 'Delete that file' \
+contains 'and explains how to hand it back' "Put the plugin's block back" \
   "$(wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local theirs "$SEEDREL" "$(seed_deadline)" 2>&1)"
 
 # 2. The sibling scan could not run, so it cannot be shown that nobody else owns this slug. The

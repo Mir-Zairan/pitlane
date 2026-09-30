@@ -130,7 +130,7 @@ JSON
   # shellcheck disable=SC2016
   {
     printf '#!/usr/bin/env bash\n'
-    printf '{ for v in WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE; do printf "%%s=%%s\\n" "$v" "${!v-<unset>}"; done\n'
+    printf '{ for v in WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE WT_ENV_FILES; do printf "%%s=%%s\\n" "$v" "${!v-<unset>}"; done\n'
     printf '  printf "PWD=%%s\\n" "$(pwd -P)"; } > "%s/$WT_SLUG.log"\n' "$LOGS"
     printf 'rm -f "%s/$WT_SLUG"\n' "$DB"
     printf '%s\n' "$extra"
@@ -222,6 +222,7 @@ contains 'and the recorded WT_PORT' "WT_PORT=$port" "$log"
 contains 'and WT_PATH' "WT_PATH=$W" "$log"
 contains 'and WT_ROOT' "WT_ROOT=$R" "$log"
 contains 'and WT_ENV_FILE' 'WT_ENV_FILE=.env.worktree.local' "$log"
+contains 'and WT_ENV_FILES, the whole list' 'WT_ENV_FILES=.env.worktree.local' "$log"
 contains 'and ran inside the worktree' "PWD=$W" "$log"
 
 # Disk-neutral apart from what is shared on purpose.

@@ -654,6 +654,7 @@ EOF
   eq 'runtime profile -> port base'        '3786'                   "$PROFILE_RT_PORTBASE"
   eq 'runtime profile -> port span'        '200'                    "$PROFILE_RT_PORTSPAN"
   eq 'runtime profile -> env file'         '.env.worktree.local'    "$PROFILE_RT_ENVFILE"
+  eq 'runtime profile -> a string is a list of one' '.env.worktree.local' "$PROFILE_RT_ENVFILES"
   eq 'runtime profile -> seed path'        '.claude/s.sh'           "$PROFILE_RT_SEED"
   eq 'runtime profile -> teardown path'    '.claude/t.sh'           "$PROFILE_RT_TEARDOWN"
   # env.vars is published as COMPACT JSON, not as pairs: that answers "is there anything to write"
@@ -690,6 +691,18 @@ EOF
   eq 'an invalid profile -> not present'  '0' "$PROFILE_PRESENT"
   eq 'an invalid profile publishes no runtime fields at all' '' \
     "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_ENVFILE"
+
+  # A LIST of env files (ADR-012) is published `:`-joined, in order, and ENVFILE is its FIRST
+  # element — never the list's JSON text, which no consumer could use as a path.
+  printf '%s' '{"schemaVersion":1,
+    "runtime":{"env":{"file":[".env.dev.local","config/.env.test.local"],"vars":{"A":"x_{slug}"}}}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'a list of env files -> present' '1' "$PROFILE_PRESENT"
+  eq 'a list of env files -> joined in order' '.env.dev.local:config/.env.test.local' "$PROFILE_RT_ENVFILES"
+  eq 'a list of env files -> ENVFILE is the first' '.env.dev.local' "$PROFILE_RT_ENVFILE"
+  printf '%s' 'not json at all' >"$target"
+  wt_load_profile "$pdir" 2>/dev/null
+  eq 'an unparseable profile clears ENVFILES too' '' "$PROFILE_RT_ENVFILES"
 
   # And a plain valid profile with no runtime block reports none.
   printf '%s' '{"schemaVersion":1}' >"$target"
@@ -1467,6 +1480,29 @@ JSON
   done
   vw '{"schemaVersion":1,"runtime":{"env":{"file":"../../x"}}}'
   contains 'validate: rejects a traversing runtime.env.file' 'runtime.env.file:' "$(vv)"
+
+  # runtime.env.file as a LIST (ADR-012). Every element is a path the plugin writes into, so every
+  # element gets the checks a single path gets, and the list must be exactly a list of strings.
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".env.dev.local",".env.test.local"],"vars":{"A":"1"}}}}'
+  eq 'validate: a list of env files is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[],"vars":{"A":"1"}}}}'
+  contains 'validate: an empty env file list is refused' 'is an empty list' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".a",".a"],"vars":{"A":"1"}}}}'
+  contains 'validate: a file listed twice is refused' 'is listed twice' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".a","../x"],"vars":{"A":"1"}}}}'
+  contains 'validate: a traversing element is refused, by index' 'runtime.env.file[1]:' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".a",3],"vars":{"A":"1"}}}}'
+  contains 'validate: a number among the paths is refused' 'list of path strings' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":[".a",{"x":1}],"vars":{"A":"1"}}}}'
+  eq 'validate: an object among the paths is ONE clear violation' \
+    'runtime.env.file: must be a path or a list of path strings, got [".a",{"x":1}]' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":{"dev":".a"},"vars":{"A":"1"}}}}'
+  contains 'validate: an object instead of a path is refused' 'must be a path or a list of paths' "$(vv)"
+  # `:` joins the list in the state record, so a path containing one would read back as two.
+  for hp in 'a:b' 'with space' 'x/'; do
+    vw '{"schemaVersion":1,"runtime":{"env":{"file":"'"$hp"'","vars":{"A":"1"}}}}'
+    contains "validate: rejects env file \"$hp\"" 'letters, digits' "$(vv)"
+  done
   vw '{"schemaVersion":1,"runtime":{"teardown":"../../rm"}}'
   contains 'validate: rejects a traversing runtime.teardown' 'runtime.teardown:' "$(vv)"
 

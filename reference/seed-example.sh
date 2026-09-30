@@ -31,9 +31,11 @@
 #                                    does not configure one
 #                       WT_PATH      absolute path of the worktree
 #                       WT_ROOT      absolute path of the main checkout
-#                       WT_ENV_FILE  the override file the profile NAMES, relative to WT_PATH.
+#                       WT_ENV_FILE  the FIRST override file the profile names, relative to WT_PATH.
 #                                    EMPTY when the profile has no `runtime.env`, and the file may
 #                                    not exist if the plugin could not write it — guard both.
+#                       WT_ENV_FILES every override file the profile names, one per line, in order
+#                                    (ADR-012) — one per environment that needs its own state.
 #   Time limit          `timeouts.seedSeconds`, or whatever is LEFT of the bootstrap budget if
 #                       that is less. Overrun is not a crash — the script is stopped and the
 #                       session continues.
@@ -72,6 +74,12 @@
 # 4. IT IS SAFE TO RUN TWICE. A hook can be interrupted before the outcome is recorded, and the
 #    next session then runs this again. (It is not retried after a failure it DID record, until
 #    this file changes — so do not rely on "it will just try again next time".)
+#
+# 5. IT CREATES EVERY STORE THE APP WILL DERIVE, IN EVERY ENVIRONMENT. The env override names a
+#    selector; the app often derives more than one name from it — a test environment that appends
+#    `_test` to a database name, a queue or cache prefix, a search index. Clone or create each one
+#    the worktree will touch. A seed that isolates development and forgets the test database lets a
+#    parallel session's test run recreate the shared one mid-suite.
 
 # SC2317/SC2329/SC2034: everything below the sentinel is deliberately UNREACHABLE until a developer
 # deletes that line, and target_exists() is deliberately uncalled-looking for the same reason. That
@@ -145,7 +153,7 @@ fi
 # If your app needs migrations run afterwards, run them HERE, against ${TARGET} — not against
 # whatever the ambient environment points at.
 #
-# READING THE OVERRIDE FILE: do not `source` it. The plugin writes values VERBATIM and unquoted —
+# READING THE OVERRIDE FILES: do not `source` them. The plugin writes values VERBATIM and unquoted —
 # dotenv dialects disagree about quoting, so the profile author's own text is used as-is — and a
 # value may legitimately contain `{worktree}`, which expands to a path containing the branch name.
 # Sourcing turns `DOC_ROOT=/wt/x;whatever` into two commands, run unattended at session start. Read
@@ -157,6 +165,10 @@ fi
 #       export "$k=$v"
 #     done < "${WT_PATH}/${WT_ENV_FILE}"
 #   fi
+#
+# Later lines win, as they do for dotenv: the plugin's block sits after the developer's own lines,
+# so reading the whole file in order ends on the worktree's values. With several files, read each
+# one from WT_ENV_FILES for the environment you are seeding.
 #
 # Note both guards: WT_ENV_FILE is the path your profile NAMES, so it is empty when the profile has
 # a seed and no `runtime.env`, and the file may not exist if the plugin could not write it.

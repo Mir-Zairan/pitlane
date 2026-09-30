@@ -151,11 +151,18 @@ as **options to choose from, never as pre-filled defaults**. Ask about:
 
 - **the environment variable that selects the database**, if there is one;
 - **the port variable**, a sensible base to derive from, and how wide a span to spread across;
-- **which override file the app actually loads** — this becomes `runtime.env.file`, and nothing else
-  can supply it: the engine has nowhere to write the overrides without it. It must be a file the app
-  loads **last**, and it must **not** be a file the checkout already has. Never name `.env` or
-  anything you just offered for `.worktreeinclude` — the engine would overwrite the copied file. A
-  dedicated, gitignored `.env.worktree.local`-style name is what you want;
+- **which env files the app actually loads, per environment** — these become `runtime.env.file`, a
+  path or a list of paths ([ADR-012](../../docs/01-decisions.md#adr-012)), and nothing else can
+  supply them: the engine has nowhere to write the overrides without them. Find out from the app's
+  own env loader, not from convention — many frameworks read only fixed names and a *different* set
+  per environment (development may read a local file that the test environment skips), so a
+  dedicated, invented file name is usually **never read at all**. Name one gitignored file per
+  environment that needs its own state. The file may already exist, and may be one you just offered
+  for `.worktreeinclude`: the engine appends a managed block after the developer's lines rather than
+  replacing the file. Two things to confirm with the developer, because the block depends on both:
+  the app's dotenv parser must honour the **last** assignment of a variable, and nothing the app
+  runs may set the same variable in the **process** environment first — a `VAR=value` prefix in the
+  repo's own docs or scripts beats every file;
 - **whether a seed step is needed** — does a fresh database need populating before the app runs?
 - **whether a teardown step is needed** — see the rule about it below.
 
@@ -167,15 +174,17 @@ that recreates its databases wholesale will destroy a parallel session's test ru
 well the dev database is isolated, and it will do it invisibly, mid-suite.
 
 So surface **every** environment the `hint` records came from and let the developer pick which ones
-need their own state. Write one `runtime.env.vars` entry per confirmed environment. "Only development"
-is a fine answer — but it has to be an answer, not an omission you made for them.
+need their own state. Every confirmed environment needs its env file in `runtime.env.file`, and the
+seed must create every store the app derives from the selector in that environment — a test env that
+appends `_test` to a database name needs that database cloned too. "Only development" is a fine
+answer — but it has to be an answer, not an omission you made for them.
 
 ### Rules for this step, and they are not negotiable
 
 - **Write no `runtime` block the developer did not explicitly confirm.** Omitting it is valid and
   means *touch nothing*.
 - Confirm each answer back in concrete terms — "a worktree named `alice/fix-99` would get database
-  `app_alice_fix_99` on port 3214, with overrides written to `.env.worktree.local`" — because that is
+  `app_alice_fix_99` on port 3214, with overrides written to `.env.development.local` and `.env.test.local`" — because that is
   the sentence in which a wrong guess becomes obvious.
 - **Never author a command that drops, truncates, resets, recreates or dumps a database.** Not in
   `seed`, and above all not in `teardown`. Teardown is by nature "destroy the state we made", so it is

@@ -809,5 +809,29 @@ fi
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0 PROFILE_RT_TEARDOWN='' PROFILE_SEED_TIMEOUT=''
 
+# wt_release_env_overrides: the block comes out of every file the record says is ours (ADR-012),
+# by the RECORDED list and its aligned dispositions — a `theirs` or empty slot is not opened.
+RW=$TMP/release-wt
+mkdir -p "$RW/sub"
+blk=$(printf '%s\nA=1\n%s' "$WT_ENV_BEGIN" "$WT_ENV_END")
+printf 'KEEP=1\n%s\n' "$blk" >"$RW/.env.a"
+printf '%s\n' "$blk" >"$RW/sub/.env.b"
+printf 'MINE=1\n%s\n' "$blk" >"$RW/.env.c"
+printf 'NEVER=1\n%s\n' "$blk" >"$RW/.env.d"
+wt_release_env_overrides "$RW" '.env.a:sub/.env.b:.env.c:.env.d' 'ours:ours:theirs:'
+eq 'release: an ours file keeps its own lines' 'KEEP=1' "$(cat "$RW/.env.a")"
+eq 'release: an ours file that was only the block is removed' no \
+  "$([ -e "$RW/sub/.env.b" ] && echo yes || echo no)"
+eq 'release: a theirs slot is not opened' "MINE=1|$WT_ENV_BEGIN|A=1|$WT_ENV_END" \
+  "$(paste -sd '|' - <"$RW/.env.c")"
+eq 'release: an empty slot is not opened' "NEVER=1|$WT_ENV_BEGIN|A=1|$WT_ENV_END" \
+  "$(paste -sd '|' - <"$RW/.env.d")"
+# A record from before ADR-012 is the same shape with one element.
+printf 'OLD=1\n%s\n' "$blk" >"$RW/.env.e"
+wt_release_env_overrides "$RW" '.env.e' 'ours'
+eq 'release: a single-file record still works' 'OLD=1' "$(cat "$RW/.env.e")"
+wt_release_env_overrides "$RW" '' ''
+eq 'release: an empty record is a no-op' 0 $?
+
 printf '%d passed, %d failed, %d backend(s) exercised\n' "$pass" "$fail" "$backends_run" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$backends_run" -gt 0 ]

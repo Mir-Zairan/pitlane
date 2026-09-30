@@ -937,7 +937,8 @@ wt_is_safe_relpath() {  # $1 = candidate
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
-# group 3 = runtime.env.vars as key/value pairs.
+# group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
+# list (ADR-012). A plain string yields no group-4 records; the scalar carries it.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
@@ -952,7 +953,8 @@ wt_profile_scan() {  # $1 = profile path
     runtime.port.var runtime.port.base runtime.port.span runtime.port \
     -- deps dir lock strategy install verify lockChecksum \
     -- copy . \
-    --kv runtime.env.vars <"$1"
+    --kv runtime.env.vars \
+    -- runtime.env.file . <"$1"
 }
 
 # Split the scalar record of a wt_profile_scan stream into named variables — the ONE place that
@@ -974,6 +976,11 @@ wt_profile_scan() {  # $1 = profile path
 # Sets WT_PS_* and nothing else. `|| true` because a short record makes `read` return 1, which
 # would abort a caller running under `set -e`.
 #
+# WT_PS_ENVFILES is DERIVED, not positional: runtime.env.file normalised to a `:`-joined list
+# (ADR-012). A string is a list of one; a list is its group-4 elements in order. The validator
+# refuses `:` in an env file path, which is what makes the join unambiguous. WT_PS_ENVFILE stays the
+# raw scalar — compact JSON for a list — because that is how the validator tells the two shapes apart.
+#
 # SC2034: every WT_PS_* looks unused here because they ARE this function's return value; the
 # readers are its two callers.
 # shellcheck disable=SC2034
@@ -989,7 +996,32 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
     WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
     <<<"$body" || true
+  WT_PS_ENVFILES=''
+  case $WT_PS_ENVFILE in
+    '['*)
+      while IFS= read -r -d "$WT_RS" rec; do
+        case $rec in
+          4"$WT_US"*) ;;
+          *) continue ;;
+        esac
+        WT_PS_ENVFILES=${WT_PS_ENVFILES:+$WT_PS_ENVFILES:}${rec#*"$WT_US"}
+      done < <(printf '%s' "$raw")
+      ;;
+    *) WT_PS_ENVFILES=$WT_PS_ENVFILE ;;
+  esac
   return 0
+}
+
+# True if $1 is acceptable as ONE runtime.env.file path: relative, inside the tree, and drawn from
+# a conservative character set. The set is narrower than a filesystem allows on purpose — every
+# env file convention in use fits it, and it excludes `:`, which joins the list in the state record,
+# and every character a JSON backend might escape differently, so the list check below is exact on
+# both backends.
+wt_is_safe_envfile() {  # $1 = candidate
+  case ${1-} in
+    '' | *[!A-Za-z0-9._@+/-]* | */) return 1 ;;
+  esac
+  wt_is_safe_relpath "$1"
 }
 
 # The only schemaVersion this build understands. A profile written by a newer plugin
@@ -1082,6 +1114,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local slug envvars copy cpath
   local seedp downp envfile unk tok
   local portvar portbase portspan portobj ekey eval_ nkeys=0
+  local ef efrest efseen efrebuilt efn
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1342,20 +1375,58 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
           wt_log "runtime.teardown names $downp, which does not exist in ${root%/} — teardown will do nothing"
         fi
       fi
-      if [ -n "$envfile" ] && ! wt_is_safe_relpath "$envfile"; then
-        printf 'runtime.env.file: "%s" must be a relative path inside the repository\n' "$envfile"
-        bad=1
-      fi
-      # THE OVERRIDE FILE MUST NOT ALSO BE A COPIED FILE. Both lists draw from the same gitignored
-      # set, so naming one path in both means the copier places the main checkout's version first
-      # and layer 3 then reads it as developer-managed forever — the worktree runs on the shared
-      # database while the plugin blames the developer. The engine now skips it in the copier, so
-      # this is a warning rather than a violation, but the profile still says something it does not
-      # mean and the author should know.
-      if [ -n "$envfile" ] && [ -n "$copy" ]; then
-        case $copy in
-          *"\"$envfile\""*)
-            wt_log "runtime.env.file names $envfile, which copy[] also lists — the plugin writes that file, so it will not be copied in as well; remove it from copy[]"
+      # --- runtime.env.file -----------------------------------------------------
+      # A path or a list of paths (ADR-012). Each is a file the plugin writes a managed block into,
+      # so each gets the path-escape check, and the list must be exactly what it looks like: the
+      # compact JSON is rebuilt from the elements and compared, which catches a number, an object
+      # or a nested list hiding among the strings — none of which pass the character set — and a
+      # stream truncated before group 4, which would otherwise read as an empty list.
+      if [ -n "$envfile" ]; then
+        case $envfile in
+          '['*']')
+            efrebuilt='' efseen=':' efn=0
+            if [ "$envfile" = '[]' ]; then
+              printf 'runtime.env.file: is an empty list — name at least one file, or omit it\n'
+              bad=1
+            elif case ${envfile#\[} in *'{'* | *'['*) true ;; *) false ;; esac; then
+              # A nested object or list: its text would split on its own `:` and `,` into
+              # nonsense elements, so say what is wrong once rather than per fragment.
+              printf 'runtime.env.file: must be a path or a list of path strings, got %s\n' "$envfile"
+              bad=1
+            else
+              efrest=$WT_PS_ENVFILES
+              while [ -n "$efrest" ]; do
+                ef=${efrest%%:*}
+                if [ "$ef" = "$efrest" ]; then efrest=''; else efrest=${efrest#*:}; fi
+                if ! wt_is_safe_envfile "$ef"; then
+                  printf 'runtime.env.file[%d]: "%s" must be a relative path of letters, digits and . _ - @ + /\n' "$efn" "$ef"
+                  bad=1
+                fi
+                case $efseen in
+                  *":$ef:"*)
+                    printf 'runtime.env.file[%d]: "%s" is listed twice\n' "$efn" "$ef"
+                    bad=1
+                    ;;
+                esac
+                efseen="$efseen$ef:"
+                efrebuilt=${efrebuilt:+$efrebuilt,}\"$ef\"
+                efn=$((efn + 1))
+              done
+              if [ "[$efrebuilt]" != "$envfile" ]; then
+                printf 'runtime.env.file: must be a path or a list of path strings, got %s\n' "$envfile"
+                bad=1
+              fi
+            fi
+            ;;
+          '{'*)
+            printf 'runtime.env.file: must be a path or a list of paths, got %s\n' "$envfile"
+            bad=1
+            ;;
+          *)
+            if ! wt_is_safe_envfile "$envfile"; then
+              printf 'runtime.env.file: "%s" must be a relative path of letters, digits and . _ - @ + /\n' "$envfile"
+              bad=1
+            fi
             ;;
         esac
       fi
@@ -1594,12 +1665,15 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #   PROFILE_HAS_RUNTIME     1 if a runtime block exists (ADR-006: absent means touch nothing)
 #   PROFILE_BOOTSTRAP_TIMEOUT / PROFILE_SEED_TIMEOUT   seconds, validated
 #   PROFILE_RT_SLUG / PROFILE_RT_PORTVAR / PROFILE_RT_PORTBASE / PROFILE_RT_PORTSPAN
-#   PROFILE_RT_ENVFILE / PROFILE_RT_ENVVARS / PROFILE_RT_SEED / PROFILE_RT_TEARDOWN
+#   PROFILE_RT_ENVFILE / PROFILE_RT_ENVFILES / PROFILE_RT_ENVVARS / PROFILE_RT_SEED / PROFILE_RT_TEARDOWN
 #                           the runtime block, published for the same reason the evidence block is:
 #                           layer 3 must not re-split the scalar record for itself. Two positional
 #                           readers of one record have to agree forever and nothing notices when
 #                           they stop — which is why there is now exactly one, wt_profile_scalars.
 #                           All are empty unless PROFILE_PRESENT is 1.
+#                           PROFILE_RT_ENVFILES is every runtime.env.file joined with `:` (ADR-012);
+#                           PROFILE_RT_ENVFILE is the FIRST of them — the one a seed receives as
+#                           WT_ENV_FILE — not the raw scalar.
 #                           PROFILE_RT_ENVVARS is the map's COMPACT JSON, not its pairs: it answers
 #                           "is there anything to write" for free. The pairs themselves are group 3
 #                           of PROFILE_RAW, so reading them costs no interpreter start either.
@@ -1635,6 +1709,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_PORTBASE=''
   PROFILE_RT_PORTSPAN=''
   PROFILE_RT_ENVFILE=''
+  PROFILE_RT_ENVFILES=''
   PROFILE_RT_ENVVARS=''
   PROFILE_RT_SEED=''
   PROFILE_RT_TEARDOWN=''
@@ -1732,7 +1807,8 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_PORTVAR=$WT_PS_PORTVAR
   PROFILE_RT_PORTBASE=$WT_PS_PORTBASE
   PROFILE_RT_PORTSPAN=$WT_PS_PORTSPAN
-  PROFILE_RT_ENVFILE=$WT_PS_ENVFILE
+  PROFILE_RT_ENVFILES=$WT_PS_ENVFILES
+  PROFILE_RT_ENVFILE=${WT_PS_ENVFILES%%:*}
   PROFILE_RT_ENVVARS=$WT_PS_ENVVARS
   PROFILE_RT_SEED=$WT_PS_SEED
   PROFILE_RT_TEARDOWN=$WT_PS_TEARDOWN

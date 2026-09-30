@@ -127,21 +127,17 @@ if [ "$present" = 1 ]; then
     exit 0
   fi
 
-  # Only a file this plugin wrote and still carries its marker. The recorded name, never the
-  # profile's current one: a profile edited since would name a file we never made. It goes before
-  # the checkout does, so a removal that fails halfway does not leave the override behind.
+  # Only the plugin's BLOCK, and only in a file recorded `ours` that still carries it (ADR-012):
+  # the developer's own lines stay, and a file that was nothing but the block goes. The recorded
+  # names, never the profile's current ones: a profile edited since would name files we never
+  # wrote. It goes before the checkout does, so a removal that fails halfway does not leave the
+  # overrides behind.
   #
   # Nothing else is unlinked first: the state records no symlink this plugin made (dependencies
   # are hardlinked or installed, config is copied), and neither `git worktree remove` nor `rm -rf`
   # follows a symlink out of the tree.
   # shellcheck disable=SC2153  # set by wt_read_allocation, in teardown-lib.sh
-  envfile=$WT_TD_ENVFILE
-  if [ "$WT_TD_ENVSTATE" = ours ] && [ -n "$envfile" ] && wt_is_safe_relpath "$envfile" \
-    && ! wt_has_symlinked_parent "$worktree" "$envfile" \
-    && [ "$(wt_runtime_env_state "$worktree" "$envfile")" = ours ]; then
-    rm -f -- "${worktree:?}/${envfile:?}" 2>/dev/null \
-      || wt_log "could not remove the env override file $envfile"
-  fi
+  wt_release_env_overrides "$worktree" "$WT_TD_ENVFILE" "$WT_TD_ENVSTATE"
 
   # A single --force: it takes the gitignored dependency directories with it. Never -f -f.
   out=$(wt_git "$root" worktree remove --force "$worktree" 2>&1) || {

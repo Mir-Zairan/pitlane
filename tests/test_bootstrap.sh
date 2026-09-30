@@ -548,7 +548,9 @@ start_hook() {  # $1 = worktree
   ( cd "$1" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$1\"}" \
     | bash "$HOOK" 2>"$TMP/err" )
 }
-envval() { grep "^$2=" "$1/.env.worktree.local" 2>/dev/null | head -1 | cut -d= -f2-; }
+# The EFFECTIVE value: the last assignment, which is what dotenv honours and where the plugin's
+# block sits (ADR-012). $3 names another override file.
+envval() { grep "^$2=" "$1/${3:-.env.worktree.local}" 2>/dev/null | tail -1 | cut -d= -f2-; }
 
 RT=$TMP/rt
 make_rt_repo "$RT"
@@ -771,11 +773,11 @@ eq 'a refused env write stops the seed' 0 "$([ -e "$WU/seeded.txt" ] && echo 1 |
 contains 'and says the worktree is not pointed anywhere yet' 'not pointed at anything named' "$errU"
 eq 'and the session still survives' 'ok' "$(cat "$WU/vendor/marker" 2>/dev/null)"
 
-# THE OVERRIDE FILE IS NEVER COPIED IN, however it is listed. copy[] and .worktreeinclude draw from
-# the same gitignored set the override file must belong to, so a profile naming one path in both
-# would have the copier place the main checkout's version first — layer 3 then finds no marker,
-# records the worktree developer-managed FOREVER, and refuses both the overrides and the seed,
-# blaming the developer for a file the plugin put there itself.
+# AN OVERRIDE FILE LISTED FOR COPYING IS COPIED, AND THEN GETS THE BLOCK (ADR-012). The file an app
+# loads by name is usually the one holding the developer's real configuration, so it must arrive —
+# and the plugin's block, appended after it, is what isolates the worktree. This used to be the
+# opposite: the copier skipped the file, because a copied file without the marker read as
+# developer-owned forever, and that skip never covered the native `claude -w` path at all.
 RO=$TMP/rtoverlap
 make_rt_repo "$RO"
 python3 - "$RO/.claude/worktree-profile.json" <<'PYJ'
@@ -785,50 +787,116 @@ d = json.load(open(f))
 d["copy"] = [".env.worktree.local"]             # the same path runtime.env.file names
 json.dump(d, open(f, "w"))
 PYJ
-printf 'INSTALLATION_NAME=the_main_checkout_one\n' > "$RO/.env.worktree.local"
+printf 'SECRET=from-main\nINSTALLATION_NAME=the_main_checkout_one\n' > "$RO/.env.worktree.local"
 git -C "$RO" add -A; git -C "$RO" commit -qm overlap
 WO=$RO/.claude/worktrees/o1
 git -C "$RO" worktree add -q "$WO" -b worktree-o1 2>/dev/null
 start_hook "$WO" >/dev/null
-eq 'the main checkout version is NOT copied over the override file' 'demo_o1' \
-  "$(envval "$WO" INSTALLATION_NAME)"
-eq 'and the worktree is isolated rather than reading the shared value' 0 \
-  "$(grep -c 'the_main_checkout_one' "$WO/.env.worktree.local" | tr -d ' ')"
+eq 'the developer configuration IS copied in' 'from-main' "$(envval "$WO" SECRET)"
+eq 'and the block after it isolates the worktree' 'demo_o1' "$(envval "$WO" INSTALLATION_NAME)"
+eq 'which a second session leaves the same' 'demo_o1' \
+  "$(start_hook "$WO" >/dev/null; envval "$WO" INSTALLATION_NAME)"
+eq 'with the copied lines still there exactly once' 1 \
+  "$(grep -c '^SECRET=' "$WO/.env.worktree.local" | tr -d ' ')"
 
-# ...and the same for .worktreeinclude, which is the OTHER list drawing from the same gitignored
-# set. It is only honoured on the WorktreeCreate path, so this exercises that branch.
+# THE NATIVE PATH, simulated: Claude Code copies .worktreeinclude BEFORE SessionStart runs, so the
+# hook finds the developer's file already there. That is the case the old skip never covered.
+WN=$RO/.claude/worktrees/n1
+git -C "$RO" worktree add -q "$WN" -b worktree-n1 2>/dev/null
+cp "$RO/.env.worktree.local" "$WN/.env.worktree.local"
+start_hook "$WN" >/dev/null; errN=$(cat "$TMP/err")
+eq 'a file native creation copied in gets the block too' 'demo_n1' "$(envval "$WN" INSTALLATION_NAME)"
+lacks 'and is not announced as the developer file' 'is yours' "$errN"
+
+# ...and the same for .worktreeinclude on the WorktreeCreate path, where the plugin copies it.
 printf '.env.worktree.local\n' > "$RO/.worktreeinclude"
 git -C "$RO" add -A; git -C "$RO" commit -qm wtinclude
 outWC=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"o2\",\"cwd\":\"$RO\"}" "$RO")
 eq 'WorktreeCreate still prints the worktree path' "$RO/.claude/worktrees/o2" "$outWC"
-eq 'and .worktreeinclude did NOT copy the main checkout version over the override file' 0 \
-  "$(grep -c 'the_main_checkout_one' "$RO/.claude/worktrees/o2/.env.worktree.local" 2>/dev/null | tr -d ' ')"
+eq 'and .worktreeinclude copied the developer configuration in' 'from-main' \
+  "$(envval "$RO/.claude/worktrees/o2" SECRET)"
 eq 'while the worktree got its own isolated value' 'demo_o2' \
   "$(envval "$RO/.claude/worktrees/o2" INSTALLATION_NAME)"
 
-# A CHANGED runtime.env.file makes the recorded disposition meaningless — it described a different
-# file. Carrying `theirs` across would suppress the once-only notice for the NEW file, so a
-# developer who is now managing a second file would never be told the plugin has stopped writing it.
+# OWNERSHIP IS PER FILE, looked up by name. Taking over one file must not stop the plugin writing a
+# file it has never seen — a newly listed file that already exists is the developer's configuration
+# and gets the block — and the file taken over stays taken over.
 RV=$TMP/rtchangedenv
 make_rt_repo "$RV"
 git -C "$RV" worktree add -q "$RV/.claude/worktrees/v1" -b worktree-v1 2>/dev/null
 WV=$RV/.claude/worktrees/v1
 start_hook "$WV" >/dev/null
-printf 'MINE=1\n' > "$WV/.env.worktree.local"          # take ownership of the first file
-start_hook "$WV" >/dev/null                              # ...and be told once
+printf 'MINE=1\n' > "$WV/.env.worktree.local"          # take the first file over: its block is gone
+start_hook "$WV" >/dev/null; errV1=$(cat "$TMP/err")
+contains 'taking a file over is announced' '.env.worktree.local is yours' "$errV1"
+eq 'and it is left alone' 'MINE=1' "$(cat "$WV/.env.worktree.local")"
+start_hook "$WV" >/dev/null; errV2=$(cat "$TMP/err")
+lacks 'but only once' 'is yours' "$errV2"
 printf '.env.other.local\n' >> "$WV/.gitignore"
 python3 - "$WV/.claude/worktree-profile.json" <<'PYJ'
 import json, sys
 f = sys.argv[1]
 d = json.load(open(f))
-d["runtime"]["env"]["file"] = ".env.other.local"
+d["runtime"]["env"]["file"] = [".env.worktree.local", ".env.other.local"]
 json.dump(d, open(f, "w"))
 PYJ
-printf 'ALSO_MINE=1\n' > "$WV/.env.other.local"          # and of the new one
+printf 'ALSO_MINE=1\n' > "$WV/.env.other.local"
 start_hook "$WV" >/dev/null; errV=$(cat "$TMP/err")
-contains 'a NEW developer-managed override file is announced on its own terms' \
-  '.env.other.local is yours' "$errV"
-eq 'and it is left alone' 'ALSO_MINE=1' "$(cat "$WV/.env.other.local")"
+eq 'a newly listed existing file keeps its lines' 'ALSO_MINE=1' "$(head -1 "$WV/.env.other.local")"
+eq 'and gets the block' 'demo_v1' "$(envval "$WV" INSTALLATION_NAME .env.other.local)"
+eq 'while the file taken over is still left alone' 'MINE=1' "$(cat "$WV/.env.worktree.local")"
+lacks 'and is not re-announced' '.env.worktree.local is yours' "$errV"
+# shellcheck disable=SC1091  # sourced from the plugin at run time
+eq 'the record keeps one disposition per file, aligned' 'theirs:ours' \
+  "$(. "${HOOK%/*}/lib.sh"; . "${HOOK%/*}/bootstrap-lib.sh"; wt_runtime_state_get "$WV" envstate)"
+
+# A SESSION THAT CANNOT WRITE A FILE KEEPS WHAT WAS RECORDED FOR IT. Forgetting `ours` there would
+# let a later take-over (block deleted) read as "never written" and get the block appended again.
+rm -f "$WV/.env.other.local"; mkdir "$WV/.env.other.local"
+start_hook "$WV" >/dev/null
+# shellcheck disable=SC1091  # sourced from the plugin at run time
+eq 'an unwritable file keeps its recorded disposition' 'theirs:ours' \
+  "$(. "${HOOK%/*}/lib.sh"; . "${HOOK%/*}/bootstrap-lib.sh"; wt_runtime_state_get "$WV" envstate)"
+rmdir "$WV/.env.other.local"
+printf 'TOOK_IT=1\n' > "$WV/.env.other.local"
+start_hook "$WV" >/dev/null
+eq 'so taking it over afterwards is still honoured' 'TOOK_IT=1' "$(cat "$WV/.env.other.local")"
+
+# EVERY ENVIRONMENT'S FILE gets the same block, and the seed sees them all.
+RM=$TMP/rtmulti
+make_rt_repo "$RM" ',
+    "seed": ".claude/worktree-seed.sh"'
+printf '.env.test.local\n' >> "$RM/.gitignore"
+python3 - "$RM/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["runtime"]["env"]["file"] = [".env.worktree.local", ".env.test.local"]
+json.dump(d, open(f, "w"))
+PYJ
+mkdir -p "$RM/.claude"
+# shellcheck disable=SC2016  # the $WT_* references must reach the seed script.
+printf '#!/usr/bin/env bash\nprintf "%%s|%%s" "$WT_ENV_FILE" "$WT_ENV_FILES" > "$WT_PATH/seed-env.txt"\n' \
+  > "$RM/.claude/worktree-seed.sh"
+chmod +x "$RM/.claude/worktree-seed.sh"
+git -C "$RM" add -A; git -C "$RM" commit -qm multi
+WM=$RM/.claude/worktrees/m1
+git -C "$RM" worktree add -q "$WM" -b worktree-m1 2>/dev/null
+start_hook "$WM" >/dev/null; errM=$(cat "$TMP/err")
+eq 'the first file gets the block' 'demo_m1' "$(envval "$WM" INSTALLATION_NAME)"
+eq 'and so does the second' 'demo_m1' "$(envval "$WM" INSTALLATION_NAME .env.test.local)"
+contains 'and the summary names both' 'env=.env.worktree.local, .env.test.local' "$errM"
+eq 'the seed receives the first as WT_ENV_FILE and all of them as WT_ENV_FILES' \
+  ".env.worktree.local|.env.worktree.local
+.env.test.local" "$(cat "$WM/seed-env.txt" 2>/dev/null)"
+# One file taken over is enough to stop a reseed: that environment points somewhere the slug does
+# not describe.
+printf 'MINE=1\n' > "$WM/.env.test.local"
+# shellcheck disable=SC2016  # $WT_PATH must reach the seed script, not be expanded here.
+printf '#!/usr/bin/env bash\nprintf again > "$WT_PATH/seed-again.txt"\n' > "$WM/.claude/worktree-seed.sh"
+start_hook "$WM" >/dev/null; errM2=$(cat "$TMP/err")
+eq 'a seed with one file taken over is refused' 0 "$([ -e "$WM/seed-again.txt" ] && echo 1 || echo 0)"
+contains 'and the refusal names the files' '.env.worktree.local or .env.test.local is managed by you' "$errM2"
 
 # ACCEPTANCE: every runtime failure path still yields a session. A seed that fails, and one that
 # hangs past its budget.

@@ -877,8 +877,9 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
     WT_PORT=$WT_TD_PORT
     WT_PATH=$wt
     WT_ROOT=$root
-    WT_ENV_FILE=$WT_TD_ENVFILE
-    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE
+    WT_ENV_FILE=${WT_TD_ENVFILE%%:*}
+    WT_ENV_FILES=${WT_TD_ENVFILE//:/$WT_NL}
+    export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE WT_ENV_FILES
     wt_run_in_shell "./'$esc'" "$rundir" "$secs"
   )
   rc=$?
@@ -893,6 +894,24 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
       wt_log "runtime: the teardown script failed (exit $rc) — its database or containers may still exist"
       ;;
   esac
+  return 0
+}
+
+# Take the plugin's block out of every override file the record says is `ours` (ADR-012). $2 and
+# $3 are the record's `:`-joined, aligned file list and dispositions; a file whose slot is `theirs`
+# or empty is the developer's, or was never written, and is not opened at all. The recorded list,
+# never the profile's current one: a profile edited since would name files the plugin never wrote.
+wt_release_env_overrides() {  # $1 = worktree, $2 = recorded env files, $3 = recorded dispositions
+  local worktree=${1%/} files=${2-} states=${3-} f st
+  while [ -n "$files" ]; do
+    f=${files%%:*}
+    st=${states%%:*}
+    if [ "$f" = "$files" ]; then files=''; else files=${files#*:}; fi
+    if [ "$st" = "$states" ]; then states=''; else states=${states#*:}; fi
+    [ "$st" = ours ] || continue
+    wt_runtime_env_release "$worktree" "$f" \
+      || wt_log "could not remove the plugin's block from $f"
+  done
   return 0
 }
 
