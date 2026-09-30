@@ -256,22 +256,28 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
 # The self-healing this enables is real but NARROWER than it first looks, so state it precisely:
 # it covers the profile's `copy[]` only. That list is re-applied on every entry, so a worktree
 # that lost one of those files gets it back next session — something native cannot do, since
-# `.worktreeinclude` is honoured at creation and never again. `.worktreeinclude` itself is
-# re-applied only on the WorktreeCreate path, where native never ran; on SessionStart it is
-# deliberately left alone, because redoing what native already did could only ever disagree
-# with it.
+# `.worktreeinclude` is honoured at creation and never again. `.worktreeinclude` itself is applied
+# on the WorktreeCreate path, where native never ran, and on a worktree's FIRST SessionStart, which
+# covers one made with plain `git worktree add` (bootstrap.sh says why). Both are copy-if-missing.
 
 # Emit, NUL-separated, the paths `.worktreeinclude` selects: untracked files matching its patterns.
 # The gitignored half of the rule is applied later, by the copier, in one batched call.
 #
-# Only for the WorktreeCreate path. Registering that hook disables native `.worktreeinclude`
-# handling, so the plugin owes the behaviour there; on SessionStart native has already done it and
-# repeating it could only ever disagree with what it did.
-wt_worktreeinclude_paths() {  # $1 = main checkout
-  local root=${1%/}
-  [ -f "$root/.worktreeinclude" ] || return 0
+# THE PATTERNS ARE THE WORKTREE'S OWN when it has a `.worktreeinclude`, the main checkout's
+# otherwise — the rule ADR-008 sets for the profile, for the same reason: the branch checked out in
+# the worktree is what says what it needs, and a branch that adds the file must not wait for the main
+# checkout to catch up (measured: a review branch adding it bootstrapped with nothing copied, because
+# the main checkout was on a branch without one). The FILES are always the main checkout's: that is
+# where the gitignored originals live.
+wt_worktreeinclude_paths() {  # $1 = main checkout, $2 = worktree (optional)
+  local root=${1%/} worktree=${2-} patterns
+  patterns=$root/.worktreeinclude
+  if [ -n "$worktree" ] && [ -f "${worktree%/}/.worktreeinclude" ] && [ ! -L "${worktree%/}/.worktreeinclude" ]; then
+    patterns=${worktree%/}/.worktreeinclude
+  fi
+  [ -f "$patterns" ] || return 0
   # -z because a path may contain a newline, and this feeds a NUL-delimited reader.
-  wt_git "$root" ls-files -z -o -i --exclude-from="$root/.worktreeinclude" 2>/dev/null || true
+  wt_git "$root" ls-files -z -o -i --exclude-from="$patterns" 2>/dev/null || true
 }
 
 # True if any PARENT component of the relative path $2, resolved under $1, is a symlink.
@@ -449,7 +455,7 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
   local root=${1%/} worktree=${2%/} own_include=${3:-0} rec body
 
   {
-    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root"
+    [ "$own_include" = 1 ] && wt_worktreeinclude_paths "$root" "$worktree"
     # copy[] comes out of the scan wt_load_profile already made — group 2 — so honouring it costs
     # no interpreter start at all. PROFILE_RAW is empty unless the profile validated, so an
     # unusable profile contributes nothing here rather than contributing half its list.

@@ -563,6 +563,20 @@ printf 'SECRET=native-put-this\n' > "$WNA/.env"
 run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WNA\"}" "$WNA" >/dev/null
 eq 'first session: a file native already copied is not overwritten' 'SECRET=native-put-this' "$(cat "$WNA/.env")"
 
+# THE WORKTREE'S OWN .worktreeinclude wins over the main checkout's (ADR-008's rule for the profile):
+# a branch that adds one must not wait for the main checkout to have it too.
+RWI=$TMP/wtinclude-own
+make_repo "$RWI" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+printf 'EXTRA=from-main\n' > "$RWI/.env.extra"
+git -C "$RWI" rm -q --cached .worktreeinclude; rm -f "$RWI/.worktreeinclude"; git -C "$RWI" commit -qm 'no include on main'
+git -C "$RWI" checkout -q -b adds-include
+printf '.env.extra\n' > "$RWI/.worktreeinclude"; git -C "$RWI" add .worktreeinclude; git -C "$RWI" commit -qm 'adds include'
+git -C "$RWI" checkout -q -
+WWI=$RWI/.claude/worktrees/wi
+git -C "$RWI" worktree add -q "$WWI" adds-include 2>/dev/null
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WWI\"}" "$WWI" >/dev/null
+eq 'own .worktreeinclude: the worktree branch patterns are used' 'EXTRA=from-main' "$(cat "$WWI/.env.extra" 2>/dev/null)"
+
 # A NAME THAT IS A LEGAL DIRECTORY BUT NOT A LEGAL BRANCH. `worktree-my fix` used to fail
 # `git worktree add -b`, so the hook printed no path and creation failed (a Phase 3 carry-over).
 RSP=$TMP/spaced
