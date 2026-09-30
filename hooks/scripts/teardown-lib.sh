@@ -698,13 +698,13 @@ wt_submodules_hold_commits() {  # $1 = checkout, $2 = its path under the worktre
 #   WT_TD_NAME         the name the seed saw: the one the ledger entry first recorded, else
 #                      wt_name_from_path's — which differs for a WorktreeCreate name with a `/`
 #                      (`alice/fix-99` lives in `alice-fix-99/`) when the ledger entry is missing.
-#   WT_TD_SLUG, WT_TD_PORT, WT_TD_PORTSOURCE, WT_TD_ENVFILE, WT_TD_ENVSTATE
+#   WT_TD_SLUG, WT_TD_PORT, WT_TD_PORTSOURCE, WT_TD_ENVFILE, WT_TD_ENVSTATE, WT_TD_SEEDSTATUS
 #                      the `rt` record's fields, empty when WT_TD_SOURCE is.
 #   WT_TD_STATUS       the teardown script's outcome: none (nothing to run), done, failed, timeout,
 #                      or skipped (a script that could not be run, or no time left to run it).
 #   WT_TD_LEDGER       what became of the ledger entry: forgotten, kept, or none (there was none).
 WT_TD_KEEP_REASON='' WT_TD_SOURCE='' WT_TD_NAME='' WT_TD_SLUG='' WT_TD_PORT='' WT_TD_PORTSOURCE=''
-WT_TD_ENVFILE='' WT_TD_ENVSTATE='' WT_TD_STATUS=none WT_TD_LEDGER=none
+WT_TD_ENVFILE='' WT_TD_ENVSTATE='' WT_TD_SEEDSTATUS='' WT_TD_STATUS=none WT_TD_LEDGER=none
 
 # Take the per-worktree lock bootstrap holds while it runs, on descriptor $2, and keep it until the
 # caller releases it (wt_lock_release) or exits. Returns 0 when teardown may go on, 1 when the
@@ -781,7 +781,7 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
   local state=${1-} root=${2-} entry=${3-} wt=${4-} field value
 
   WT_TD_SOURCE='' WT_TD_NAME='' WT_TD_SLUG='' WT_TD_PORT='' WT_TD_PORTSOURCE=''
-  WT_TD_ENVFILE='' WT_TD_ENVSTATE=''
+  WT_TD_ENVFILE='' WT_TD_ENVSTATE='' WT_TD_SEEDSTATUS=''
 
   # The ledger keeps the first name recorded for this allocation (wt_ledger_write), even when the
   # state file is the source: the rt record holds no name. Without an entry it is derived exactly as
@@ -798,7 +798,7 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
     return 1
   fi
 
-  for field in slug port portsource envfile envstate; do
+  for field in slug port portsource envfile envstate seedstatus; do
     if [ "$WT_TD_SOURCE" = ledger ]; then
       value=$(wt_ledger_field "$root" "$entry" "$field") || value=''
     else
@@ -810,6 +810,7 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
       portsource) WT_TD_PORTSOURCE=$value ;;
       envfile) WT_TD_ENVFILE=$value ;;
       envstate) WT_TD_ENVSTATE=$value ;;
+      seedstatus) WT_TD_SEEDSTATUS=$value ;;
     esac
   done
   return 0
@@ -847,6 +848,22 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
     return 0
   fi
   [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "$rel" ] || return 0
+
+  # ONLY WHAT A SEED MADE (ADR-013). With a seed in the profile, the teardown script undoes it, so
+  # it runs only when the record says the seed actually ran — `done`, or `failed`/`timeout`, which
+  # may have left half a database. A seed that was refused, skipped or never attempted created
+  # nothing, and the name the record holds may belong to someone else: a live sibling on the same
+  # slug (the seed refuses exactly then), or a database a developer cloned by hand for a worktree
+  # that predates the plugin. Nothing to undo is `none`, so the entry is let go.
+  if [ -n "${PROFILE_RT_SEED:-}" ]; then
+    case $WT_TD_SEEDSTATUS in
+      done | failed | timeout) ;;
+      *)
+        wt_log "runtime: the seed never ran for slug=$WT_TD_SLUG (recorded: ${WT_TD_SEEDSTATUS:-nothing}), so there is nothing of the plugin's to tear down — $rel not run"
+        return 0
+        ;;
+    esac
+  fi
 
   WT_TD_STATUS=skipped
   if ! wt_is_safe_relpath "$rel" || wt_has_symlinked_parent "$rundir" "$rel" || [ -L "$rundir/$rel" ]; then

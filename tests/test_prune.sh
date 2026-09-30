@@ -585,6 +585,32 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Adoption: worktrees that predate the plugin (ADR-013)
+# ---------------------------------------------------------------------------
+# Made with plain git, set up by hand, never bootstrapped: no state file, no ledger entry. A report
+# over them must offer nothing for a live one, and must never claim a runtime allocation — any
+# database such a worktree uses was made by hand, and the plugin cannot see it.
+RA=$TMP/adopt
+git init -q -b main "$RA"
+git -C "$RA" config user.email t@example.com; git -C "$RA" config user.name t
+printf '.claude/worktrees/\n.env.local\n' >"$RA/.gitignore"
+printf 'tracked\n' >"$RA/app.txt"
+git -C "$RA" add -A; git -C "$RA" commit -qm init
+for n in handclean handdirty agent-a1; do
+  git -C "$RA" worktree add -q "$RA/.claude/worktrees/$n" -b "worktree-$n" 2>/dev/null
+  printf 'DB=hand_clone_%s\n' "$n" >"$RA/.claude/worktrees/$n/.env.local"
+done
+printf 'edited\n' >>"$RA/.claude/worktrees/handdirty/app.txt"
+prune "$RA"
+eq 'adoption: the report exits 0' 0 "$(cat "$TMP/rc")"
+eq 'adoption: a clean live worktree is not offered' '' "$(grep "worktrees/handclean" "$TMP/out")"
+eq 'adoption: nor an old-looking subagent worktree that is still live' '' "$(grep "worktrees/agent-a1" "$TMP/out")"
+eq 'adoption: a dirty one is listed as held, with nothing to apply' 'none' \
+  "$(field held "$RA/.claude/worktrees/handdirty" 5)"
+eq 'adoption: no runtime allocation is invented for them' 0 \
+  "$(grep -c "$(printf '\t')runtime-leftover$(printf '\t')" "$TMP/out" | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 

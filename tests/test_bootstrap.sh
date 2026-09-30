@@ -871,7 +871,10 @@ d = json.load(open(f))
 d["runtime"]["env"]["file"] = [".env.worktree.local", ".env.other.local"]
 json.dump(d, open(f, "w"))
 PYJ
-printf 'ALSO_MINE=1\n' > "$WV/.env.other.local"
+# The main checkout has the file too, and the worktree's is a copy of it — what .worktreeinclude or
+# native creation would have put there. A copy gets the block; a hand-made file would not (ADR-013).
+printf 'ALSO_MINE=1\n' > "$RV/.env.other.local"
+cp "$RV/.env.other.local" "$WV/.env.other.local"
 start_hook "$WV" >/dev/null; errV=$(cat "$TMP/err")
 eq 'a newly listed existing file keeps its lines' 'ALSO_MINE=1' "$(head -1 "$WV/.env.other.local")"
 eq 'and gets the block' 'demo_v1' "$(envval "$WV" INSTALLATION_NAME .env.other.local)"
@@ -892,6 +895,37 @@ rmdir "$WV/.env.other.local"
 printf 'TOOK_IT=1\n' > "$WV/.env.other.local"
 start_hook "$WV" >/dev/null
 eq 'so taking it over afterwards is still honoured' 'TOOK_IT=1' "$(cat "$WV/.env.other.local")"
+
+# ADOPTION (ADR-013): a worktree set up by hand before the plugin arrived. Its env file differs from
+# the main checkout's and nothing records it, so the plugin must not re-point it — and must not seed.
+RA=$TMP/rtadopt
+make_rt_repo "$RA" ',
+    "seed": ".claude/worktree-seed.sh"'
+printf 'INSTALLATION_NAME=shared_db\n' > "$RA/.env.worktree.local"
+mkdir -p "$RA/.claude"
+# shellcheck disable=SC2016  # $WT_PATH must reach the seed script, not be expanded here.
+printf '#!/usr/bin/env bash\nprintf ran > "$WT_PATH/seeded.txt"\n' > "$RA/.claude/worktree-seed.sh"
+chmod +x "$RA/.claude/worktree-seed.sh"
+git -C "$RA" add -A; git -C "$RA" commit -qm adopt
+WA1=$RA/.claude/worktrees/handmade
+git -C "$RA" worktree add -q "$WA1" -b worktree-handmade 2>/dev/null
+printf 'INSTALLATION_NAME=handmade_clone\n' > "$WA1/.env.worktree.local"   # pointed at a hand clone
+start_hook "$WA1" >/dev/null; errA=$(cat "$TMP/err")
+eq 'adoption: a hand-configured env file is left byte for byte alone' 'INSTALLATION_NAME=handmade_clone' \
+  "$(cat "$WA1/.env.worktree.local")"
+contains 'adoption: and it says why, once' 'set up in this worktree by hand' "$errA"
+eq 'adoption: nothing is seeded against a name the worktree does not use' 0 \
+  "$([ -e "$WA1/seeded.txt" ] && echo 1 || echo 0)"
+start_hook "$WA1" >/dev/null; errA2=$(cat "$TMP/err")
+lacks 'adoption: the notice is not repeated' 'set up in this worktree by hand' "$errA2"
+# A file that exists only in the worktree was made there too.
+WA2=$RA/.claude/worktrees/handmade2
+git -C "$RA" worktree add -q "$WA2" -b worktree-handmade2 2>/dev/null
+rm -f "$RA/.env.worktree.local"
+printf 'INSTALLATION_NAME=only_here\n' > "$WA2/.env.worktree.local"
+start_hook "$WA2" >/dev/null
+eq 'adoption: a file only the worktree has is left alone too' 'INSTALLATION_NAME=only_here' \
+  "$(cat "$WA2/.env.worktree.local")"
 
 # EVERY ENVIRONMENT'S FILE gets the same block, and the seed sees them all.
 RM=$TMP/rtmulti

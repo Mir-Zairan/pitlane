@@ -177,5 +177,6 @@ echo "worktree-seed: replace this section with the clone your database needs" >&
 exit 1
 
 # A note on what you have when this returns 0: the worktree has its own port, its own override
-# file, and its own data. Phase 5's teardown will run `runtime.teardown` — a separate script,
+# file, and its own data. Phase 5's teardown will run `runtime.teardown` — only for a worktree
+# whose seed ran (ADR-013) — a separate script,
 # written under the same rules, and the only place a DROP belongs.

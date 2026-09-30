@@ -2806,6 +2806,16 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
       f=${rest%%:*}
       if [ "$f" = "$rest" ]; then rest=''; else rest=${rest#*:}; fi
       prior=$(wt_runtime_env_recorded "$oldenv" "$oldstates" "$f")
+      # A FILE NOTHING RECORDS, WITHOUT A BLOCK, THAT DIFFERS FROM THE MAIN CHECKOUT'S was written in
+      # this worktree by hand — most often one set up before the plugin was adopted, pointed at a
+      # database cloned by hand (ADR-013). Appending the block would silently re-point it. A file
+      # native creation or .worktreeinclude just copied in is byte-identical to the main checkout's,
+      # which is the one case the block is for. Said once, since the verdict is then recorded.
+      if [ -z "$prior" ] && [ "$(wt_runtime_env_state "$worktree" "$f")" = unmarked ] \
+        && ! cmp -s -- "$root/$f" "$worktree/$f" 2>/dev/null; then
+        prior=theirs
+        wt_log "runtime: $f is yours — it differs from the main checkout's copy, so it was set up in this worktree by hand; it will be left alone, and nothing will be seeded. To hand it to the plugin, add this line at its end: $WT_ENV_MARKER"
+      fi
       wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}" "$prior"
       case $WT_ENV_WROTE in
         written) fstate=ours ;;

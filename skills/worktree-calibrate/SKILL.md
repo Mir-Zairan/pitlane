@@ -296,7 +296,9 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
 - how to start the dev server on the worktree's port, when the port is taken by a flag;
 - to make another worktree, use `EnterWorktree` or a subagent with `isolation: "worktree"` — not a
   raw `git worktree add` from inside a session, which no hook sees. The exception is checking out an
-  *existing* branch, which neither can do: `git worktree add` it, then start a new session inside it.
+  *existing* branch, which neither can do: `git worktree add .claude/worktrees/<name> <branch>`, then
+  start a new session inside it. It must be under `.claude/worktrees/` — a worktree anywhere else is
+  never bootstrapped.
 
 If there is no `runtime` block, leave out the database and port lines rather than writing them as
 "not isolated" — say that in the confirmation instead.

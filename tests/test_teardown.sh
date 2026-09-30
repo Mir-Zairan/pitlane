@@ -591,6 +591,29 @@ contains 'ledger only: the recorded env file' 'WT_ENV_FILE=.env.worktree.local' 
 eq 'ledger only: the ledger entry is forgotten' no "$(exists "$R/.git/worktree-ledger/stateless")"
 
 # ---------------------------------------------------------------------------
+# A seed that never ran: nothing of the plugin's to tear down (ADR-013)
+# ---------------------------------------------------------------------------
+# The record still holds a slug, and a database by that name may belong to someone else — a live
+# sibling on the same slug, or a clone a developer made by hand. The teardown script must not run.
+
+RN=$TMP/never-seeded
+make_repo "$RN"
+chmod -x "$RN/.claude/worktree-seed.sh"
+git -C "$RN" update-index --chmod=-x .claude/worktree-seed.sh
+git -C "$RN" commit -qm 'seed not executable'
+printf 'someone_elses\n' >"$DB/unseeded"
+WN=$(create "$RN" unseeded)
+eq 'never seeded: fixture — the seed did not run' 'someone_elses' "$(cat "$DB/unseeded" 2>/dev/null)"
+remove "$(remove_payload "$WN" "$RN")" "$RN"
+errN=$(cat "$TMP/err")
+eq 'never seeded: the worktree is still removed' no "$(exists "$WN")"
+eq 'never seeded: the teardown script did not run' no "$(exists "$LOGS/unseeded.log")"
+eq 'never seeded: so the database of that name is untouched' 'someone_elses' "$(cat "$DB/unseeded" 2>/dev/null)"
+contains 'never seeded: and it says why' 'the seed never ran for slug=unseeded' "$errN"
+eq 'never seeded: the ledger entry is let go — there is nothing left to undo' no \
+  "$(exists "$RN/.git/worktree-ledger/unseeded")"
+
+# ---------------------------------------------------------------------------
 # A hostile worktree name, through the whole cycle
 # ---------------------------------------------------------------------------
 #
