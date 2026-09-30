@@ -1605,13 +1605,19 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     # The optional cheap sanity check. It decides `done` versus `dirty`, and `dirty` is what makes
     # the next entry try again rather than trust this one.
+    #
+    # IT RUNS IN THE HOST SHELL, NOT THE TOOLCHAIN WRAPPER. A verify is a cheap check by contract —
+    # every one the detection table proposes is a plain file test — while the wrapper is not cheap:
+    # measured on the reference repo, one `nix develop --command true` costs 14s warm in the main
+    # checkout and 25–38s in a fresh worktree, and a repo with nine dependency entries paid that nine
+    # times on its first bootstrap, for nine `test -r` calls. The time bound is unchanged.
     if [ "$rc" -eq 0 ] && [ -n "$verify" ]; then
       left=$(wt_budget_left "$deadline")
       if [ "$left" -le 0 ]; then
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
         rc=1
       else
-        wt_run_in_shell "$verify" "$worktree" "$left"
+        PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
         rc=$?
         [ "$rc" -eq 0 ] || wt_log "  $dir: the verify command failed (exit $rc) — it will be retried next session"
       fi

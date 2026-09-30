@@ -519,6 +519,30 @@ contains '...and the next run sees a finished dependency, not a frozen partial o
 # only the development database is the "looks right, is subtly wrong" failure the phase names: a
 # test runner that recreates its databases wholesale destroys a parallel session's test run
 # regardless of how well the dev database is separated.
+# VERIFY RUNS ON THE HOST, INSTALL INSIDE THE TOOLCHAIN. The wrapper can cost tens of seconds a
+# call (measured: nix develop, 14–38s), and a verify is a cheap file test by contract.
+RWV=$TMP/verifyhost
+mkdir -p "$RWV"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/wrapper.log"\nexec "$@"\n' "$TMP" > "$TMP/wrap.sh"
+chmod +x "$TMP/wrap.sh"
+make_repo "$RWV" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker","verify":"test -r vendor/marker"}'
+python3 - "$RWV/.claude/worktree-profile.json" "$TMP/wrap.sh" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["shell"] = sys.argv[2]
+json.dump(d, open(f, "w"))
+PYJ
+git -C "$RWV" add -A; git -C "$RWV" commit -qm wrapper
+WWV=$RWV/.claude/worktrees/v1
+git -C "$RWV" worktree add -q "$WWV" -b worktree-v1 2>/dev/null
+: > "$TMP/wrapper.log"
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WWV\"}" "$WWV" >/dev/null
+contains 'verify on host: the install ran through the toolchain wrapper' 'printf ok > vendor/marker' "$(cat "$TMP/wrapper.log")"
+lacks 'verify on host: the verify did not' 'test -r vendor/marker' "$(cat "$TMP/wrapper.log")"
+eq 'verify on host: and the entry is still recorded done' 'ok' "$(cat "$WWV/vendor/marker" 2>/dev/null)"
+lacks 'verify on host: with no verify failure reported' 'verify command failed' "$(cat "$TMP/err")"
+
 # A NAME THAT IS A LEGAL DIRECTORY BUT NOT A LEGAL BRANCH. `worktree-my fix` used to fail
 # `git worktree add -b`, so the hook printed no path and creation failed (a Phase 3 carry-over).
 RSP=$TMP/spaced
