@@ -1,6 +1,6 @@
 # Detection
 
-What `/worktree-calibrate` can work out for itself, what it must ask about, and what it must refuse to
+What `/pitlane-setup` can work out for itself, what it must ask about, and what it must refuse to
 do quietly.
 
 > **`reference/detection.json` is ground truth.** The tables below are a readable rendering of it, for
@@ -8,15 +8,13 @@ do quietly.
 > file at runtime. **To add an ecosystem, edit `detection.json`** — then update the table here in the
 > same commit. If the two ever disagree, the JSON is correct and this file is stale.
 >
-> `docs/02-architecture.md` used to carry a third copy of these tables. It now points here. One table
-> restated in three places is a doc-rot generator, and this repo's rule is that documents which lie are
-> worse than no documents.
+> One table restated in several places is a doc-rot generator, and this repo's rule is that documents
+> which lie are worse than no documents.
 
 ## The split this file exists to enforce
 
 Layers 1 and 2 are **genuinely detectable**: a lockfile implies an install command, a `flake.nix`
-implies a shell wrapper. Layer 3 is **not**, and must never be guessed
-([ADR-006](../docs/01-decisions.md#adr-006)) — nothing in a repository says that an env var selects a
+implies a shell wrapper. Layer 3 is **not**, and must never be guessed — nothing in a repository says that an env var selects a
 tenant database.
 
 So calibration *detects and proposes* the first two, and *hints and asks* for the third. The failure
@@ -25,8 +23,7 @@ Detection should refuse to guess rather than guess quietly.
 
 ## Dependency directories
 
-First column is the marker file at the repo root. Strategy rationale is
-[ADR-004](../docs/01-decisions.md#adr-004) / [ADR-005](../docs/01-decisions.md#adr-005): `install`
+First column is the marker file at the repo root. The strategy rationale: `install`
 where the tool has its own content-addressable store, `hardlink` where it materialises real bytes per
 project, `skip` where the artefacts are build output that a shared cache already handles.
 
@@ -83,7 +80,7 @@ into an array. Ordering plus a guard expresses the same thing with no nesting.
 - **A venv is not fully relocatable.** Scripts in `.venv/bin` hard-code an absolute interpreter path
   in their shebang, so a hardlinked venv still points at the main checkout's path. It usually works
   because the interpreter is outside the repo, but it is the reason `uv` is `install` rather than
-  `hardlink` even beyond ADR-005.
+  `hardlink` even beyond its global cache.
 - **`Cargo.lock` gets `dir: null`, not `dir: target`.** `install` is documented as the command that
   populates `dir`, and `cargo fetch` populates `CARGO_HOME`, not `target/`. Naming a directory the
   entry then skips would be a claim it doesn't honour. Nothing per-project is managed for Rust.
@@ -142,7 +139,7 @@ every healthy Go repo, which is exactly the false positive the probe exists to r
 Full prove-by-installing is deliberately **not** done at calibrate time. It costs minutes (on the
 real repository, a 400 MB `vendor/` plus a pnpm workspace), and it proves the wrong property: an install
 that migrates the shared database **exits 0**, so the dangerous variant is exactly the one that passes.
-Phase 6 owns the real run.
+A real run on a real repository is what proves it.
 
 ## Post-install hazards
 
@@ -207,8 +204,8 @@ post-install-cmd  ->  @install-lib, @cache:clear, @db, @warm-up, @assets:install
 ```
 
 A plain `composer install` in a fresh worktree therefore migrates the shared database and rewrites
-its views and functions, while another session is using it. This is bug 4 of the source
-conversation's scripts ([00-context](../docs/00-context.md#the-source-conversation)) — confirmed
+its views and functions, while another session is using it. This is a bug found in earlier
+hand-written worktree scripts — confirmed
 against a real repository rather than assumed.
 
 Now read that chain against a one-level, case-sensitive matcher, because this is the *reason* for
@@ -269,8 +266,8 @@ compose overrides, …).
 
 Two rules:
 
-1. **Propose a `.worktreeinclude`, not profile `copy` entries.** `.worktreeinclude` stays authoritative
-   ([ADR-007](../docs/01-decisions.md#adr-007)): it is native behaviour that keeps working if this
+1. **Propose a `.worktreeinclude`, not profile `copy` entries.** `.worktreeinclude` stays authoritative:
+   it is native behaviour that keeps working if this
    plugin is uninstalled, and repos already using it get taken over transparently. `copy` is a
    supplement for what that file cannot express.
 2. **A candidate only counts if it is actually gitignored.** Native copying applies the
@@ -291,8 +288,7 @@ classes rather than one-offs:
   `terraform.tfstate`. Duplicating these is not just leaky, it is actively destructive: two worktrees
   writing copies of one state file diverge and the original loses.
 
-Secrets belong in a copied `.env`, never in the committed profile
-([ADR-008](../docs/01-decisions.md#adr-008)).
+Secrets belong in a copied `.env`, never in the committed profile.
 
 ## Layer 3: hints, never conclusions
 
@@ -311,7 +307,7 @@ Everything found there is offered as a **hint beside a question**, never as a pr
 isolation" is always an offered outcome** — a profile with no `runtime` block is valid and means touch
 nothing.
 
-The reason is [ADR-006](../docs/01-decisions.md#adr-006), and it is worth restating in full because it
+The reason is worth restating in full because it
 is the rule most tempting to shave: nothing in a repository states which variable
 selects a tenant database, or that a test database gets dropped wholesale by an env var. A wrong guess here
 does not produce a broken worktree. It corrupts a colleague's data.
@@ -341,8 +337,7 @@ lockfile. Nothing acts on it. It exists so that later, cheap, deterministic shel
 of applying stale advice in silence.
 
 The comparison is a checksum and a string compare — no re-detection, no judgement, no model. That is
-what keeps it legal inside a hook ([ADR-002](../docs/01-decisions.md#adr-002)), and it warns without
-ever blocking ([ADR-003](../docs/01-decisions.md#adr-003)).
+what keeps it legal inside a hook, and it warns without ever blocking.
 
 Its limits, stated honestly:
 

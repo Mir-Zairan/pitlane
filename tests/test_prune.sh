@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end tests for hooks/scripts/prune.sh — the /worktree-prune sweep — against worktrees that
+# End-to-end tests for hooks/scripts/prune.sh — the /pitlane-tidy sweep — against worktrees that
 # bootstrap.sh itself created from a WorktreeCreate payload, so every state file and ledger entry is
 # the real one, then broken the ways real machines break them: a checkout deleted by hand, an admin
 # dir pruned under a checkout, a ledger write that failed, a main checkout that moved.
@@ -585,7 +585,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Abandoned subagent worktrees (ADR-014)
+# Abandoned subagent worktrees
 # ---------------------------------------------------------------------------
 # Claude Code leaves a subagent worktree that a WorktreeCreate hook made, and fires no WorktreeRemove
 # for it (measured, 2.1.286). Only an `agent-<hex>` worktree that is unlocked, holds no work and has
@@ -635,7 +635,7 @@ eq 'abandoned: and the worktree is still there' yes "$(exists "$WRJ/new-file.txt
 git -C "$RB" worktree unlock "$WLK" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# Adoption: worktrees that predate the plugin (ADR-013)
+# Adoption: worktrees that predate the plugin
 # ---------------------------------------------------------------------------
 # Made with plain git, set up by hand, never bootstrapped: no state file, no ledger entry. A report
 # over them must offer nothing for a live one, and must never claim a runtime allocation — any

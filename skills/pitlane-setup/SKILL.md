@@ -1,15 +1,14 @@
 ---
-name: worktree-calibrate
-description: Examine this repository and write its worktree profile (.claude/worktree-profile.json) — how dependencies install, what toolchain shell that must run inside, and what runtime state two parallel sessions would collide on. Use when setting up the worktree plugin in a new repo, when a bootstrap warns that no profile exists, or after the repo's toolchain or dependency set changes.
+name: pitlane-setup
+description: Examine this repository and write its worktree profile (.claude/worktree-profile.json) — how dependencies install, what toolchain shell that must run inside, and what runtime state two parallel sessions would collide on. Use when setting up Pitlane in a new repo, when a bootstrap warns that no profile exists, or after the repo's toolchain or dependency set changes.
 argument-hint: "[--force]"
 ---
 
-# Worktree — calibrate to this repo
+# Pitlane — set it up for this repo
 
 Write `<repo>/.claude/worktree-profile.json`: the one file that makes this generic plugin fit
 *this* repository. Everything repo-specific lives there, so the hooks that run on every session
-can stay dumb, fast, deterministic bash
-([ADR-001](../../docs/01-decisions.md#adr-001), [ADR-002](../../docs/01-decisions.md#adr-002)).
+can stay dumb, fast, deterministic bash.
 
 You run **once per repository, with the developer present**. That is the only moment judgement is
 allowed, so spend it on the things that actually need judgement and let the script do the rest.
@@ -21,8 +20,7 @@ shell wrapper. `hooks/scripts/detect.sh` works those out deterministically, from
 `reference/detection.json`. Do not re-derive them from memory, and do not improvise reasons — the
 reasons are data, so that two runs give the same answer.
 
-**Layer 3 is not detectable, and must never be guessed**
-([ADR-006](../../docs/01-decisions.md#adr-006)). Nothing in a repository states that an env var
+**Layer 3 is not detectable, and must never be guessed**. Nothing in a repository states that an env var
 selects a tenant database. A wrong guess here does not produce a broken worktree — it corrupts a
 colleague's data. So you **ask**, with detected values offered only as hints, and *no runtime
 isolation* is a perfectly good answer.
@@ -98,8 +96,7 @@ rhetorical.
 Say the strategy rationale plainly when it comes up, because it is the part people push back on:
 `install` is for a package manager with its own content-addressable store (pnpm, bun, uv, Yarn
 Berry) where the tree is mostly not real disk and sharing it is unsafe; `hardlink` is for one that
-writes real bytes per project; `skip` is for build output a shared cache already handles
-([ADR-004](../../docs/01-decisions.md#adr-004), [ADR-005](../../docs/01-decisions.md#adr-005)).
+writes real bytes per project; `skip` is for build output a shared cache already handles.
 
 **Hazards are not a footnote.** When you see `escalate`, stop and ask — quote the `hazardChain` so
 the developer can see what the install actually reaches.
@@ -121,7 +118,7 @@ rather than implying you found something.
 Every `config` record is a file a fresh worktree would be missing and cannot regenerate.
 
 Offer to write or extend `.worktreeinclude` at the repo root — `.gitignore` syntax, one pattern per
-line. **Not** profile `copy` entries ([ADR-007](../../docs/01-decisions.md#adr-007)): it is native
+line. **Not** profile `copy` entries: it is native
 Claude Code behaviour that keeps working if this plugin is uninstalled, and repos already using it
 get taken over transparently. `copy` is only for what that file cannot express.
 
@@ -170,7 +167,7 @@ as **options to choose from, never as pre-filled defaults**. Ask about:
   is a flag, the variable only helps if the start command uses it, so record that command for the
   agent note below. Then a sensible base to derive from, and how wide a span to spread across;
 - **which env files the app actually loads, per environment** — these become `runtime.env.file`, a
-  path or a list of paths ([ADR-012](../../docs/01-decisions.md#adr-012)), and nothing else can
+  path or a list of paths, and nothing else can
   supply them: the engine has nowhere to write the overrides without them. Find out from the app's
   own env loader, not from convention — many frameworks read only fixed names and a *different* set
   per environment (development may read a local file that the test environment skips), so a
@@ -221,7 +218,7 @@ answer — but it has to be an answer, not an omission you made for them.
 - **Never author a command that drops, truncates, resets, recreates or dumps a database.** Not in
   `seed`, and above all not in `teardown`. Teardown is by nature "destroy the state we made", so it is
   the single easiest place to be helpful and catastrophic: a `DROP DATABASE` whose slug mapping is
-  even slightly off drops the shared one, it is committed for the whole team, and a later phase runs
+  even slightly off drops the shared one, it is committed for the whole team, and the teardown hook runs
   it unattended on every worktree removal. `runtime.teardown` follows exactly the same rules as
   `runtime.seed` — confirmed by the developer, never inferred, contents never invented, and **omitted
   by default**.
@@ -232,7 +229,7 @@ answer — but it has to be an answer, not an omission you made for them.
   `echo 'worktree-seed.sh is still the unedited stub' >&2; exit 1` sentinel for the developer to
   delete. A comment-only script exits 0, which would report the worktree as seeded when nothing
   happened, and ship a silently no-op seed step to every teammate. Do not `chmod +x` it either.
-- **No secrets in the profile, ever** ([ADR-008](../../docs/01-decisions.md#adr-008)). A password for
+- **No secrets in the profile, ever**. A password for
   the seed step is read from the environment or from the copied `.env` at run time. If a hint looks
   like a credential, do not put it in the file — not even as an example.
 
@@ -276,11 +273,10 @@ noise.
 
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
 get hardlinked and which get installed, what shell that runs inside, roughly how long the first
-bootstrap will take, and what — if anything — will be isolated. Then ask **who it is for**
-([ADR-016](../../docs/01-decisions.md#adr-016)):
+bootstrap will take, and what — if anything — will be isolated. Then ask **who it is for**:
 
 - **the team** — commit the profile, `.worktreeinclude` and the scripts; a teammate who installs the
-  plugin gets a working setup with no calibration run of their own (ADR-008);
+  plugin gets a working setup with no calibration run of their own;
 - **only this developer** — commit nothing. Leave the files untracked in the main checkout and list them
   in `.git/info/exclude` (never committed, shared by every worktree); put the seed and teardown scripts
   in the profile's `copy[]` so each worktree gets them; and write the agent note to `CLAUDE.local.md`,
@@ -312,10 +308,9 @@ If there is no `runtime` block, leave out the database and port lines rather tha
 ## What you must not do
 
 - **Do not act on the profile.** No copying, no installing, no ports, no seeding, no worktree
-  creation. This command writes a file and nothing else; later phases consume it.
+  creation. This command writes a file and nothing else; the hooks consume it.
 - **Do not hand-write detection.** If a lockfile or toolchain is unrecognised, the fix is an entry in
   `reference/detection.json` — one place, benefiting every repo — not a special case improvised into
   one profile.
 - **Do not put judgement in the hooks.** Anything you learn here belongs in the profile.
-  ([ADR-002](../../docs/01-decisions.md#adr-002)).
-- **Do not propose `strategy: "store"`.** It is a valid schema value that no phase implements yet.
+- **Do not propose `strategy: "store"`.** It is a valid schema value that is not implemented.

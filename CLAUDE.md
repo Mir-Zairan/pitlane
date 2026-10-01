@@ -10,7 +10,7 @@ Instructions for working on this plugin.
   project-specific env vars, database names, ports or ticket prefixes in code, comments, tests or
   examples. When a concrete example genuinely helps, invent a neutral one (`alice/fix-99`).
 - **Hooks are deterministic shell.** No model calls, no network, no interactive prompts inside a hook.
-  Anything that needs judgement happens in `/worktree-calibrate` and is written to the profile.
+  Anything that needs judgement happens in `/pitlane-setup` and is written to the profile.
 - **A hook must never cost the user their session.** On any internal failure, warn on stderr, still emit
   the worktree path, exit 0. A worktree missing its `vendor/` is recoverable; a session that won't start
   is not.

@@ -143,7 +143,7 @@ git -C "$SEP" worktree add -q "$SEP/.claude/worktrees/w" -b worktree-w >/dev/nul
 SEPWT="$SEP/.claude/worktrees/w"
 
 # A submodule: its common dir is <super>/.git/modules/<name>. Getting {root} wrong here
-# would make Phase 3 write dependency trees inside git's own metadata.
+# would make bootstrap write dependency trees inside git's own metadata.
 SUPER="$TMP/super"
 mkdir -p "$SUPER"
 git -C "$SUPER" init -q -b main
@@ -349,7 +349,7 @@ worktree: two' "$err"
   lacks 'a capped slug has no doubled underscore' '__' "$sa"
   case $sa in *_) sa_tail=1 ;; *) sa_tail=0 ;; esac
   rc_is 'a capped slug does not end in _' 0 "$sa_tail"
-  # IDEMPOTENCE SURVIVES THE CAP. Phase 4 round-trips a slug through runtime.slug and re-slugifies
+  # IDEMPOTENCE SURVIVES THE CAP. Runtime isolation round-trips a slug through runtime.slug and re-slugifies
   # the result, so a capped slug that changed on a second pass would derive a different database
   # on the very next session.
   eq 'slugify is idempotent on a capped slug' "$sa" "$(wt_slugify "$sa")"
@@ -494,7 +494,7 @@ worktree: two' "$err"
   done
   eq 'derive_port prints nothing when it refuses' '' "$(wt_derive_port s 0 0 2>/dev/null)"
   # A leading zero must be read as base 10, not octal — `08` is a fatal arithmetic error otherwise,
-  # and a fatal expansion error in a sourced library takes the whole hook down (ADR-003).
+  # and a fatal expansion error in a sourced library takes the whole hook down.
   eq 'derive_port reads a zero-padded base as decimal, not octal' \
     "$(wt_derive_port s 4100 200)" "$(wt_derive_port s 04100 200)"
 
@@ -692,7 +692,7 @@ EOF
   eq 'an invalid profile publishes no runtime fields at all' '' \
     "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_ENVFILE"
 
-  # A LIST of env files (ADR-012) is published `:`-joined, in order, and ENVFILE is its FIRST
+  # A LIST of env files is published `:`-joined, in order, and ENVFILE is its FIRST
   # element — never the list's JSON text, which no consumer could use as a path.
   printf '%s' '{"schemaVersion":1,
     "runtime":{"env":{"file":[".env.dev.local","config/.env.test.local"],"vars":{"A":"x_{slug}"}}}}' >"$target"
@@ -759,7 +759,7 @@ EOF
   eq 'an invalid profile leaves shellArgs empty, not half-loaded' '' "$PROFILE_SHELLARGS"
   eq '...and is not present' '0' "$PROFILE_PRESENT"
 
-  # ADR-006: absent runtime means touch nothing. An explicit false or {} says the same.
+  # Absent runtime means touch nothing. An explicit false or {} says the same.
   cp "$TMP/profile-runtime-false.json" "$target"
   wt_load_profile "$pdir"
   eq 'runtime:false -> no runtime' '0' "$PROFILE_HAS_RUNTIME"
@@ -1092,7 +1092,7 @@ EOF
 
   # --- wt_json_scan: --kv groups ----------------------------------------------
   # An object's OWN pairs, added for runtime.env.vars — a map whose keys the plugin cannot know in
-  # advance (ADR-006), so no dotted path reaches them and no array iterates them. It is a GROUP
+  # advance, so no dotted path reaches them and no array iterates them. It is a GROUP
   # rather than a separate reader so the validator and the engine both get the pairs out of the
   # scan they already pay for; a standalone reader cost two extra cold interpreter starts on the
   # hook that blocks session start. Asserted on BOTH backends, like every other group.
@@ -1424,7 +1424,7 @@ JSON
   eq 'validate: a slug template mentioning {slug} is silent' '' \
     "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null | grep -c 'no per-worktree placeholder' | tr -d ' ' | sed 's/^0$//')"
 
-  # THE SHIPPED TEMPLATE MUST VALIDATE. It is what /worktree-calibrate fills in and what a
+  # THE SHIPPED TEMPLATE MUST VALIDATE. It is what /pitlane-setup fills in and what a
   # developer copies, so a rule that rejects it is a rule that breaks every new repo. Checked with
   # no root, since this plugin repo has neither of the template's example lockfiles.
   eq 'validate: reference/profile.template.json passes its own rules' '' \
@@ -1481,7 +1481,7 @@ JSON
   vw '{"schemaVersion":1,"runtime":{"env":{"file":"../../x"}}}'
   contains 'validate: rejects a traversing runtime.env.file' 'runtime.env.file:' "$(vv)"
 
-  # runtime.env.file as a LIST (ADR-012). Every element is a path the plugin writes into, so every
+  # runtime.env.file as a LIST. Every element is a path the plugin writes into, so every
   # element gets the checks a single path gets, and the list must be exactly a list of strings.
   vw '{"schemaVersion":1,"runtime":{"env":{"file":[".env.dev.local",".env.test.local"],"vars":{"A":"1"}}}}'
   eq 'validate: a list of env files is valid' '' "$(vv)"
@@ -1523,7 +1523,7 @@ JSON
   # store is a valid schema value nothing implements: warn, do not invalidate.
   vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"store","install":"x"}]}'
   eq 'validate: store is not a violation' '' "$(vv)"
-  contains 'validate: store warns that no phase implements it' 'reserved schema value' \
+  contains 'validate: store warns that it is not implemented' 'reserved schema value' \
     "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
 
   # Structural type errors on the containers themselves.
@@ -1577,7 +1577,7 @@ JSON
   eq 'load_profile: and none of its values are trusted' '' "$PROFILE_SHELL"
   err=$(wt_load_profile "$VR" 2>&1 >/dev/null)
   contains 'load_profile: says why, and names the offending key' 'deps[0].lock' "$err"
-  contains 'load_profile: points at the fix' '/worktree-calibrate' "$err"
+  contains 'load_profile: points at the fix' '/pitlane-setup' "$err"
   vw '{"schemaVersion":1,"shell":"good"}'
   wt_load_profile "$VR" 2>/dev/null
   eq 'load_profile: a valid profile is still loaded' 1 "$PROFILE_PRESENT"
@@ -1763,8 +1763,8 @@ JSON
   contains 'validate: and says which tools are missing' 'jq nor python3' "$err"
 
   # --- wt_profile_drifted ---------------------------------------------------
-  # No call site in this phase; Phase 3 owns wiring it. It must be a checksum and a string
-  # compare only — never a re-detection (ADR-002).
+  # Bootstrap's drift report calls it. It must be a checksum and a string
+  # compare only — never a re-detection.
   : >"$VR/composer.lock"
   VCK=$(cksum <"$VR/composer.lock")
   vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","lockChecksum":"'"$VCK"'"}]}'
@@ -1809,7 +1809,7 @@ JSON
 
   # --- caller safety --------------------------------------------------------
   # The caller runs `set -euo pipefail`; a library function returning non-zero, or
-  # referencing an unset variable, must not take the session down. ADR-003.
+  # referencing an unset variable, must not take the session down.
   out=$(bash -c "set -euo pipefail; . '$LIB'
     wt_read_field nope '{}' >/dev/null || true
     wt_repo_root /nonexistent >/dev/null || true

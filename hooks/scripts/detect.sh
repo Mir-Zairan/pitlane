@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Mechanical detection for /worktree-calibrate. Reads reference/detection.json, inspects a
+# Mechanical detection for /pitlane-setup. Reads reference/detection.json, inspects a
 # repository, and prints what it found.
 #
 # THIS IS NOT A HOOK, and the distinction matters in both directions.
@@ -11,13 +11,13 @@
 # network, because that is what makes the mechanical half of calibration repeatable: the
 # same repository must produce the same proposal every run, which turns "a second
 # calibration changes nothing" into something a test can assert rather than something a
-# developer has to trust. ADR-002 draws the line at hook time; this is the deterministic
+# developer has to trust. Judgement stays out of hook time; this is the deterministic
 # half of the other side of that line.
 #
 # WHAT IT DOES NOT DO. It proposes; it never concludes. Layer 3 is not inferred here — every
 # runtime line is labelled `hint` and nothing else, because nothing in a repository states
 # that an env var selects a tenant database, and a wrong guess there does not produce a
-# broken worktree, it corrupts a colleague's data (ADR-006). It also writes nothing at all:
+# broken worktree, it corrupts a colleague's data. It also writes nothing at all:
 # the skill owns the profile.
 #
 # OUTPUT: tab-separated records on stdout, one per line, first field is the label.
@@ -694,7 +694,7 @@ fi
 #
 # Deliberately NOT a trial install. That costs minutes on a real repository, and an install
 # that migrates the shared database exits 0 — so the dangerous variant is exactly the one
-# that would pass. Phase 6 owns the real run.
+# that would pass. The real run belongs to validation against a real repository.
 
 probe_tool() {  # $1 = tool, $2 = version arguments
   local tool=$1 args=$2
@@ -757,7 +757,7 @@ done < <(wt_json_records shellProbe.tools marker tool versionArgs <"$WT_DETECTIO
 # ---------------------------------------------------------------------------
 # Gitignored config a fresh checkout would miss
 # ---------------------------------------------------------------------------
-# Proposed as a .worktreeinclude, never as profile `copy` entries (ADR-007), and only when
+# Proposed as a .worktreeinclude, never as profile `copy` entries, and only when
 # ACTUALLY gitignored — native copying applies the gitignored-only rule, so listing a
 # tracked file there achieves nothing.
 
@@ -783,7 +783,7 @@ fi
 # Layer 3: HINTS ONLY
 # ---------------------------------------------------------------------------
 # Nothing below concludes anything, and that is not caution for its own sake. Layer 3 is
-# never inferred (ADR-006): nothing in a repository states that an env var selects a tenant
+# never inferred: nothing in a repository states that an env var selects a tenant
 # database, and a wrong guess here does not produce a broken worktree — it corrupts a
 # colleague's data. Every line is a `hint` for the skill to put beside a question.
 
@@ -798,7 +798,7 @@ scan_hints() {  # $1 = kind, $2 = ERE, $3 = dotted path to the source list
       # A credential-shaped NAME is never offered as a runtime candidate. Found by running
       # this against a real repository, where the tenancy family matched a variable called
       # ACCOUNTING_CREDENTIAL_KEY: the name itself is not a leak, but a hint is a suggestion,
-      # and suggesting that one invites a secret into a committed profile (ADR-008).
+      # and suggesting that one invites a secret into a committed profile.
       if [ -n "$NEVER_HINT" ] && printf '%s' "$name" | grep -qE "$NEVER_HINT" 2>/dev/null; then
         continue
       fi

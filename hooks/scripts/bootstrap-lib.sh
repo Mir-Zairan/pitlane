@@ -10,13 +10,13 @@
 # here: dependency strategies, locking, per-worktree state. Teardown needs the state and ledger
 # readers too, which is why it sources this file rather than lib.sh alone. Keeping the
 # engine separate is the same split `detect.sh` already uses — a large consumer sitting on top of
-# lib.sh, with its own test file — and it keeps a phase-sized feature out of the diff of the file
+# lib.sh, with its own test file — and it keeps a whole feature out of the diff of the file
 # whose byte-for-byte dual-backend behaviour 700-odd assertions pin.
 #
-# Everything here inherits lib.sh's three rules (docs/01-decisions.md):
-#   1. No model, no network, no prompting (ADR-002).
+# Everything here inherits lib.sh's three rules:
+#   1. No model, no network, no prompting.
 #   2. NOTHING here calls `exit`. Functions return a code; the entrypoint decides what to skip.
-#      Its contract is to always exit 0 and still print the worktree path (ADR-003).
+#      Its contract is to always exit 0 and still print the worktree path.
 #   3. stdout is a protocol. Every message goes to stderr via wt_log().
 #
 # Same portability floor as lib.sh: bash 3.2, git 2.7, POSIX tools, no jq dependency.
@@ -69,9 +69,9 @@ wt_name_from_path() {  # $1 = worktree path
   printf '%s' "$name"
 }
 
-# The profile is committed (ADR-008), so a branch that adds a dependency also updates it.
+# The profile is committed, so a branch that adds a dependency also updates it.
 # The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
-# a worktree gets bootstrapped from whatever main happens to have, while Phase 3 reads its
+# a worktree gets bootstrapped from whatever main happens to have, while bootstrap reads its
 # *lockfiles* from the worktree, and the two disagree.
 wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
   local which=$1
@@ -91,11 +91,10 @@ wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
 # named "composer install" — so the argv is exactly the thing worth pinning in tests.
 #
 # HOW THE WRAPPER TAKES ITS COMMAND is read from the profile's `shellArgs`, NOT derived by matching
-# the `shell` string. Phase 2 added that field precisely because string-matching only covers
+# the `shell` string. That field exists precisely because string-matching only covers
 # wrappers already on the list: a hand-written `shell` such as `docker compose run --rm app`, an
 # `sh -c` wrapper, or a repo's own `./dev` script has no entry to match. The string-match below is
-# the FALLBACK for a profile that omits the field, not the primary path. (This discharges the
-# phase-3 task that said: honour shellArgs, or delete it from the schema.)
+# the FALLBACK for a profile that omits the field, not the primary path.
 #
 #   argv    the command follows as separate arguments:  nix develop --command bash -lc '<cmd>'
 #   string  the command must be ONE argument:           nix-shell --run '<cmd>'
@@ -110,11 +109,11 @@ wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
 # argument. That matters because `{name}`, `{worktree}` and `{root}` expand raw text into it —
 # a colleague's branch name — and wt_expand substitutes without quoting. One shell means the
 # profile author's own quoting is the only quoting, which is the same trust boundary a Makefile
-# or a package.json `scripts` entry has (ADR-008); two would let the WORKTREE NAME, which comes
+# or a package.json `scripts` entry has; two would let the WORKTREE NAME, which comes
 # from a different and less trusted party than the profile, start a second command.
 #
 # Note there is no `cd` here: the caller runs this with the worktree as its working directory.
-# That is why `nix develop` needs no explicit path argument, which the phase document's sketch
+# That is why `nix develop` needs no explicit path argument, which an earlier sketch
 # (`nix develop <worktree> --command`) added by hand.
 wt_build_shell_argv() {  # $1 = command string; sets WT_CMD_ARGV
   local cmd=${1-} shell=${PROFILE_SHELL-} mode=${PROFILE_SHELLARGS-}
@@ -152,7 +151,7 @@ wt_build_shell_argv() {  # $1 = command string; sets WT_CMD_ARGV
   # `set -u` is a FATAL unbound-variable error on bash 3.2, this file's stated portability floor
   # and the stock macOS shell, and it would happen in the hook's own shell rather than a
   # subshell: the entrypoint would die before printing the worktree path, which is precisely the
-  # ADR-003 failure this layer exists to prevent. Treat it as no wrapper at all.
+  # failure this layer exists to prevent. Treat it as no wrapper at all.
   if [ "${#WT_CMD_ARGV[@]}" -eq 0 ]; then
     wt_log "the profile's shell is set but contains no command — running on the host shell"
     WT_CMD_ARGV=(bash -lc "$cmd")
@@ -189,7 +188,7 @@ wt_nix_shell_missing() {  # $1 = directory the command will run in
 # does not.
 #
 # It NEVER lets a failure escape as a shell error: the caller is a hook that must exit 0 whatever
-# happens (ADR-003), so every path here returns a status rather than tripping `set -e`.
+# happens, so every path here returns a status rather than tripping `set -e`.
 wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0
 
@@ -242,10 +241,10 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
 # ---------------------------------------------------------------------------
 #
 # TWO SOURCES, ONE RULE. `.worktreeinclude` is authoritative and stays native wherever native
-# creation runs (ADR-007); the profile's `copy[]` is a supplement native knows nothing about.
+# creation runs; the profile's `copy[]` is a supplement native knows nothing about.
 # Both end up in the same copier so they cannot drift apart in what they consider safe.
 #
-# THE RULE, from ADR-007: a path is copied only if it MATCHES and is ALSO gitignored. Verified on
+# THE RULE: a path is copied only if it MATCHES and is ALSO gitignored. Verified on
 # git 2.34 while building this: `git ls-files -o -i --exclude-from=F` uses ONLY F as its ignore
 # source — the flags are not unioned with .gitignore — so matching and being-gitignored really are
 # two questions, and the second needs its own `git check-ignore` pass. A tracked file listed in
@@ -264,7 +263,7 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
 # The gitignored half of the rule is applied later, by the copier, in one batched call.
 #
 # THE PATTERNS ARE THE WORKTREE'S OWN when it has a `.worktreeinclude`, the main checkout's
-# otherwise — the rule ADR-008 sets for the profile, for the same reason: the branch checked out in
+# otherwise — the rule the profile follows, for the same reason: the branch checked out in
 # the worktree is what says what it needs, and a branch that adds the file must not wait for the main
 # checkout to catch up (measured: a review branch adding it bootstrapped with nothing copied, because
 # the main checkout was on a branch without one). The FILES are always the main checkout's: that is
@@ -340,7 +339,7 @@ wt_copy_paths() {  # $1 = main checkout, $2 = worktree
     return 0
   fi
 
-  # ONE call for every candidate. check-ignore answers the "and is gitignored" half of ADR-007's
+  # ONE call for every candidate. check-ignore answers the "and is gitignored" half of the
   # rule, using the repository's real ignore rules rather than a hand-rolled matcher.
   #
   # The result is read into an array and compared EXACTLY. Two traps here, both avoided
@@ -445,7 +444,7 @@ wt_copy_paths() {  # $1 = main checkout, $2 = worktree
 # The whole config step: `.worktreeinclude` (only where native did not already do it) merged with
 # the profile's copy[], through one copier.
 #
-# AN OVERRIDE FILE IS COPIED LIKE ANY OTHER, and that is deliberate since ADR-012. The file an app
+# AN OVERRIDE FILE IS COPIED LIKE ANY OTHER, and that is deliberate. The file an app
 # loads is usually the one holding the developer's real configuration, so it SHOULD arrive first;
 # layer 3 then appends its managed block to that copy. This used to skip the override file, because
 # a copied file without the plugin's marker read as developer-owned forever — but that skip only
@@ -487,7 +486,7 @@ wt_copy_config() {  # $1 = main checkout, $2 = worktree, $3 = 1 to also honour .
 # a repository can agree on. They are empty and are never removed: an unlink would race with the
 # next acquirer opening the same path, and an empty file per dependency is not worth that.
 #
-# ON FAILURE TO ACQUIRE, PROCEED UNLOCKED WITH A WARNING. That is ADR-003 applied to locking
+# ON FAILURE TO ACQUIRE, PROCEED UNLOCKED WITH A WARNING. That is the warn-and-continue rule applied to locking
 # itself: a session that hangs waiting for another worktree's 90-second install is exactly the
 # cost the user must never pay. It is an HONEST weakening — the race becomes rarer, not
 # impossible — and the alternative, blocking, is worse for the failure it prevents.
@@ -632,7 +631,7 @@ wt_lock_release() {  # $1 = fd number
 # string may contain anything except these, which the readers strip.
 #
 # WHERE IT LIVES: the worktree's own private git directory, `<root>/.git/worktrees/<name>`. The
-# phase document says "inside the worktree — it dies with the worktree", and this satisfies that
+# requirement is "inside the worktree — it dies with the worktree", and this satisfies that
 # (git removes it with the worktree) while avoiding what a file in the checkout would cost: an
 # untracked entry in every `git status`, in a repo whose .gitignore knows nothing about us, which
 # a developer could commit by accident. A checkout that cannot report a private git dir falls
@@ -641,7 +640,7 @@ wt_lock_release() {  # $1 = fd number
 # STATUS IS WRITTEN BEFORE THE WORK, NOT AFTER. An entry goes to `doing` before the install starts
 # and only becomes `done` once the command AND its verify have succeeded. That is what separates
 # "installed" from "killed halfway by the timeout", which a populated directory cannot tell you —
-# and the phase's own acceptance list requires a hung install to leave a usable session.
+# and the design requires a hung install to leave a usable session.
 #
 # NO PARTIAL TRUST, the same rule the profile has: unreadable, wrong version, unparseable, or an
 # entry left at `doing` all mean THE SAME THING — not done, do it again. Redoing safe work is
@@ -782,7 +781,7 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} when rec
 
   # Recorded but never compared: it answers "when did this last happen" for a developer looking at
-  # a worktree that seems stale, and gives Phase 5 something to age entries by. It is deliberately
+  # a worktree that seems stale, and gives prune something to age entries by. It is deliberately
   # NOT part of the freshness decision — a timestamp cannot tell you whether a tree is correct, and
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
@@ -846,7 +845,7 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
 # ---------------------------------------------------------------------------
 #
 # ONE record, kind `rt`, in the SAME state file the dependency records live in. One file rather
-# than two because it is one worktree's state, it dies with the worktree the same way, and Phase 5
+# than two because it is one worktree's state, it dies with the worktree the same way, and teardown
 # then has one place to look rather than two that can disagree about whether a worktree was ever
 # set up. The two writers each recognise their own kind and carry every other kind through
 # verbatim, so neither needs to understand the other's fields.
@@ -856,13 +855,13 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
 #                  database is actually named after, not the template it came from.
 #   2 port         the allocated port, or empty when none was derived
 #   3 portsource   `derived` or `probed` — whether the port is the one the slug hashes to, or one
-#                  found by stepping past a sibling's claim. Phase 5 wants to know which.
+#                  found by stepping past a sibling's claim. Teardown wants to know which.
 #   4 envfile      every override file, `:`-joined, each relative to THE WORKTREE, resolving as
 #                  <worktree>/<envfile> — stated exactly because the consumer of this field
 #                  rewrites those files, and `wt_copy_paths` already uses "repo-relative" for paths
 #                  resolved against the MAIN CHECKOUT. Recorded so teardown takes the plugin's
 #                  block out of the files by name rather than by re-expanding a profile that may
-#                  have changed underneath it (ADR-012). A record from before ADR-012 holds one.
+#                  have changed underneath it. A record from an older version holds one.
 #   5 envstate     one disposition per file in field 4, `:`-joined and aligned with it: `ours`
 #                  (the plugin has written its block there), `theirs` (the developer took the file
 #                  over by deleting the block), or EMPTY (never written yet). Recorded so the
@@ -874,16 +873,16 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
 #                  its timeout every session
 #   8 when         epoch seconds, recorded and never compared (see wt_state_set)
 #
-# WHAT THIS RECORD CANNOT DO, stated rather than left for Phase 5 to discover. It is a single
+# WHAT THIS RECORD CANNOT DO, stated rather than left for teardown to discover. It is a single
 # slot describing the CURRENT allocation, so it cannot describe a superseded one. `runtime.slug`
-# and `runtime.env.file` are profile templates, and ADR-008 lets a worktree's own committed profile
-# win — so editing either on a branch re-points a live worktree, and the previous slug's database
+# and `runtime.env.file` are profile templates, and a worktree's own committed profile
+# wins — so editing either on a branch re-points a live worktree, and the previous slug's database
 # becomes referenced by nothing: the only record of it was overwritten. Teardown would then not
-# remove it and `/worktree-prune` would not find it.
+# remove it and `/pitlane-tidy` would not find it.
 #
 # Deliberately NOT solved here. Reclaiming an orphaned database needs the inverse of a repo-owned
 # seed script, which only the repo knows how to write, and unreferenced-state sweeping is
-# explicitly Phase 5's `/worktree-prune`. It is recorded in the Phase 4 handoff so that phase
+# explicitly `/pitlane-tidy`'s job. It is stated here so that teardown
 # inherits a named problem rather than a surprise.
 #
 # WT_STATE_VERSION IS NOT BUMPED. A new record KIND is not a change an older parser misreads: the
@@ -914,8 +913,8 @@ wt_runtime_state_set() {  # $1 = worktree, $2 = slug, $3 = port, $4 = portsource
 # Read one field of this worktree's `rt` record, by NAME. Prints nothing and returns 1 when there
 # is no usable record.
 #
-# A named accessor rather than "go and parse the state file" is the contract Phase 5 consumes: its
-# teardown must not re-derive a slug or re-expand an env path to find out what this phase created,
+# A named accessor rather than "go and parse the state file" is the contract teardown consumes: its
+# teardown must not re-derive a slug or re-expand an env path to find out what bootstrap created,
 # because a profile edited in between would send it looking in the wrong place — or, worse, let it
 # delete something it never made.
 #
@@ -982,7 +981,7 @@ wt_runtime_state_read() {  # $1 = state file, $2 = field name
 # worktree: on `git worktree remove`, on Claude Code's own removal of a launch-time worktree, and on
 # `git worktree prune` after a checkout was deleted by hand. Not every one of those runs our
 # teardown first, so the one record naming the database a seed created — and the port and env file
-# beside it — can vanish while the database itself lives on, and `/worktree-prune` cannot find what
+# beside it — can vanish while the database itself lives on, and `/pitlane-tidy` cannot find what
 # nothing records.
 #
 # So every `rt` write is copied to `<git-common-dir>/worktree-ledger/<admin id>`: the shared git
@@ -1089,12 +1088,12 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
   ledger=$common/$WT_LEDGER_DIRNAME
   entry=$ledger/$id
   if ! wt_ledger_is_entry_name "$id"; then
-    wt_log "runtime: worktree id \"$id\" cannot name a ledger entry — /worktree-prune will not know about this worktree's allocation"
+    wt_log "runtime: worktree id \"$id\" cannot name a ledger entry — /pitlane-tidy will not know about this worktree's allocation"
     return 0
   fi
 
   if [ ! -d "$ledger" ] && ! mkdir -p "$ledger" 2>/dev/null; then
-    wt_log "runtime: could not create the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
+    wt_log "runtime: could not create the ledger at $ledger — /pitlane-tidy will not know about this worktree's allocation"
     return 0
   fi
 
@@ -1132,7 +1131,7 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
 
   wt_state_join worktree "$wt" "$id" "$name"
   if ! tmp=$(mktemp "$ledger/${WT_LEDGER_TMP_PREFIX}XXXXXX" 2>/dev/null); then
-    wt_log "runtime: could not write to the ledger at $ledger — /worktree-prune will not know about this worktree's allocation"
+    wt_log "runtime: could not write to the ledger at $ledger — /pitlane-tidy will not know about this worktree's allocation"
     return 0
   fi
   if ! {
@@ -1141,7 +1140,7 @@ wt_ledger_write() {  # $1 = worktree, $2 = the rt record
     printf '%s%s' "$rtrec" "$WT_RS"
   } >"$tmp" 2>/dev/null || ! mv -f "$tmp" "$entry" 2>/dev/null; then
     rm -f "${tmp:?}"
-    wt_log "runtime: could not write the ledger entry $entry — /worktree-prune will not know about this worktree's allocation"
+    wt_log "runtime: could not write the ledger entry $entry — /pitlane-tidy will not know about this worktree's allocation"
   fi
   return 0
 }
@@ -1300,7 +1299,7 @@ wt_value_has_shell_syntax() {  # $1 = value
 
 # Name the first placeholder in $1 whose value is unsafe to put in command position, or nothing.
 #
-# THIS DISCHARGES THE OBLIGATION lib.sh's wt_expand states and assigns to this phase:
+# THIS DISCHARGES THE OBLIGATION lib.sh's wt_expand states and assigns to bootstrap:
 # "SUBSTITUTION IS NOT QUOTING ... a caller placing an unconstrained placeholder in command
 # position must quote it itself." An install command is exactly that position. {slug} and {port}
 # are safe by construction ([a-z0-9_] and digits); {name}, {worktree} and {root} are raw text, and
@@ -1353,7 +1352,7 @@ wt_prime_paths() {  # $1 = main checkout, $2 = worktree
 # worktree's install.
 #
 # EVERY FAILURE WARNS AND CONTINUES. A worktree missing its vendor/ is a five-second fix; a
-# session that will not start is lost work (ADR-003). Nothing below returns non-zero to the
+# session that will not start is lost work. Nothing below returns non-zero to the
 # entrypoint, and no step's failure prevents the next dependency being attempted.
 
 # Seconds left of the bootstrap budget, floor 0.
@@ -1367,7 +1366,7 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
 # Populate one dependency directory by copying the main checkout's with hardlinks.
 #
 # Returns 0 on success, 1 to say "fall back to a real install". A hardlink copy of a 400 MB
-# vendor/ is near-instant and costs almost no disk (ADR-004), but it is only VALID when the two
+# vendor/ is near-instant and costs almost no disk, but it is only VALID when the two
 # checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
 # it is not always possible: a worktree on another filesystem cannot hardlink at all.
 #   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done.
@@ -1408,7 +1407,7 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
   fi
 
   # `cp -al` fails on a cross-filesystem copy and on filesystems without hardlinks. Both are
-  # ordinary situations, not errors: fall back rather than dying (ADR-003). Any partial tree is
+  # ordinary situations, not errors: fall back rather than dying. Any partial tree is
   # removed first, or the install that follows would run on top of debris.
   if cp -al "$src" "$dest" 2>/dev/null; then
     return 0
@@ -1460,7 +1459,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         continue
         ;;
       store)
-        # A valid schema value that no phase has built (Phase 7). Treated as install, which is
+        # A valid schema value that nothing implements yet. Treated as install, which is
         # always correct if slower, and said out loud so nobody assumes a store exists.
         wt_log "  ${dir:-deps[$n]}: strategy \"store\" is not implemented yet — installing instead"
         strategy=install
@@ -1644,7 +1643,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # Drift: has the checkout moved away from what the profile was calibrated on?
 # ---------------------------------------------------------------------------
 #
-# Phase 2 shipped the `evidence` block and a comparator for its checksums but deliberately no call
+# The profile gained the `evidence` block and a comparator for its checksums but deliberately no call
 # site. This is that call site, and it covers ALL of the evidence, not just the checksums — until
 # now `evidence.markers`, `evidence.shellMarker` and `evidence.detectionVersion` were written and
 # validated with no reader at all, which is the inert-field smell this repo dislikes.
@@ -1655,13 +1654,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 #   detectionVersion  a newer shipped table might propose better answers
 #
 # IT IS A STRING COMPARE AND A FILE TEST, NEVER A RE-DETECTION. That is what keeps it legal inside
-# a hook at all (ADR-002 forbids a hook doing discovery), and it WARNS WITHOUT EVER BLOCKING
-# (ADR-003). Its honest limits are recorded in reference/detection.md: a lockfile can churn with
+# a hook at all (a hook must never do discovery), and it WARNS WITHOUT EVER BLOCKING.
+# Its honest limits are recorded in reference/detection.md: a lockfile can churn with
 # nothing meaningful changing, and — worse — a hazard can appear in composer.json's `scripts`
 # without touching any lockfile, so the case where a warning matters most produces none.
 #
 # The detection table is READ, not copied into this file. reference/detection.json is ground truth
-# and Phase 2's rule is that adding an ecosystem is one entry there and nothing else; a duplicated
+# and the rule is that adding an ecosystem is one entry there and nothing else; a duplicated
 # marker list here would be a second copy to rot. It costs one interpreter start, and only for a
 # profile that actually carries evidence — a profile without it cannot report drift anyway.
 # Resolved to an ABSOLUTE path at source time. A bare `dirname "${BASH_SOURCE[0]}"` is relative
@@ -1695,19 +1694,19 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
   # `evidence`, and they need neither the evidence block nor the detection table — so gating them
   # on either meant a profile carrying checksums but no evidence (a hand-written one, or any
   # install where the table cannot be found) silently got no drift warning at all, leaving the one
-  # comparator Phase 2 actually shipped unwired for exactly those profiles.
+  # comparator that actually shipped unwired for exactly those profiles.
   #
   # TWO ROUTES TO ONE ANSWER, and the reason is measured rather than stylistic. With a profile
   # loaded, the checksums are already in PROFILE_RAW, so comparing them here costs nothing —
   # calling lib.sh's wt_profile_drifted would re-read the file and spend an interpreter start on
-  # the very path this phase cut from four to one. Without one (a caller checking a profile it is
+  # the very path bootstrap cut from four to one. Without one (a caller checking a profile it is
   # not about to use), that function is the only way to get them, and it is delegated to rather
   # than reimplemented. tests/test_bootstrap_lib.sh asserts the two agree on the same profile,
   # because two routes to one answer is exactly the shape that drifts apart.
   if [ -z "${PROFILE_RAW:-}" ] && [ -n "$profile" ]; then
     problems=$(wt_profile_drifted "$profile" "$tree") || {
       wt_log "$problems"
-      wt_log "run /worktree-calibrate if the dependency set really changed"
+      wt_log "run /pitlane-setup if the dependency set really changed"
     }
   elif [ -n "${PROFILE_RAW:-}" ]; then
     while IFS= read -r -d "$WT_RS" rec; do
@@ -1721,12 +1720,12 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
       [ -n "$lock" ] && [ -n "$cksum" ] || continue
       wt_is_safe_relpath "$lock" || continue
       if [ ! -f "$tree/$lock" ]; then
-        wt_log "$lock no longer exists, but the profile was calibrated against it — run /worktree-calibrate"
+        wt_log "$lock no longer exists, but the profile was calibrated against it — run /pitlane-setup"
         continue
       fi
       now=$(cksum <"$tree/$lock" 2>/dev/null) || continue
       if [ "$now" != "$cksum" ]; then
-        wt_log "$lock has changed since calibration — the recorded install command may be for a different dependency set; run /worktree-calibrate if so"
+        wt_log "$lock has changed since calibration — the recorded install command may be for a different dependency set; run /pitlane-setup if so"
       fi
     done < <(printf '%s' "$PROFILE_RAW")
   fi
@@ -1786,16 +1785,16 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
   done < <(printf '%s\n' "$evmark" | tr -d '[]"' | tr ',' '\n')
 
   if [ -n "$gained" ]; then
-    wt_log "the profile was calibrated before this checkout had:$gained — run /worktree-calibrate so those are set up too"
+    wt_log "the profile was calibrated before this checkout had:$gained — run /pitlane-setup so those are set up too"
   fi
   if [ -n "$lost" ]; then
-    wt_log "the profile expects these, which this checkout no longer has:$lost — run /worktree-calibrate"
+    wt_log "the profile expects these, which this checkout no longer has:$lost — run /pitlane-setup"
   fi
   if [ "$evshell" != "$curshell" ]; then
-    wt_log "the toolchain marker changed since calibration (${evshell:-none} -> ${curshell:-none}) — installs may be running on the wrong toolchain; run /worktree-calibrate"
+    wt_log "the toolchain marker changed since calibration (${evshell:-none} -> ${curshell:-none}) — installs may be running on the wrong toolchain; run /pitlane-setup"
   fi
   if [ -n "$evdet" ] && [ -n "$curdet" ] && [ "$evdet" != "$curdet" ]; then
-    wt_log "this plugin's detection table is now version $curdet, the profile was written against $evdet — /worktree-calibrate may propose better answers"
+    wt_log "this plugin's detection table is now version $curdet, the profile was written against $evdet — /pitlane-setup may propose better answers"
   fi
   return 0
 }
@@ -2105,7 +2104,7 @@ EOF
 # WHAT THIS WRITES IS DOTENV, `KEY=value` a line at a time, and deliberately nothing cleverer. A
 # renderer that could also produce YAML or PHP config would have to know that target format's
 # nesting and typing conventions — is a boolean quoted, is a key dotted or nested — which is
-# exactly the repo-specific judgement ADR-006 forbids inferring and which calibration never
+# exactly the repo-specific judgement the plugin must never infer and which calibration never
 # gathered. A repo that needs another format already has the escape hatch: `runtime.seed` receives
 # WT_ENV_FILE and every derived value, and can translate.
 #
@@ -2115,7 +2114,7 @@ EOF
 # shape-checked, because a key of `A=1` writes a line setting a variable the profile never names,
 # and no care on the value side can defend against damage done before the `=`.
 
-# THE PLUGIN OWNS A BLOCK, NOT A FILE (ADR-012). Frameworks load env files by fixed name, and the
+# THE PLUGIN OWNS A BLOCK, NOT A FILE. Frameworks load env files by fixed name, and the
 # file an app loads is usually the one holding the developer's real configuration — copied in by
 # `.worktreeinclude` before any hook runs. So the overrides go into THAT file, between two marker
 # lines, appended after the developer's own assignments so that dotenv's last-assignment-wins
@@ -2123,7 +2122,7 @@ EOF
 # carried through byte for byte.
 #
 # WT_ENV_MARKER is the begin line's PREFIX, and the ownership check matches it as a prefix so a
-# later version can extend the line. A file written before ADR-012 began with a longer line that
+# later version can extend the line. A file written by an older version began with a longer line that
 # has this same prefix and had no end line; it reads as a block running to end of file, which is
 # exactly the whole file it was.
 WT_ENV_MARKER='# managed by the worktree plugin'
@@ -2414,7 +2413,7 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     # line-oriented, so the writer folds line breaks rather than trusting its input not to have
     # any. The JSON layer folds these already; this is the backstop for a stream built another way.
     # AN UNCONSTRAINED PLACEHOLDER MUST NOT CARRY SHELL SYNTAX INTO A FILE THE APP PARSES. Since
-    # ADR-012 the block goes into the file the framework really loads, and several dotenv dialects
+    # the block now goes into the file the framework really loads, and several dotenv dialects
     # (Symfony's, Ruby's) run `$(...)` in an unquoted value — so `DB=app_{name}` plus a colleague's
     # branch named `x$(cmd)` would run `cmd` on every boot of the app. {name}, {worktree} and {root}
     # are raw text from a less trusted party than the committed profile; the same refusal the
@@ -2470,15 +2469,15 @@ wt_runtime_env_release() {  # $1 = worktree, $2 = relative path
 #
 #   * it runs INSIDE the profile's `shell`, with the WORKTREE as its working directory;
 #   * it receives WT_NAME, WT_SLUG, WT_PORT, WT_PATH, WT_ROOT, WT_ENV_FILE (the first override file)
-#     and WT_ENV_FILES (all of them, one per line — ADR-012) in the environment —
+#     and WT_ENV_FILES (all of them, one per line) in the environment —
 #     never as arguments and never interpolated into a command line;
-#   * a non-zero exit warns and the session continues (ADR-003); the state file records the
+#   * a non-zero exit warns and the session continues; the state file records the
 #     failure so a re-entry can retry;
 #   * it is time-boxed, out of what is LEFT of the bootstrap budget rather than out of a fresh
 #     allowance, because both run inside one hook invocation and their SUM has to fit.
 #
 # WHY VALUES ARRIVE AS ENVIRONMENT AND NOT AS ARGUMENTS. `runtime.seed` is a PATH, not a command
-# template, so nothing expands into command position and the whole injection class Phase 3 had to
+# template, so nothing expands into command position and the whole injection class bootstrap had to
 # defend against with wt_unsafe_command_placeholder does not arise here. The path itself is the one
 # thing that does reach a command string, so it is invoked as `./'<path>'` relative to the working
 # directory the runner already sets — which keeps $WT_PATH, and therefore the untrusted worktree
@@ -2492,7 +2491,7 @@ wt_runtime_env_release() {  # $1 = worktree, $2 = relative path
 
 # Run the seed. Sets WT_SEED_STATUS to one of: done, failed, timeout, skipped, refused, none.
 wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env files $6=env state $7=seed rel $8=deadline
-  # $5 is every override file, `:`-joined (ADR-012). $6 carries their COMBINED disposition — `ours`,
+  # $5 is every override file, `:`-joined. $6 carries their COMBINED disposition — `ours`,
   # `theirs` if any file is the developer's, or `unwritten` if the profile asked for a file this
   # session could not write. The per-file dispositions live in the state record, which this
   # function carries through rather than overwriting with the combined one.
@@ -2591,7 +2590,7 @@ wt_runtime_seed() {  # $1=root $2=worktree $3=slug $4=port $5=env files $6=env s
 
   # --- REFUSAL 3: another live worktree already owns this slug -------------------------------
   # There is no safe "probe forward" for a database name the way there is for a port: inventing an
-  # alternative is exactly the inference ADR-006 forbids. Refuse, name the collision, let the
+  # alternative is exactly the inference the plugin must never make. Refuse, name the collision, let the
   # developer rename the worktree or fix the profile.
   # Distinct names: `prev`/`prevck` hold the RECORDED SEED FINGERPRINT read above, and reusing them
   # as this loop's variables clobbered it — so the "do not retry an unchanged failure" rule below
@@ -2715,9 +2714,9 @@ EOF
 # An in-process call at the point runtime isolation has to happen: inside the SAME SessionStart
 # invocation, before the hook returns, because env overrides must exist before the session starts.
 # There is no cross-process boundary here to justify serialising the hand-off through a file — the
-# artifact pattern belongs to teardown (Phase 5), which is a genuinely separate event.
+# artifact pattern belongs to teardown, which is a genuinely separate event.
 #
-# SILENT when the profile has no runtime block, because absent means TOUCH NOTHING (ADR-006) and a
+# SILENT when the profile has no runtime block, because absent means TOUCH NOTHING and a
 # plugin that comments on every session start is one people uninstall.
 
 # The marker a developer drops in a worktree to opt that ONE worktree out of layer 3 entirely.
@@ -2730,8 +2729,8 @@ EOF
 WT_NO_RUNTIME_MARKER='.claude/worktree-no-runtime'
 
 # The disposition recorded for env file $3, given the recorded `:`-joined file list $1 and the
-# aligned `:`-joined dispositions $2. Prints `ours`, `theirs`, or nothing. A record from before
-# ADR-012 holds one file and one disposition, which is the same shape with a single element.
+# aligned `:`-joined dispositions $2. Prints `ours`, `theirs`, or nothing. A record from an
+# older version holds one file and one disposition, which is the same shape with a single element.
 wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, $3 = file
   local files=${1-} states=${2-} want=${3-} f st
   [ -n "$files" ] && [ -n "$want" ] || return 0
@@ -2824,7 +2823,7 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
   export WT_PORT
 
   # --- the env override files ------------------------------------------------------------------
-  # One managed block per file the app loads (ADR-012), each with its OWN recorded disposition: a
+  # One managed block per file the app loads, each with its OWN recorded disposition: a
   # developer can take over the test env's file and leave the dev env's to the plugin. The record
   # keeps the list and the dispositions `:`-joined and aligned, and a file's prior disposition is
   # looked up BY NAME, so reordering the list or adding a file cannot hand one file's `ours` to
@@ -2845,7 +2844,7 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
       prior=$(wt_runtime_env_recorded "$oldenv" "$oldstates" "$f")
       # A FILE NOTHING RECORDS, WITHOUT A BLOCK, THAT DIFFERS FROM THE MAIN CHECKOUT'S was written in
       # this worktree by hand — most often one set up before the plugin was adopted, pointed at a
-      # database cloned by hand (ADR-013). Appending the block would silently re-point it. A file
+      # database cloned by hand. Appending the block would silently re-point it. A file
       # native creation or .worktreeinclude just copied in is byte-identical to the main checkout's,
       # which is the one case the block is for. Said once, since the verdict is then recorded.
       if [ -z "$prior" ] && [ "$(wt_runtime_env_state "$worktree" "$f")" = unmarked ] \

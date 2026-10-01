@@ -197,7 +197,7 @@ git -C "$R5" commit -qm drop 2>/dev/null
 W5=$R5/.claude/worktrees/f5
 git -C "$R5" worktree add -q "$W5" -b worktree-f5 2>/dev/null
 inject 'no profile at all' "$R5" "$W5"
-contains 'no profile: it says what to do about it' 'worktree-calibrate' "$(cat "$TMP/err")"
+contains 'no profile: it says what to do about it' 'pitlane-setup' "$(cat "$TMP/err")"
 
 # A profile that is present and invalid.
 R6=$TMP/r6
@@ -348,7 +348,7 @@ lacks 'and neither reported a corrupt or interleaved install' 'interrupted' \
 # ---------------------------------------------------------------------------
 # Acceptance: a real ecosystem, end to end
 # ---------------------------------------------------------------------------
-# The phase's acceptance asks for a scratch pnpm repo and a scratch composer repo to come up with
+# Bootstrap's acceptance asks for a scratch pnpm repo and a scratch composer repo to come up with
 # config and dependencies present and no manual steps.
 #
 # pnpm is exercised FOR REAL when it is on PATH — a dependency-free package still produces a
@@ -357,8 +357,8 @@ lacks 'and neither reported a corrupt or interleaved install' 'interrupted' \
 #
 # composer is NOT installed on every machine this runs on, so its repo is composer-SHAPED: the
 # same vendor/ + composer.lock + hardlink strategy, driven by a stand-in command. That proves the
-# engine's behaviour, not composer's. A real composer run against a 400 MB vendor/ is Phase 6's
-# job, and the handoff says so rather than implying this covered it.
+# engine's behaviour, not composer's. A real composer run against a 400 MB vendor/ is a
+# real repository's job, and this says so rather than implying it covered it.
 
 if command -v pnpm >/dev/null 2>&1; then
   RP=$TMP/pnpmrepo
@@ -395,7 +395,7 @@ JSON
     eq 'pnpm: the session start writes nothing to stdout' '' "$out"
     eq 'pnpm: node_modules really is installed by a real pnpm' yes \
       "$([ -d "$WP/node_modules" ] && echo yes)"
-    # ADR-005: pnpm has its own content-addressable store, so it must be installed, never shared.
+    # pnpm has its own content-addressable store, so it must be installed, never shared.
     lacks 'pnpm: and it was installed, not hardlinked from the main checkout' 'hardlinked' "$err"
     eq 'pnpm: the worktree is usable with no manual steps' yes \
       "$([ -d "$WP/node_modules" ] && [ -f "$WP/package.json" ] && echo yes)"
@@ -431,7 +431,7 @@ else
 fi
 
 # composer-SHAPED: vendor/ hardlinked from the main checkout when the lockfiles agree, which is
-# the case ADR-004 exists for and the one a real composer repo hits.
+# the case hardlinking exists for and the one a real composer repo hits.
 # NOTE ON THE HARNESS, because it changes what can be asserted: this creates worktrees with plain
 # `git worktree add`, which does NOT do Claude Code's native `.worktreeinclude` copying. So on the
 # SessionStart path a .worktreeinclude file legitimately never arrives here, and asserting it
@@ -507,7 +507,7 @@ contains '...and the next run sees a finished dependency, not a frozen partial o
   'already up to date' "$(cat "$TMP/err")"
 
 # ---------------------------------------------------------------------------
-# Layer 3 — the phase's acceptance criteria, end to end through the hook
+# Layer 3 — runtime isolation's acceptance criteria, end to end through the hook
 # ---------------------------------------------------------------------------
 #
 # The unit suite drives the engine's functions directly. This drives the ENTRYPOINT, which is the
@@ -515,7 +515,7 @@ contains '...and the next run sees a finished dependency, not a frozen partial o
 # and the whole sequence survives a real hook invocation.
 
 # A repo whose profile isolates a port and THREE environments — development, test and CI. Isolating
-# only the development database is the "looks right, is subtly wrong" failure the phase names: a
+# only the development database is the "looks right, is subtly wrong" failure to design against: a
 # test runner that recreates its databases wholesale destroys a parallel session's test run
 # regardless of how well the dev database is separated.
 # VERIFY RUNS ON THE HOST, INSTALL INSIDE THE TOOLCHAIN. The wrapper can cost tens of seconds a
@@ -563,7 +563,7 @@ printf 'SECRET=native-put-this\n' > "$WNA/.env"
 run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WNA\"}" "$WNA" >/dev/null
 eq 'first session: a file native already copied is not overwritten' 'SECRET=native-put-this' "$(cat "$WNA/.env")"
 
-# THE WORKTREE'S OWN .worktreeinclude wins over the main checkout's (ADR-008's rule for the profile):
+# THE WORKTREE'S OWN .worktreeinclude wins over the main checkout's (the profile's own rule):
 # a branch that adds one must not wait for the main checkout to have it too.
 RWI=$TMP/wtinclude-own
 make_repo "$RWI" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
@@ -578,7 +578,7 @@ run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\
 eq 'own .worktreeinclude: the worktree branch patterns are used' 'EXTRA=from-main' "$(cat "$WWI/.env.extra" 2>/dev/null)"
 
 # A NAME THAT IS A LEGAL DIRECTORY BUT NOT A LEGAL BRANCH. `worktree-my fix` used to fail
-# `git worktree add -b`, so the hook printed no path and creation failed (a Phase 3 carry-over).
+# `git worktree add -b`, so the hook printed no path and creation failed.
 RSP=$TMP/spaced
 make_repo "$RSP" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
 outSP=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"my fix\",\"cwd\":\"$RSP\"}" "$RSP")
@@ -589,7 +589,7 @@ contains 'spaced name: and it says which branch it used' 'using worktree-my-fix'
 eq 'spaced name: reopening it prints the same path' "$RSP/.claude/worktrees/my fix" \
   "$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"my fix\",\"cwd\":\"$RSP\"}" "$RSP")"
 
-# A NESTED PROJECT WITH ITS OWN LOCKFILE — what detect.sh now proposes (Phase 6 pre-flight): its
+# A NESTED PROJECT WITH ITS OWN LOCKFILE — what detect.sh now proposes: its
 # dir and lock carry the directory, and its commands `cd` into it from the worktree root. The
 # engine has to be able to hardlink it and, when the lockfile differs, install it there.
 RN=$TMP/nested
@@ -658,7 +658,7 @@ start_hook() {  # $1 = worktree
     | bash "$HOOK" 2>"$TMP/err" )
 }
 # The EFFECTIVE value: the last assignment, which is what dotenv honours and where the plugin's
-# block sits (ADR-012). $3 names another override file.
+# block sits. $3 names another override file.
 envval() { grep "^$2=" "$1/${3:-.env.worktree.local}" 2>/dev/null | tail -1 | cut -d= -f2-; }
 
 RT=$TMP/rt
@@ -882,7 +882,7 @@ eq 'a refused env write stops the seed' 0 "$([ -e "$WU/seeded.txt" ] && echo 1 |
 contains 'and says the worktree is not pointed anywhere yet' 'not pointed at anything named' "$errU"
 eq 'and the session still survives' 'ok' "$(cat "$WU/vendor/marker" 2>/dev/null)"
 
-# AN OVERRIDE FILE LISTED FOR COPYING IS COPIED, AND THEN GETS THE BLOCK (ADR-012). The file an app
+# AN OVERRIDE FILE LISTED FOR COPYING IS COPIED, AND THEN GETS THE BLOCK. The file an app
 # loads by name is usually the one holding the developer's real configuration, so it must arrive —
 # and the plugin's block, appended after it, is what isolates the worktree. This used to be the
 # opposite: the copier skipped the file, because a copied file without the marker read as
@@ -950,7 +950,7 @@ d["runtime"]["env"]["file"] = [".env.worktree.local", ".env.other.local"]
 json.dump(d, open(f, "w"))
 PYJ
 # The main checkout has the file too, and the worktree's is a copy of it — what .worktreeinclude or
-# native creation would have put there. A copy gets the block; a hand-made file would not (ADR-013).
+# native creation would have put there. A copy gets the block; a hand-made file would not.
 printf 'ALSO_MINE=1\n' > "$RV/.env.other.local"
 cp "$RV/.env.other.local" "$WV/.env.other.local"
 start_hook "$WV" >/dev/null; errV=$(cat "$TMP/err")
@@ -974,7 +974,7 @@ printf 'TOOK_IT=1\n' > "$WV/.env.other.local"
 start_hook "$WV" >/dev/null
 eq 'so taking it over afterwards is still honoured' 'TOOK_IT=1' "$(cat "$WV/.env.other.local")"
 
-# ADOPTION (ADR-013): a worktree set up by hand before the plugin arrived. Its env file differs from
+# ADOPTION: a worktree set up by hand before the plugin arrived. Its env file differs from
 # the main checkout's and nothing records it, so the plugin must not re-point it — and must not seed.
 RA=$TMP/rtadopt
 make_rt_repo "$RA" ',

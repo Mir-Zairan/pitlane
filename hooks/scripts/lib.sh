@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 #
-# Shared library for the worktree plugin's hooks. Sourced, never executed.
+# Shared library for Pitlane's hooks. Sourced, never executed.
 #
-# Everything here obeys three rules that come from docs/01-decisions.md:
+# Everything here obeys three rules:
 #
-#   1. No model, no network, no prompting (ADR-002). This is plain bash reading a JSON
-#      file that /worktree-calibrate wrote earlier.
+#   1. No model, no network, no prompting. This is plain bash reading a JSON
+#      file that /pitlane-setup wrote earlier.
 #   2. Nothing in here ever calls `exit`. A library that exits kills its caller, and the
-#      caller's contract is to always exit 0 and still print the worktree path (ADR-003).
+#      caller's contract is to always exit 0 and still print the worktree path.
 #      Functions signal failure with a return code; the caller decides what to skip.
 #   3. stdout is a protocol. Only the hook entrypoint writes to stdout, and only the
 #      worktree path. Every message in here goes to stderr via wt_log().
@@ -137,7 +137,7 @@ wt_use_jq() { [ "${WT_JSON_BACKEND:-}" != "python3" ] && command -v jq >/dev/nul
 #
 # stdin as utf-8-sig: a profile saved with a UTF-8 BOM is accepted by jq, so python must
 # accept it too. Without this the two backends disagree about whether the profile exists
-# at all — and since the profile is committed (ADR-008), one teammate would get the full
+# at all — and since the profile is committed, one teammate would get the full
 # toolchain and another bare defaults from the same file.
 #
 # try/except keeps ancient pythons harmless.
@@ -237,7 +237,7 @@ wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within e
 #          field path after it is a caller error rather than something silently ignored.
 #
 # `--kv` exists because `runtime.env.vars` maps env var names the plugin cannot know in advance
-# (ADR-006 forbids inferring which variable selects a tenant) to templates. It is a GROUP rather
+# (which variable selects a tenant is never inferred) to templates. It is a GROUP rather
 # than its own reader so that reading it costs no additional interpreter start: the validator and
 # the engine both need those pairs, and a separate reader meant two more cold starts on the hook
 # that blocks session start 1:1.
@@ -246,7 +246,7 @@ wt_json_records() {  # $1 = dotted path to the array, $@ = dotted paths within e
 # arrays paid three cold interpreter starts. That is the whole cost on the session-start path: a
 # cold python3 dominates, and wt_validate_profile — which runs inside wt_load_profile, on a hook
 # measured to block session start 1:1 — cost exactly those three. This is the "one spawn or two"
-# question docs/phases/phase-3-bootstrap.md asks Phase 3 to settle, answered as one. Measured with
+# question bootstrap had to settle, answered as one. Measured with
 # a counting shim in front of the interpreter: wt_validate_profile went 3 spawns -> 1 and
 # wt_load_profile 4 -> 2, worth ~78ms -> ~41ms per load over 10 reps on a warm cache.
 #
@@ -524,7 +524,7 @@ wt_read_input() {
 # A field from the hook payload. `wt_read_field name`, `wt_read_field tool_input.file_path`.
 # Second argument overrides the JSON text (used by the tests).
 #
-# Returns 1 and prints nothing when the field is absent OR is the empty string. Phase 2
+# Returns 1 and prints nothing when the field is absent OR is the empty string. A caller
 # will need a presence-vs-value accessor for any field where "" is meaningful; no field
 # in the current schema is.
 wt_read_field() {  # $1 = dotted path, $2 = JSON text (default: $HOOK_INPUT)
@@ -569,7 +569,7 @@ wt_repo_root() {  # $1 = directory (default: $PWD)
 
 # Root of the MAIN checkout, even when called from inside a linked worktree.
 #
-# Phase 3 computes hardlink stores and relative symlinks from {root}, and Claude Code
+# Bootstrap computes hardlink stores and relative symlinks from {root}, and Claude Code
 # puts worktrees at <root>/.claude/worktrees/<name>, so a wrong answer here writes
 # dependency trees into the wrong directory. Two plausible one-liners are both wrong:
 #
@@ -669,7 +669,7 @@ WT_SLUG_MAX=40
 # The prefix is re-trimmed of a trailing `_` before the suffix is joined on, which keeps this
 # function IDEMPOTENT: without it a prefix ending in `_` would produce `__`, and re-slugifying the
 # result would collapse that and return something different. Idempotence matters because the slug
-# round-trips through the profile's `runtime.slug` template, which Phase 4 re-slugifies on the way
+# round-trips through the profile's `runtime.slug` template, which runtime isolation re-slugifies on the way
 # out.
 #
 # LC_ALL=C TWICE, because the two spellings cover different processes and neither covers both.
@@ -707,7 +707,7 @@ wt_slugify() {  # $1 = worktree name
 #
 # This is the gate the JSON layer deliberately does not apply. A key out of `runtime.env.vars` becomes
 # the left-hand side of a `KEY=value` line in a file the application loads, and that profile is
-# committed (ADR-008) so the key arrives with anyone's branch. Without a shape check, a key of
+# committed so the key arrives with anyone's branch. Without a shape check, a key of
 # `A=1` writes a line that sets a DIFFERENT variable than the profile appears to name, and a key
 # containing a space or an `=` produces a line most dotenv parsers read as something else entirely
 # — neither of which the value-side quoting can defend against, because the damage is done before
@@ -806,7 +806,7 @@ wt_port_candidates() {  # $1 = slug, $2 = base, $3 = span, $4 = max (default WT_
 # ([a-z0-9_] and digits), but {name}, {worktree} and {root} are raw text that can come
 # from a colleague's branch name — `{name}` expanding inside a command string turns
 # `q; rm -rf x` into two commands. A caller placing an unconstrained placeholder in
-# command position must quote it itself; Phase 3 owns that.
+# command position must quote it itself; bootstrap owns that.
 wt_expand() {  # $1 = template
   local rest=${1-} out='' pre tok
   while [ "${rest#*\{}" != "$rest" ]; do
@@ -893,7 +893,7 @@ wt_unknown_placeholders() {  # $1 = template
 # legitimately named `..cache` or `foo..bar` is fine, and a substring test would refuse it.
 #
 # This runs BEFORE any existence check, and that order is the point. The profile is
-# committed (ADR-008), so these paths arrive with any branch anyone pushes, and consumers
+# committed, so these paths arrive with any branch anyone pushes, and consumers
 # act on them with `cp -al`, file writes and teardown deletion. Resolving first and hoping
 # the result looks reasonable is how a `dir` of `../../..` ends up naming the home
 # directory; refusing the shape outright cannot be talked round.
@@ -938,7 +938,7 @@ wt_is_safe_relpath() {  # $1 = candidate
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
 # group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
-# list (ADR-012). A plain string yields no group-4 records; the scalar carries it.
+# list. A plain string yields no group-4 records; the scalar carries it.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
@@ -966,7 +966,7 @@ wt_profile_scan() {  # $1 = profile path
 # notice a disagreement, and the failure mode is silent: one path added in one list and not the
 # other shifts every later field, so the code checking timeouts receives `runtime`. The drift had
 # already begun before this was extracted: the comment above one of the two copies said "ALL
-# FIFTEEN are named" while the list beneath it named sixteen. This phase would have made it three
+# FIFTEEN are named" while the list beneath it named sixteen. The next feature would have made it three
 # copies of nineteen.
 #
 # EVERY field is named even though most callers want a handful: bash `read` puts the unconsumed
@@ -977,7 +977,7 @@ wt_profile_scan() {  # $1 = profile path
 # would abort a caller running under `set -e`.
 #
 # WT_PS_ENVFILES is DERIVED, not positional: runtime.env.file normalised to a `:`-joined list
-# (ADR-012). A string is a list of one; a list is its group-4 elements in order. The validator
+# A string is a list of one; a list is its group-4 elements in order. The validator
 # refuses `:` in an env file path, which is what makes the join unambiguous. WT_PS_ENVFILE stays the
 # raw scalar — compact JSON for a list — because that is how the validator tells the two shapes apart.
 #
@@ -1037,10 +1037,10 @@ WT_HOOK_TIMEOUT=600
 
 # True if $1 is a positive whole number of seconds.
 #
-# A timeout is taken from a file that ADR-008 says is committed, so it arrives with
+# A timeout is taken from a file that is committed, so it arrives with
 # other people's branches. `timeout 0` means *no timeout at all*, which would turn the
-# one guard against a hanging bootstrap into an unbounded hang — the exact way ADR-003
-# says a user must never lose a session. Anything non-numeric makes `timeout` exit 125,
+# one guard against a hanging bootstrap into an unbounded hang — the exact way
+# a user must never lose a session. Anything non-numeric makes `timeout` exit 125,
 # which a consumer would misread as "the bootstrap failed".
 wt_is_seconds() {  # $1 = candidate
   wt_is_posint "${1-}"
@@ -1063,7 +1063,7 @@ wt_is_posint() {  # $1 = candidate
 }
 
 # The allowed values for deps[].strategy. "store" is accepted because it is a valid schema
-# value, but no phase has built it — see wt_validate_profile, which warns on it.
+# value, but nothing implements it yet — see wt_validate_profile, which warns on it.
 WT_STRATEGIES='install hardlink store skip'
 
 # Validate a profile file. Prints EVERY violation it finds, one per line, to stdout in the
@@ -1072,7 +1072,7 @@ WT_STRATEGIES='install hardlink store skip'
 #
 # TWO CALLERS, TWO SEVERITIES, ONE FUNCTION AND ONE MESSAGE TEXT:
 #   the hook path (wt_load_profile) logs the violations and falls back to defaults;
-#   /worktree-calibrate prints the same lines and refuses to write.
+#   /pitlane-setup prints the same lines and refuses to write.
 # The wording is therefore written once and never re-authored for a second audience.
 #
 # EVERY violation is collected before returning, not just the first. A hand-broken profile
@@ -1100,14 +1100,14 @@ WT_STRATEGIES='install hardlink store skip'
 #
 # COSTS ONE BACKEND INVOCATION — still one, including the runtime.env.vars key check, which reads
 # its pairs out of the same stream as group 3 rather than opening the file again. It used to cost
-# three — scalars, then deps records, then copy records — which is the "one spawn or two" question docs/phases/phase-3-bootstrap.md asked Phase 3
+# three — scalars, then deps records, then copy records — which is the "one spawn or two" question bootstrap had
 # to settle. It matters because it runs inside wt_load_profile, on a hook measured to block session
 # start 1:1. Measured on the python3 backend with a counting shim in front of the interpreter:
 # wt_validate_profile went 3 spawns -> 1 and wt_load_profile 4 -> 2, worth ~78ms -> ~41ms per load
 # over 10 reps on a warm cache. wt_json_scan reads the whole document at once.
 #
 # Never calls `exit` — it is library code, and its caller's contract is to survive
-# everything (ADR-003).
+# everything.
 wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-read wt_profile_scan output
   local file=${1-} root=${2-} raw rec body version shell shellargs deps runtime boot seedt
   local evdet evmark evshell n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
@@ -1200,7 +1200,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         '') printf 'deps[%d].strategy: missing\n' "$n"; bad=1 ;;
         install | hardlink | skip) ;;
         store)
-          wt_log "deps[$n].strategy is \"store\", which is a reserved schema value that no phase implements yet — it will be treated as \"install\""
+          wt_log "deps[$n].strategy is \"store\", which is a reserved schema value that is not implemented yet — it will be treated as \"install\""
           ;;
         *)
           printf 'deps[%d].strategy: "%s" is not one of %s\n' "$n" "$strategy" \
@@ -1280,7 +1280,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   fi
 
   # --- copy[] ---------------------------------------------------------------
-  # A list of repo-relative paths a later phase acts on with file operations, arriving in a
+  # A list of repo-relative paths bootstrap acts on with file operations, arriving in a
   # committed file from anyone's branch — the same threat as deps[].dir, so the same check.
   # It needs the "." identity field because its elements are bare strings, not objects.
   if [ -n "$copy" ]; then
@@ -1310,7 +1310,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     # The same fail-closed guard the deps loop has, and for a sharper reason now that both
     # arrays come from ONE invocation: a stream truncated after the deps records leaves this
     # loop with zero iterations, `bad` untouched, and every copy[] path-escape check skipped
-    # while the profile is pronounced clean. copy[] entries are paths a later phase performs
+    # while the profile is pronounced clean. copy[] entries are paths bootstrap performs
     # file operations on, arriving in a committed file from anyone's branch.
     if [ "$ncopy" -eq 0 ]; then
       printf 'copy: is a non-empty array but could not be read — refusing to treat it as empty\n'
@@ -1341,7 +1341,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   # 10# forces base 10. wt_is_seconds accepts "08" (it strips leading zeros only for its own
   # emptiness test), and bash reads a leading zero as OCTAL: `$((08 + 120))` is a fatal
   # "value too great for base" expansion error, which under `set -e` kills the caller
-  # outright — measured, and exactly what a sourced library must never do (ADR-003).
+  # outright — measured, and exactly what a sourced library must never do.
   if wt_is_seconds "$boot" && wt_is_seconds "$seedt"; then
     sum=$((10#$boot + 10#$seedt))
     if [ "$sum" -gt "$WT_HOOK_TIMEOUT" ]; then
@@ -1350,7 +1350,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   fi
 
   # --- runtime --------------------------------------------------------------
-  # Absent means touch nothing (ADR-006) and is entirely valid, so only a PRESENT block
+  # Absent means touch nothing and is entirely valid, so only a PRESENT block
   # is checked.
   case $runtime in
     '' | 'false' | 'null' | '{}') ;;
@@ -1376,7 +1376,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         fi
       fi
       # --- runtime.env.file -----------------------------------------------------
-      # A path or a list of paths (ADR-012). Each is a file the plugin writes a managed block into,
+      # A path or a list of paths. Each is a file the plugin writes a managed block into,
       # so each gets the path-escape check, and the list must be exactly what it looks like: the
       # compact JSON is rebuilt from the elements and compared, which catches a number, an object
       # or a nested list hiding among the strings — none of which pass the character set — and a
@@ -1500,7 +1500,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       # application loads: a key of `A=1` writes a line setting a DIFFERENT variable than the
       # profile appears to name, and a key carrying a newline writes a second line entirely. No
       # amount of care on the value side defends against that, because the damage is done before
-      # the `=` the writer adds. The profile is committed (ADR-008), so these arrive with anyone's
+      # the `=` the writer adds. The profile is committed, so these arrive with anyone's
       # branch.
       #
       # It costs NO extra backend invocation: the pairs arrive as group 3 of the same
@@ -1614,16 +1614,16 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
 #
 # Scope, stated precisely because the field is called `evidence` and it would be easy to assume
 # more: this reads `deps[].lockChecksum` ONLY. `evidence.markers`, `evidence.shellMarker` and
-# `evidence.detectionVersion` are written and validated by Phase 2 but have no reader yet —
-# comparing them is a named Phase 3 task, because each catches a different kind of drift a
+# `evidence.detectionVersion` are written and validated by calibration but are not read here —
+# comparing them is bootstrap's job, because each catches a different kind of drift a
 # checksum cannot (a new ecosystem, a toolchain that appeared, a newer detection table).
 #
-# NO CALL SITE IN THIS PHASE — deliberately. Phase 2 ships the evidence block, this
-# comparator and its tests; docs/phases/phase-3-bootstrap.md owns wiring it into
-# bootstrap.sh, where it must WARN AND NEVER BLOCK (ADR-003).
+# NO CALL SITE IN THIS FILE — deliberately. The profile carries the evidence block, this
+# file the comparator and its tests; bootstrap owns wiring it into
+# bootstrap.sh, where it must WARN AND NEVER BLOCK.
 #
 # It is a checksum and a string compare, never a re-detection. That is what keeps it legal
-# inside a hook at all (ADR-002 forbids a hook doing discovery), and it is also the honest
+# inside a hook at all (a hook must never do discovery), and it is also the honest
 # limit of the feature: reference/detection.md records that a lockfile can churn without
 # anything meaningful changing, and — worse — that a hazard can appear in composer.json's
 # scripts section without touching any lockfile, producing no warning exactly where one
@@ -1666,7 +1666,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 # Load .claude/worktree-profile.json from $1 (default: $PWD) into PROFILE_* variables,
 # falling back to safe defaults when it is absent, unreadable, unparseable, or a version
 # we don't know. Always returns 0 — a missing profile is a normal state, not an error,
-# and ADR-002 forbids the hook from going and detecting anything itself.
+# and the hook must never go and detect anything itself.
 #
 # Sets:
 #   PROFILE_PATH            where it looked
@@ -1683,7 +1683,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #                           iterate deps[] and copy[] WITHOUT a second interpreter start. Empty
 #                           unless PROFILE_PRESENT is 1 — an unusable profile's records must not
 #                           be acted on, which is the no-partial-trust rule again.
-#   PROFILE_HAS_RUNTIME     1 if a runtime block exists (ADR-006: absent means touch nothing)
+#   PROFILE_HAS_RUNTIME     1 if a runtime block exists (absent means touch nothing)
 #   PROFILE_BOOTSTRAP_TIMEOUT / PROFILE_SEED_TIMEOUT   seconds, validated
 #   PROFILE_RT_SLUG / PROFILE_RT_PORTVAR / PROFILE_RT_PORTBASE / PROFILE_RT_PORTSPAN
 #   PROFILE_RT_ENVFILE / PROFILE_RT_ENVFILES / PROFILE_RT_ENVVARS / PROFILE_RT_SEED / PROFILE_RT_TEARDOWN
@@ -1692,7 +1692,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = repo root
 #                           readers of one record have to agree forever and nothing notices when
 #                           they stop — which is why there is now exactly one, wt_profile_scalars.
 #                           All are empty unless PROFILE_PRESENT is 1.
-#                           PROFILE_RT_ENVFILES is every runtime.env.file joined with `:` (ADR-012);
+#                           PROFILE_RT_ENVFILES is every runtime.env.file joined with `:`;
 #                           PROFILE_RT_ENVFILE is the FIRST of them — the one a seed receives as
 #                           WT_ENV_FILE — not the raw scalar.
 #                           PROFILE_RT_ENVVARS is the map's COMPACT JSON, not its pairs: it answers
@@ -1794,7 +1794,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   fi
   if [ -z "${WT_SKIP_VALIDATION:-}" ]; then
     problems=$(wt_validate_profile "$PROFILE_PATH" "$root" "$raw") || {
-      wt_log "$PROFILE_PATH is not valid — using defaults. Run /worktree-calibrate to rewrite it:"
+      wt_log "$PROFILE_PATH is not valid — using defaults. Run /pitlane-setup to rewrite it:"
       wt_log "$problems"
       return 0
     }
@@ -1811,7 +1811,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   # back to matching the shell string against a table of known wrappers.
   PROFILE_SHELLARGS=$shellargs
 
-  # An explicit `false` or an empty block means the same as absent: touch nothing (ADR-006).
+  # An explicit `false` or an empty block means the same as absent: touch nothing.
   case $runtime in
     '' | 'false' | 'null' | '{}') PROFILE_HAS_RUNTIME=0 ;;
     *) PROFILE_HAS_RUNTIME=1 ;;

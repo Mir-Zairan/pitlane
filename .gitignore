@@ -1,4 +1,4 @@
-# Consumer-side generated profile — written by /worktree-calibrate into the TARGET
+# Consumer-side generated profile — written by /pitlane-setup into the TARGET
 # repo, never into this plugin repo.
 .claude/worktree-profile.json
 
@@ -18,6 +18,6 @@ tmp/
 .claude/settings.local.json
 .claude/worktrees/
 
-# Design docs, phase notes and the source conversation stay local, never published.
+# Design docs and the source conversation stay local, never published.
 docs/
 CLAUDE.local.md

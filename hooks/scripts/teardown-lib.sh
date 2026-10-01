@@ -20,14 +20,14 @@
 # previous candidate's target after a refusal. What to do with a worktree that may go is the second
 # half of this file ("Tearing down what was allocated"), which both callers run in the same order.
 #
-# THE ASYMMETRY IS THE DESIGN (docs/phases/phase-5-teardown.md). Creating the wrong thing wastes
+# THE ASYMMETRY IS THE DESIGN. Creating the wrong thing wastes
 # disk; deleting the wrong thing destroys work. So both functions fail CLOSED: a path that cannot be
 # proven to be a registered linked worktree is refused, and a worktree whose state git cannot report
 # is treated as holding work. A refusal costs the user a stale directory; a wrong answer costs them
 # a branch.
 #
-# Everything here inherits lib.sh's three rules (docs/01-decisions.md):
-#   1. No model, no network, no prompting (ADR-002).
+# Everything here inherits lib.sh's three rules:
+#   1. No model, no network, no prompting.
 #   2. NOTHING here calls `exit`. Functions return a code; the entrypoint decides what to skip.
 #   3. stdout is a protocol. Every message goes to stderr via wt_log(); the only stdout is
 #      wt_worktree_holds_work's reasons, which are its documented result.
@@ -48,7 +48,7 @@ WT_TEARDOWN_LIB_SOURCED=1
 # Which worktree a removal names
 # ---------------------------------------------------------------------------
 #
-# THE PAYLOAD, AS MEASURED (Phase 6, Claude Code 2.1.286 — ADR-014): `worktree_path` is the absolute
+# THE PAYLOAD, AS MEASURED (Claude Code 2.1.286): `worktree_path` is the absolute
 # checkout path, and `cwd` is that same worktree; there is no `reason` on the ExitWorktree path. The
 # source conversation's scripts read `path`, and an older docs example pointed into
 # `<repo>/.git/worktrees/<id>` — both are still accepted, and every shape is proven against git
@@ -765,7 +765,7 @@ wt_acquire_allocation_lock() {  # $1 = main checkout, $2 = ledger entry, $3 = fd
   rc=$?
   case $rc in
     0) return 0 ;;
-    1) WT_TD_KEEP_REASON='another teardown or /worktree-prune is releasing its runtime allocation' ;;
+    1) WT_TD_KEEP_REASON='another teardown or /pitlane-tidy is releasing its runtime allocation' ;;
     *) WT_TD_KEEP_REASON='could not check for another release of its runtime allocation: its lock file cannot be opened' ;;
   esac
   return 1
@@ -833,7 +833,7 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
 # since the seed ran would otherwise send the script after a database it never made.
 #
 # THE SCRIPT IS THE COMMITTED ONE. When the worktree is present the guard has just shown it clean,
-# so the file under it is what its branch committed — the same trust the seed ran under (ADR-008).
+# so the file under it is what its branch committed — the same trust the seed ran under.
 # Once it is gone, $1 is the main checkout. A path that leaves $1 through a symlink is refused.
 wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 = main checkout, $4 = deadline (epoch seconds) or empty
   local rundir=${1-} wt=${2-} root=${3-} deadline=${4-} rel=${PROFILE_RT_TEARDOWN:-} esc secs left rc
@@ -850,7 +850,7 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
   fi
   [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "$rel" ] || return 0
 
-  # ONLY WHAT A SEED MADE (ADR-013). With a seed in the profile, the teardown script undoes it, so
+  # ONLY WHAT A SEED MADE. With a seed in the profile, the teardown script undoes it, so
   # it runs only when the record says the seed actually ran — `done`, or `failed`/`timeout`, which
   # may have left half a database. A seed that was refused, skipped or never attempted created
   # nothing, and the name the record holds may belong to someone else: a live sibling on the same
@@ -915,7 +915,7 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
   return 0
 }
 
-# Take the plugin's block out of every override file the record says is `ours` (ADR-012). $2 and
+# Take the plugin's block out of every override file the record says is `ours`. $2 and
 # $3 are the record's `:`-joined, aligned file list and dispositions; a file whose slot is `theirs`
 # or empty is the developer's, or was never written, and is not opened at all. The recorded list,
 # never the profile's current one: a profile edited since would name files the plugin never wrote.
@@ -953,7 +953,7 @@ wt_report_kept() {  # $1 = worktree, $2 = reasons, one per line
   while IFS= read -r reason; do
     [ -n "$reason" ] && wt_log "  - $reason"
   done <<<"${2-}"
-  wt_log 'nothing was removed; /worktree-prune will list it'
+  wt_log 'nothing was removed; /pitlane-tidy will list it'
 }
 
 # Forget the ledger entry once nothing it records can still exist, or keep it and say so. It goes
@@ -976,9 +976,9 @@ wt_settle_ledger_entry() {  # $1 = main checkout, $2 = ledger entry or empty, $3
       return 0
     fi
     WT_TD_LEDGER=kept
-    wt_log "could not remove the runtime ledger entry $entry; /worktree-prune will list it"
+    wt_log "could not remove the runtime ledger entry $entry; /pitlane-tidy will list it"
     return 0
   fi
   WT_TD_LEDGER=kept
-  wt_log "the runtime ledger entry $entry is kept; /worktree-prune will list it"
+  wt_log "the runtime ledger entry $entry is kept; /pitlane-tidy will list it"
 }

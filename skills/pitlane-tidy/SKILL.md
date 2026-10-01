@@ -1,13 +1,13 @@
 ---
-name: worktree-prune
+name: pitlane-tidy
 description: Find what this plugin's worktrees left behind — orphaned worktree directories, stale git registrations, runtime allocations (databases, containers) nothing uses any more, broken ledger entries — report it with the disk each item frees, and remove only the items the developer confirms. Use when disk is filling up with old worktrees, after worktrees were deleted by hand, or when a teardown did not finish.
 argument-hint: "[--dry-run]"
 ---
 
-# Worktree — prune what worktrees left behind
+# Pitlane — tidy up what worktrees left behind
 
 `hooks/scripts/prune.sh` does all the finding, judging and deleting. It is deterministic shell and
-never asks anything ([ADR-002](../../docs/01-decisions.md#adr-002)). Your job is the part a script
+never asks anything. Your job is the part a script
 cannot do: show its report to the developer in plain words, ask which items to remove, and pass
 exactly those back to it.
 
@@ -71,7 +71,7 @@ registration of a worktree that is gone), `runtime-leftover` (a runtime allocati
 unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
 `WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live
 worktree with work in it).
-**A kind you do not recognise — `store` is reserved for a later phase — is shown as reported, under
+**A kind you do not recognise — `store` is reserved for a future version — is shown as reported, under
 its own name.** What decides whether an item can be offered is its `action`, never its kind.
 
 `bytes` is `du -sk` x 1024, or `-` where there is nothing to measure (a runtime allocation lives in

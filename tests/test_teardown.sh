@@ -250,7 +250,7 @@ WD=$(create "$R" dirty)
 printf 'edited\n' >"$WD/app.txt"
 out=$(remove "$(remove_payload "$WD" "$R")" "$R")
 err=$(cat "$TMP/err")
-eq 'dirty: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+eq 'dirty: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
 eq 'dirty: nothing on stdout' '' "$out"
 eq 'dirty: the worktree is kept' yes "$(exists "$WD")"
 eq 'dirty: the edit survives' 'edited' "$(cat "$WD/app.txt")"
@@ -287,7 +287,7 @@ eq 'failing teardown: the worktree is still removed' no "$(exists "$WF")"
 eq 'failing teardown: the ledger entry is KEPT for prune' yes \
   "$(exists "$RF/.git/worktree-ledger/boom")"
 contains 'failing teardown: stderr says it failed' 'failed (exit 3)' "$err"
-contains 'failing teardown: and that prune will list it' '/worktree-prune will list it' "$err"
+contains 'failing teardown: and that prune will list it' '/pitlane-tidy will list it' "$err"
 
 if command -v timeout >/dev/null 2>&1; then
   RH=$TMP/repo-hangs
@@ -316,7 +316,7 @@ make_repo "$RL" 'printf dump > "$WT_PATH/dump.sql"'
 WL=$(create "$RL" leaves)
 out=$(remove "$(remove_payload "$WL" "$RL")" "$RL")
 err=$(cat "$TMP/err")
-eq 'script leaves work: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+eq 'script leaves work: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
 eq 'script leaves work: nothing on stdout' '' "$out"
 eq 'script leaves work: the worktree is kept' yes "$(exists "$WL/dump.sql")"
 eq 'script leaves work: with its env override' yes "$(exists "$WL/.env.worktree.local")"
@@ -414,7 +414,7 @@ if command -v flock >/dev/null 2>&1; then
   out=$(remove "$(remove_payload "$WP" "$RG")" "$RG")
   err=$(cat "$TMP/err")
   exec 6>&- 5>&-
-  eq 'allocation held, present: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+  eq 'allocation held, present: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
   eq 'allocation held, present: the worktree is kept' yes "$(exists "$WP/.env.worktree.local")"
   eq 'allocation held, present: the teardown script did NOT run' yes "$(exists "$DB/heldpresent")"
   eq 'allocation held, present: the ledger entry is kept' yes \
@@ -487,7 +487,7 @@ if command -v flock >/dev/null 2>&1; then
   out=$(remove "$(remove_payload "$WB" "$RB")" "$RB")
   err=$(cat "$TMP/err")
   exec 7>&-
-  eq 'lock held: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+  eq 'lock held: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
   eq 'lock held: nothing on stdout' '' "$out"
   eq 'lock held: the worktree is kept' yes "$(exists "$WB/.env.worktree.local")"
   eq 'lock held: the teardown script did NOT run' yes "$(exists "$DB/busy")"
@@ -500,7 +500,7 @@ if command -v flock >/dev/null 2>&1; then
   out=$(remove "$(remove_payload "$WB" "$RB")" "$RB")
   err=$(cat "$TMP/err")
   rm -f "$busy_lock"
-  eq 'unusable lock: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+  eq 'unusable lock: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
   eq 'unusable lock: the worktree is kept' yes "$(exists "$WB/.env.worktree.local")"
   eq 'unusable lock: the teardown script did NOT run' yes "$(exists "$DB/busy")"
   eq 'unusable lock: the symlink target was not created' no "$(exists "$TMP/lock-target")"
@@ -591,7 +591,7 @@ contains 'ledger only: the recorded env file' 'WT_ENV_FILE=.env.worktree.local' 
 eq 'ledger only: the ledger entry is forgotten' no "$(exists "$R/.git/worktree-ledger/stateless")"
 
 # ---------------------------------------------------------------------------
-# A seed that never ran: nothing of the plugin's to tear down (ADR-013)
+# A seed that never ran: nothing of the plugin's to tear down
 # ---------------------------------------------------------------------------
 # The record still holds a slug, and a database by that name may belong to someone else — a live
 # sibling on the same slug, or a clone a developer made by hand. The teardown script must not run.
@@ -680,7 +680,7 @@ make_repo "$RS" 'mv "$WT_PATH" "$WT_PATH.moved" && ln -s "$WT_PATH.moved" "$WT_P
 WSW=$(create "$RS" swapped)
 out=$(PATH=$TMP/shim:$PATH remove "$(remove_payload "$WSW" "$RS")" "$RS")
 err=$(cat "$TMP/err")
-eq 'swapped for a symlink: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+eq 'swapped for a symlink: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
 eq 'swapped for a symlink: nothing on stdout' '' "$out"
 eq 'swapped for a symlink: the directory it points at survives' yes "$(exists "$WSW.moved/app.txt")"
 eq 'swapped for a symlink: the ledger entry is kept' yes "$(exists "$RS/.git/worktree-ledger/swapped")"
@@ -697,7 +697,7 @@ if [ "$(id -u)" != 0 ]; then
   out=$(PATH=$TMP/shim:$PATH remove "$(remove_payload "$WU" "$R")" "$R")
   err=$(cat "$TMP/err")
   chmod 755 "$WU/vendor/sealed"
-  eq 'undeletable: exits 1, so Claude Code reports the worktree kept rather than removed (ADR-014)' 1 "$(cat "$TMP/rc")"
+  eq 'undeletable: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
   eq 'undeletable: nothing on stdout' '' "$out"
   eq 'undeletable: the directory is still there' yes "$(exists "$WU/vendor/sealed/file")"
   eq 'undeletable: the ledger entry is kept' yes "$(exists "$R/.git/worktree-ledger/undeletable")"

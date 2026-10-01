@@ -3,8 +3,8 @@
 # WorktreeRemove entrypoint. Tears a worktree down — its runtime allocation, its env override file,
 # the checkout and its git registration — but ONLY when the worktree holds no work. A worktree that
 # does is left exactly as it is: nothing is run, nothing is removed, the reasons go to stderr, and
-# /worktree-prune lists it later. Deleting the wrong thing destroys work; leaving the right thing
-# costs disk (docs/phases/phase-5-teardown.md).
+# /pitlane-tidy lists it later. Deleting the wrong thing destroys work; leaving the right thing
+# costs disk.
 #
 # WHO REMOVES THE DIRECTORY. Because this plugin registers WorktreeCreate, Claude Code does not run
 # `git worktree remove` for the worktrees that hook created, so this hook must. A launch-time
@@ -23,13 +23,13 @@
 #   * no `git worktree remove -f -f`. A locked worktree is someone saying "not this one", and the
 #     guard already counts it as work.
 #
-# THE EXIT STATUS SAYS WHETHER THE DIRECTORY IS GONE (ADR-014). A worktree this hook KEEPS — it
+# THE EXIT STATUS SAYS WHETHER THE DIRECTORY IS GONE. A worktree this hook KEEPS — it
 # holds work, a bootstrap or a release is still running, the directory could not be deleted — exits
 # 1. Measured on Claude Code 2.1.286: with exit 0 and the directory still there, Claude Code told
 # the session "Exited and removed worktree", and the model reported the user's uncommitted file as
 # deleted; with exit 1 it says "could not remove it — kept at <path>", and reopening that name
 # later works (it reopens the kept worktree). stderr reaches nobody, so the status is the only
-# honest channel. Everything else follows ADR-003: an internal failure warns on stderr and exits 0.
+# honest channel. Everything else follows the fail-open rule: an internal failure warns on stderr and exits 0.
 # `set -e` is deliberately NOT used, as in bootstrap.sh. stdout stays EMPTY.
 set -uo pipefail
 
@@ -97,14 +97,14 @@ if [ "$present" = 1 ]; then
 fi
 
 # --- 2. what this plugin allocated, read BEFORE anything is deleted ---------------------------
-# Held until exit, through the ledger step: /worktree-prune releases the same entries.
+# Held until exit, through the ledger step: /pitlane-tidy releases the same entries.
 if [ -n "$entry" ]; then
   if ! wt_acquire_allocation_lock "$root" "$entry" 9; then
     if [ "$present" = 1 ]; then
       wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
       wt_exit_kept
     fi
-    wt_log "not tearing down $worktree: $WT_TD_KEEP_REASON; /worktree-prune will list it"
+    wt_log "not tearing down $worktree: $WT_TD_KEEP_REASON; /pitlane-tidy will list it"
     exit 0
   fi
   # The release it waited on may have finished, and forgotten the entry.
@@ -112,7 +112,7 @@ if [ -n "$entry" ]; then
 fi
 wt_read_allocation "$state" "$root" "$entry" "$worktree"
 
-# The profile the worktree was set up with: its own committed copy wins (ADR-008). Once the
+# The profile the worktree was set up with: its own committed copy wins. Once the
 # directory is gone, the main checkout's is the only one left.
 if [ "$present" = 1 ]; then
   rundir=$worktree
@@ -135,7 +135,7 @@ if [ "$present" = 1 ]; then
     wt_exit_kept
   fi
 
-  # Only the plugin's BLOCK, and only in a file recorded `ours` that still carries it (ADR-012):
+  # Only the plugin's BLOCK, and only in a file recorded `ours` that still carries it:
   # the developer's own lines stay, and a file that was nothing but the block goes. The recorded
   # names, never the profile's current ones: a profile edited since would name files we never
   # wrote. It goes before the checkout does, so a removal that fails halfway does not leave the
@@ -169,7 +169,7 @@ if [ "$present" = 1 ]; then
     fi
     # Only THIS worktree's registration, and only while it still points here. A repository-wide
     # `git worktree prune` would also erase every other missing worktree's admin dir, and the state
-    # file in it that /worktree-prune reads.
+    # file in it that /pitlane-tidy reads.
     if [ -n "$admin" ] && [ -d "$admin" ] \
       && pointer=$(wt_read_git_pointer "$admin/gitdir" "$admin") \
       && [ "$(wt_physical_path "$pointer")" = "$worktree/.git" ]; then
@@ -179,7 +179,7 @@ if [ "$present" = 1 ]; then
   wt_log "removed $worktree (its branch is kept)"
 fi
 # A directory already gone keeps any admin dir git left behind: its checkout cannot be read, so the
-# guard cannot vouch for it, and `git worktree prune` or /worktree-prune owns that decision.
+# guard cannot vouch for it, and `git worktree prune` or /pitlane-tidy owns that decision.
 
 # --- 5. the ledger ---------------------------------------------------------------------------
 wt_settle_ledger_entry "$root" "$entry" 1

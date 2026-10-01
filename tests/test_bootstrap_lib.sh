@@ -405,7 +405,7 @@ eq 'worktreeinclude: a gitignored file in a named directory is copied' 'KEY' \
 eq 'worktreeinclude: parent directories are created as needed' 'DEEP' \
   "$(cat "$WT/nested/deep/thing.txt" 2>/dev/null)"
 eq 'worktreeinclude: a glob pattern matches' 'LOCAL' "$(cat "$WT/config.local" 2>/dev/null)"
-# ADR-007's other half: matching is not enough, it must ALSO be gitignored.
+# .worktreeinclude's other half: matching is not enough, it must ALSO be gitignored.
 eq 'worktreeinclude: a TRACKED file it names is NOT copied' '' \
   "$(cat "$WT/tracked.txt" 2>/dev/null)"
 # ...and being gitignored is not enough either, it must be named.
@@ -663,7 +663,7 @@ if command -v flock >/dev/null 2>&1; then
   rc=$(flock -w 1 "$LK" -c true >/dev/null 2>&1; echo $?)
   eq 'and releasing it lets the next one in' 0 "$rc"
 
-  # The ADR-003 behaviour: contention must never stall a session. Hold the lock from a child,
+  # The never-cost-a-session behaviour: contention must never stall a session. Hold the lock from a child,
   # then confirm the acquire gives up quickly and reports "not held" rather than waiting.
   # A readiness marker rather than a bare sleep: on a loaded machine the holder may not have the
   # lock yet, the parent would acquire it, and the two assertions below would fail for reasons
@@ -882,7 +882,7 @@ eq 'and the runtime record survives a dependency write' 'demo_one' \
 eq '...including its seed status, which is what stops the seed re-running forever' 'done' \
   "$(wt_runtime_state_get "$SWT" seedstatus)"
 
-# Every field round-trips, by NAME. Phase 5 consumes these rather than re-deriving a slug or
+# Every field round-trips, by NAME. Teardown consumes these rather than re-deriving a slug or
 # re-expanding an env path, because a profile edited in between would send it looking elsewhere.
 eq 'rt field: slug'       'demo_one'             "$(wt_runtime_state_get "$SWT" slug)"
 eq 'rt field: port'       '3812'                 "$(wt_runtime_state_get "$SWT" port)"
@@ -1315,7 +1315,7 @@ if [ "$(id -u)" != 0 ]; then
   chmod 700 "$ROWT/.claude"
 fi
 
-# The timestamp the phase's task list asks for: recorded, and never part of the freshness
+# The timestamp bootstrap records: recorded, and never part of the freshness
 # decision — a clock cannot tell you whether a tree is correct.
 wt_state_set "$SWT" vendor hardlink L6 I6 "done"
 eq 'a state record carries a timestamp' yes \
@@ -1748,7 +1748,7 @@ eq 'a profile that matches the checkout reports no drift at all' '' \
 : > "$DRTREE/pnpm-lock.yaml"
 out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a lockfile the profile never saw is reported' 'pnpm-lock.yaml' "$out"
-contains '...and points at the fix' 'worktree-calibrate' "$out"
+contains '...and points at the fix' 'pitlane-setup' "$out"
 : > "$DRTREE/Gemfile.lock"
 out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
 contains 'a second gained ecosystem is reported too' 'Gemfile.lock' "$out"
@@ -1799,7 +1799,7 @@ contains 'an older detection table version is reported' 'detection table is now 
 
 # THE LOCKFILE CHECKSUMS, which live in deps[] and not in `evidence`. They must be checked even
 # when there is no evidence block at all — a hand-written profile still records them, and gating
-# them on evidence left the one comparator Phase 2 shipped unwired for exactly those profiles.
+# them on evidence left the one comparator calibration shipped unwired for exactly those profiles.
 # shellcheck disable=SC2034
 PROFILE_RAW=$(raw_with "1 1")
 out=$(wt_report_drift "$DRTREE" "$CURDET" '["composer.lock"]' '' 2>&1)
@@ -2234,7 +2234,7 @@ eq 'a rewrite updates the port' 'SERVER_PORT=3999' "$(grep '^SERVER_PORT=' "$EW/
 eq 'and drops a variable the profile no longer names' 0 \
   "$(grep -c '^APP_ENV=' "$EW/$EF" | tr -d ' ')"
 
-# A FILE THE PLUGIN HAS NEVER WRITTEN GETS THE BLOCK APPENDED (ADR-012). It is the developer's
+# A FILE THE PLUGIN HAS NEVER WRITTEN GETS THE BLOCK APPENDED. It is the developer's
 # configuration, copied in, and the app loads it by name — so the overrides have to go INTO it,
 # after the developer's lines, where dotenv's last-assignment-wins resolves them for the plugin.
 printf 'SECRET=keep-me\nDATABASE_NAME=shared_db\n' >"$EW/$EF"
@@ -2346,7 +2346,7 @@ eq 'and a rewrite through CRLF content still leaves one block' 1 \
   "$(grep -c "^$WT_ENV_MARKER" "$EW/$EF" | tr -d ' ')"
 rm -f "$EW/$EF"
 
-# A FILE FROM BEFORE ADR-012 began with a longer marker line and had no end line. It is a block
+# A FILE FROM AN OLDER RELEASE began with a longer marker line and had no end line. It is a block
 # running to end of file, so a rewrite replaces all of it rather than keeping its old values.
 printf '%s — delete this line to take ownership of this file\nOLD=1\n' "$WT_ENV_MARKER" >"$EW/$EF"
 eq 'an old whole-file marker reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
@@ -2972,10 +2972,10 @@ rm -rf "$SW/seed-saw.txt" "$SW/seed-runs.txt" "$SW/seed-refuse.txt" "$SW/seed-od
 unset WT_SIBLINGS WT_SIBLINGS_OK
 
 # ---------------------------------------------------------------------------
-# The Phase 4 hand-off
+# The runtime hand-off
 # ---------------------------------------------------------------------------
 PROFILE_HAS_RUNTIME=0
-eq 'with no runtime block the hand-off is silent (ADR-006: touch nothing)' '' \
+eq 'with no runtime block the hand-off is silent (touch nothing)' '' \
   "$(wt_runtime_handoff "$DREPO" "$DWT" 2>&1)"
 PROFILE_HAS_RUNTIME=1
 # With a runtime block but nothing in it to act on, it is still silent about ports and files and

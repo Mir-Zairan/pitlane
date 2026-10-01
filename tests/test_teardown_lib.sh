@@ -809,7 +809,7 @@ fi
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0 PROFILE_RT_TEARDOWN='' PROFILE_SEED_TIMEOUT=''
 
-# wt_release_env_overrides: the block comes out of every file the record says is ours (ADR-012),
+# wt_release_env_overrides: the block comes out of every file the record says is ours,
 # by the RECORDED list and its aligned dispositions — a `theirs` or empty slot is not opened.
 RW=$TMP/release-wt
 mkdir -p "$RW/sub"
@@ -826,7 +826,7 @@ eq 'release: a theirs slot is not opened' "MINE=1|$WT_ENV_BEGIN|A=1|$WT_ENV_END"
   "$(paste -sd '|' - <"$RW/.env.c")"
 eq 'release: an empty slot is not opened' "NEVER=1|$WT_ENV_BEGIN|A=1|$WT_ENV_END" \
   "$(paste -sd '|' - <"$RW/.env.d")"
-# A record from before ADR-012 is the same shape with one element.
+# A record from before env files became a list is the same shape with one element.
 printf 'OLD=1\n%s\n' "$blk" >"$RW/.env.e"
 wt_release_env_overrides "$RW" '.env.e' 'ours'
 eq 'release: a single-file record still works' 'OLD=1' "$(cat "$RW/.env.e")"

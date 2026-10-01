@@ -3,9 +3,9 @@
 # where the linter cannot see them used — and it then flags every helper only they call.
 # shellcheck disable=SC2329
 #
-# The /worktree-prune sweep: finds what this plugin's worktrees left behind, reports it, and removes
-# exactly the items a developer confirmed. The skill (skills/worktree-prune) shows the report and
-# asks; this script never asks anything, and is deterministic shell like the hooks (ADR-002).
+# The /pitlane-tidy sweep: finds what this plugin's worktrees left behind, reports it, and removes
+# exactly the items a developer confirmed. The skill (skills/pitlane-tidy) shows the report and
+# asks; this script never asks anything, and is deterministic shell like the hooks.
 #
 #   prune.sh [--repo <dir>]                   REPORT. Changes nothing on disk, not even in .git.
 #   prune.sh [--repo <dir>] --apply <id>...   act on exactly those items, and nothing else.
@@ -18,7 +18,7 @@
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
 #   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | abandoned | held; `store` is reserved
-#           for Phase 7's unreferenced dependency stores, so a reader must accept it already.
+#           for a future finder of unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
 #   action  delete    remove the path.
@@ -48,7 +48,7 @@
 # WHAT IS NEVER DONE, whatever an item says:
 #   * no live registered worktree is touched — the ones Claude Code created natively and the
 #     developer's own `--worktree` ones included. One that holds work is listed as `held`. THE ONE
-#     EXCEPTION is `abandoned` (ADR-014): a subagent worktree — `agent-<hex>`, the name Claude Code
+#     EXCEPTION is `abandoned`: a subagent worktree — `agent-<hex>`, the name Claude Code
 #     gives them — that is unlocked, holds no work, and that nothing has touched for
 #     WT_PRUNE_ABANDONED_MINUTES. Claude Code removes the subagent worktrees it creates, but not the
 #     ones a WorktreeCreate hook created, and fires no WorktreeRemove for them (measured, 2.1.286);
@@ -116,7 +116,7 @@ WT_PRUNE_FINDERS=(
   wt_find_ledger_junk
   wt_find_abandoned_worktrees
   wt_find_held_worktrees
-  # TODO(phase-7): wt_find_unreferenced_stores — dependency stores under the store root that no live
+  # TODO: wt_find_unreferenced_stores — dependency stores under the store root that no live
   # worktree's links resolve into, kind `store`, applied by a wt_apply_store that re-counts the
   # references before it deletes.
 )
@@ -693,7 +693,7 @@ wt_apply_orphan_dir() {  # $1 = item index
 
 # Run the teardown hook itself on an abandoned subagent worktree, re-judged first. Same payload
 # shape Claude Code sends (measured): worktree_path, and cwd. The hook's exit status says whether the
-# directory is gone (ADR-014); the directory is checked as well, since that is the fact that counts.
+# directory is gone; the directory is checked as well, since that is the fact that counts.
 wt_apply_abandoned() {  # $1 = item index
   local wt=${PRUNE_KEY[$1]} why rc
   case $wt in

@@ -35,7 +35,7 @@
 #                                    EMPTY when the profile has no `runtime.env`, and the file may
 #                                    not exist if the plugin could not write it — guard both.
 #                       WT_ENV_FILES every override file the profile names, one per line, in order
-#                                    (ADR-012) — one per environment that needs its own state.
+#                                    — one per environment that needs its own state.
 #   Time limit          `timeouts.seedSeconds`, or whatever is LEFT of the bootstrap budget if
 #                       that is less. Overrun is not a crash — the script is stopped and the
 #                       session continues.
@@ -185,6 +185,6 @@ echo "worktree-seed: replace this section with the clone your database needs" >&
 exit 1
 
 # A note on what you have when this returns 0: the worktree has its own port, its own override
-# file, and its own data. Phase 5's teardown will run `runtime.teardown` — only for a worktree
-# whose seed ran (ADR-013) — a separate script,
+# file, and its own data. Teardown will run `runtime.teardown` — only for a worktree
+# whose seed ran — a separate script,
 # written under the same rules, and the only place a DROP belongs.

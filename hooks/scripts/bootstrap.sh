@@ -9,20 +9,20 @@
 #   SessionStart    Fires for launch-time `claude -w`. stdout is INJECTED INTO THE MODEL'S
 #                   CONTEXT, so nothing may go there. Creation was native, so `.worktreeinclude`
 #                   has ALREADY been honoured and must not be redone; only the profile's copy[]
-#                   is this hook's business. Phase 1 measured that the session blocks until this
+#                   is this hook's business. The session measurably blocks until this
 #                   returns, which is what makes a synchronous bootstrap safe.
 #   WorktreeCreate  Fires for the mid-session EnterWorktree tool and for subagents with
 #                   isolation:"worktree" — never for launch-time `claude -w`, because plugin hooks
-#                   join the registry after the worktree already exists (ADR-009). stdout IS the
+#                   join the registry after the worktree already exists. stdout IS the
 #                   worktree path and nothing else. It REPLACES native creation on those paths, so
 #                   this hook creates the worktree AND owes `.worktreeinclude` itself.
 #
-# Registering the second one is Phase 3's decision, taken because those two paths otherwise get no
+# Registering the second one is a deliberate decision, taken because those two paths otherwise get no
 # bootstrap at all — a subagent lands in a checkout with no dependencies. Its one unrecoverable
 # failure mode is bought off by wt_symlink_refuses running before anything is created; what that
-# does NOT buy off is recorded in the phase handoff.
+# does NOT buy off is a known, accepted gap.
 #
-# ADR-003 governs everything below: warn on stderr, still emit the path, exit 0. `set -e` is
+# Everything below follows one rule: warn on stderr, still emit the path, exit 0. `set -e` is
 # deliberately NOT used — a bootstrap that aborts halfway costs the user their session, which is
 # strictly worse than a worktree missing its dependencies.
 set -uo pipefail
@@ -58,16 +58,16 @@ here=${payload_cwd:-$PWD}
 # Refuse a worktree path that a symlink could redirect out of the repository.
 #
 # THE ORDER OF THIS CHECK IS THE WHOLE POINT, and it is why registering WorktreeCreate is
-# defensible at all. Claude Code performs the same refusal — measured in Phase 1, its message
+# defensible at all. Claude Code performs the same refusal — measured, its message
 # names `.claude`, `.claude/worktrees` and the worktree directory itself — but on the hook path it
-# fires only AFTER the hook has run. Phase 1 measured the consequence: the session failed while
+# fires only AFTER the hook has run. The measured consequence: the session failed while
 # the hook's worktree stayed registered OUTSIDE the repository, with whatever it had installed,
-# seeded or allocated already done and nothing to roll it back. ADR-009 calls that row "cannot be
-# fully recovered" and treats it as the strongest argument against taking over creation.
+# seeded or allocated already done and nothing to roll it back. That outcome cannot be
+# fully recovered, and is the strongest argument against taking over creation.
 #
 # Doing the check FIRST converts that into native's own behaviour: refuse, create nothing, print
 # no path, and let Claude Code report the failure. It is a copy of a rule this plugin does not
-# own, so it can drift if a future release tightens it — that is recorded in the phase handoff
+# own, so it can drift if a future release tightens it — that is stated here
 # rather than pretended away.
 wt_symlink_refuses() {  # $1 = main checkout, $2 = the worktree path about to be created
   local root=${1%/} worktree=${2-}
@@ -91,7 +91,7 @@ wt_symlink_refuses() {  # $1 = main checkout, $2 = the worktree path about to be
 # already honoured `.worktreeinclude`.
 #
 # It NEVER returns non-zero and never lets a step's failure reach the caller: the entrypoint's job
-# is to exit 0 having warned, whatever happened here (ADR-003).
+# is to exit 0 having warned, whatever happened here.
 wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own .worktreeinclude
   local root=${1%/} worktree=${2%/} own_include=${3:-0}
   local started deadline budget elapsed held=0
@@ -101,7 +101,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   if [ -n "$started" ]; then
     # CLAMPED BELOW THE HOOK'S OWN TIMEOUT. The platform's timer starts first, and the default
     # bootstrap budget is exactly the hook timeout — so without this the platform kills the hook
-    # before the internal guard can fire, and ADR-003's warn-and-continue path never runs. On the
+    # before the internal guard can fire, and the warn-and-continue path never runs. On the
     # WorktreeCreate branch that is worse than slow: the path is printed only after this returns,
     # so creation fails outright while the worktree is already registered and half-populated,
     # which is precisely the unrecoverable state the symlink pre-check exists to avoid.
@@ -122,7 +122,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # It sits beside the state file, in the worktree's private git dir, NOT in the checkout. Lock
   # files are never unlinked, so one in the working tree would be a permanent untracked entry in
   # `git status` of a repo whose .gitignore knows nothing about this plugin — committable by
-  # accident, and enough to make `git worktree remove` refuse without --force, which Phase 5 would
+  # accident, and enough to make `git worktree remove` refuse without --force, which teardown would
   # then have to work around.
   wt_prime_paths "$root" "$worktree"
   wt_lock_acquire "$(wt_state_path "$worktree").lock" 5 8 && held=1
@@ -148,7 +148,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # THE DEADLINE IS PASSED IN. `timeouts.seedSeconds` and `timeouts.bootstrapSeconds` run inside
   # ONE hook invocation, so it is their SUM that must fit — a seed that took a fresh allowance
   # would let the platform kill the hook before any internal guard fired, which is the one failure
-  # ADR-003 exists to prevent.
+  # the warn-and-exit-0 rule exists to prevent.
   wt_runtime_handoff "$root" "$worktree" "$deadline"
 
   [ "$held" -eq 1 ] && wt_lock_release 8
@@ -229,13 +229,13 @@ case $event in
     else
       # WHICH REF A NEW BRANCH IS BASED ON. Native creation follows Claude Code's `worktree.baseRef`
       # setting, whose default `fresh` means the repo's default branch ON THE REMOTE, not local
-      # HEAD (measured in Phase 1). Since this hook replaces native creation on these paths, basing
+      # HEAD (measured). Since this hook replaces native creation on these paths, basing
       # on local HEAD would silently hand a colleague a worktree cut from whatever happened to be
       # checked out — a wrong base is worse than a missing one, because it looks fine.
       #
       # So: match the default. What is NOT matched is a user who has configured
-      # `worktree.baseRef: head`; reading their settings is out of this phase's scope and the gap
-      # is recorded in the handoff rather than guessed at.
+      # `worktree.baseRef: head`; reading their settings is out of this hook's scope and the gap
+      # is acknowledged rather than guessed at.
       base=refs/remotes/origin/HEAD
       if ! wt_git "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
         base=HEAD
@@ -261,7 +261,7 @@ case $event in
     wt_log "worktree=$worktree slug=$WT_SLUG profile=$([ "$PROFILE_PRESENT" = 1 ] && echo "$PROFILE_PATH" || echo none)"
 
     # own_include=1: registering this hook DISABLES native `.worktreeinclude` handling on this
-    # path (measured in Phase 1), so the plugin owes the behaviour here.
+    # path (measured), so the plugin owes the behaviour here.
     wt_bootstrap_worktree "$root" "$worktree" 1
 
     # The one line that must reach stdout, printed LAST so nothing above can interleave with it.
@@ -271,7 +271,7 @@ case $event in
 
   SessionStart)
     # Only a genuinely new or resumed session can need bootstrapping. `compact` fires
-    # mid-session, where the "the model cannot race the hook" measurement in ADR-009 —
+    # mid-session, where the "the model cannot race the hook" measurement —
     # taken at startup — does not apply, and where re-running a bootstrap would be pure
     # cost. Stay silent rather than logging on every compaction.
     case $source_kind in
@@ -307,12 +307,12 @@ case $event in
     if [ "$PROFILE_PRESENT" = 1 ]; then
       wt_log "profile $PROFILE_PATH: shell=${PROFILE_SHELL:-<host>} runtime=$([ "$PROFILE_HAS_RUNTIME" = 1 ] && echo yes || echo no)"
     else
-      wt_log "no usable profile at $PROFILE_PATH — run /worktree-calibrate to write one; doing the safe minimum"
+      wt_log "no usable profile at $PROFILE_PATH — run /pitlane-setup to write one; doing the safe minimum"
     fi
 
     # `.worktreeinclude` ON THE FIRST BOOTSTRAP ONLY. Native `claude -w` has already honoured it —
     # but a worktree made with plain `git worktree add` (the only way to check out an existing
-    # branch, ADR-013) never had it applied by anyone, and measured on a real repository it arrived
+    # branch) never had it applied by anyone, and measured on a real repository it arrived
     # with neither `.env.local` nor the developer's `.env.dev.local`. The copier only ever fills
     # gaps, so where native did the work this is a no-op; and once the worktree has a state file it
     # is skipped, so later sessions do not pay for the walk over the main checkout. The profile's

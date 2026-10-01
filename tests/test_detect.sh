@@ -3,7 +3,7 @@
 # Exercises hooks/scripts/detect.sh against scratch repositories built under /tmp.
 #
 # This suite is the reason detect.sh exists as a script rather than as instructions in the
-# calibrate skill's prose. The phase asks for a sane profile on several dissimilar repos and
+# calibrate skill's prose. Calibration owes a sane profile on several dissimilar repos and
 # for "a second run changes nothing", and neither is checkable when detection is a model
 # reading a table — it would be a different judgement every session. Here they are assertions.
 #
@@ -105,11 +105,11 @@ run_suite() {
   hasnt 'npm: a build script is not a lifecycle hazard' 'hazard|' "$out"
 
   # --- a pnpm workspace --------------------------------------------------------
-  # The one case ADR-005 exists for: pnpm has its own content-addressable store, so the tree
+  # The one case install-not-hardlink exists for: pnpm has its own content-addressable store, so the tree
   # must be INSTALLED, never hardlinked.
   r=$(mkrepo pnpmws package.json pnpm-lock.yaml pnpm-workspace.yaml)
   out=$(det "$r")
-  eq 'pnpm: install, never hardlink (ADR-005)' 'install' "$(field "$out" dep 5)"
+  eq 'pnpm: install, never hardlink' 'install' "$(field "$out" dep 5)"
   eq 'pnpm: --frozen-lockfile'  'pnpm install --frozen-lockfile' "$(field "$out" dep 6)"
   has 'pnpm: the reason names the content-addressable store' 'content-addresses' "$out"
 
@@ -246,7 +246,7 @@ run_suite() {
   # Only ACTUALLY gitignored files count: native .worktreeinclude copying applies the
   # gitignored-only rule, so a tracked file listed there does nothing.
   # `.env.local` is a candidate glob AND is committed here, so it exercises the check-ignore
-  # gate in its negative direction — the direction ADR-007 depends on, since a tracked file
+  # gate in its negative direction — the direction .worktreeinclude depends on, since a tracked file
   # listed in .worktreeinclude is a silent no-op. An earlier fixture used a name no glob
   # matched, so the gate was never reached at all.
   r=$(mkrepo cfg uv.lock .env .env.local)
@@ -277,7 +277,7 @@ run_suite() {
   hasnt 'config: an SSH-key-shaped name is refused by neverPropose' 'config|id_rsa.local.yml' "$out"
 
   # --- layer 3 is hints only ---------------------------------------------------
-  # Nothing here may conclude anything (ADR-006). A wrong guess does not break a worktree; it
+  # Nothing here may conclude anything. A wrong guess does not break a worktree; it
   # corrupts a colleague's data.
   r=$(mkrepo hints uv.lock docker-compose.yml .env)
   printf 'services:\n  db:\n    image: mysql\n  cache:\n    image: redis\n' >"$r/docker-compose.yml"
