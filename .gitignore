@@ -17,3 +17,6 @@
 tmp/
 .claude/settings.local.json
 .claude/worktrees/
+
+# Design docs, phase notes and the source conversation stay local, never published.
+docs/
