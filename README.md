@@ -35,8 +35,11 @@ claude plugin marketplace add Mir-Zairan/worktree
 claude plugin install worktree@worktree --scope project   # or --scope user
 ```
 
-Project scope writes the repo's committed `.claude/settings.json`, so every teammate gets it. The plugin
-loads inside worktrees without a per-worktree install.
+Project scope writes the repo's committed `.claude/settings.json`, which makes Claude Code offer the
+plugin to every teammate — but **each developer still runs the install command once**: a plugin that is
+only enabled by the project's settings is cached, not installed, and its hooks never run (measured; its
+slash commands may appear anyway, which hides the problem). Once installed it loads inside every
+worktree of the repo without a per-worktree install.
 
 ## Calibrate once per repository
 
@@ -105,9 +108,12 @@ own before dropping it.
 
 ## Cleaning up
 
-A worktree is torn down when Claude Code removes it — **only if it holds no work** (uncommitted or
+A worktree the plugin created (`EnterWorktree`, subagents) is torn down when Claude Code removes it —
+**only if it holds no work** (uncommitted or
 unpushed changes, an operation in progress, a lock). One that does is kept, and Claude Code is told it was
-kept. For anything left over:
+kept. A `claude -w` worktree is removed by Claude Code itself, which tells no hook, so its runtime
+allocation (its databases) is deliberately left for you to release — re-entering the same name reuses
+it. For that, and anything else left over:
 
 ```
 /worktree-prune
@@ -138,6 +144,10 @@ and never a database the plugin did not allocate.
 - **A hand-configured worktree was left alone.** Deliberate: an env file that differs from the main
   checkout's and was never written by the plugin is treated as yours. Add the block's first line back to
   hand it over.
+- **A worktree was not bootstrapped at all, though the plugin's commands work.** It is enabled by the
+  project but not installed for you: run `claude plugin install worktree@worktree --scope project`.
+- **Databases from removed `claude -w` worktrees stay around.** Deliberate (re-entry reuses them);
+  `/worktree-prune` releases them when you are done.
 - **Subagent worktrees pile up.** Claude Code does not remove subagent worktrees a `WorktreeCreate` hook
   made; `/worktree-prune` offers the abandoned ones.
 
