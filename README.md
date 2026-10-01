@@ -9,6 +9,20 @@ no settings, no installed packages, and it shares the same database and web addr
 So one session can break another's work without anyone noticing. Pitlane fixes that: like a pit lane readies a car before it goes back out, it readies each copy before a session starts. Every new copy
 comes ready to use and gets its own database and its own address, so each session works on its own.
 
+## What it does
+
+| Feature | What you get |
+|---|---|
+| **Settings** | Copies `.env` and other ignored config into each copy |
+| **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk |
+| **Database & port** | Each copy gets its own, so sessions never clash |
+| **Pull requests** | `claude -w "#1234"` opens a PR, set up like any other copy |
+| **Reopening** | A copy that's already set up opens in seconds |
+| **Slow starts** | Tells you what's missing; `/pitlane-finish` completes it |
+| **Cleanup** | `/pitlane-tidy` removes old copies, never unsaved work |
+
+Your app's server is not started for you: each copy is ready, and you run it when you need it.
+
 ## How to use it
 
 1. **Install it** in Claude Code:
