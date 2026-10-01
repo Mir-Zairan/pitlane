@@ -80,6 +80,14 @@
 #    `_test` to a database name, a queue or cache prefix, a search index. Clone or create each one
 #    the worktree will touch. A seed that isolates development and forgets the test database lets a
 #    parallel session's test run recreate the shared one mid-suite.
+#
+# 6. IT MARKS WHAT IT MAKES — FIRST, AND FINISHED LAST. Write an ownership marker (this slug) into the
+#    target as soon as it exists, and flip it to finished only when the copy is done. The seed is
+#    time-boxed and the hook can be stopped, so a copy WILL be interrupted one day. With the marker
+#    written last, the half-made database looks like a stranger's and every later session refuses it
+#    (measured: one slow run wedged a worktree that way). With it written first, the seed can tell its
+#    own unfinished copy — and only that — apart, and make it again; and teardown can drop anything that
+#    carries this slug's marker.
 
 # SC2317/SC2329/SC2034: everything below the sentinel is deliberately UNREACHABLE until a developer
 # deletes that line, and target_exists() is deliberately uncalled-looking for the same reason. That

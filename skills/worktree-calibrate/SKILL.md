@@ -276,9 +276,15 @@ noise.
 
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
 get hardlinked and which get installed, what shell that runs inside, roughly how long the first
-bootstrap will take, and what — if anything — will be isolated. Recommend committing the profile: it
-is meant to be shared, so a teammate who installs the plugin gets a working setup with no
-calibration run of their own ([ADR-008](../../docs/01-decisions.md#adr-008)).
+bootstrap will take, and what — if anything — will be isolated. Then ask **who it is for**
+([ADR-016](../../docs/01-decisions.md#adr-016)):
+
+- **the team** — commit the profile, `.worktreeinclude` and the scripts; a teammate who installs the
+  plugin gets a working setup with no calibration run of their own (ADR-008);
+- **only this developer** — commit nothing. Leave the files untracked in the main checkout and list them
+  in `.git/info/exclude` (never committed, shared by every worktree); put the seed and teardown scripts
+  in the profile's `copy[]` so each worktree gets them; and write the agent note to `CLAUDE.local.md`,
+  listed in `.worktreeinclude`, instead of the repo's shared instructions.
 
 ### Propose a note for the repo's agent instructions
 

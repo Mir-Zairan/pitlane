@@ -41,6 +41,14 @@ only enabled by the project's settings is cached, not installed, and its hooks n
 slash commands may appear anyway, which hides the problem). Once installed it loads inside every
 worktree of the repo without a per-worktree install.
 
+### Just for yourself
+
+Nothing has to be committed to the repo ([ADR-016](docs/01-decisions.md#adr-016)). Install at user
+scope (`--scope user`), keep the profile, `.worktreeinclude` and the seed/teardown scripts untracked in
+the main checkout, list them in `.git/info/exclude`, put the scripts in the profile's `copy[]`, and keep
+the agent note in `CLAUDE.local.md`. Worktrees cut from any branch still bootstrap, because the plugin
+falls back to the main checkout's files. `/worktree-calibrate` offers this as an option.
+
 ## Calibrate once per repository
 
 ```
