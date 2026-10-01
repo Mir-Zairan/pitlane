@@ -181,6 +181,96 @@ wt_nix_shell_missing() {  # $1 = directory the command will run in
   esac
 }
 
+# ---------------------------------------------------------------------------
+# The resource guard — a setup step must never take the desktop down with it
+# ---------------------------------------------------------------------------
+#
+# MEASURED, the reason this exists: a session resume started `nix develop` for a new lockfile while
+# the machine was already short of memory. The memory guard of the desktop (systemd-oomd) found the
+# user session over its pressure limit and killed the browser and then the session bus, which logs
+# the user out. The hook had done nothing wrong but start a tool; ANY tool can do this — a toolchain
+# evaluating, a container image pulling, an install resolving a large tree, a seed restoring a dump.
+#
+# So every command the bootstrap runs goes through three generic protections, applied here once:
+#   1. LOW PRIORITY. `nice` (and `ionice -c3` where present), so the step yields to what the user is
+#      doing instead of competing with it.
+#   2. A MEMORY CAP. Where a user systemd can make a transient scope (Linux with cgroup v2), the step
+#      runs in one with MemoryMax and no swap, so a step that grows too large is the one that is
+#      killed — reported, and retried later — instead of the desktop around it.
+#   3. A PRE-FLIGHT REFUSAL. When too little memory is free to start a step at all, it is not
+#      started; it is left for /pitlane-finish or the next session, like a step that ran out of time.
+#
+# The cap is min(half of RAM, free memory minus a reserve for the desktop). PITLANE_MEMORY_MAX
+# overrides it: a size systemd accepts (`6G`, `40%`), or `off` to switch the cap and the refusal off.
+# Where none of the mechanisms exist (macOS, no user systemd) the step runs as before, only niced.
+# Builds a nix daemon performs run in the daemon's own cgroup and are outside any cap set here.
+#
+# WT_MEMINFO and WT_SYSTEMD_RUN exist for the tests: a fake /proc/meminfo, and a forced answer to
+# "can this host make a capped scope" ('' = no).
+WT_GUARD_REFUSED=199          # the status a refused step returns; callers report it as low memory
+WT_GUARD_MIN_KB=$((1024 * 1024))   # never start a heavy step with less than 1 GiB to give it
+WT_GUARD_REFUSE=${WT_GUARD_REFUSE:-1}
+WT_GUARD_SCOPE=${WT_GUARD_SCOPE-}  # cached probe: '' (not probed), yes, no
+WT_GUARD_CAP=''               # the cap the last guarded run used, for the caller's message
+
+wt_meminfo_kb() {  # $1 = field (MemTotal, MemAvailable); prints kB or fails
+  local file=${WT_MEMINFO:-/proc/meminfo} v
+  [ -r "$file" ] || return 1
+  v=$(awk -v k="$1:" '$1 == k { print $2; exit }' "$file" 2>/dev/null) || return 1
+  wt_is_posint "$v" || return 1
+  printf '%s\n' "$v"
+}
+
+wt_guard_can_scope() {
+  if [ -z "$WT_GUARD_SCOPE" ]; then
+    WT_GUARD_SCOPE=no
+    if [ -n "${WT_SYSTEMD_RUN+set}" ]; then
+      [ -n "$WT_SYSTEMD_RUN" ] && WT_GUARD_SCOPE=yes
+    elif command -v systemd-run >/dev/null 2>&1 &&
+         systemd-run --user --scope --quiet --collect -p MemoryMax=64M true </dev/null >/dev/null 2>&1; then
+      WT_GUARD_SCOPE=yes
+    fi
+  fi
+  [ "$WT_GUARD_SCOPE" = yes ]
+}
+
+# Prefix WT_CMD_ARGV with the guard. Returns WT_GUARD_REFUSED (and logs why) when the step must not
+# start. Never fails otherwise: a missing mechanism only means a weaker guard.
+wt_guard_argv() {  # $1 = the command, for the message
+  local total avail reserve cap pre=()
+  WT_GUARD_CAP=''
+  command -v nice >/dev/null 2>&1 && pre=(nice -n 10)
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1 && pre=("${pre[@]}" ionice -c3)
+
+  case ${PITLANE_MEMORY_MAX:-} in
+    off | OFF | 0) ;;
+    ?*)
+      wt_guard_can_scope && WT_GUARD_CAP=$PITLANE_MEMORY_MAX
+      ;;
+    *)
+      if total=$(wt_meminfo_kb MemTotal) && avail=$(wt_meminfo_kb MemAvailable); then
+        reserve=$((total / 16))
+        [ "$reserve" -ge $((1024 * 1024)) ] || reserve=$((1024 * 1024))
+        cap=$((avail - reserve))
+        [ "$cap" -le $((total / 2)) ] || cap=$((total / 2))
+        if [ "$WT_GUARD_REFUSE" = 1 ] && [ "$cap" -lt "$WT_GUARD_MIN_KB" ]; then
+          wt_log "  only $((avail / 1024)) MiB of memory is free — not starting \"$1\" now, so it cannot crowd out the desktop; close something heavy and run /pitlane-finish (PITLANE_MEMORY_MAX=off skips this check)"
+          return "$WT_GUARD_REFUSED"
+        fi
+        [ "$cap" -ge "$WT_GUARD_MIN_KB" ] || cap=$WT_GUARD_MIN_KB
+        wt_guard_can_scope && WT_GUARD_CAP="$((cap / 1024))M"
+      fi
+      ;;
+  esac
+
+  if [ -n "$WT_GUARD_CAP" ]; then
+    pre=("${WT_SYSTEMD_RUN:-systemd-run}" --user --scope --quiet --collect
+         -p "MemoryMax=$WT_GUARD_CAP" -p MemorySwapMax=0 "${pre[@]}")
+  fi
+  [ "${#pre[@]}" -eq 0 ] || WT_CMD_ARGV=("${pre[@]}" "${WT_CMD_ARGV[@]}")
+  return 0
+}
+
 # Run $1 inside the profile's toolchain, in directory $2, with a timeout of $3 seconds.
 #
 # Returns the command's own exit status, or 124 when `timeout` killed it — which the caller must
@@ -209,6 +299,9 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   else
     wt_build_shell_argv "$cmd"
   fi
+  if [ "${WT_GUARD:-on}" != off ]; then
+    wt_guard_argv "$cmd" || return "$WT_GUARD_REFUSED"
+  fi
 
   # THE CHILD'S STDOUT GOES TO STDERR. Not tidiness — stdout is a protocol: on WorktreeCreate it
   # IS the worktree path and nothing else, and on SessionStart it is injected into the model's
@@ -232,6 +325,11 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
     # so once: an unbounded install is a risk, but refusing to install is a certainty.
     wt_log "coreutils timeout is not on PATH — running \"$cmd\" without a time limit"
     ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+  fi
+  # A step the cap stopped dies of SIGKILL: 137 through `timeout`. Say what happened, because "exit
+  # 137" reads like a crash in the tool rather than the guard doing its job.
+  if [ "$rc" -eq 137 ] && [ -n "$WT_GUARD_CAP" ]; then
+    wt_log "  \"$cmd\" was stopped at its ${WT_GUARD_CAP} memory cap, so it could not crowd out the desktop — it is left for /pitlane-finish or the next session (PITLANE_MEMORY_MAX raises the cap)"
   fi
   return $rc
 }
@@ -1429,7 +1527,8 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
 # a re-entry stays at its sub-second cost.
 #
 # WT_TOOLCHAIN: '' (not tried), ready, slow (timed out — a download is probably still going; a later
-# step with time of its own may try again, and the download resumes), broken (exited non-zero).
+# step with time of its own may try again, and the download resumes), broken (exited non-zero),
+# lowmem (the resource guard refused it or stopped it at its cap — retried by the next run).
 WT_TOOLCHAIN=''
 
 wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0 when the shell is usable
@@ -1437,7 +1536,7 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
   [ -n "${PROFILE_SHELL:-}" ] || return 0
   case $WT_TOOLCHAIN in
     ready) return 0 ;;
-    broken) return 1 ;;
+    broken | lowmem) return 1 ;;
   esac
   left=$(wt_budget_left "$deadline")
   if [ "$left" -le 0 ]; then
@@ -1458,6 +1557,11 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
     124)
       WT_TOOLCHAIN=slow
       wt_log "  toolchain: still not ready after ${elapsed:-$left}s — it is probably downloading; the steps that need it are left for /pitlane-finish or the next session"
+      return 1
+      ;;
+    137 | "$WT_GUARD_REFUSED")
+      # The guard's doing, not the toolchain's: retried by the next run, which may have more memory.
+      WT_TOOLCHAIN=lowmem
       return 1
       ;;
     *)
@@ -1669,6 +1773,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       case $rc in
         0) wt_log "  $dir: installed${elapsed:+ in ${elapsed}s}" ;;
         124) wt_log "  $dir: the install ran past the ${left}s left in the budget and was stopped — the worktree may be incomplete" ;;
+        137 | "$WT_GUARD_REFUSED") wt_log "  $dir: not installed for lack of memory — left for /pitlane-finish or the next session" ;;
         *) wt_log "  $dir: the install command failed (exit $rc) — the worktree may be incomplete" ;;
       esac
     elif [ "$effective" = hardlink ]; then
@@ -1689,7 +1794,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
         rc=1
       else
-        PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
+        WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
         rc=$?
         [ "$rc" -eq 0 ] || wt_log "  $dir: the verify command failed (exit $rc) — it will be retried next session"
       fi
@@ -2831,6 +2936,12 @@ EOF
         wt_log "  runtime: the seed ran past the ${secs}s it had and was stopped — the database may be half-made; it will be retried when the script changes"
       fi
       WT_SEED_STATUS=timeout
+      ;;
+    137 | "$WT_GUARD_REFUSED")
+      # Memory, not the script: never fingerprinted, so the next session retries it.
+      wt_log "  runtime: the seed was not completed for lack of memory — it will be tried again by /pitlane-finish or the next session"
+      WT_SEED_STATUS=failed
+      cksum=''
       ;;
     *)
       wt_log "  runtime: the seed failed (exit $rc) — the worktree has its own port and env file, but its database may not be ready"

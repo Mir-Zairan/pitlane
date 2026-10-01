@@ -26,6 +26,9 @@ It prints progress on stderr and one status line on stdout as its last word:
 - `Pitlane: still not complete — missing: …` — show the user that line and the stderr lines that
   explain each missing item (they say why: a toolchain that failed to start, a seed that refused, a
   command that failed). Do not retry in a loop; one more run only if the reason was time.
+  If the reason was **memory** ("memory is free", "memory cap"), Pitlane held the step back so it could
+  not freeze the desktop: tell the user to close something heavy and run it again, or to set
+  `PITLANE_MEMORY_MAX` (e.g. `PITLANE_MEMORY_MAX=12G`) if the step genuinely needs more.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
 
 ## The rule

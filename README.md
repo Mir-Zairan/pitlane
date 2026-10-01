@@ -19,6 +19,7 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Pull requests** | `claude -w "#1234"` opens a PR, set up like any other copy |
 | **Reopening** | A copy that's already set up opens in seconds |
 | **Slow starts** | Tells you what's missing; `/pitlane-finish` completes it |
+| **Light on your machine** | Setup runs at low priority under a memory cap, so it can't freeze your desktop |
 | **Cleanup** | `/pitlane-tidy` removes old copies, never unsaved work |
 
 Your app's server is not started for you: each copy is ready, and you run it when you need it.

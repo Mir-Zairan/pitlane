@@ -44,6 +44,10 @@ WT_TEARDOWN_LIB_SOURCED=1
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/bootstrap-lib.sh"
 
+# A teardown script still runs niced and under the memory cap, but is never REFUSED for low memory:
+# dropping a database or stopping a container is what frees memory, so holding it back is backwards.
+WT_GUARD_REFUSE=0
+
 # ---------------------------------------------------------------------------
 # Which worktree a removal names
 # ---------------------------------------------------------------------------

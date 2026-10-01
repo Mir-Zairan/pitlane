@@ -1192,5 +1192,39 @@ PYJ
   lacks '...not the databases, which are done' 'databases (seed' "$outSB"
 fi
 
+# ---------------------------------------------------------------------------
+# Low memory — the setup steps back instead of crowding out the desktop
+# ---------------------------------------------------------------------------
+# A fake /proc/meminfo with 1.5 GiB free of 16: below what a heavy step is started with.
+printf 'MemTotal: 16777216 kB\nMemAvailable: 1572864 kB\n' > "$TMP/meminfo.low"
+printf 'MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\n' > "$TMP/meminfo.ok"
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$TMP/passshell"; chmod +x "$TMP/passshell"
+LM=$TMP/lowmem
+make_repo "$LM" '{"dir":"node_modules","lock":"composer.lock","strategy":"install","install":"mkdir -p node_modules && printf ok > node_modules/m"},
+    {"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor"}'
+python3 - "$LM/.claude/worktree-profile.json" "$TMP/passshell" <<'PYJ'
+import json, sys
+f = sys.argv[1]; d = json.load(open(f)); d["shell"] = sys.argv[2]; json.dump(d, open(f, "w"))
+PYJ
+printf 'node_modules/\n' >> "$LM/.gitignore"
+git -C "$LM" add -A; git -C "$LM" commit -qm lowmem
+mkdir -p "$LM/vendor"; printf 'MAIN\n' > "$LM/vendor/autoload.php"
+WLM=$LM/.claude/worktrees/lm
+git -C "$LM" worktree add -q "$WLM" -b worktree-lm 2>/dev/null
+
+outL=$(WT_MEMINFO=$TMP/meminfo.low start_hook "$WLM"); rcL=$?; errL=$(cat "$TMP/err")
+eq 'low memory: the session still starts' 0 "$rcL"
+eq 'low memory: the hardlink, which needs no memory to speak of, is still done' MAIN \
+  "$(cat "$WLM/vendor/autoload.php" 2>/dev/null)"
+eq 'low memory: the toolchain and the install are not started' no \
+  "$([ -e "$WLM/node_modules/m" ] && echo yes || echo no)"
+contains 'low memory: stderr says why' 'MiB of memory is free' "$errL"
+lacks '...and does not call the toolchain broken' 'failed to start' "$errL"
+contains 'low memory: the session is told what is missing' 'still missing: node_modules.' "$outL"
+
+outL=$(WT_MEMINFO=$TMP/meminfo.ok start_hook "$WLM")
+eq 'with memory back, the next session completes it' ok "$(cat "$WLM/node_modules/m" 2>/dev/null)"
+eq '...and is silent again' '' "$outL"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

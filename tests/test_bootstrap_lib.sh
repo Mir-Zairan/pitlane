@@ -343,6 +343,83 @@ contains 'with no timeout binary it says so' 'without a time limit' "$err"
 contains '...and still runs the command' 'ok' "$err"
 
 # ---------------------------------------------------------------------------
+# The resource guard
+# ---------------------------------------------------------------------------
+# Driven through a fake /proc/meminfo and a fake systemd-run that records its argv and then runs
+# the command it wraps, so every assertion is about THIS code, not the host's memory.
+PROFILE_SHELL='' PROFILE_SHELLARGS=''
+meminfo() {  # $1 = total kB, $2 = available kB
+  printf 'MemTotal:       %s kB\nMemFree:        1 kB\nMemAvailable:   %s kB\n' "$1" "$2" > "$TMP/meminfo"
+}
+cat > "$TMP/fake-systemd-run" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/scope.log"
+shift 4
+while [ "\${1-}" = -p ]; do shift 2; done
+exec "\$@"
+SH
+chmod +x "$TMP/fake-systemd-run"
+guarded() {  # run one command under the guard with a fresh probe; stderr to $TMP/gerr
+  : > "$TMP/scope.log"; rm -f "$TMP/run/ran"
+  ( WT_GUARD_SCOPE=''; WT_MEMINFO=$TMP/meminfo; export WT_MEMINFO
+    wt_run_in_shell 'touch ran' "$TMP/run" 10 ) >/dev/null 2>"$TMP/gerr"
+}
+GiB=$((1024 * 1024))
+
+meminfo $((16 * GiB)) $((8 * GiB))
+WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+eq 'with memory to spare the step runs' yes "$([ -e "$TMP/run/ran" ] && echo yes)"
+contains '...inside a capped scope: free memory minus the desktop reserve' 'MemoryMax=7168M' "$(cat "$TMP/scope.log")"
+contains '...with no swap to thrash' 'MemorySwapMax=0' "$(cat "$TMP/scope.log")"
+contains '...and at low priority' 'nice -n 10' "$(cat "$TMP/scope.log")"
+
+meminfo $((16 * GiB)) $((15 * GiB))
+WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+contains 'the cap is never more than half the RAM, however much is free' 'MemoryMax=8192M' "$(cat "$TMP/scope.log")"
+
+meminfo $((16 * GiB)) $((3 * GiB / 2))
+WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded; rc=$?
+eq 'with too little free memory the step is refused' "$WT_GUARD_REFUSED" "$rc"
+eq '...and never started' no "$([ -e "$TMP/run/ran" ] && echo yes || echo no)"
+contains '...saying why and what to do' 'MiB of memory is free' "$(cat "$TMP/gerr")"
+contains '...pointing at /pitlane-finish' '/pitlane-finish' "$(cat "$TMP/gerr")"
+WT_GUARD_REFUSE=0 WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+eq 'a caller that must not be refused (teardown) still runs, at the minimum cap' yes \
+  "$([ -e "$TMP/run/ran" ] && echo yes)"
+contains '...which is 1 GiB' 'MemoryMax=1024M' "$(cat "$TMP/scope.log")"
+PITLANE_MEMORY_MAX=off WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+eq 'PITLANE_MEMORY_MAX=off switches the refusal off' yes "$([ -e "$TMP/run/ran" ] && echo yes)"
+eq '...and the cap' '' "$(cat "$TMP/scope.log")"
+WT_GUARD=off WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+eq 'WT_GUARD=off (the cheap verify) is never refused or capped' yes "$([ -e "$TMP/run/ran" ] && echo yes)"
+
+meminfo $((16 * GiB)) $((8 * GiB))
+PITLANE_MEMORY_MAX=3G WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+contains 'PITLANE_MEMORY_MAX sets the cap explicitly' 'MemoryMax=3G' "$(cat "$TMP/scope.log")"
+WT_SYSTEMD_RUN='' guarded
+eq 'a host that cannot make a scope still runs the step' yes "$([ -e "$TMP/run/ran" ] && echo yes)"
+rm -f "$TMP/meminfo"
+WT_SYSTEMD_RUN=$TMP/fake-systemd-run guarded
+eq 'a host with no /proc/meminfo (macOS) runs the step uncapped' yes "$([ -e "$TMP/run/ran" ] && echo yes)"
+eq '...without a scope' '' "$(cat "$TMP/scope.log")"
+
+# THE REAL THING, where this host can make a capped scope: a step that outgrows its cap is the one
+# killed, and says so — not the session around it.
+WT_GUARD_SCOPE=''
+if (unset WT_SYSTEMD_RUN; wt_guard_can_scope) && command -v python3 >/dev/null 2>&1; then
+  # SC2034: both are read by the sourced engine inside the subshell.
+  # shellcheck disable=SC2034
+  rc=$( (WT_GUARD_SCOPE=''; PITLANE_MEMORY_MAX=96M
+         wt_run_in_shell 'python3 -c "b = bytearray(512 * 1024 * 1024)"' "$TMP/run" 60) >/dev/null 2>"$TMP/gerr"; echo $?)
+  eq 'a step that outgrows a real cap is killed (137)' 137 "$rc"
+  contains '...and the message says it was the cap, not a crash' 'memory cap' "$(cat "$TMP/gerr")"
+else
+  printf 'WARNING: no user systemd scope on this host — the real memory cap was NOT exercised\n' >&2
+fi
+# shellcheck disable=SC2034  # reset the engine's cached probe for the tests after this block
+WT_GUARD_SCOPE=''
+
+# ---------------------------------------------------------------------------
 # Config copying
 # ---------------------------------------------------------------------------
 # These need a REAL git repository: the whole point is that the gitignore semantics are git's
