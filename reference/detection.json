@@ -250,7 +250,7 @@
       "for every healthy Go repo, which is precisely the false positive the probe exists to avoid.",
       "",
       "Full prove-by-installing is deliberately NOT done here: it costs minutes, and an install that",
-      "TIMEOUT IS 180s because a COLD nix flake evaluation measured over 60s on the reference repo,",
+      "TIMEOUT IS 180s because a COLD nix flake evaluation measured over 60s on a real repository,",
       "which made an earlier 60s budget report a false 'the wrapper is wrong for this repo'. A timeout",
       "is reported as INCONCLUSIVE, never as a failure — the two mean different things to a developer."
     ],
@@ -370,11 +370,11 @@
       "resolveIndirection": {
         "_comment": [
           "MATCH THE WHOLE CHAIN, NOT THE FIRST LINK. The probe returns a script's immediate value, and in",
-          "real repos that value is almost always a reference to somewhere else. The reference repo is the",
+          "real repos that value is almost always a reference to somewhere else. A real repository is the",
           "worked example and it defeats a naive one-level match twice over:",
           "  post-install-cmd -> [\"@db\", ...]          the pattern sees only \"@db\"",
           "  @db              -> [..., \"@db:migrate\"]  one more hop to the match",
-          "  @db:migrate      -> acme\\Composer\\Scripts::dbMigrate   camelCase, hence caseInsensitive",
+          "  @db:migrate      -> App\\Composer\\Scripts::dbMigrate   camelCase, hence caseInsensitive",
           "So follow these forms until they bottom out, and match the pattern against every level.",
           "",
           "A MATCH AND AN UNREADABLE TRAIL ARE DIFFERENT FINDINGS, reported under different labels.",

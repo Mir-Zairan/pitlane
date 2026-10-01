@@ -312,7 +312,7 @@ case $event in
 
     # `.worktreeinclude` ON THE FIRST BOOTSTRAP ONLY. Native `claude -w` has already honoured it —
     # but a worktree made with plain `git worktree add` (the only way to check out an existing
-    # branch, ADR-013) never had it applied by anyone, and measured on the reference repo it arrived
+    # branch, ADR-013) never had it applied by anyone, and measured on a real repository it arrived
     # with neither `.env.local` nor the developer's `.env.dev.local`. The copier only ever fills
     # gaps, so where native did the work this is a no-op; and once the worktree has a state file it
     # is skipped, so later sessions do not pay for the walk over the main checkout. The profile's

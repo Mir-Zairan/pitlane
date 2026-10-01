@@ -1436,7 +1436,7 @@ PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf INSTALLED > /dev/nul
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 eq 'hardlink: the tree appears in the worktree' 'REAL' "$(cat "$DWT/vendor/pkg/file.txt" 2>/dev/null)"
 contains 'hardlink: and it is reported as a link, not an install' 'hardlinked from the main checkout' "$out"
-# The point of hardlinking: the same inode, so 397 MB costs almost nothing.
+# The point of hardlinking: the same inode, so 400 MB costs almost nothing.
 eq 'hardlink: the file really is the same inode, not a copy' \
   "$(stat -c '%i' "$DREPO/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DREPO/vendor/pkg/file.txt")" \
   "$(stat -c '%i' "$DWT/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DWT/vendor/pkg/file.txt")"
@@ -1953,7 +1953,7 @@ wt_port_in_use 0     ; eq 'port_in_use rejects zero'                1 $?
 # SC2123: assigning PATH is the POINT — the guard under test is "no coreutils timeout on PATH".
 # shellcheck disable=SC2123
 eq 'port_in_use without coreutils timeout answers no, without probing' 1 \
-  "$(PATH=/nonexistent; wt_port_in_use 3786; echo $?)"
+  "$(PATH=/nonexistent; wt_port_in_use 4100; echo $?)"
 # A port something IS listening on, using a real listener so the probe itself is exercised.
 if command -v python3 >/dev/null 2>&1; then
   python3 - "$TMP/lport" <<'PYL' &
@@ -1974,9 +1974,9 @@ fi
 # --- wt_runtime_claim_port ---
 # Determinism first: it is what a bookmarked URL depends on.
 rm -f "$(wt_state_path "$PA")"
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200; p_first=$WT_PORT
-in_range_b 'a claimed port is inside the span' 3786 200 "$p_first"
-eq 'the derived port is what a bare derivation gives' "$(wt_derive_port alpha_slug 3786 200)" \
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_first=$WT_PORT
+in_range_b 'a claimed port is inside the span' 4100 200 "$p_first"
+eq 'the derived port is what a bare derivation gives' "$(wt_derive_port alpha_slug 4100 200)" \
   "$p_first"
 eq 'and it is reported as derived, not probed' 'derived' "$WT_PORT_SOURCE"
 
@@ -2008,7 +2008,7 @@ rm -f "$TMP/lock-order"
     else printf 'released-too-early' >"$TMP/lock-order"; fi
     eval "exec $1>&-" 2>/dev/null || true
   }
-  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 >/dev/null 2>&1
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 >/dev/null 2>&1
 )
 eq 'the allocation is recorded BEFORE the lock is released' 'recorded-then-released' \
   "$(cat "$TMP/lock-order" 2>/dev/null)"
@@ -2016,55 +2016,55 @@ eq 'the allocation is recorded BEFORE the lock is released' 'recorded-then-relea
 # Existing runtime state is CARRIED FORWARD by the claim, not blanked — otherwise every claim would
 # erase the seed marker and re-clone the database.
 wt_runtime_state_set "$PA" alpha_slug "$p_first" derived .env.wt ours "done" SEEDCK
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
 eq 'a re-claim preserves the seed status' 'done' "$(wt_runtime_state_get "$PA" seedstatus)"
 eq 'and the env file it wrote' '.env.wt' "$(wt_runtime_state_get "$PA" envfile)"
 
 # ...but a CHANGED slug is a different logical allocation: its database has not been seeded, so
 # inheriting a `done` marker would skip seeding the new one entirely.
-wt_runtime_claim_port "$PREPO" "$PA" changed_slug 3786 200
+wt_runtime_claim_port "$PREPO" "$PA" changed_slug 4100 200
 eq 'a changed slug resets the seed status' 'none' "$(wt_runtime_state_get "$PA" seedstatus)"
 eq 'and does not carry the old env file across' '' "$(wt_runtime_state_get "$PA" envfile)"
 
 # THE RECORDED PORT WINS OVER RE-DERIVATION — the acceptance criterion "reopening a worktree lands
 # on the same port it had before".
 wt_runtime_state_set "$PA" alpha_slug 4242 probed .e ours none ''
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
 eq 'a recorded port for the SAME slug is reused verbatim' 4242 "$WT_PORT"
 eq 'and its recorded source is preserved, not reset to derived' 'probed' "$WT_PORT_SOURCE"
 # A recorded port outside the port space is no more usable than a derived one would be.
 wt_runtime_state_set "$PA" alpha_slug 99999 derived .e ours none ''
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
-in_range_b 'a recorded port outside the port space is re-derived' 3786 200 "$WT_PORT"
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
+in_range_b 'a recorded port outside the port space is re-derived' 4100 200 "$WT_PORT"
 
 # PROBING FORWARD past a live sibling, pinned by pointing the sibling at exactly the port this slug
 # derives to, so the collision is certain rather than incidental.
 rm -f "$(wt_state_path "$PA")"
-want=$(wt_derive_port alpha_slug 3786 200)
+want=$(wt_derive_port alpha_slug 4100 200)
 wt_runtime_state_set "$PB" beta_slug "$want" derived .e ours none ''
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200; p_probe=$WT_PORT
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_probe=$WT_PORT
 ne 'a port claimed by a live sibling is stepped over' "$want" "$p_probe"
-in_range_b 'and the replacement is still inside the span' 3786 200 "$p_probe"
+in_range_b 'and the replacement is still inside the span' 4100 200 "$p_probe"
 eq 'and it is reported as probed, so teardown knows it was not derived' 'probed' "$WT_PORT_SOURCE"
 rm -f "$(wt_state_path "$PA")"
 contains 'and it says which port it stepped over' 'is taken by another worktree' \
-  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>&1 >/dev/null)"
+  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)"
 
 # TWO siblings, so the inner record loop really has to examine more than one. With one sibling a
 # mutation that stops after the first record passes, and in a three-worktree repo the second
 # sibling's port is handed straight to a new worktree.
 git -C "$PREPO" worktree add -q "$PREPO/.claude/worktrees/gamma" -b wg 2>/dev/null
 PG=$PREPO/.claude/worktrees/gamma
-c1=$(wt_port_candidates alpha_slug 3786 200 | sed -n 1p)
-c2=$(wt_port_candidates alpha_slug 3786 200 | sed -n 2p)
-c3=$(wt_port_candidates alpha_slug 3786 200 | sed -n 3p)
+c1=$(wt_port_candidates alpha_slug 4100 200 | sed -n 1p)
+c2=$(wt_port_candidates alpha_slug 4100 200 | sed -n 2p)
+c3=$(wt_port_candidates alpha_slug 4100 200 | sed -n 3p)
 wt_runtime_state_set "$PB" beta_slug  "$c1" derived .e ours none ''
 wt_runtime_state_set "$PG" gamma_slug "$c2" derived .e ours none ''
 rm -f "$(wt_state_path "$PA")"
 wt_runtime_siblings "$PREPO" "$PA"
 eq 'both siblings appear in one enumeration' 2 \
   "$(printf '%s' "$WT_SIBLINGS" | tr -cd "$RS_" | wc -c | tr -d ' ')"
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
 eq 'two claimed candidates are both stepped over' "$c3" "$WT_PORT"
 git -C "$PREPO" worktree remove --force "$PG" 2>/dev/null
 
@@ -2076,35 +2076,35 @@ git -C "$PREPO" worktree remove --force "$PG" 2>/dev/null
 # about separately because no port move can fix it.
 rm -f "$(wt_state_path "$PA")"
 wt_runtime_state_set "$PB" alpha_slug "$want" derived .e ours none ''
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
 ne 'a live sibling on the same slug is stepped over like any other' "$want" "$WT_PORT"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
 # A span of 1 with the single port already claimed: every candidate is taken, so it keeps the
 # derived value and says so. It must not hang, loop, or print nothing.
 rm -f "$(wt_state_path "$PA")"
-wt_runtime_state_set "$PB" beta_slug 3786 derived .e ours none ''
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 1 2>/dev/null
-eq 'a fully-claimed span keeps the derived port rather than failing' 3786 "$WT_PORT"
+wt_runtime_state_set "$PB" beta_slug 4100 derived .e ours none ''
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 1 2>/dev/null
+eq 'a fully-claimed span keeps the derived port rather than failing' 4100 "$WT_PORT"
 eq 'and reports it as derived, since nothing was successfully probed' 'derived' "$WT_PORT_SOURCE"
 rm -f "$(wt_state_path "$PA")"
 contains 'and warns that it may fail to bind' 'may fail to bind' \
-  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 1 2>&1 >/dev/null)"
-# A ZERO-PADDED base on that same path. wt_is_posint accepts "03786" and bash reads a leading zero
+  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 1 2>&1 >/dev/null)"
+# A ZERO-PADDED base on that same path. wt_is_posint accepts "04100" and bash reads a leading zero
 # as OCTAL, so a message computing base+span without the 10# prefix is a fatal arithmetic error —
 # on the one path that is already reporting a problem, which is the worst place to add a second one.
 rm -f "$(wt_state_path "$PA")"
 contains 'the fully-claimed message survives a zero-padded base' 'may fail to bind' \
-  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 03786 1 2>&1 >/dev/null)"
+  "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 04100 1 2>&1 >/dev/null)"
 rm -f "$(wt_state_path "$PA")"
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 03786 1 2>/dev/null
-eq 'and a zero-padded base still derives a decimal port' 3786 "$WT_PORT"
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 04100 1 2>/dev/null
+eq 'and a zero-padded base still derives a decimal port' 4100 "$WT_PORT"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
 # An unusable port configuration yields nothing at all rather than a wrong number. The validator
 # only WARNS about these, so the engine is what actually has to refuse.
 rm -f "$(wt_state_path "$PA")"
-for bad in '0 200' '3786 0' 'x 200' '3786 x' '80 10' '65000 1000'; do
+for bad in '0 200' '4100 0' 'x 200' '4100 x' '80 10' '65000 1000'; do
   # SC2086: the split is the POINT — each entry is a base/span pair to be separated.
   # shellcheck disable=SC2086
   set -- $bad
@@ -2127,11 +2127,11 @@ noflock_claim() {
   PATH=$NOFLOCK
   # shellcheck disable=SC2034
   WT_FLOCK_WARNED=''
-  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>/dev/null
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
   printf '%s' "$WT_PORT"
 }
 noflock_port=$(noflock_claim)
-in_range_b 'a port is still allocated with no flock on PATH' 3786 200 "$noflock_port"
+in_range_b 'a port is still allocated with no flock on PATH' 4100 200 "$noflock_port"
 # A helper rather than an inline subshell so the shellcheck directives attach to the assignments
 # they describe. PATH is narrowed on purpose (no flock), and WT_FLOCK_WARNED is reset so the
 # library's one-shot warning can fire again — it is read by the sourced library, not by this file.
@@ -2143,7 +2143,7 @@ noflock_stderr() {
   rm -f "$(wt_state_path "$PA")"
   # SC2069: the order captures stderr ONLY, which is what this assertion reads. Deliberate.
   # shellcheck disable=SC2069
-  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>&1 >/dev/null
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null
 }
 lacks 'and the message does not claim a competing worktree that does not exist' \
   'another worktree is allocating' "$(noflock_stderr)"
@@ -2152,13 +2152,13 @@ lacks 'and the message does not claim a competing worktree that does not exist' 
 # Shadowing the probe rather than binding a socket: what is under test is that the ANSWER does not
 # move the port, not the probe itself (which is asserted directly above).
 rm -f "$(wt_state_path "$PA")"
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200; p_clean=$WT_PORT
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_clean=$WT_PORT
 rm -f "$(wt_state_path "$PA")"
 p_busy=$(
   # SC2329: invoked INDIRECTLY — it shadows the real probe for this subshell.
   # shellcheck disable=SC2329
   wt_port_in_use() { return 0; }
-  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>/dev/null
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
   printf '%s' "$WT_PORT"
 )
 eq 'a foreign listener does NOT move the port — it only warns' "$p_clean" "$p_busy"
@@ -2166,7 +2166,7 @@ rm -f "$(wt_state_path "$PA")"
 contains 'and the warning says the port was left alone' 'leaving the port as it is' \
   "$(# shellcheck disable=SC2329
      wt_port_in_use() { return 0; }
-     wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 3786 200 2>&1 >/dev/null)"
+     wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)"
 rm -f "$(wt_state_path "$PA")"
 
 # ---------------------------------------------------------------------------
@@ -2201,12 +2201,12 @@ export WT_NAME WT_SLUG WT_PATH WT_ROOT WT_PORT
 eq 'an absent override file is absent' 'absent' "$(wt_runtime_env_state "$EW" "$EF")"
 
 # --- writing it ---
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}' 'APP_ENV=dev')"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}' 'APP_ENV=dev')"
 eq 'writing the override file reports written' 'written' "$WT_ENV_WROTE"
 eq 'the port line is written from the profile-named variable' 'SERVER_PORT=3812' \
   "$(grep '^SERVER_PORT=' "$EW/$EF")"
-eq 'a {slug} placeholder is expanded in a value' 'INSTALLATION_NAME=demo_alice_fix_99' \
-  "$(grep '^INSTALLATION_NAME=' "$EW/$EF")"
+eq 'a {slug} placeholder is expanded in a value' 'DATABASE_NAME=demo_alice_fix_99' \
+  "$(grep '^DATABASE_NAME=' "$EW/$EF")"
 eq 'a literal value is written as-is' 'APP_ENV=dev' "$(grep '^APP_ENV=' "$EW/$EF")"
 eq 'the file now reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
 # These files hold database names and, in a repo that puts one there, a connection string.
@@ -2229,7 +2229,7 @@ case $WT_ENV_END in
 esac
 
 # REWRITING keeps values in sync when the profile changes.
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')"
 eq 'a rewrite updates the port' 'SERVER_PORT=3999' "$(grep '^SERVER_PORT=' "$EW/$EF")"
 eq 'and drops a variable the profile no longer names' 0 \
   "$(grep -c '^APP_ENV=' "$EW/$EF" | tr -d ' ')"
@@ -2237,20 +2237,20 @@ eq 'and drops a variable the profile no longer names' 0 \
 # A FILE THE PLUGIN HAS NEVER WRITTEN GETS THE BLOCK APPENDED (ADR-012). It is the developer's
 # configuration, copied in, and the app loads it by name — so the overrides have to go INTO it,
 # after the developer's lines, where dotenv's last-assignment-wins resolves them for the plugin.
-printf 'SECRET=keep-me\nINSTALLATION_NAME=shared_db\n' >"$EW/$EF"
+printf 'SECRET=keep-me\nDATABASE_NAME=shared_db\n' >"$EW/$EF"
 eq 'a file without a block reads as unmarked' 'unmarked' "$(wt_runtime_env_state "$EW" "$EF")"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')"
 eq 'an unmarked file with nothing recorded is written' 'written' "$WT_ENV_WROTE"
-eq 'the developer lines stay first, untouched' 'SECRET=keep-me|INSTALLATION_NAME=shared_db' \
+eq 'the developer lines stay first, untouched' 'SECRET=keep-me|DATABASE_NAME=shared_db' \
   "$(head -2 "$EW/$EF" | paste -sd '|' -)"
 eq 'the block follows them' "$WT_ENV_BEGIN" "$(sed -n 3p "$EW/$EF")"
-eq 'so the plugin assignment is the LAST one, which dotenv honours' 'INSTALLATION_NAME=demo_alice_fix_99' \
-  "$(grep '^INSTALLATION_NAME=' "$EW/$EF" | tail -1)"
+eq 'so the plugin assignment is the LAST one, which dotenv honours' 'DATABASE_NAME=demo_alice_fix_99' \
+  "$(grep '^DATABASE_NAME=' "$EW/$EF" | tail -1)"
 eq 'and the file now reads as ours' 'ours' "$(wt_runtime_env_state "$EW" "$EF")"
 
 # A LINE BELOW THE BLOCK KEEPS WINNING: a rewrite replaces the block IN PLACE, never moves it.
 printf 'SERVER_PORT=9999\n' >>"$EW/$EF"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3813 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" "ours"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3813 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" "ours"
 eq 'a rewrite updates the block' 'SERVER_PORT=3813' "$(grep '^SERVER_PORT=' "$EW/$EF" | head -1)"
 eq 'and the developer override below it is still last' 'SERVER_PORT=9999' \
   "$(tail -1 "$EW/$EF")"
@@ -2259,21 +2259,21 @@ eq 'and there is still exactly one block' 1 "$(grep -c "^$WT_ENV_MARKER" "$EW/$E
 
 # A BLOCK THE DEVELOPER DELETED IS A FILE THEY TOOK OVER — but only the state record can tell that
 # apart from a file never written, so the recorded disposition is what decides.
-printf 'INSTALLATION_NAME=someone_elses_db\n' >"$EW/$EF"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" ours
+printf 'DATABASE_NAME=someone_elses_db\n' >"$EW/$EF"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" ours
 eq 'a recorded-ours file whose block is gone is developer-managed' 'developer' "$WT_ENV_WROTE"
-eq 'and is left byte for byte alone' 'INSTALLATION_NAME=someone_elses_db' "$(cat "$EW/$EF")"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
+eq 'and is left byte for byte alone' 'DATABASE_NAME=someone_elses_db' "$(cat "$EW/$EF")"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" theirs
 eq 'and so is one already recorded as theirs' 'developer' "$WT_ENV_WROTE"
-eq 'still byte for byte' 'INSTALLATION_NAME=someone_elses_db' "$(cat "$EW/$EF")"
+eq 'still byte for byte' 'DATABASE_NAME=someone_elses_db' "$(cat "$EW/$EF")"
 # Putting the begin line back hands it back.
 printf '%s\n' "$WT_ENV_MARKER" >>"$EW/$EF"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" theirs
 eq 'a restored marker line hands the file back' 'written' "$WT_ENV_WROTE"
-eq 'keeping the developer line above the block' 'INSTALLATION_NAME=someone_elses_db' "$(head -1 "$EW/$EF")"
+eq 'keeping the developer line above the block' 'DATABASE_NAME=someone_elses_db' "$(head -1 "$EW/$EF")"
 # Deleting a file the plugin created hands it back too.
 rm -f "$EW/$EF"
-wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}')" theirs
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" theirs
 eq 'deleting the file hands ownership back to the plugin' 'written' "$WT_ENV_WROTE"
 
 # A path that is not a regular readable file is a REFUSAL, not a developer take-over: nothing can
@@ -2478,13 +2478,13 @@ eq 'and contains no KEY=VALUE lines' 0 \
 # that says two worktrees must not destroy each other's TEST runs either.
 rm -f "$EW/$EF"
 wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 \
-  "$(mk_pairs 'INSTALLATION_NAME=demo_{slug}' 'TEST_INSTALLATION_NAME=demo_{slug}_test' 'CI_INSTALLATION_NAME=demo_{slug}_ci')"
-eq 'the development database is isolated' 'INSTALLATION_NAME=demo_alice_fix_99' \
-  "$(grep '^INSTALLATION_NAME=' "$EW/$EF")"
-eq 'the test database is isolated too' 'TEST_INSTALLATION_NAME=demo_alice_fix_99_test' \
-  "$(grep '^TEST_INSTALLATION_NAME=' "$EW/$EF")"
-eq 'and so is CI' 'CI_INSTALLATION_NAME=demo_alice_fix_99_ci' \
-  "$(grep '^CI_INSTALLATION_NAME=' "$EW/$EF")"
+  "$(mk_pairs 'DATABASE_NAME=demo_{slug}' 'TEST_DATABASE_NAME=demo_{slug}_test' 'CI_DATABASE_NAME=demo_{slug}_ci')"
+eq 'the development database is isolated' 'DATABASE_NAME=demo_alice_fix_99' \
+  "$(grep '^DATABASE_NAME=' "$EW/$EF")"
+eq 'the test database is isolated too' 'TEST_DATABASE_NAME=demo_alice_fix_99_test' \
+  "$(grep '^TEST_DATABASE_NAME=' "$EW/$EF")"
+eq 'and so is CI' 'CI_DATABASE_NAME=demo_alice_fix_99_ci' \
+  "$(grep '^CI_DATABASE_NAME=' "$EW/$EF")"
 
 # {port} resolves from the exported WT_PORT, which is what makes a URL in a value work.
 rm -f "$EW/$EF"
@@ -2614,7 +2614,7 @@ eq 'nothing escaped into the worktrees directory' 0 \
 # not re-announced. The once-ness lives in the caller's state record, so what this function owes is
 # SILENCE — a wt_log added here would make every session warn, and nothing pinned that.
 rm -f "$EW/$EF"
-printf 'INSTALLATION_NAME=colleagues_db\n' >"$EW/$EF"
+printf 'DATABASE_NAME=colleagues_db\n' >"$EW/$EF"
 before=$(cat "$EW/$EF")
 eq 'the developer path says nothing itself' '' \
   "$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3812 "$(mk_pairs 'A=1')" ours 2>&1)"

@@ -633,7 +633,7 @@ WT_SLUG_MAX=40
 # value or a filename: lowercased, every run of characters outside [a-z0-9_] collapsed
 # to a single _, and leading/trailing _ trimmed.
 #
-#   colleague/QT-999  ->  colleague_qt_999
+#   colleague/ABC-999  ->  colleague_abc_999
 #   feature/AB--12    ->  feature_ab_12
 #
 # `tr` rather than bash's ${s,,} because ${s,,} is bash 4.0+ and stock macOS ships 3.2,
@@ -1486,7 +1486,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         wt_log "runtime.port.var names $portvar but there is no port.base/port.span to derive a port from — no port will be written"
       fi
       # `port` ITSELF is shape-checked, not merely its three children. A profile writing
-      # `"port": 3786` — the obvious shorthand — walks all three children to nothing, skips every
+      # `"port": 4100` — the obvious shorthand — walks all three children to nothing, skips every
       # rule above and validates clean while port isolation silently never happens. Every other
       # container in this schema (deps, copy, runtime, env.vars) is checked the same way.
       case $portobj in

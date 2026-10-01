@@ -87,7 +87,7 @@ contains() {  # $1 = label, $2 = needle, $3 = haystack
 # Fixtures
 # ---------------------------------------------------------------------------
 
-PAYLOAD='{"name":"colleague/QT-999","cwd":"/some/dir","blocking":true,"quiet":false,
+PAYLOAD='{"name":"colleague/ABC-999","cwd":"/some/dir","blocking":true,"quiet":false,
           "count":7,"big":12345678901234567890,"float":1.5,"neg":-3,
           "tool_input":{"file_path":"/a/b.php"},"nested":{"deep":{"k":"v"}},
           "obj":{"a":1},"arr":[1,2],"emptyobj":{},"emptyarr":[],
@@ -101,7 +101,7 @@ cat >"$TMP/profile-v1.json" <<'JSON'
   "copy": [],
   "deps": [{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
             "install":"composer install --no-interaction --no-progress --no-scripts"}],
-  "runtime": {"slug":"{name}","port":{"var":"SERVER_PORT","base":3786,"span":200}},
+  "runtime": {"slug":"{name}","port":{"var":"SERVER_PORT","base":4100,"span":200}},
   "timeouts": {"bootstrapSeconds": 420, "seedSeconds": 120}
 }
 JSON
@@ -195,7 +195,7 @@ worktree: two' "$err"
   fi
 
   # --- wt_read_field --------------------------------------------------------
-  eq 'read_field string'          'colleague/QT-999' "$(wt_read_field name "$PAYLOAD")"
+  eq 'read_field string'          'colleague/ABC-999' "$(wt_read_field name "$PAYLOAD")"
   eq 'read_field nested one deep' '/a/b.php'         "$(wt_read_field tool_input.file_path "$PAYLOAD")"
   eq 'read_field nested two deep' 'v'                "$(wt_read_field nested.deep.k "$PAYLOAD")"
   eq 'read_field true is lowercase'  'true'  "$(wt_read_field blocking "$PAYLOAD")"
@@ -248,9 +248,9 @@ worktree: two' "$err"
   # --- wt_read_input --------------------------------------------------------
   # stdin can only be consumed once; wt_read_input must cache it.
   got=$(printf '%s' "$PAYLOAD" | (wt_read_input; wt_read_input; wt_read_field name))
-  eq 'read_input caches stdin so a second read still works' 'colleague/QT-999' "$got"
+  eq 'read_input caches stdin so a second read still works' 'colleague/ABC-999' "$got"
   got=$(printf '%s' "$PAYLOAD" | (wt_read_input; bash -c ". '$LIB'; wt_read_input; wt_read_field name"))
-  eq 'read_input exports the payload so a child does not re-read stdin' 'colleague/QT-999' "$got"
+  eq 'read_input exports the payload so a child does not re-read stdin' 'colleague/ABC-999' "$got"
   # An unguarded `cat` blocks forever on an open-but-not-closed stdin; the [ -t 0 ] guard
   # is what stops a hook run from a terminal hanging the session. 124 = timeout fired.
   timeout 3 bash -c ". '$LIB'; wt_read_input" </dev/null >/dev/null 2>&1
@@ -310,14 +310,14 @@ worktree: two' "$err"
     "$(GIT_DIR="$REPO/.git" GIT_WORK_TREE="$REPO" wt_main_root "$SEP")"
 
   # --- wt_slugify -----------------------------------------------------------
-  eq 'slugify documented example' 'colleague_qt_999' "$(wt_slugify 'colleague/QT-999')"
+  eq 'slugify documented example' 'colleague_abc_999' "$(wt_slugify 'colleague/ABC-999')"
   eq 'slugify collapses runs'     'feature_ab_12'    "$(wt_slugify 'feature/AB--12')"
   eq 'slugify keeps underscores'  'a_b'              "$(wt_slugify 'a_b')"
   eq 'slugify trims edges'        'a'                "$(wt_slugify '--a--')"
-  eq 'slugify is idempotent'      'colleague_qt_999' "$(wt_slugify "$(wt_slugify 'colleague/QT-999')")"
+  eq 'slugify is idempotent'      'colleague_abc_999' "$(wt_slugify "$(wt_slugify 'colleague/ABC-999')")"
   eq 'slugify digits survive'     '1234'             "$(wt_slugify '1234')"
   eq 'slugify spaces'             'my_branch'        "$(wt_slugify 'My Branch')"
-  eq 'slugify is stable across calls' "$(wt_slugify 'QT-1')" "$(wt_slugify 'QT-1')"
+  eq 'slugify is stable across calls' "$(wt_slugify 'ABC-1')" "$(wt_slugify 'ABC-1')"
   # The slug keys a database name and a port, so distinct names must stay DISTINCT.
   # A shared 'wt' fallback would put every non-ASCII-named worktree on one database.
   local s_ja s_ko s_slash s_dash s_empty
@@ -417,7 +417,7 @@ worktree: two' "$err"
   rc_is 'nor does the underscore-prefix one' 0 "$us_tail"
   eq 'that slug is idempotent too' "$s_us" "$(wt_slugify "$s_us")"
   # A short name is untouched by any of this.
-  eq 'a short name is unaffected by the cap' 'colleague_qt_999' "$(wt_slugify 'colleague/QT-999')"
+  eq 'a short name is unaffected by the cap' 'colleague_abc_999' "$(wt_slugify 'colleague/ABC-999')"
 
   # --- wt_is_posint / wt_is_seconds -------------------------------------------
   # One implementation, two names. wt_is_seconds is an alias, so these pin that it stayed one.
@@ -434,7 +434,7 @@ worktree: two' "$err"
   # The gate the JSON layer deliberately leaves to its consumer. A key becomes the left-hand side of a
   # KEY=value line, so the shapes that must be refused are the ones that would write a line naming
   # a DIFFERENT variable than the profile appears to name.
-  for good in A A_B _leading FOO123 INSTALLATION_NAME a; do
+  for good in A A_B _leading FOO123 DATABASE_NAME a; do
     wt_is_safe_envkey "$good"; rc_is "safe_envkey accepts $good" 0 $?
   done
   # SC2016: the `$` in 'A$B' is a LITERAL dollar, which is one of the shapes being refused --
@@ -463,26 +463,26 @@ worktree: two' "$err"
   # --- wt_derive_port ---------------------------------------------------------
   # Pure arithmetic over cksum. The properties that matter: deterministic, inside the range, and
   # the same on any machine — a developer bookmarks this port.
-  eq 'derive_port is deterministic' "$(wt_derive_port demo_x 3786 200)" \
-    "$(wt_derive_port demo_x 3786 200)"
-  p1=$(wt_derive_port demo_x 3786 200)
-  in_range 'derive_port lands inside [base, base+span)' 3786 200 "$p1"
-  in_range 'derive_port with span 1 lands on base itself' 3786 1 \
-    "$(wt_derive_port anything 3786 1)"
-  eq 'derive_port with span 1 IS base' 3786 "$(wt_derive_port anything 3786 1)"
+  eq 'derive_port is deterministic' "$(wt_derive_port demo_x 4100 200)" \
+    "$(wt_derive_port demo_x 4100 200)"
+  p1=$(wt_derive_port demo_x 4100 200)
+  in_range 'derive_port lands inside [base, base+span)' 4100 200 "$p1"
+  in_range 'derive_port with span 1 lands on base itself' 4100 1 \
+    "$(wt_derive_port anything 4100 1)"
+  eq 'derive_port with span 1 IS base' 4100 "$(wt_derive_port anything 4100 1)"
   # Distinctness is the property isolation depends on. Not guaranteed for every pair — a hash can
   # collide — so this pins that a realistic set of worktree names spreads out rather than piling up.
   ports=''
   for n in alice_fix_99 bob_fix_99 carol_hotfix main demo_test feature_a feature_b release_1; do
-    ports="$ports$(wt_derive_port "$n" 3786 200)
+    ports="$ports$(wt_derive_port "$n" 4100 200)
 "
   done
   eq 'eight realistic slugs derive eight distinct ports' 8 \
     "$(printf '%s' "$ports" | sort -u | grep -c .)"
   # A slug that differs by one character must not land on the same port by construction.
   ne 'two slugs differing in one character derive different ports' \
-    "$(wt_derive_port demo_alice_fix_99 3786 200)" \
-    "$(wt_derive_port demo_alice_fix_98 3786 200)"
+    "$(wt_derive_port demo_alice_fix_99 4100 200)" \
+    "$(wt_derive_port demo_alice_fix_98 4100 200)"
   # Malformed range: return 1 and print nothing, so a caller cannot read a broken profile as a port.
   for bad_base in '' 0 abc -5 1.5; do
     rc_is "derive_port rejects base '$bad_base'" 1 \
@@ -490,18 +490,18 @@ worktree: two' "$err"
   done
   for bad_span in '' 0 abc -5; do
     rc_is "derive_port rejects span '$bad_span'" 1 \
-      "$(wt_derive_port s 3786 "$bad_span" >/dev/null 2>&1; echo $?)"
+      "$(wt_derive_port s 4100 "$bad_span" >/dev/null 2>&1; echo $?)"
   done
   eq 'derive_port prints nothing when it refuses' '' "$(wt_derive_port s 0 0 2>/dev/null)"
   # A leading zero must be read as base 10, not octal — `08` is a fatal arithmetic error otherwise,
   # and a fatal expansion error in a sourced library takes the whole hook down (ADR-003).
   eq 'derive_port reads a zero-padded base as decimal, not octal' \
-    "$(wt_derive_port s 3786 200)" "$(wt_derive_port s 03786 200)"
+    "$(wt_derive_port s 4100 200)" "$(wt_derive_port s 04100 200)"
 
   # --- wt_port_candidates -----------------------------------------------------
   # The probe order, kept pure and separate from any notion of what is taken.
-  cands=$(wt_port_candidates demo_x 3786 200)
-  eq 'the first candidate IS the derived port' "$(wt_derive_port demo_x 3786 200)" \
+  cands=$(wt_port_candidates demo_x 4100 200)
+  eq 'the first candidate IS the derived port' "$(wt_derive_port demo_x 4100 200)" \
     "$(printf '%s' "$cands" | head -1)"
   eq 'candidates are capped at WT_PORT_PROBE_MAX, not the whole span' "$WT_PORT_PROBE_MAX" \
     "$(printf '%s\n' "$cands" | grep -c .)"
@@ -509,14 +509,14 @@ worktree: two' "$err"
     "$(printf '%s\n' "$cands" | sort -u | grep -c .)"
   # WRAPPING. A derived port near the top of the span must still reach the bottom of it, or the
   # worktrees that hash high would have far fewer places to go than the ones that hash low.
-  small=$(wt_port_candidates demo_x 3786 5)
+  small=$(wt_port_candidates demo_x 4100 5)
   eq 'a span smaller than the cap yields exactly span candidates' 5 \
     "$(printf '%s\n' "$small" | grep -c .)"
-  eq 'and they are the whole span, in wrapped order' '3786 3787 3788 3789 3790' \
+  eq 'and they are the whole span, in wrapped order' '4100 4101 4102 4103 4104' \
     "$(printf '%s\n' "$small" | sort -n | tr '\n' ' ' | sed 's/ $//')"
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    in_range 'every candidate stays inside the span' 3786 5 "$c"
+    in_range 'every candidate stays inside the span' 4100 5 "$c"
   done <<EOF
 $small
 EOF
@@ -525,29 +525,29 @@ EOF
   # end of the profile's range onto ports it never asked for.
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    in_range 'every default candidate stays inside the span' 3786 200 "$c"
+    in_range 'every default candidate stays inside the span' 4100 200 "$c"
   done <<EOF
 $cands
 EOF
   # The wrap assertions above are only meaningful if the derived port is not base itself — pin that
   # the fixture actually exercises wrapping rather than passing by luck.
-  ne 'the span-5 fixture really does wrap (its first candidate is not base)' 3786 \
-    "$(wt_derive_port demo_x 3786 5)"
+  ne 'the span-5 fixture really does wrap (its first candidate is not base)' 4100 \
+    "$(wt_derive_port demo_x 4100 5)"
   eq 'candidates come back in wrapped ORDER, not merely as the right set' \
-    "$(f=$(wt_derive_port demo_x 3786 5); i=0
-       while [ "$i" -lt 5 ]; do printf '%s ' $((3786 + ((f - 3786 + i) % 5))); i=$((i + 1)); done)" \
+    "$(f=$(wt_derive_port demo_x 4100 5); i=0
+       while [ "$i" -lt 5 ]; do printf '%s ' $((4100 + ((f - 4100 + i) % 5))); i=$((i + 1)); done)" \
     "$(printf '%s\n' "$small" | tr '\n' ' ')"
 
   # The `max` parameter and its fallback had no caller at all: with the fallback removed, a
   # malformed max made the loop condition error out and the function print NOTHING while exiting 0,
   # which a caller reads as "no ports available" rather than as a bug.
   eq 'an explicit max caps the list' 7 \
-    "$(wt_port_candidates demo_x 3786 200 7 | grep -c .)"
+    "$(wt_port_candidates demo_x 4100 200 7 | grep -c .)"
   eq 'a malformed max falls back to WT_PORT_PROBE_MAX rather than emitting nothing' \
-    "$WT_PORT_PROBE_MAX" "$(wt_port_candidates demo_x 3786 200 abc | grep -c .)"
+    "$WT_PORT_PROBE_MAX" "$(wt_port_candidates demo_x 4100 200 abc | grep -c .)"
 
   rc_is 'port_candidates refuses a malformed span, as derive_port does' 1 \
-    "$(wt_port_candidates s 3786 0 >/dev/null 2>&1; echo $?)"
+    "$(wt_port_candidates s 4100 0 >/dev/null 2>&1; echo $?)"
 
   # THE PORT RANGE IS BOUNDED, not merely positive. A digits-only check passed a nineteen-digit
   # base, which wrapped bash's arithmetic and returned a negative "port" with a success code.
@@ -564,14 +564,14 @@ EOF
 
   # --- wt_expand ------------------------------------------------------------
   # shellcheck disable=SC2034  # read by wt_expand in the sourced lib
-  WT_NAME='QT-999' WT_SLUG='qt_999' WT_PORT='3801' WT_PATH='/r/.claude/worktrees/x' WT_ROOT='/r'
-  eq 'expand name'     'QT-999'  "$(wt_expand '{name}')"
-  eq 'expand slug'     'qt_999'  "$(wt_expand '{slug}')"
+  WT_NAME='ABC-999' WT_SLUG='abc_999' WT_PORT='3801' WT_PATH='/r/.claude/worktrees/x' WT_ROOT='/r'
+  eq 'expand name'     'ABC-999'  "$(wt_expand '{name}')"
+  eq 'expand slug'     'abc_999'  "$(wt_expand '{slug}')"
   eq 'expand port'     '3801'    "$(wt_expand '{port}')"
   eq 'expand worktree' '/r/.claude/worktrees/x' "$(wt_expand '{worktree}')"
   eq 'expand root'     '/r'      "$(wt_expand '{root}')"
-  eq 'expand mixed' 'demo_qt_999 on 3801 in /r' "$(wt_expand 'demo_{slug} on {port} in {root}')"
-  eq 'expand repeats a placeholder' 'qt_999-qt_999' "$(wt_expand '{slug}-{slug}')"
+  eq 'expand mixed' 'demo_abc_999 on 3801 in /r' "$(wt_expand 'demo_{slug} on {port} in {root}')"
+  eq 'expand repeats a placeholder' 'abc_999-abc_999' "$(wt_expand '{slug}-{slug}')"
   eq 'expand leaves an unknown placeholder alone' '{nope}' "$(wt_expand '{nope}')"
   # SC2016: the single quotes are the point — ${FOO} must reach wt_expand as literal text.
   # shellcheck disable=SC2016
@@ -583,7 +583,7 @@ EOF
   eq 'expand passes text through untouched' 'no placeholders' "$(wt_expand 'no placeholders')"
   eq 'expand of empty is empty' '' "$(wt_expand '')"
   eq 'expand mixes known and unknown' '/r and {other}' "$(wt_expand '{root} and {other}')"
-  eq 'expand handles a doubled brace' '{QT-999}' "$(wt_expand '{{name}}')"
+  eq 'expand handles a doubled brace' '{ABC-999}' "$(wt_expand '{{name}}')"
   # The reason wt_expand is a single left-to-right scan: a chain of ${s//} substitutions
   # would rescan the substituted value and let a worktree NAME inject a placeholder.
   # This MUST be a prefix assignment, not a subshell — inside ( ) the pass/fail counters
@@ -643,15 +643,15 @@ EOF
   : >"$pdir/.claude/s.sh"
   : >"$pdir/.claude/t.sh"
   printf '%s' '{"schemaVersion":1,
-    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
-               "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}},
+    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":4100,"span":200},
+               "env":{"file":".env.worktree.local","vars":{"DATABASE_NAME":"demo_{slug}"}},
                "seed":".claude/s.sh","teardown":".claude/t.sh"}}' >"$target"
   wt_load_profile "$pdir"
   eq 'runtime profile -> present'          '1'                      "$PROFILE_PRESENT"
   eq 'runtime profile -> has runtime'      '1'                      "$PROFILE_HAS_RUNTIME"
   eq 'runtime profile -> slug template'    '{slug}'                 "$PROFILE_RT_SLUG"
   eq 'runtime profile -> port var'         'SERVER_PORT'            "$PROFILE_RT_PORTVAR"
-  eq 'runtime profile -> port base'        '3786'                   "$PROFILE_RT_PORTBASE"
+  eq 'runtime profile -> port base'        '4100'                   "$PROFILE_RT_PORTBASE"
   eq 'runtime profile -> port span'        '200'                    "$PROFILE_RT_PORTSPAN"
   eq 'runtime profile -> env file'         '.env.worktree.local'    "$PROFILE_RT_ENVFILE"
   eq 'runtime profile -> a string is a list of one' '.env.worktree.local' "$PROFILE_RT_ENVFILES"
@@ -659,7 +659,7 @@ EOF
   eq 'runtime profile -> teardown path'    '.claude/t.sh'           "$PROFILE_RT_TEARDOWN"
   # env.vars is published as COMPACT JSON, not as pairs: that answers "is there anything to write"
   # for free, and the pairs themselves arrive as group 3 of the same scan.
-  eq 'runtime profile -> env vars as compact JSON' '{"INSTALLATION_NAME":"demo_{slug}"}' \
+  eq 'runtime profile -> env vars as compact JSON' '{"DATABASE_NAME":"demo_{slug}"}' \
     "$PROFILE_RT_ENVVARS"
 
   # STALE FIELDS BETWEEN LOADS. wt_load_profile is called more than once per process —
@@ -681,11 +681,11 @@ EOF
 
   # An INVALID profile also exits early — no partial trust, so not even the fields that parsed.
   printf '%s' '{"schemaVersion":1,
-    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
-               "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}}}}' >"$target"
+    "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":4100,"span":200},
+               "env":{"file":".env.worktree.local","vars":{"DATABASE_NAME":"demo_{slug}"}}}}' >"$target"
   wt_load_profile "$pdir"
   eq 'reloaded: the RT fields are populated again' 'SERVER_PORT' "$PROFILE_RT_PORTVAR"
-  printf '%s' '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":200},
+  printf '%s' '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},
     "env":{"file":".e","vars":{"BAD KEY":"1"}}}}' >"$target"
   wt_load_profile "$pdir" 2>/dev/null
   eq 'an invalid profile -> not present'  '0' "$PROFILE_PRESENT"
@@ -736,7 +736,7 @@ EOF
   # The evidence block, read out of the SAME sixteen-field positional record. It is the field most
   # exposed to a positional slip because it was appended last, and the consequence of getting it
   # wrong is not silence: an empty shellMarker against a repo that has a flake.nix produces a
-  # "toolchain marker changed" warning on every single session of a nix repo — the reference repo
+  # "toolchain marker changed" warning on every single session of a nix repo — a real repository
   # being one. This suite is also the only one that runs under both JSON backends.
   printf '%s' '{"schemaVersion":1,"shell":"nix develop --command","shellArgs":"argv",
     "copy":[".env"],
@@ -1096,14 +1096,14 @@ EOF
   # rather than a separate reader so the validator and the engine both get the pairs out of the
   # scan they already pay for; a standalone reader cost two extra cold interpreter starts on the
   # hook that blocks session start. Asserted on BOTH backends, like every other group.
-  KV='{"v":1,"vars":{"INSTALLATION_NAME":"demo_{slug}","APP_ENV":"dev"},
+  KV='{"v":1,"vars":{"DATABASE_NAME":"demo_{slug}","APP_ENV":"dev"},
        "one":{"A":"1"},"empty":{},"arr":[1,2],"scalar":"s","nested":{"o":{"deep":{"K":"v"}}},
        "types":{"n":5,"t":true,"f":false,"nul":null,"o":{"x":1},"a":[1],"s":""},
        "uni":{"café":"über"},"d":[{"x":"y"}]}'
   jk() { printf '%s' "$KV" | wt_json_scan v --kv "$1"; }
 
   eq 'kv group: pairs in document order, tagged, RS-terminated' \
-    "0${US}1${RS}1${US}INSTALLATION_NAME${US}demo_{slug}${RS}1${US}APP_ENV${US}dev${RS}" "$(jk vars)"
+    "0${US}1${RS}1${US}DATABASE_NAME${US}demo_{slug}${RS}1${US}APP_ENV${US}dev${RS}" "$(jk vars)"
   eq 'kv group: a dotted path reaches a nested object' "0${US}1${RS}1${US}K${US}v${RS}" \
     "$(jk nested.o.deep)"
   # Every data outcome contributes no records but still emits the scalar record, so a caller can
@@ -1225,7 +1225,7 @@ EOF
  "runtime":{"seed":"F10_seed","teardown":"F11_teardown",
             "env":{"file":"F12_envfile","vars":{"F14_KEY":"F14_val"}},
             "slug":"F13_slug",
-            "port":{"var":"F17_PORTVAR","base":3786,"span":200}},
+            "port":{"var":"F17_PORTVAR","base":4100,"span":200}},
  "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
  "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
  "copy":["F15_copy"]}
@@ -1248,7 +1248,7 @@ JSON
   contains 'scalars field 15 is copy'              'F15_copy'         "$WT_PS_COPY"
   eq 'scalars field 16 is evidence.shellMarker'    'F16_shellmarker'  "$WT_PS_EVSHELL"
   eq 'scalars field 17 is runtime.port.var'        'F17_PORTVAR'      "$WT_PS_PORTVAR"
-  eq 'scalars field 18 is runtime.port.base'       '3786'             "$WT_PS_PORTBASE"
+  eq 'scalars field 18 is runtime.port.base'       '4100'             "$WT_PS_PORTBASE"
   eq 'scalars field 19 is runtime.port.span'       '200'              "$WT_PS_PORTSPAN"
   contains 'scalars field 20 is runtime.port as compact JSON' 'F17_PORTVAR' "$WT_PS_PORT"
   # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
@@ -1304,8 +1304,8 @@ JSON
   # with a SAFE FALLBACK warns and the profile survives; a field without one is fatal. Getting
   # this backwards in either direction is expensive: a wrong rejection silently downgrades a
   # working repo to bare defaults, and a wrong acceptance writes a broken env file.
-  vw '{"schemaVersion":1,"runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":3786,"span":200},
-        "env":{"file":".env.worktree.local","vars":{"INSTALLATION_NAME":"demo_{slug}"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":4100,"span":200},
+        "env":{"file":".env.worktree.local","vars":{"DATABASE_NAME":"demo_{slug}"}}}}'
   eq 'validate: a complete, well-formed runtime block reports nothing' '' "$(vv)"
 
   # EVERY PORT PROBLEM IS A WARNING, NOT A VIOLATION, and the line is drawn on consequence. A port
@@ -1321,12 +1321,12 @@ JSON
   # shellcheck disable=SC2069
   vpw() { wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null; }
   for pcase in \
-    '"var":"A=B","base":3786,"span":200|runtime.port.var: "A=B" is not a legal environment variable name' \
+    '"var":"A=B","base":4100,"span":200|runtime.port.var: "A=B" is not a legal environment variable name' \
     '"var":"P","base":80,"span":10|runtime.port.base: "80"' \
     '"var":"P","base":65000,"span":1000|runs past 65535' \
-    '"var":"P","base":3786,"span":"wide"|runtime.port.span: "wide"' \
+    '"var":"P","base":4100,"span":"wide"|runtime.port.span: "wide"' \
     '"var":"P"|no port.base/port.span to derive a port from' \
-    '"base":3786,"span":200|nowhere to write the derived port'
+    '"base":4100,"span":200|nowhere to write the derived port'
   do
     pbody=${pcase%%|*}; pwant=${pcase#*|}
     vw '{"schemaVersion":1,"runtime":{"port":{'"$pbody"'},"env":{"file":".e","vars":{"A":"1"}}}}'
@@ -1334,23 +1334,23 @@ JSON
     contains "validate: port case ($pbody) warns instead" "$pwant" "$(vpw)"
   done
   # A span of 1 is honoured but means every worktree lands on one port.
-  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":1},"env":{"file":".e","vars":{"A":"1"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":1},"env":{"file":".e","vars":{"A":"1"}}}}'
   eq 'validate: a span of 1 is not a violation' '' "$(vv)"
   contains 'validate: ...but it warns that every worktree gets one port' \
-    'every worktree derives port 3786' "$(vpw)"
+    'every worktree derives port 4100' "$(vpw)"
   # A well-formed port block says nothing at all.
-  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":3786,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
   eq 'validate: a well-formed port block is silent on stderr too' '' "$(vpw)"
 
-  # `port` ITSELF is shape-checked, not merely its three children. `"port": 3786` is the obvious
+  # `port` ITSELF is shape-checked, not merely its three children. `"port": 4100` is the obvious
   # shorthand a developer reaches for, and it walks all three children to nothing — so without this
   # every rule above is skipped and the profile validates clean while port isolation silently never
   # happens. This one IS fatal: unlike a bad value, a wrong-shaped container means the developer
   # asked for something the schema cannot express, and there is nothing safe to fall back to.
-  vw '{"schemaVersion":1,"runtime":{"port":3786,"env":{"file":".e","vars":{"A":"1"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"port":4100,"env":{"file":".e","vars":{"A":"1"}}}}'
   contains 'validate: a scalar runtime.port is a violation' \
     'runtime.port: must be an object' "$(vv)"
-  vw '{"schemaVersion":1,"runtime":{"port":[3786,200],"env":{"file":".e","vars":{"A":"1"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"port":[4100,200],"env":{"file":".e","vars":{"A":"1"}}}}'
   contains 'validate: an array runtime.port is a violation' \
     'runtime.port: must be an object' "$(vv)"
   vw '{"schemaVersion":1,"runtime":{"port":{},"env":{"file":".e","vars":{"A":"1"}}}}'
@@ -1409,7 +1409,7 @@ JSON
   eq 'validate: an env.file with no vars and no port.var is not a violation' '' "$(vv)"
   contains 'validate: ...but it warns the file would be empty' 'would be written empty' \
     "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
-  vw '{"schemaVersion":1,"runtime":{"port":{"base":3786,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
+  vw '{"schemaVersion":1,"runtime":{"port":{"base":4100,"span":200},"env":{"file":".e","vars":{"A":"1"}}}}'
   contains 'validate: port base/span with no var warns rather than failing' \
     'nowhere to write the derived port' "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
 

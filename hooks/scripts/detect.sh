@@ -126,7 +126,7 @@ json_array_items() {  # $1 = compact JSON array
   # printf WITH a trailing newline. Without it the final item has no delimiter, `read`
   # returns 1 at EOF, and the loop body never runs for it — so a one-item array yielded
   # nothing at all and a two-item array silently dropped the last. That is how every
-  # dependency in the reference repo went undetected.
+  # dependency in a real repository went undetected.
   printf '%s\n' "$raw" | tr ',' '\n' | while IFS= read -r item; do
     item=${item# }
     item=${item#\"}
@@ -229,7 +229,7 @@ manifest_value() {  # $1 = manifest path, $2 = dotted key
 #
 #   post-install-cmd -> ["@duckdb:install-lib", "@cache:clear", "@db", ...]   sees only "@db"
 #   @db              -> [..., "@db:migrate", ...]                            one hop to the match
-#   @db:migrate      -> acme\Composer\Scripts::dbMigrate                     camelCase, hence -i
+#   @db:migrate      -> App\Composer\Scripts::dbMigrate                     camelCase, hence -i
 #
 # A naive matcher therefore reports the very repository the hazard rule was written from as
 # clean. This follows `@name` and `npm|pnpm|yarn run <name>` references within the same
@@ -350,7 +350,7 @@ check_escalations() {  # $1 = dep index, $2 = hazard id, $3 = chain text
 # optimises for a throwaway machine running one job, and its --no-dev / --filter would leave
 # a development worktree with no dev dependencies and half a workspace.
 
-# How many files to cite per dependency before summarising. The reference repo invokes
+# How many files to cite per dependency before summarising. A real repository invokes
 # composer in thirteen workflows; thirteen near-identical lines bury the one fact that
 # matters, which is WHAT they agree on.
 CORROBORATE_MAX=3
@@ -430,7 +430,7 @@ corroborate_candidates() {  # $1 = source entry
 }
 
 # The keepFlags present ON THE LINES THAT INVOKE $1, not merely somewhere in the file.
-# Measured on the reference repo: matching the whole file credited pnpm with composer's
+# Measured on a real repository: matching the whole file credited pnpm with composer's
 # --no-scripts, because both tools appear in one workflow. Returns 1 when the tool is not
 # invoked in the file at all.
 tool_flags_in() {  # $1 = tool, $2 = repo-relative file
@@ -739,7 +739,7 @@ while IFS=$WT_US read -r -d "$WT_RS" p_marker p_tool p_args; do
     rc=$?
     if [ "$rc" = 124 ]; then
       # INCONCLUSIVE, not a failure. A cold nix flake evaluation measured over 60s on the
-      # reference repo, and calling that "the wrapper is wrong" sends the developer to fix
+      # real repository, and calling that "the wrapper is wrong" sends the developer to fix
       # something that is not broken.
       emit probe "$p_tool" timeout "gave up after ${PROBE_TIMEOUT}s"
       warn "the $p_tool probe timed out after ${PROBE_TIMEOUT}s, which is INCONCLUSIVE rather than a failure — a cold nix or container evaluation can take longer than this. Re-run calibration once the toolchain is warm if you want the check."

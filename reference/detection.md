@@ -140,7 +140,7 @@ subcommand is `go version`. Hard-coding `--version` would report "toolchain abse
 every healthy Go repo, which is exactly the false positive the probe exists to rule out.
 
 Full prove-by-installing is deliberately **not** done at calibrate time. It costs minutes (on the
-reference repo, a 397 MB `vendor/` plus a pnpm workspace), and it proves the wrong property: an install
+real repository, a 400 MB `vendor/` plus a pnpm workspace), and it proves the wrong property: an install
 that migrates the shared database **exits 0**, so the dangerous variant is exactly the one that passes.
 Phase 6 owns the real run.
 
@@ -198,9 +198,7 @@ development database.
 
 ### The worked example that proves it
 
-The repository this design was drawn from — recorded as the reference repo in
-[00-context](../docs/00-context.md#the-reference-repo), which is where measurements name their
-subject — chains into a migration like this:
+The repository this design was drawn from chains into a migration like this:
 
 ```
 post-install-cmd  ->  @install-lib, @cache:clear, @db, @warm-up, @assets:install
@@ -314,8 +312,8 @@ isolation" is always an offered outcome** — a profile with no `runtime` block 
 nothing.
 
 The reason is [ADR-006](../docs/01-decisions.md#adr-006), and it is worth restating in full because it
-is the rule most tempting to shave: nothing in a repository states that `INSTALLATION_NAME=demo`
-selects a tenant database, or that `demo_test` gets dropped wholesale by an env var. A wrong guess here
+is the rule most tempting to shave: nothing in a repository states which variable
+selects a tenant database, or that a test database gets dropped wholesale by an env var. A wrong guess here
 does not produce a broken worktree. It corrupts a colleague's data.
 
 ### Three more things detection reports for layer 3 — still facts, not conclusions

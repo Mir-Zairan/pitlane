@@ -113,7 +113,7 @@ make_repo() {  # $1 = dir, $2 = extra teardown shell, $3 = seedSeconds
             "install":"mkdir -p vendor && printf installed > vendor/autoload.php"}],
   "runtime": {
     "slug": "{slug}",
-    "port": { "var": "SERVER_PORT", "base": 3786, "span": 200 },
+    "port": { "var": "SERVER_PORT", "base": 4100, "span": 200 },
     "env": { "file": ".env.worktree.local", "vars": { "DATABASE": "demo_{slug}" } },
     "seed": ".claude/worktree-seed.sh",
     "teardown": ".claude/worktree-teardown.sh"

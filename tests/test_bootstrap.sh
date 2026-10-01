@@ -357,7 +357,7 @@ lacks 'and neither reported a corrupt or interleaved install' 'interrupted' \
 #
 # composer is NOT installed on every machine this runs on, so its repo is composer-SHAPED: the
 # same vendor/ + composer.lock + hardlink strategy, driven by a stand-in command. That proves the
-# engine's behaviour, not composer's. A real composer run against a 397 MB vendor/ is Phase 6's
+# engine's behaviour, not composer's. A real composer run against a 400 MB vendor/ is Phase 6's
 # job, and the handoff says so rather than implying this covered it.
 
 if command -v pnpm >/dev/null 2>&1; then
@@ -637,13 +637,13 @@ make_rt_repo() {  # $1 = dir, $2 = extra runtime JSON keys
             "install":"mkdir -p vendor && printf ok > vendor/marker"}],
   "runtime": {
     "slug": "{slug}",
-    "port": { "var": "SERVER_PORT", "base": 3786, "span": 200 },
+    "port": { "var": "SERVER_PORT", "base": 4100, "span": 200 },
     "env": {
       "file": ".env.worktree.local",
       "vars": {
-        "INSTALLATION_NAME": "demo_{slug}",
-        "TEST_INSTALLATION_NAME": "demo_{slug}_test",
-        "CI_INSTALLATION_NAME": "demo_{slug}_ci"
+        "DATABASE_NAME": "demo_{slug}",
+        "TEST_DATABASE_NAME": "demo_{slug}_test",
+        "CI_DATABASE_NAME": "demo_{slug}_ci"
       }
     }$extra
   },
@@ -679,21 +679,21 @@ eq 'both worktrees still get their dependencies' 'okok' \
 pA=$(envval "$WA" SERVER_PORT); pB=$(envval "$WB" SERVER_PORT)
 ne 'two worktrees get different ports' "$pA" "$pB"
 ne 'two worktrees get different development databases' \
-  "$(envval "$WA" INSTALLATION_NAME)" "$(envval "$WB" INSTALLATION_NAME)"
+  "$(envval "$WA" DATABASE_NAME)" "$(envval "$WB" DATABASE_NAME)"
 ne 'two worktrees get different TEST databases too' \
-  "$(envval "$WA" TEST_INSTALLATION_NAME)" "$(envval "$WB" TEST_INSTALLATION_NAME)"
+  "$(envval "$WA" TEST_DATABASE_NAME)" "$(envval "$WB" TEST_DATABASE_NAME)"
 ne 'and different CI databases' \
-  "$(envval "$WA" CI_INSTALLATION_NAME)" "$(envval "$WB" CI_INSTALLATION_NAME)"
+  "$(envval "$WA" CI_DATABASE_NAME)" "$(envval "$WB" CI_DATABASE_NAME)"
 eq "alice's development database is named after her slug" 'demo_alice' \
-  "$(envval "$WA" INSTALLATION_NAME)"
+  "$(envval "$WA" DATABASE_NAME)"
 eq "and her test database is a distinct name again" 'demo_alice_test' \
-  "$(envval "$WA" TEST_INSTALLATION_NAME)"
+  "$(envval "$WA" TEST_DATABASE_NAME)"
 contains 'and the hook says what it settled on' 'runtime: slug=alice' "$errA"
 
 # ACCEPTANCE: reopening lands on the same port and the same database. A developer bookmarks the URL.
 start_hook "$WA" >/dev/null
 eq 'reopening a worktree keeps its port' "$pA" "$(envval "$WA" SERVER_PORT)"
-eq 'and its database' 'demo_alice' "$(envval "$WA" INSTALLATION_NAME)"
+eq 'and its database' 'demo_alice' "$(envval "$WA" DATABASE_NAME)"
 
 # The override file must not show up as an untracked change — that is how one gets committed and
 # every teammate's worktree ends up pointing at one database.
@@ -702,11 +702,11 @@ eq "the override file is invisible to git status" '' \
 
 # ACCEPTANCE: a developer can redirect a worktree without touching the profile, and the plugin
 # respects it on EVERY later session — warning once, not every time.
-printf 'INSTALLATION_NAME=the_shared_one\n' > "$WA/.env.worktree.local"
+printf 'DATABASE_NAME=the_shared_one\n' > "$WA/.env.worktree.local"
 start_hook "$WA" >/dev/null; first=$(cat "$TMP/err")
 start_hook "$WA" >/dev/null; second=$(cat "$TMP/err")
 eq 'a hand-edited override file survives a re-bootstrap byte for byte' \
-  'INSTALLATION_NAME=the_shared_one' "$(cat "$WA/.env.worktree.local")"
+  'DATABASE_NAME=the_shared_one' "$(cat "$WA/.env.worktree.local")"
 contains 'and the developer is told once that it is now theirs' 'it will be left alone' "$first"
 lacks 'and NOT told again on the next session' 'it will be left alone' "$second"
 rm -f "$WA/.env.worktree.local"
@@ -736,17 +736,17 @@ git -C "$RT" worktree add -q "$WN2" -b worktree-bob-fix-99 2>/dev/null
 start_hook "$WN1" >/dev/null
 start_hook "$WN2" >/dev/null
 ne 'two NESTED worktrees sharing a leaf name get different databases' \
-  "$(envval "$WN1" INSTALLATION_NAME)" "$(envval "$WN2" INSTALLATION_NAME)"
+  "$(envval "$WN1" DATABASE_NAME)" "$(envval "$WN2" DATABASE_NAME)"
 ne 'and different ports' "$(envval "$WN1" SERVER_PORT)" "$(envval "$WN2" SERVER_PORT)"
 eq 'a nested name slugs to a legal database name' 'demo_alice_fix_99' \
-  "$(envval "$WN1" INSTALLATION_NAME)"
+  "$(envval "$WN1" DATABASE_NAME)"
 
 # A long, punctuation-heavy, non-ASCII name still produces something legal.
 WLONG="$RT/.claude/worktrees/Ünïcode--Feature/Very-Long-Branch-Name-That-Goes-On-And-On-For-A-While"
 mkdir -p "${WLONG%/*}"
 git -C "$RT" worktree add -q "$WLONG" -b worktree-long 2>/dev/null
 start_hook "$WLONG" >/dev/null
-longdb=$(envval "$WLONG" INSTALLATION_NAME)
+longdb=$(envval "$WLONG" DATABASE_NAME)
 ne 'an awkward name still yields a database name' '' "$longdb"
 eq 'and it contains only characters an identifier may have' '' \
   "$(printf '%s' "$longdb" | tr -d 'a-z0-9_')"
@@ -774,10 +774,10 @@ git -C "$RC" worktree add -q "$WC2" -b worktree-two 2>/dev/null
 start_hook "$WC1" >/dev/null; constwarn=$(cat "$TMP/err")
 start_hook "$WC2" >/dev/null
 ne 'a constant runtime.slug still gives two worktrees different databases' \
-  "$(envval "$WC1" INSTALLATION_NAME)" "$(envval "$WC2" INSTALLATION_NAME)"
+  "$(envval "$WC1" DATABASE_NAME)" "$(envval "$WC2" DATABASE_NAME)"
 ne 'and different ports' "$(envval "$WC1" SERVER_PORT)" "$(envval "$WC2" SERVER_PORT)"
 eq 'and the database is named after the worktree, as the validator promised' 'demo_one' \
-  "$(envval "$WC1" INSTALLATION_NAME)"
+  "$(envval "$WC1" DATABASE_NAME)"
 contains 'and the engine says it ignored the template' 'same for every worktree' "$constwarn"
 
 # A profile that OMITS runtime.slug behaves the same way — the ordinary case, and the one whose
@@ -796,7 +796,7 @@ WD1=$RD/.claude/worktrees/dee
 git -C "$RD" worktree add -q "$WD1" -b worktree-dee 2>/dev/null
 start_hook "$WD1" >/dev/null
 eq 'a profile with no runtime.slug names the database after the worktree' 'demo_dee' \
-  "$(envval "$WD1" INSTALLATION_NAME)"
+  "$(envval "$WD1" DATABASE_NAME)"
 
 # CHANGING runtime.slug re-points a live worktree, and its seed must run again for the NEW
 # database — even with no runtime.port, where the port claim (which also resets these) never runs.
@@ -896,15 +896,15 @@ d = json.load(open(f))
 d["copy"] = [".env.worktree.local"]             # the same path runtime.env.file names
 json.dump(d, open(f, "w"))
 PYJ
-printf 'SECRET=from-main\nINSTALLATION_NAME=the_main_checkout_one\n' > "$RO/.env.worktree.local"
+printf 'SECRET=from-main\nDATABASE_NAME=the_main_checkout_one\n' > "$RO/.env.worktree.local"
 git -C "$RO" add -A; git -C "$RO" commit -qm overlap
 WO=$RO/.claude/worktrees/o1
 git -C "$RO" worktree add -q "$WO" -b worktree-o1 2>/dev/null
 start_hook "$WO" >/dev/null
 eq 'the developer configuration IS copied in' 'from-main' "$(envval "$WO" SECRET)"
-eq 'and the block after it isolates the worktree' 'demo_o1' "$(envval "$WO" INSTALLATION_NAME)"
+eq 'and the block after it isolates the worktree' 'demo_o1' "$(envval "$WO" DATABASE_NAME)"
 eq 'which a second session leaves the same' 'demo_o1' \
-  "$(start_hook "$WO" >/dev/null; envval "$WO" INSTALLATION_NAME)"
+  "$(start_hook "$WO" >/dev/null; envval "$WO" DATABASE_NAME)"
 eq 'with the copied lines still there exactly once' 1 \
   "$(grep -c '^SECRET=' "$WO/.env.worktree.local" | tr -d ' ')"
 
@@ -914,7 +914,7 @@ WN=$RO/.claude/worktrees/n1
 git -C "$RO" worktree add -q "$WN" -b worktree-n1 2>/dev/null
 cp "$RO/.env.worktree.local" "$WN/.env.worktree.local"
 start_hook "$WN" >/dev/null; errN=$(cat "$TMP/err")
-eq 'a file native creation copied in gets the block too' 'demo_n1' "$(envval "$WN" INSTALLATION_NAME)"
+eq 'a file native creation copied in gets the block too' 'demo_n1' "$(envval "$WN" DATABASE_NAME)"
 lacks 'and is not announced as the developer file' 'is yours' "$errN"
 
 # ...and the same for .worktreeinclude on the WorktreeCreate path, where the plugin copies it.
@@ -925,7 +925,7 @@ eq 'WorktreeCreate still prints the worktree path' "$RO/.claude/worktrees/o2" "$
 eq 'and .worktreeinclude copied the developer configuration in' 'from-main' \
   "$(envval "$RO/.claude/worktrees/o2" SECRET)"
 eq 'while the worktree got its own isolated value' 'demo_o2' \
-  "$(envval "$RO/.claude/worktrees/o2" INSTALLATION_NAME)"
+  "$(envval "$RO/.claude/worktrees/o2" DATABASE_NAME)"
 
 # OWNERSHIP IS PER FILE, looked up by name. Taking over one file must not stop the plugin writing a
 # file it has never seen — a newly listed file that already exists is the developer's configuration
@@ -955,7 +955,7 @@ printf 'ALSO_MINE=1\n' > "$RV/.env.other.local"
 cp "$RV/.env.other.local" "$WV/.env.other.local"
 start_hook "$WV" >/dev/null; errV=$(cat "$TMP/err")
 eq 'a newly listed existing file keeps its lines' 'ALSO_MINE=1' "$(head -1 "$WV/.env.other.local")"
-eq 'and gets the block' 'demo_v1' "$(envval "$WV" INSTALLATION_NAME .env.other.local)"
+eq 'and gets the block' 'demo_v1' "$(envval "$WV" DATABASE_NAME .env.other.local)"
 eq 'while the file taken over is still left alone' 'MINE=1' "$(cat "$WV/.env.worktree.local")"
 lacks 'and is not re-announced' '.env.worktree.local is yours' "$errV"
 # shellcheck disable=SC1091  # sourced from the plugin at run time
@@ -979,7 +979,7 @@ eq 'so taking it over afterwards is still honoured' 'TOOK_IT=1' "$(cat "$WV/.env
 RA=$TMP/rtadopt
 make_rt_repo "$RA" ',
     "seed": ".claude/worktree-seed.sh"'
-printf 'INSTALLATION_NAME=shared_db\n' > "$RA/.env.worktree.local"
+printf 'DATABASE_NAME=shared_db\n' > "$RA/.env.worktree.local"
 mkdir -p "$RA/.claude"
 # shellcheck disable=SC2016  # $WT_PATH must reach the seed script, not be expanded here.
 printf '#!/usr/bin/env bash\nprintf ran > "$WT_PATH/seeded.txt"\n' > "$RA/.claude/worktree-seed.sh"
@@ -987,9 +987,9 @@ chmod +x "$RA/.claude/worktree-seed.sh"
 git -C "$RA" add -A; git -C "$RA" commit -qm adopt
 WA1=$RA/.claude/worktrees/handmade
 git -C "$RA" worktree add -q "$WA1" -b worktree-handmade 2>/dev/null
-printf 'INSTALLATION_NAME=handmade_clone\n' > "$WA1/.env.worktree.local"   # pointed at a hand clone
+printf 'DATABASE_NAME=handmade_clone\n' > "$WA1/.env.worktree.local"   # pointed at a hand clone
 start_hook "$WA1" >/dev/null; errA=$(cat "$TMP/err")
-eq 'adoption: a hand-configured env file is left byte for byte alone' 'INSTALLATION_NAME=handmade_clone' \
+eq 'adoption: a hand-configured env file is left byte for byte alone' 'DATABASE_NAME=handmade_clone' \
   "$(cat "$WA1/.env.worktree.local")"
 contains 'adoption: and it says why, once' 'set up in this worktree by hand' "$errA"
 eq 'adoption: nothing is seeded against a name the worktree does not use' 0 \
@@ -1000,9 +1000,9 @@ lacks 'adoption: the notice is not repeated' 'set up in this worktree by hand' "
 WA2=$RA/.claude/worktrees/handmade2
 git -C "$RA" worktree add -q "$WA2" -b worktree-handmade2 2>/dev/null
 rm -f "$RA/.env.worktree.local"
-printf 'INSTALLATION_NAME=only_here\n' > "$WA2/.env.worktree.local"
+printf 'DATABASE_NAME=only_here\n' > "$WA2/.env.worktree.local"
 start_hook "$WA2" >/dev/null
-eq 'adoption: a file only the worktree has is left alone too' 'INSTALLATION_NAME=only_here' \
+eq 'adoption: a file only the worktree has is left alone too' 'DATABASE_NAME=only_here' \
   "$(cat "$WA2/.env.worktree.local")"
 
 # EVERY ENVIRONMENT'S FILE gets the same block, and the seed sees them all.
@@ -1026,8 +1026,8 @@ git -C "$RM" add -A; git -C "$RM" commit -qm multi
 WM=$RM/.claude/worktrees/m1
 git -C "$RM" worktree add -q "$WM" -b worktree-m1 2>/dev/null
 start_hook "$WM" >/dev/null; errM=$(cat "$TMP/err")
-eq 'the first file gets the block' 'demo_m1' "$(envval "$WM" INSTALLATION_NAME)"
-eq 'and so does the second' 'demo_m1' "$(envval "$WM" INSTALLATION_NAME .env.test.local)"
+eq 'the first file gets the block' 'demo_m1' "$(envval "$WM" DATABASE_NAME)"
+eq 'and so does the second' 'demo_m1' "$(envval "$WM" DATABASE_NAME .env.test.local)"
 contains 'and the summary names both' 'env=.env.worktree.local, .env.test.local' "$errM"
 eq 'the seed receives the first as WT_ENV_FILE and all of them as WT_ENV_FILES' \
   ".env.worktree.local|.env.worktree.local
@@ -1056,7 +1056,7 @@ outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
 eq 'a failing seed still leaves a usable session (nothing on stdout)' '' "$outS"
 contains 'and it says the seed failed' 'the seed failed' "$errS"
 eq 'and the worktree still got its dependencies' 'ok' "$(cat "$WS/vendor/marker" 2>/dev/null)"
-eq 'and its port and database' 'demo_s1' "$(envval "$WS" INSTALLATION_NAME)"
+eq 'and its port and database' 'demo_s1' "$(envval "$WS" DATABASE_NAME)"
 contains 'and the bootstrap still reports finishing' 'bootstrap finished in' "$errS"
 
 if command -v timeout >/dev/null 2>&1; then

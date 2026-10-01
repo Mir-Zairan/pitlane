@@ -180,10 +180,10 @@
 
   "runtime": {
     "slug": "{slug}",
-    "port": { "var": "SERVER_PORT", "base": 3786, "span": 200 },
+    "port": { "var": "SERVER_PORT", "base": 4100, "span": 200 },
     "env": {
       "file": [".env.development.local", ".env.test.local"],
-      "vars": { "INSTALLATION_NAME": "demo_{slug}" }
+      "vars": { "DATABASE_NAME": "demo_{slug}" }
     },
     "seed": ".claude/worktree-seed.sh",
     "teardown": ".claude/worktree-teardown.sh"

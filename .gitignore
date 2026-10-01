@@ -20,3 +20,4 @@ tmp/
 
 # Design docs, phase notes and the source conversation stay local, never published.
 docs/
+CLAUDE.local.md

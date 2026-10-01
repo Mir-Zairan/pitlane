@@ -1366,7 +1366,7 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
 
 # Populate one dependency directory by copying the main checkout's with hardlinks.
 #
-# Returns 0 on success, 1 to say "fall back to a real install". A hardlink copy of a 397 MB
+# Returns 0 on success, 1 to say "fall back to a real install". A hardlink copy of a 400 MB
 # vendor/ is near-instant and costs almost no disk (ADR-004), but it is only VALID when the two
 # checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
 # it is not always possible: a worktree on another filesystem cannot hardlink at all.
@@ -1614,7 +1614,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     #
     # IT RUNS IN THE HOST SHELL, NOT THE TOOLCHAIN WRAPPER. A verify is a cheap check by contract —
     # every one the detection table proposes is a plain file test — while the wrapper is not cheap:
-    # measured on the reference repo, one `nix develop --command true` costs 14s warm in the main
+    # measured on a real repository, one `nix develop --command true` costs 14s warm in the main
     # checkout and 25–38s in a fresh worktree, and a repo with nine dependency entries paid that nine
     # times on its first bootstrap, for nine `test -r` calls. The time bound is unchanged.
     if [ "$rc" -eq 0 ] && [ -n "$verify" ]; then
