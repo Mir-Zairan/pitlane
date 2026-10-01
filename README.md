@@ -2,8 +2,7 @@
   <img src="assets/pitlane-banner.svg" alt="Pitlane — parallel Claude Code sessions, each in its own lane" width="720">
 </p>
 
-Run several Claude Code sessions on the same project at the same time, without them getting in each
-other's way.
+<p align="center"><b><i>Many sessions. One project. No pile-ups.</i></b></p>
 
 When Claude Code starts a session in a separate copy of your project, that copy is empty-handed: it has
 no settings, no installed packages, and it shares the same database and web address as every other copy.
