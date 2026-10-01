@@ -30,7 +30,15 @@ comes ready to use and gets its own database and its own address, so each sessio
 3. **Work as usual.** Start a session in its own copy with `claude -w my-task`. It comes ready to run, with
    its own database and address. Start as many as you like.
 
-4. **Tidy up now and then.** When you are finished with some copies, type:
+4. **If a copy was not fully ready.** The first start in a new copy can be slow — a toolchain to
+   download, a large install. Pitlane does the quick steps first and, if time runs out, tells the session
+   what is still missing. To finish it, type:
+
+   ```
+   /pitlane-finish
+   ```
+
+5. **Tidy up now and then.** When you are finished with some copies, type:
 
    ```
    /pitlane-tidy

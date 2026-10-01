@@ -1417,7 +1417,62 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# The toolchain, started once and on demand
+# ---------------------------------------------------------------------------
+#
+# The profile's `shell` is entered by every install and by the seed, and the FIRST entry in a new
+# worktree can take any amount of time: a toolchain download after its lockfile changed (measured:
+# 2 GB, five minutes, for one nixpkgs bump), an image pull, a runtime install. Paid inside the first
+# install, it ate the whole budget and nothing said why. So it is paid once, as its own step, timed and
+# reported, right before the first command that needs it — never on a session where nothing does, so
+# a re-entry stays at its sub-second cost.
+#
+# WT_TOOLCHAIN: '' (not tried), ready, slow (timed out — a download is probably still going; a later
+# step with time of its own may try again, and the download resumes), broken (exited non-zero).
+WT_TOOLCHAIN=''
+
+wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0 when the shell is usable
+  local worktree=${1%/} deadline=${2-} left started rc elapsed
+  [ -n "${PROFILE_SHELL:-}" ] || return 0
+  case $WT_TOOLCHAIN in
+    ready) return 0 ;;
+    broken) return 1 ;;
+  esac
+  left=$(wt_budget_left "$deadline")
+  if [ "$left" -le 0 ]; then
+    return 1
+  fi
+  wt_log "  toolchain: starting ${PROFILE_SHELL} (${left}s of the budget left) — the first time in a new worktree, or after its lockfile changes, this may download it"
+  started=$(date +%s 2>/dev/null) || started=''
+  wt_run_in_shell "true" "$worktree" "$left"
+  rc=$?
+  elapsed=''
+  [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
+  case $rc in
+    0)
+      WT_TOOLCHAIN=ready
+      wt_log "  toolchain: ready${elapsed:+ in ${elapsed}s}"
+      return 0
+      ;;
+    124)
+      WT_TOOLCHAIN=slow
+      wt_log "  toolchain: still not ready after ${elapsed:-$left}s — it is probably downloading; the steps that need it are left for /pitlane-finish or the next session"
+      return 1
+      ;;
+    *)
+      WT_TOOLCHAIN=broken
+      wt_log "  toolchain: \"${PROFILE_SHELL}\" failed to start (exit $rc) — the steps that need it are skipped; run it by hand in the worktree to see why"
+      return 1
+      ;;
+  esac
+}
+
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
+#
+# TWO PASSES, cheapest first: hardlinked entries (a second or so each, and no toolchain needed), then
+# installed ones. Profile order used to decide, so one slow install early in the list left every
+# hardlink after it undone when the budget ran out.
 wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local rec body dir lock strategy install verify _cksum n=-1
@@ -1425,6 +1480,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
 
+  local pass
+  for pass in cheap slow; do
+  n=-1
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
       1"$WT_US"*) ;;
@@ -1433,6 +1491,11 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     n=$((n + 1))
     body=${rec#*"$WT_US"}
     IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    case $pass:$strategy in
+      cheap:hardlink | cheap:skip | slow:install | slow:store) ;;
+      slow:hardlink | slow:skip | cheap:*) continue ;;
+      *) ;;
+    esac
 
     # Public entry point, so the shapes are re-checked rather than assumed validated. A `dir` of
     # ../../.. reaches `rm -rf` and `cp -al` further down.
@@ -1590,10 +1653,14 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
+      if ! wt_toolchain_warm "$worktree" "$deadline"; then
+        wt_log "  $dir: needs the toolchain, which is not ready — leaving it for /pitlane-finish or the next session"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      left=$(wt_budget_left "$deadline")
       wt_log "  $dir: installing (${left}s of the budget left)"
-      case ${PROFILE_SHELL:-} in
-        nix*) wt_log "  $dir: evaluating the nix environment first, which can take a minute on a cold worktree" ;;
-      esac
       started=$(date +%s 2>/dev/null) || started=''
       wt_run_in_shell "$install" "$worktree" "$left"
       rc=$?
@@ -1636,7 +1703,55 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     [ "$held" -eq 1 ] && wt_lock_release 9
   done < <(printf '%s' "$PROFILE_RAW")
+  done
   return 0
+}
+
+# What this worktree's bootstrap has NOT finished, one item per line: each dependency directory not
+# recorded done for its current lockfile and install command, then `databases (seed: <status>)` when
+# the profile has a seed that has not run to done. Empty output means the worktree is complete.
+# It is what the session is told, so it reads the state the steps recorded rather than guessing.
+wt_bootstrap_pending() {  # $1 = worktree
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed
+  [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    case $strategy in hardlink | install | store) ;; *) continue ;; esac
+    { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
+    [ "$strategy" = store ] && strategy=install
+    install=$(wt_expand "$install")
+    lckhash=$(wt_cksum_file "$worktree/$lock")
+    ickhash=$(wt_cksum_string "$install")
+    wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" || printf '%s\n' "$dir"
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ] \
+    && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
+    seed=$(wt_runtime_state_get "$worktree" seedstatus) || seed=none
+    [ "$seed" = "done" ] || printf 'databases (seed: %s)\n' "${seed:-none}"
+  fi
+  return 0
+}
+
+# The one-paragraph notice a session gets when its worktree is not finished — on SessionStart's
+# stdout, which becomes the model's context. SILENT when everything is done: the bootstrap's normal
+# output stays out of the context, and only an incomplete worktree, which a session would otherwise
+# mistake for a ready one and "fix" by hand, earns a word.
+wt_bootstrap_notice() {  # $1 = pending items, one per line
+  local items=${1-} list n=0 shown='' item
+  [ -n "$items" ] || return 0
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    n=$((n + 1))
+    [ "$n" -le 4 ] && shown=${shown:+$shown, }$item
+  done <<<"$items"
+  list=$shown
+  [ "$n" -gt 4 ] && list="$list and $((n - 4)) more"
+  printf 'Pitlane: this worktree is not fully set up yet — still missing: %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$list"
 }
 
 # ---------------------------------------------------------------------------
@@ -2641,6 +2756,31 @@ EOF
   fi
   if ! wt_is_posint "$secs"; then
     wt_log "  runtime: no time left in the bootstrap budget to run the seed — leaving it for the next session"
+    wt_runtime_state_set "$worktree" "$slug" "$port" \
+      "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
+      "$(wt_runtime_state_get "$worktree" envfile || printf '%s' "$envrel")" \
+      "$(wt_runtime_state_get "$worktree" envstate || printf '%s' "$envstate")" failed "" || true
+    WT_SEED_STATUS=failed
+    return 0
+  fi
+
+  # The seed runs inside the toolchain too, so it is started first — with the seed's own time, which
+  # the installs could not spend. A toolchain that still is not ready leaves the seed for later,
+  # recorded as not run, so the next session or /pitlane-finish retries it.
+  if ! wt_toolchain_warm "$worktree" "$deadline"; then
+    wt_log "  runtime: the toolchain is not ready, so the seed has not run — leaving it for /pitlane-finish or the next session"
+    wt_runtime_state_set "$worktree" "$slug" "$port" \
+      "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
+      "$(wt_runtime_state_get "$worktree" envfile || printf '%s' "$envrel")" \
+      "$(wt_runtime_state_get "$worktree" envstate || printf '%s' "$envstate")" failed "" || true
+    WT_SEED_STATUS=failed
+    return 0
+  fi
+  left=$(wt_budget_left "$deadline")
+  case $left in '' | *[!0-9]*) ;; *) [ "$((10#$left))" -ge "$((10#$secs))" ] || secs=$left ;; esac
+  # `timeout 0` would mean no limit at all, so a warm-up that used the seed's time leaves it for later.
+  if ! wt_is_posint "$secs"; then
+    wt_log "  runtime: starting the toolchain used the seed's time — leaving the seed for /pitlane-finish or the next session"
     wt_runtime_state_set "$worktree" "$slug" "$port" \
       "$(wt_runtime_state_get "$worktree" portsource || printf derived)" \
       "$(wt_runtime_state_get "$worktree" envfile || printf '%s' "$envrel")" \

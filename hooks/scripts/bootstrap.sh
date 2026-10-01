@@ -39,6 +39,18 @@ set -uo pipefail
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/bootstrap-lib.sh"
 
+# `bootstrap.sh --finish`: run from inside a worktree (the /pitlane-finish skill does) to complete
+# whatever its start-up bootstrap had to leave out, with no hook time limit. It is the SessionStart
+# path with the payload built here instead of read from stdin.
+WT_FINISH=''
+if [ "${1-}" = --finish ]; then
+  WT_FINISH=1
+  HOOK_INPUT=$(python3 -c 'import json,os; print(json.dumps({"hook_event_name":"SessionStart","source":"startup","cwd":os.getcwd()}))' 2>/dev/null) || HOOK_INPUT=''
+  WT_INPUT_READ=1
+  export HOOK_INPUT WT_INPUT_READ
+fi
+export WT_FINISH
+
 wt_read_input
 
 # Probe the JSON backend explicitly and SAY SO when it is missing. Without this the hook
@@ -94,10 +106,16 @@ wt_symlink_refuses() {  # $1 = main checkout, $2 = the worktree path about to be
 # is to exit 0 having warned, whatever happened here.
 wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own .worktreeinclude
   local root=${1%/} worktree=${2%/} own_include=${3:-0}
-  local started deadline budget elapsed held=0
+  local started deadline hook_deadline budget reserve elapsed held=0
 
   started=$(date +%s 2>/dev/null) || started=''
-  deadline=''
+  deadline='' hook_deadline=''
+  # Finishing from /pitlane-finish runs outside any hook, so the only limit is a generous one.
+  if [ "${WT_FINISH:-}" = 1 ]; then
+    WT_HOOK_TIMEOUT=${WT_FINISH_LIMIT:-3600}
+    PROFILE_BOOTSTRAP_TIMEOUT=$((WT_HOOK_TIMEOUT - 30))
+    [ "${PROFILE_SEED_TIMEOUT:-0}" -ge 1200 ] 2>/dev/null || PROFILE_SEED_TIMEOUT=1200
+  fi
   if [ -n "$started" ]; then
     # CLAMPED BELOW THE HOOK'S OWN TIMEOUT. The platform's timer starts first, and the default
     # bootstrap budget is exactly the hook timeout — so without this the platform kills the hook
@@ -111,7 +129,20 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
       budget=$((WT_HOOK_TIMEOUT - 30))
       wt_log "the bootstrap budget (${PROFILE_BOOTSTRAP_TIMEOUT}s) leaves no room under the ${WT_HOOK_TIMEOUT}s hook timeout — using ${budget}s so a slow step is reported rather than killed"
     fi
+    # TWO DEADLINES, so a slow install cannot starve the seed. Dependencies stop at
+    # bootstrapSeconds; the seed then gets its own seedSeconds on top — the SUM the profile is
+    # validated against. Before, the seed ran on whatever the installs had left, and measured on a
+    # real repository a toolchain download ate it all: the env overrides pointed at databases
+    # that were never made. The seed's share is reserved out of the hook's window, capped at half
+    # of it, because both timeouts default to the hook timeout itself when a profile sets neither.
+    hook_deadline=$((started + WT_HOOK_TIMEOUT - 30))
+    reserve=0
+    if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ]; then
+      reserve=${PROFILE_SEED_TIMEOUT:-0}
+      [ "$reserve" -le $(((WT_HOOK_TIMEOUT - 30) / 2)) ] 2>/dev/null || reserve=$(((WT_HOOK_TIMEOUT - 30) / 2))
+    fi
     deadline=$((started + budget))
+    [ "$deadline" -le $((hook_deadline - reserve)) ] || deadline=$((hook_deadline - reserve))
   fi
 
   # A second lock, scoped to THIS worktree, so two sessions entering the same worktree at once do
@@ -149,7 +180,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # ONE hook invocation, so it is their SUM that must fit — a seed that took a fresh allowance
   # would let the platform kill the hook before any internal guard fired, which is the one failure
   # the warn-and-exit-0 rule exists to prevent.
-  wt_runtime_handoff "$root" "$worktree" "$deadline"
+  wt_runtime_handoff "$root" "$worktree" "${hook_deadline:-$deadline}"
 
   [ "$held" -eq 1 ] && wt_lock_release 8
 
@@ -284,7 +315,10 @@ case $event in
     # a plugin that logs on every single session start is a plugin people uninstall.
     case "$here/" in
       *"$WT_SUBPATH"*) ;;
-      *) exit 0 ;;
+      *)
+        [ "${WT_FINISH:-}" = 1 ] && printf 'Pitlane: run /pitlane-finish from inside a worktree under .claude/worktrees/ — this is not one.\n'
+        exit 0
+        ;;
     esac
 
     worktree=$(wt_repo_root "$here") || worktree=$here
@@ -321,7 +355,23 @@ case $event in
     [ -f "$(wt_state_path "$worktree")" ] || own_include=1
     wt_bootstrap_worktree "$root" "$worktree" "$own_include"
 
-    # NOTHING to stdout: for SessionStart, stdout becomes model context.
+    # stdout is the model's context here, so it stays EMPTY when the worktree is complete — and gets
+    # one short notice when it is not, because a session that mistakes a half-set-up worktree for a
+    # ready one goes on to install and clone by hand (measured: it is what sessions did before this
+    # plugin existed). /pitlane-finish reads the same list as a plain status line.
+    pending=$(wt_bootstrap_pending "$worktree")
+    if [ "${WT_FINISH:-}" = 1 ]; then
+      if [ -z "$pending" ]; then
+        printf 'Pitlane: this worktree is fully set up.\n'
+      else
+        printf 'Pitlane: still not complete — missing: %s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
+      fi
+      exit 0
+    fi
+    if [ -n "$pending" ]; then
+      wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
+      wt_bootstrap_notice "$pending"
+    fi
     exit 0
     ;;
 

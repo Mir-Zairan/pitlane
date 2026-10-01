@@ -165,7 +165,13 @@ inject() {  # $1 = label, $2 = repo, $3 = worktree
   out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$3\"}" "$3")
   rc=$?
   eq "$1: the hook still exits 0" 0 "$rc"
-  eq "$1: and still writes nothing to stdout" '' "$out"
+  # stdout is model context: nothing, or the one-line "not fully set up" notice — never a stray byte.
+  case $out in
+    '' | 'Pitlane: this worktree is not fully set up yet'*) pass=$((pass + 1)) ;;
+    *) fail=$((fail + 1)); printf 'FAIL %s: stdout is neither empty nor the notice\n      actual: %q\n' "$1" "$out" >&2 ;;
+  esac
+  eq "$1: and stdout is at most one line" 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+  INJECT_OUT=$out
 }
 
 R2=$TMP/r2
@@ -173,6 +179,8 @@ make_repo "$R2" '{"dir":"vendor","lock":"composer.lock","strategy":"install","in
 W2=$R2/.claude/worktrees/f2
 git -C "$R2" worktree add -q "$W2" -b worktree-f2 2>/dev/null
 inject 'an install that fails' "$R2" "$W2"
+contains 'a failed install is named in the SessionStart notice' 'still missing: vendor' "$INJECT_OUT"
+contains '...which points at /pitlane-finish' '/pitlane-finish' "$INJECT_OUT"
 contains 'an install that fails: says so' 'install command failed' "$(cat "$TMP/err")"
 
 R3=$TMP/r3
@@ -1053,7 +1061,8 @@ git -C "$RS" add .claude/worktree-seed.sh; git -C "$RS" commit -qm seed
 WS=$RS/.claude/worktrees/s1
 git -C "$RS" worktree add -q "$WS" -b worktree-s1 2>/dev/null
 outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
-eq 'a failing seed still leaves a usable session (nothing on stdout)' '' "$outS"
+contains 'a failing seed still leaves a usable session (only the notice on stdout)' \
+  'still missing: databases (seed: failed)' "$outS"
 contains 'and it says the seed failed' 'the seed failed' "$errS"
 eq 'and the worktree still got its dependencies' 'ok' "$(cat "$WS/vendor/marker" 2>/dev/null)"
 eq 'and its port and database' 'demo_s1' "$(envval "$WS" DATABASE_NAME)"
@@ -1071,7 +1080,8 @@ d["timeouts"]["seedSeconds"] = 1
 json.dump(d, open(f, "w"))
 PYJ
   outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
-  eq 'a HANGING seed still leaves a usable session' '' "$outS"
+  contains 'a HANGING seed still leaves a usable session (only the notice on stdout)' \
+    'still missing: databases (seed: timeout)' "$outS"
   contains 'and the hang is stopped and reported' 'was stopped' "$errS"
   contains 'and the bootstrap still finishes' 'bootstrap finished in' "$errS"
 fi
@@ -1089,6 +1099,98 @@ after=$(cd "$WNR" && find . -path ./.git -prune -o -print | LC_ALL=C sort)
 eq 'a profile with no runtime block leaves the worktree unchanged' "$before" "$after"
 lacks 'and says nothing at all about runtime' 'runtime:' "$errNR"
 eq 'and nothing shows up in git status' '' "$(git -C "$WNR" status --porcelain 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# A slow toolchain — the hook's time runs out, and the session is told so
+# ---------------------------------------------------------------------------
+# Not nix-specific: any wrapper (a container, a dev-env manager) can spend a first start downloading.
+# The fake one logs every start and, while $TMP/shell.slow exists, never becomes ready.
+
+if command -v timeout >/dev/null 2>&1; then
+  cat > "$TMP/fakeshell" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/shell.log"
+[ -e "$TMP/shell.slow" ] && exec sleep 30
+exec "\$@"
+SH
+  chmod +x "$TMP/fakeshell"
+
+  FT=$TMP/slowtool
+  # The INSTALL entry is listed first on purpose: the hardlink after it must still be done first.
+  make_repo "$FT" '{"dir":"node_modules","lock":"composer.lock","strategy":"install","install":"mkdir -p node_modules && printf ok > node_modules/m"},
+    {"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor"}'
+  python3 - "$FT/.claude/worktree-profile.json" "$TMP/fakeshell" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["shell"] = sys.argv[2]
+d["timeouts"]["bootstrapSeconds"] = 3
+json.dump(d, open(f, "w"))
+PYJ
+  printf 'node_modules/\n' >> "$FT/.gitignore"
+  git -C "$FT" add -A; git -C "$FT" commit -qm slow
+  mkdir -p "$FT/vendor"; printf 'MAIN\n' > "$FT/vendor/autoload.php"
+  WF=$FT/.claude/worktrees/slow
+  git -C "$FT" worktree add -q "$WF" -b worktree-slow 2>/dev/null
+
+  touch "$TMP/shell.slow"
+  outF=$(start_hook "$WF"); errF=$(cat "$TMP/err")
+  eq 'slow toolchain: the cheap hardlink is done although the install came first in deps[]' 'MAIN' \
+    "$(cat "$WF/vendor/autoload.php" 2>/dev/null)"
+  contains 'slow toolchain: the warm-up is timed and reported' 'toolchain: still not ready' "$errF"
+  eq 'slow toolchain: the install that needs it was left alone' no \
+    "$([ -e "$WF/node_modules/m" ] && echo yes || echo no)"
+  contains 'slow toolchain: the session is told what is missing on stdout' \
+    'still missing: node_modules.' "$outF"
+  lacks '...and only what is missing — the hardlinked vendor is not named' 'vendor' "$outF"
+  contains '...and how to finish it' 'Run /pitlane-finish' "$outF"
+  eq '...in a single line of model context' 1 "$(printf '%s\n' "$outF" | wc -l | tr -d ' ')"
+
+  # /pitlane-finish: no hook time limit, so the same toolchain now gets as long as it needs.
+  rm -f "$TMP/shell.slow"
+  outF=$( (cd "$WF" && bash "$HOOK" --finish </dev/null 2>"$TMP/err") ); rcF=$?; errF=$(cat "$TMP/err")
+  eq '--finish exits 0' 0 "$rcF"
+  eq '--finish reports the worktree complete as its only stdout' \
+    'Pitlane: this worktree is fully set up.' "$outF"
+  eq '--finish ran the install the hook had to skip' ok "$(cat "$WF/node_modules/m" 2>/dev/null)"
+  contains '--finish warmed the toolchain first' 'toolchain: ready' "$errF"
+
+  # A complete worktree: silent, and the toolchain is not even started.
+  : > "$TMP/shell.log"
+  outF=$(start_hook "$WF")
+  eq 'a complete worktree gets no notice on stdout' '' "$outF"
+  eq 'and a complete re-entry never starts the toolchain' '' "$(cat "$TMP/shell.log")"
+
+  outF=$( (cd "$FT" && bash "$HOOK" --finish </dev/null 2>/dev/null) )
+  contains '--finish outside a worktree says so instead of doing nothing silently' \
+    'from inside a worktree' "$outF"
+
+  # THE SEED HAS ITS OWN BUDGET. An install that eats all of bootstrapSeconds used to leave the
+  # seed nothing; now it gets its seedSeconds on top, so the worktree still gets its databases.
+  SB=$TMP/seedbudget
+  make_rt_repo "$SB" ',
+    "seed": ".claude/worktree-seed.sh"'
+  python3 - "$SB/.claude/worktree-profile.json" <<'PYJ'
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d["deps"][0]["install"] = "exec sleep 30"
+d.setdefault("timeouts", {})["bootstrapSeconds"] = 2
+d["timeouts"]["seedSeconds"] = 20
+json.dump(d, open(f, "w"))
+PYJ
+  # shellcheck disable=SC2016  # $WT_PATH belongs to the seed script, not this suite
+  printf '#!/usr/bin/env bash\nprintf seeded > "$WT_PATH/seeded.txt"\n' > "$SB/.claude/worktree-seed.sh"
+  chmod +x "$SB/.claude/worktree-seed.sh"
+  git -C "$SB" add -A; git -C "$SB" commit -qm seed
+  WSB=$SB/.claude/worktrees/sb
+  git -C "$SB" worktree add -q "$WSB" -b worktree-sb 2>/dev/null
+  outSB=$(start_hook "$WSB")
+  eq 'the seed still runs when installs use up the whole bootstrap budget' seeded \
+    "$(cat "$WSB/seeded.txt" 2>/dev/null)"
+  contains '...and the notice names only the install' 'still missing: vendor.' "$outSB"
+  lacks '...not the databases, which are done' 'databases (seed' "$outSB"
+fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]
