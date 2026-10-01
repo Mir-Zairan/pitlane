@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/pitlane-banner.svg" alt="Pitlane — parallel Claude Code sessions, each in its own lane" width="720">
+</p>
+
 # Pitlane
 
 Run several Claude Code sessions on the same project at the same time, without them getting in each
