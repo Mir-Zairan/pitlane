@@ -2,10 +2,24 @@
   <img src="assets/pitlane-banner.svg" alt="Pitlane — parallel Claude Code sessions, each in its own lane" width="720">
 </p>
 
+<h1 align="center">Pitlane</h1>
+
 <p align="center"><b><i>Many sessions. One project. No pile-ups.</i></b></p>
 
-When Claude Code starts a session in a separate copy of your project, that copy is empty-handed: it has
-no settings, no installed packages, and it shares the same database and web address as every other copy.
+<p align="center">
+  A <a href="https://claude.com/claude-code">Claude Code</a> plugin that gets every git worktree ready to work in,
+  so you can run parallel Claude Code sessions on one project without them colliding.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Mir-Zairan/pitlane/releases"><img src="https://img.shields.io/github/v/tag/Mir-Zairan/pitlane?label=version" alt="Latest version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Mir-Zairan/pitlane" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Claude%20Code-plugin-d97757" alt="Claude Code plugin">
+</p>
+
+When Claude Code starts a session in a separate copy of your project (a git worktree, which is what
+`claude -w` makes), that copy is empty-handed: it has no settings, no installed packages, and it shares
+the same database and web address as every other copy.
 So one session can break another's work without anyone noticing. Pitlane fixes that: like a pit lane readies a car before it goes back out, it readies each copy before a session starts. Every new copy
 comes ready to use and gets its own database and its own address, so each session works on its own.
 
@@ -24,6 +38,18 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Cleanup** | `/pitlane-tidy` removes old copies, never unsaved work |
 
 Your app's server is not started for you: each copy is ready, and you run it when you need it.
+
+## Works with
+
+- **Package managers:** Composer, npm, pnpm, Yarn, Bun, uv, Poetry, Pipenv, Bundler, Mix, Cargo and Go
+  modules. Pitlane spots them from their lockfiles.
+- **Toolchains:** Nix flakes and `shell.nix`, direnv, or plain tools on your machine. A devcontainer
+  is spotted too, and you point Pitlane at the container command yourself.
+- **Databases and services:** any. You give Pitlane a short script that creates a copy's database
+  (MySQL, PostgreSQL, a Docker container, whatever your project uses); it runs it with that copy's own
+  name and port, and a matching script removes it again.
+
+It needs `bash`, `git`, and either `python3` or `jq`, on Linux or macOS.
 
 ## How to use it
 
@@ -67,6 +93,19 @@ Your app's server is not started for you: each copy is ready, and you run it whe
 
    It shows what can be cleaned up and removes only what you choose. Anything with unsaved work is
    always kept.
+
+## Questions
+
+**Is it safe to open someone else's pull request?** Pitlane runs nothing from it without asking. It
+copies settings and assigns the port, then shows you the setup commands and waits for your approval,
+and it asks again after every new push. Approving lets the install run the pull request's own package
+scripts, so read its changes first, as you would before installing it by hand.
+
+**Does it slow down starting a session?** No. Only the quick steps run before your first prompt;
+installs and the database finish in the background.
+
+**Can I use it without a database?** Yes. Without one, Pitlane just copies settings and installs or
+links packages.
 
 ## License
 

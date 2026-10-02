@@ -13,10 +13,16 @@
       "category": "workflow",
       "keywords": [
         "pitlane",
+        "claude-code",
+        "claude-code-plugin",
+        "git-worktree",
         "worktree",
         "parallel-sessions",
-        "bootstrap",
-        "developer-experience"
+        "parallel-agents",
+        "ai-coding-agents",
+        "database-isolation",
+        "developer-experience",
+        "bootstrap"
       ],
       "license": "MIT"
     }
