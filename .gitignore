@@ -21,3 +21,7 @@ tmp/
 # Design docs and the source conversation stay local, never published.
 docs/
 CLAUDE.local.md
+
+# Promo videos, kept locally
+video/
+film/
