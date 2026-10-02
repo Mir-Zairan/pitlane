@@ -18,7 +18,7 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Database & port** | Each copy gets its own, so sessions never clash |
 | **Pull requests** | `claude -w "#1234"` opens a PR, set up like any other copy |
 | **Reopening** | A copy that's already set up opens in seconds |
-| **Slow starts** | Tells you what's missing; `/pitlane-finish` completes it |
+| **No waiting** | Installs and the database finish in the background, so your first prompt starts at once |
 | **Light on your machine** | Setup runs at low priority under a memory cap, so it can't freeze your desktop |
 | **Cleanup** | `/pitlane-tidy` removes old copies, never unsaved work |
 
@@ -45,9 +45,10 @@ Your app's server is not started for you: each copy is ready, and you run it whe
 3. **Work as usual.** Start a session in its own copy with `claude -w my-task`. It comes ready to run, with
    its own database and address. Start as many as you like.
 
-4. **If a copy was not fully ready.** The first start in a new copy can be slow — a toolchain to
-   download, a large install. Pitlane does the quick steps first and, if time runs out, tells the session
-   what is still missing. To finish it, type:
+4. **Start working straight away.** In a new copy, Pitlane does the quick steps (settings, linked
+   packages, the port) before your first prompt, and finishes installs and the database in the
+   background. The session is told what is still in progress. To wait for it, or to finish a setup that
+   was held back, type:
 
    ```
    /pitlane-finish

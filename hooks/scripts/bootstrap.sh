@@ -42,14 +42,24 @@ set -uo pipefail
 # `bootstrap.sh --finish`: run from inside a worktree (the /pitlane-finish skill does) to complete
 # whatever its start-up bootstrap had to leave out, with no hook time limit. It is the SessionStart
 # path with the payload built here instead of read from stdin.
-WT_FINISH=''
+#
+# `--finish --background` is the same run, started detached by a SessionStart that deferred its slow
+# steps (WT_DEFER below): it records its pid where /pitlane-finish and later sessions can see it.
+WT_FINISH='' WT_BACKGROUND=''
+WT_BOOTSTRAP_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bootstrap.sh"
+export WT_BOOTSTRAP_SCRIPT
 if [ "${1-}" = --finish ]; then
   WT_FINISH=1
-  HOOK_INPUT=$(python3 -c 'import json,os; print(json.dumps({"hook_event_name":"SessionStart","source":"startup","cwd":os.getcwd()}))' 2>/dev/null) || HOOK_INPUT=''
+  [ "${2-}" = --background ] && WT_BACKGROUND=1
+  # Either JSON backend: a jq-only host must not get an empty payload, which would make the
+  # background run — and /pitlane-finish — silently do nothing.
+  HOOK_INPUT=$(python3 -c 'import json,os; print(json.dumps({"hook_event_name":"SessionStart","source":"startup","cwd":os.getcwd()}))' 2>/dev/null) \
+    || HOOK_INPUT=$(jq -nc --arg c "$PWD" '{hook_event_name:"SessionStart",source:"startup",cwd:$c}' 2>/dev/null) \
+    || HOOK_INPUT=''
   WT_INPUT_READ=1
   export HOOK_INPUT WT_INPUT_READ
 fi
-export WT_FINISH
+export WT_FINISH WT_BACKGROUND
 
 wt_read_input
 
@@ -351,9 +361,40 @@ case $event in
     # gaps, so where native did the work this is a no-op; and once the worktree has a state file it
     # is skipped, so later sessions do not pay for the walk over the main checkout. The profile's
     # copy[] is applied every session regardless, because native knows nothing about it.
+    # /pitlane-finish while a background run is still going: wait for it rather than race it, then
+    # walk the sequence once more, which finds it done and reports so.
+    if [ "${WT_FINISH:-}" = 1 ]; then
+      if [ "${WT_BACKGROUND:-}" = 1 ]; then
+        wt_background_claim "$worktree"
+      else
+        wt_background_wait "$worktree"
+      fi
+    fi
+
+    # DEFERRED, on a normal start. Claude Code holds the session's first prompt until this hook
+    # returns, and measured on a real repository the installs and the seed made that four and a half
+    # minutes — for a prompt that needed neither. So the start-up run does only what is cheap and what
+    # everything else depends on (config, hardlinks, the port and the env overrides), and the rest is
+    # handed to a detached `--finish --background`. PITLANE_BACKGROUND=off keeps it all in the hook.
+    WT_DEFER=0
+    if [ "${WT_FINISH:-}" != 1 ] && wt_background_enabled; then
+      WT_DEFER=1
+    fi
+
     own_include=0
     [ -f "$(wt_state_path "$worktree")" ] || own_include=1
     wt_bootstrap_worktree "$root" "$worktree" "$own_include"
+    # A session that started while this background run was going was told "in progress" and started
+    # no run of its own — but it may have found work this run had already walked past (a lockfile
+    # changed by a checkout). So the run goes round again for it, a bounded number of times.
+    if [ "${WT_BACKGROUND:-}" = 1 ]; then
+      rounds=0
+      while wt_background_take_again "$worktree" && [ "$rounds" -lt 3 ]; do
+        rounds=$((rounds + 1))
+        wt_log "a session started meanwhile — going round once more"
+        wt_bootstrap_worktree "$root" "$worktree" 0
+      done
+    fi
 
     # stdout is the model's context here, so it stays EMPTY when the worktree is complete — and gets
     # one short notice when it is not, because a session that mistakes a half-set-up worktree for a
@@ -369,8 +410,13 @@ case $event in
       exit 0
     fi
     if [ -n "$pending" ]; then
-      wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
-      wt_bootstrap_notice "$pending"
+      if [ "$WT_DEFER" = 1 ] && wt_background_start "$worktree"; then
+        wt_log "finishing in the background: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
+        wt_bootstrap_notice "$pending" background
+      else
+        wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
+        wt_bootstrap_notice "$pending"
+      fi
     fi
     exit 0
     ;;

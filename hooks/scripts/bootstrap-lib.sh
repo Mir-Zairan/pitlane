@@ -1667,6 +1667,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       continue
     fi
 
+    # Deferred: an install is the slow part, and the background run that follows does it.
+    if [ "${WT_DEFER:-0}" = 1 ] && [ "$strategy" = install ]; then
+      wt_log "  $dir: to be installed in the background"
+      continue
+    fi
+
     left=$(wt_budget_left "$deadline")
     if [ "$left" -le 0 ]; then
       wt_log "  $dir: out of time before starting — leaving it for the next session"
@@ -1736,6 +1742,14 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         2) effective=present ;;
         *) effective=install ;;
       esac
+      # A hardlink that has to fall back to an install is as slow as any install, so it is deferred
+      # too. `dirty`, not `doing`: nothing was started that a later run should clear away.
+      if [ "$effective" = install ] && [ "${WT_DEFER:-0}" = 1 ]; then
+        wt_log "  $dir: to be installed in the background"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
     fi
 
     rc=0
@@ -1846,8 +1860,8 @@ wt_bootstrap_pending() {  # $1 = worktree
 # stdout, which becomes the model's context. SILENT when everything is done: the bootstrap's normal
 # output stays out of the context, and only an incomplete worktree, which a session would otherwise
 # mistake for a ready one and "fix" by hand, earns a word.
-wt_bootstrap_notice() {  # $1 = pending items, one per line
-  local items=${1-} list n=0 shown='' item
+wt_bootstrap_notice() {  # $1 = pending items, one per line, $2 = "background" when a run is finishing them
+  local items=${1-} mode=${2-} list n=0 shown='' item
   [ -n "$items" ] || return 0
   while IFS= read -r item; do
     [ -n "$item" ] || continue
@@ -1856,7 +1870,125 @@ wt_bootstrap_notice() {  # $1 = pending items, one per line
   done <<<"$items"
   list=$shown
   [ "$n" -gt 4 ] && list="$list and $((n - 4)) more"
+  if [ "$mode" = background ]; then
+    printf 'Pitlane: this worktree is still being set up in the background — in progress: %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$list"
+    return 0
+  fi
   printf 'Pitlane: this worktree is not fully set up yet — still missing: %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$list"
+}
+
+# ---------------------------------------------------------------------------
+# The background run: the slow steps, after the session has started
+# ---------------------------------------------------------------------------
+#
+# Claude Code holds a session's first prompt until every SessionStart hook has returned. So the
+# start-up run defers installs and the seed (WT_DEFER) and starts `bootstrap.sh --finish
+# --background` detached — its own session (setsid), every descriptor on a file, so the hook's pipes
+# close when the hook exits and the platform has nothing to wait for. It is the /pitlane-finish run
+# exactly, guard, locks and state included; it holds the worktree's bootstrap lock while it works,
+# which is also what makes teardown keep a worktree that is still being set up.
+#
+# Its pid and log sit beside the state file, in the worktree's private git dir, for the same reason
+# the lock does: nothing in the checkout, nothing in `git status`.
+
+wt_background_enabled() {
+  case ${PITLANE_BACKGROUND:-on} in
+    off | OFF | 0 | no | false) return 1 ;;
+  esac
+  command -v setsid >/dev/null 2>&1 || return 1
+  [ -n "${WT_BOOTSTRAP_SCRIPT:-}" ] && [ -f "$WT_BOOTSTRAP_SCRIPT" ]
+}
+
+wt_background_pidfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-bootstrap.pid' "${p%/*}"
+}
+
+wt_background_againfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-bootstrap.again' "${p%/*}"
+}
+
+# Run by the background run after its sequence: true (and the request consumed) when a session
+# asked for another round while it worked.
+wt_background_take_again() {  # $1 = worktree
+  local f
+  f=$(wt_background_againfile "$1")
+  [ -e "$f" ] || return 1
+  rm -f "$f" 2>/dev/null
+  return 0
+}
+
+wt_background_logfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-bootstrap.log' "${p%/*}"
+}
+
+# Prints the pid of this worktree's running background setup, or returns 1 when none is running.
+# A pid that is alive but no longer a bootstrap is a recycled one, and does not count.
+wt_background_pid() {  # $1 = worktree
+  local f pid
+  f=$(wt_background_pidfile "$1")
+  [ -f "$f" ] || return 1
+  pid=$(head -c 24 "$f" 2>/dev/null | tr -cd '0-9')
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/cmdline" ] && ! tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'bootstrap\.sh --finish --background'; then
+    return 1
+  fi
+  printf '%s' "$pid"
+}
+
+# Start the background run, unless one is already going. Returns 1 when it could not be started,
+# and the caller falls back to the ordinary "not finished" notice.
+wt_background_start() {  # $1 = worktree
+  local wt=${1%/} log pidf
+  if wt_background_pid "$wt" >/dev/null; then
+    # The running one may be past the step this session needs: ask it to go round again.
+    : >"$(wt_background_againfile "$wt")" 2>/dev/null || true
+    return 0
+  fi
+  log=$(wt_background_logfile "$wt")
+  pidf=$(wt_background_pidfile "$wt")
+  {
+    printf '%s background setup of %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$wt"
+  } >"$log" 2>/dev/null || return 1
+  ( cd "$wt" 2>/dev/null || exit 0
+    exec setsid bash "$WT_BOOTSTRAP_SCRIPT" --finish --background ) </dev/null >>"$log" 2>&1 &
+  printf '%s\n' "$!" >"$pidf" 2>/dev/null || return 1
+  return 0
+}
+
+# Run by the background run itself: record its own pid (setsid may have forked, so the one the hook
+# wrote can be its parent's), and clear the record on the way out, only if it is still its own.
+wt_background_claim() {  # $1 = worktree
+  WT_BG_PIDFILE=$(wt_background_pidfile "$1")
+  printf '%s\n' "$$" >"$WT_BG_PIDFILE" 2>/dev/null || true
+  rm -f "$(wt_background_againfile "$1")" 2>/dev/null
+  trap 'wt_background_release' EXIT
+}
+
+wt_background_release() {
+  [ -n "${WT_BG_PIDFILE:-}" ] || return 0
+  [ "$(tr -cd '0-9' <"$WT_BG_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WT_BG_PIDFILE"
+  return 0
+}
+
+# /pitlane-finish while a background run is going: wait for it, bounded, saying so once.
+wt_background_wait() {  # $1 = worktree
+  local wt=${1%/} pid limit=${WT_FINISH_LIMIT:-3600} waited=0
+  pid=$(wt_background_pid "$wt") || return 0
+  wt_log "the background setup (pid $pid) is still running — waiting for it; progress in $(wt_background_logfile "$wt")"
+  while wt_background_pid "$wt" >/dev/null; do
+    [ "$waited" -lt "$limit" ] || { wt_log "still running after ${limit}s — going on without it"; return 0; }
+    sleep 2
+    waited=$((waited + 2))
+  done
+  wt_log "the background setup finished after ${waited}s more"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3160,7 +3292,9 @@ EOF
   fi
 
   # --- the seed ----------------------------------------------------------------------------------
-  if [ -n "${PROFILE_RT_SEED:-}" ]; then
+  # Deferred like the installs: the env overrides above are cheap and are already written, so the
+  # session knows its databases' names; making them is the background run's job.
+  if [ -n "${PROFILE_RT_SEED:-}" ] && [ "${WT_DEFER:-0}" != 1 ]; then
     wt_runtime_seed "$root" "$worktree" "$slug" "$port" "$envfiles" "$envstate" \
       "${PROFILE_RT_SEED}" "$deadline"
   fi

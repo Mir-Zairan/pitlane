@@ -18,6 +18,10 @@ trap 'rm -rf "$TMP"' EXIT
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+# These suites assert what a start-up run DID, so it does all of it in the hook; the background
+# hand-off has its own tests, which turn it back on.
+PITLANE_BACKGROUND=off
+export PITLANE_BACKGROUND
 unset XDG_CONFIG_HOME
 # A corepack-managed pnpm keeps ITSELF in $HOME/.cache/node/corepack. Moving HOME makes corepack
 # think pnpm is not installed and try to download it, which fails offline and read as "pnpm cannot
@@ -1225,6 +1229,111 @@ contains 'low memory: the session is told what is missing' 'still missing: node_
 outL=$(WT_MEMINFO=$TMP/meminfo.ok start_hook "$WLM")
 eq 'with memory back, the next session completes it' ok "$(cat "$WLM/node_modules/m" 2>/dev/null)"
 eq '...and is silent again' '' "$outL"
+
+# ---------------------------------------------------------------------------
+# The background hand-off: the session starts after the cheap steps, the rest finishes behind it
+# ---------------------------------------------------------------------------
+#
+# Claude Code holds the first prompt until SessionStart returns, so the start-up run does config,
+# hardlinks and the env overrides, and a detached `--finish --background` does the installs and the
+# seed. These tests turn the hand-off back on; everything above runs with it off.
+
+BG=$TMP/bg
+make_rt_repo "$BG" ',
+    "seed": ".claude/worktree-seed.sh"'
+python3 - "$BG/.claude/worktree-profile.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"] = [
+  {"dir": "vendor", "lock": "composer.lock", "strategy": "hardlink",
+   "install": "mkdir -p vendor && rm -f vendor/autoload.php && printf installed > vendor/autoload.php"},
+  {"dir": "node_modules", "lock": "composer.lock", "strategy": "install",
+   "install": "sleep 3 && mkdir -p node_modules && printf ok > node_modules/m"},
+]
+json.dump(d, open(p, "w"), indent=2)
+EOF
+printf 'node_modules/\nseeded.txt\n' >> "$BG/.gitignore"
+# shellcheck disable=SC2016  # $WT_PATH and $DATABASE_NAME must reach the seed script, not be expanded here.
+printf '#!/usr/bin/env bash\nsleep 1\nprintf "%%s\\n" "$WT_SLUG" > "$WT_PATH/seeded.txt"\n' > "$BG/.claude/worktree-seed.sh"
+chmod +x "$BG/.claude/worktree-seed.sh"
+git -C "$BG" add -A; git -C "$BG" commit -qm bg
+mkdir -p "$BG/vendor"; printf 'MAIN\n' > "$BG/vendor/autoload.php"
+WBG=$BG/.claude/worktrees/bg
+git -C "$BG" worktree add -q "$WBG" -b worktree-bg 2>/dev/null
+GDBG=$(git -C "$WBG" rev-parse --absolute-git-dir)
+
+t0=$(date +%s)
+outB=$(PITLANE_BACKGROUND=on start_hook "$WBG"); rcB=$?; errB=$(cat "$TMP/err")
+t1=$(date +%s)
+eq 'background: the session starts' 0 "$rcB"
+eq 'background: the hook returns before the slow install could have finished' yes \
+  "$([ $((t1 - t0)) -lt 3 ] && echo yes || echo no)"
+eq 'background: the hardlink is done before the session starts' MAIN "$(cat "$WBG/vendor/autoload.php" 2>/dev/null)"
+ne 'background: so is the port' '' "$(envval "$WBG" SERVER_PORT)"
+eq 'background: the install is not done in the hook' no "$([ -e "$WBG/node_modules/m" ] && echo yes || echo no)"
+eq 'background: nor is the seed' no "$([ -e "$WBG/seeded.txt" ] && echo yes || echo no)"
+contains 'background: the session is told it is in progress' 'still being set up in the background — in progress: node_modules, databases' "$outB"
+contains '...and what to run before work that needs it' '/pitlane-finish' "$outB"
+lacks '...and is not told it is broken' 'not fully set up yet' "$outB"
+contains 'background: stderr names the log' 'worktree-bootstrap.log' "$errB"
+pidB=$(tr -cd '0-9' < "$GDBG/worktree-bootstrap.pid" 2>/dev/null)
+eq 'background: its pid is recorded and alive' yes "$([ -n "$pidB" ] && kill -0 "$pidB" 2>/dev/null && echo yes || echo no)"
+
+# A second session while it runs starts no second run.
+PITLANE_BACKGROUND=on start_hook "$WBG" >/dev/null
+eq 'background: a second session does not start a second run' "$pidB" \
+  "$(tr -cd '0-9' < "$GDBG/worktree-bootstrap.pid" 2>/dev/null)"
+
+# Teardown keeps out while it works: it holds the worktree's bootstrap lock.
+eq 'background: it holds the worktree lock, which teardown honours' held \
+  "$(flock -n "$GDBG/worktree-bootstrap-state.lock" true 2>/dev/null && echo free || echo held)"
+
+# /pitlane-finish waits for it rather than racing it, and reports the finished worktree.
+outF=$( cd "$WBG" && bash "$HOOK" --finish 2>"$TMP/err" ); errF=$(cat "$TMP/err")
+contains 'finish: waits for the background run' 'still running — waiting for it' "$errF"
+eq 'finish: then reports a complete worktree' 'Pitlane: this worktree is fully set up.' "$outF"
+eq 'background: the install ran' ok "$(cat "$WBG/node_modules/m" 2>/dev/null)"
+eq 'background: the seed ran' bg "$(cat "$WBG/seeded.txt" 2>/dev/null)"
+eq 'background: the pid record is cleared when it ends' no "$([ -e "$GDBG/worktree-bootstrap.pid" ] && echo yes || echo no)"
+contains 'background: its log has the progress' 'node_modules: installed' "$(cat "$GDBG/worktree-bootstrap.log" 2>/dev/null)"
+lacks 'background: nothing lands in the checkout' 'worktree-bootstrap' "$(git -C "$WBG" status --porcelain)"
+
+outB=$(PITLANE_BACKGROUND=on start_hook "$WBG")
+eq 'background: a complete worktree starts silent' '' "$outB"
+eq '...and starts no run' no "$([ -e "$GDBG/worktree-bootstrap.pid" ] && echo yes || echo no)"
+
+# A session starting mid-run asks the running one to go round again: it may need work the run has
+# already walked past. And a recycled pid that is some other bootstrap does not count as the run.
+rm -rf "$WBG/node_modules"
+PITLANE_BACKGROUND=on start_hook "$WBG" >/dev/null
+PITLANE_BACKGROUND=on start_hook "$WBG" >/dev/null
+( cd "$WBG" && bash "$HOOK" --finish >/dev/null 2>&1 )
+contains 'background: a session mid-run makes it go round again' 'going round once more' \
+  "$(cat "$GDBG/worktree-bootstrap.log" 2>/dev/null)"
+eq '...and the request is consumed' no "$([ -e "$GDBG/worktree-bootstrap.again" ] && echo yes || echo no)"
+bash -c 'exec -a "bash bootstrap.sh" sleep 5' & decoy=$!
+printf '%s\n' "$decoy" > "$GDBG/worktree-bootstrap.pid"
+( cd "$WBG" && bash "$HOOK" --finish >/dev/null 2>"$TMP/err" ); errD=$(cat "$TMP/err")
+lacks 'background: a pid that is not a background run is not waited on' 'waiting for it' "$errD"
+kill "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null; rm -f "$GDBG/worktree-bootstrap.pid"
+
+# The --finish payload must not need python3: a jq-only host would otherwise get an empty payload,
+# and the background run would do nothing at all.
+if command -v jq >/dev/null 2>&1; then
+  mkdir -p "$TMP/nopy"; printf '#!/bin/sh\nexit 127\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
+  outJ=$( cd "$WBG" && PATH=$TMP/nopy:$PATH bash "$HOOK" --finish 2>"$TMP/err" )
+  eq 'finish: works with jq and no python3' 'Pitlane: this worktree is fully set up.' "$outJ"
+fi
+
+# A hardlink that must fall back to an install is just as slow, so it is deferred too.
+printf 'CHANGED\n' > "$WBG/composer.lock"
+outB=$(PITLANE_BACKGROUND=on start_hook "$WBG"); errB=$(cat "$TMP/err")
+contains 'background: a hardlink falling back to an install is deferred' 'vendor: to be installed in the background' "$errB"
+contains '...and named in the notice' 'in progress: vendor' "$outB"
+( cd "$WBG" && bash "$HOOK" --finish >/dev/null 2>&1 )
+eq '...and installed by the background run' installed "$(cat "$WBG/vendor/autoload.php" 2>/dev/null)"
+eq "...leaving the main checkout's copy alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
+git -C "$WBG" checkout -q composer.lock
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

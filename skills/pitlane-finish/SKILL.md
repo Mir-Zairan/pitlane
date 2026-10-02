@@ -1,13 +1,14 @@
 ---
 name: pitlane-finish
-description: Finish setting up this worktree when Pitlane's start-up setup ran out of time — install the dependencies it skipped, run the database seed, and report what is ready. Use when a session was told its worktree "is not fully set up yet", when dependencies or the worktree's databases are missing, or when the user asks to finish or repair a worktree's setup.
+description: Wait for, or finish, this worktree's setup — Pitlane installs dependencies and seeds the databases in the background after the session starts, and this waits for that, completes anything left over, and reports what is ready. Use before running tests, builds, the app or database queries when a session was told its worktree "is still being set up in the background" or "is not fully set up yet", when dependencies or the worktree's databases are missing, or when the user asks to finish or repair a worktree's setup.
 ---
 
 # Pitlane — finish this worktree's setup
 
-When a session starts in a worktree, Pitlane sets it up inside a time limit. A slow first step — a
-toolchain or image download, a large install — can use that time up, and the rest is left for later.
-This command does the rest now, with no time limit.
+When a session starts in a worktree, Pitlane does the quick steps before the first prompt and hands the
+slow ones — installs and the database seed — to a run in the background. A step can also be held back
+(not enough memory, a toolchain that failed to start). This command waits for a background run that is
+still going, then does whatever is left, with no time limit.
 
 ## Run it
 
@@ -17,8 +18,9 @@ From the worktree's root:
 bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --finish
 ```
 
-Run it **in the background** (`run_in_background: true`) and wait for it to finish: it may download a
-toolchain or clone databases, which can take many minutes, longer than a foreground command may run.
+Run it **in the background** (`run_in_background: true`) and wait for it to finish: it may wait for the
+background setup, download a toolchain or clone databases, which can take many minutes, longer than a
+foreground command may run. Work that needs none of the missing pieces can go on meanwhile.
 
 It prints progress on stderr and one status line on stdout as its last word:
 

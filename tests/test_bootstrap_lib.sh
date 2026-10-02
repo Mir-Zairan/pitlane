@@ -431,6 +431,10 @@ WT_GUARD_SCOPE=''
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+# These suites assert what a start-up run DID, so it does all of it in the hook; the background
+# hand-off has its own tests, which turn it back on.
+PITLANE_BACKGROUND=off
+export PITLANE_BACKGROUND
 unset XDG_CONFIG_HOME
 
 REPO=$TMP/cfgrepo
