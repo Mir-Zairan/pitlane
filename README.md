@@ -16,7 +16,7 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Settings** | Copies `.env` and other ignored config into each copy |
 | **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk |
 | **Database & port** | Each copy gets its own, so sessions never clash |
-| **Pull requests** | `claude -w "#1234"` opens a PR in its own copy |
+| **Pull requests** | `claude -w "#1234"` opens a PR in its own copy. You approve its setup before anything runs, and again after each new push |
 | **Approved commands only** | Nothing a branch's setup would run is run until you approve it, so a PR can't run code on your machine just by being opened |
 | **Reopening** | A copy that's already set up opens in seconds |
 | **No waiting** | Installs and the database finish in the background, so your first prompt starts at once |
