@@ -31,6 +31,10 @@ trap 'chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+# The approval gate has its own section in test_bootstrap.sh; everywhere else the fixture profiles
+# are the suite's own, so they are trusted the way a developer who opens only their own branches would.
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
 unset XDG_CONFIG_HOME
 HOME=$SCRATCH/home
 mkdir -p "$HOME"

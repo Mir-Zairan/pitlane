@@ -23,6 +23,10 @@ TMP=$(cd -P "$TMP" && pwd -P)
 trap 'rm -rf "$TMP"' EXIT
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# The approval gate has its own section in test_bootstrap.sh; everywhere else the fixture profiles
+# are the suite's own, so they are trusted the way a developer who opens only their own branches would.
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
 export HOME=$TMP/home
 mkdir -p "$HOME"
 

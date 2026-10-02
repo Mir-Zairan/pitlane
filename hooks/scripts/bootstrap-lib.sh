@@ -73,10 +73,281 @@ wt_name_from_path() {  # $1 = worktree path
 # The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
 # a worktree gets bootstrapped from whatever main happens to have, while bootstrap reads its
 # *lockfiles* from the worktree, and the two disagree.
+#
+# WHICH copy is loaded is NOT what makes its commands safe to run — the branch wrote it, and the
+# branch may be a stranger's pull request. That is the approval gate's job, below: whatever this
+# loads, nothing it names is executed until the developer has approved that exact content.
 wt_load_profile_for() {  # $1 = worktree, $2 = main checkout
   local which=$1
   [ -f "$1/.claude/worktree-profile.json" ] || which=$2
   wt_load_profile "$which"
+  # Not decided yet: wt_approval_check decides once the files it fingerprints are in place.
+  WT_APPROVAL=''
+  WT_APPROVAL_FP=''
+}
+
+# ---------------------------------------------------------------------------
+# Approval: nothing the profile names runs until the developer approves that content
+# ---------------------------------------------------------------------------
+#
+# THE THREAT. A worktree's profile and its seed and teardown scripts come from the branch checked
+# out in it, and a hook runs them unprompted. For `claude -w "#1234"` that branch is a pull request:
+# anyone who can open one would otherwise choose a command that runs as the reviewer, before the
+# reviewer has read a line of the diff. Preferring the main checkout's profile does not close it —
+# the scripts the profile names are still the branch's files.
+#
+# THE RULE, the one `direnv allow` uses: the profile's commands run only when its CONTENT — the
+# profile itself plus the seed and teardown scripts it names, as they are in the directory they
+# would run in — matches a fingerprint the developer approved. Any edit to any of them, by anyone,
+# needs approving again. Approval is by content, not by path or branch, so approving a profile once
+# covers every worktree that carries the same bytes, and a branch that changes nothing executable
+# never asks.
+#
+# THE RECORD lives in the repository's shared git directory, which no branch can write: a commit
+# carries files, never `.git/`. One SHA-256 per line. `cksum` will not do here, as it does for drift:
+# CRC is not collision-resistant, and the whole point is that a stranger cannot forge a match.
+#
+# WHAT THIS DOES NOT COVER, stated so nobody reads more into it: an approved install command still
+# runs whatever the branch's own manifests tell the package manager to (composer and npm lifecycle
+# scripts), and an approved `shell` still evaluates the branch's toolchain definition (a flake's
+# shellHook, a compose file). Installing a branch's dependencies is running its code; the gate only
+# guarantees that the commands Pitlane itself starts are ones the developer saw. That is why a
+# pull-request worktree's approval also covers its commit (wt_is_pr_worktree): the developer approves
+# a stranger's push knowingly, rather than inheriting the approval of their own profile. A PR reached
+# some other way — a same-repository branch a colleague pushed, checked out under any other name — is
+# treated as the developer's own branch.
+#
+# PITLANE_TRUST_PROFILES=1 turns the gate off, for a developer who only ever opens their own
+# branches. It is read from the environment, which no branch controls.
+
+WT_APPROVALS_FILENAME=pitlane-approved
+WT_APPROVAL_FORMAT='pitlane-approval 1'
+# yes | no | '' (not decided). Only `no` stops anything: callers that never load a profile
+# (the unit tests, the calibrate helpers) are not gated, and every hook path decides before it runs.
+WT_APPROVAL=''
+WT_APPROVAL_FP=''
+# The status wt_run_in_shell returns when the gate stops a command. 126 is the shell's own "found
+# but cannot execute", which every caller already treats as a failure that is not a timeout.
+WT_UNAPPROVED=126
+
+# SHA-256, as 64 lowercase hex characters, of the file $1 — or of stdin with no argument. Whichever
+# tool the host has: coreutils, the BSD/macOS `shasum`, openssl, or python3. None is POSIX, so each is
+# tried in turn until one gives a well-formed digest; a tool that is present but broken (a shim, a
+# perl without Digest::SHA) falls through to the next rather than failing the gate closed. stdin is
+# spooled to a temporary file first, since only a file can be read once per attempt. Fails, printing
+# nothing, when none works.
+wt_sha256() {  # $1 = file (default: stdin)
+  local file=${1-} tmp='' out='' tool
+  if [ -z "$file" ]; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/pitlane-sha.XXXXXX" 2>/dev/null) || return 1
+    cat >"$tmp" || { rm -f "$tmp"; return 1; }
+    file=$tmp
+  fi
+  for tool in sha256sum shasum openssl python3; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    case $tool in
+      sha256sum) out=$(sha256sum <"$file" 2>/dev/null) || out='' ;;
+      shasum) out=$(shasum -a 256 <"$file" 2>/dev/null) || out='' ;;
+      openssl) out=$(openssl dgst -sha256 -r <"$file" 2>/dev/null) || out='' ;;
+      python3) out=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())' <"$file" 2>/dev/null) || out='' ;;
+    esac
+    out=${out%%[!0-9a-fA-F]*}
+    [ "${#out}" -eq 64 ] && break
+    out=''
+  done
+  [ -n "$tmp" ] && rm -f "$tmp"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | tr 'A-F' 'a-f'
+}
+
+# $1 with every byte outside printable ASCII shown as `?`. For text a branch wrote that is about to
+# be shown to a human or a model: a carriage return or an escape sequence in an install command could
+# make the review screen show one command while another runs, and a newline could forge a line of
+# the record. NOT just [:cntrl:]: that misses the Unicode bidi overrides and zero-width characters a
+# UTF-8 terminal renders (the Trojan Source reordering), and C1 controls some terminals act on.
+wt_visible() {  # $1 = text
+  printf '%s' "${1-}" | LC_ALL=C tr -c ' -~' '?'
+}
+
+# True when $1 is a pull-request worktree: named `pr-<digits>`, the kind `claude -w "#1234"` makes, or
+# on a branch whose upstream is a pull-request ref — what `gh pr checkout` records for a fork's PR, in
+# the shared git config no branch can write. For those, the approval is bound to the commit as well as
+# the content. An approved install runs
+# the branch's own manifests (package lifecycle scripts) and an approved `shell` evaluates its
+# toolchain files, so a stranger's PR that leaves the profile alone would otherwise inherit the
+# approval the developer gave their own profile, and run its code anyway.
+wt_is_pr_worktree() {  # $1 = run directory
+  local name digits
+  local branch merge
+  case "${1%/}/" in
+    *"$WT_SUBPATH"*) ;;
+    *) return 1 ;;
+  esac
+  name=$(wt_name_from_path "${1%/}")
+  case $name in
+    pr-*)
+      digits=${name#pr-}
+      case $digits in
+        '' | *[!0-9]*) ;;
+        *) return 0 ;;
+      esac
+      ;;
+  esac
+  branch=$(wt_git "$1" symbolic-ref -q --short HEAD 2>/dev/null) || return 1
+  [ -n "$branch" ] || return 1
+  merge=$(wt_git "$1" config --get "branch.$branch.merge" 2>/dev/null) || return 1
+  case $merge in
+    refs/pull/*) return 0 ;;
+  esac
+  return 1
+}
+
+# One line of the fingerprint's manifest for a script the profile names, as it is in $1.
+wt_approval_script_line() {  # $1 = run directory, $2 = label, $3 = relative path or empty
+  local dir=${1%/} label=$2 rel=${3-} sum
+  if [ -z "$rel" ]; then
+    printf '%s -\n' "$label"
+  elif [ -f "$dir/$rel" ] && [ -r "$dir/$rel" ]; then
+    sum=$(wt_sha256 "$dir/$rel") || return 1
+    printf '%s %s %s\n' "$label" "$rel" "$sum"
+  else
+    printf '%s %s absent\n' "$label" "$rel"
+  fi
+}
+
+# The fingerprint of everything executable the loaded profile names, as it would run in $1.
+# The profile counts by content alone — the main checkout's copy and a worktree's identical one are
+# one approval — and each script by its path and content. A script that is not there yet is
+# recorded as absent, so the approval does not silently extend to whatever arrives later. A
+# pull-request worktree's fingerprint also carries its commit (wt_is_pr_worktree says why), so each
+# push to the PR is approved on its own.
+wt_approval_fingerprint() {  # $1 = run directory
+  local dir=${1%/} manifest psum head
+  psum=$(wt_sha256 "$PROFILE_PATH") || return 1
+  manifest="$WT_APPROVAL_FORMAT${WT_NL}profile $psum$WT_NL"
+  manifest=$manifest$(wt_approval_script_line "$dir" seed "${PROFILE_RT_SEED:-}") || return 1
+  manifest=$manifest$WT_NL$(wt_approval_script_line "$dir" teardown "${PROFILE_RT_TEARDOWN:-}") || return 1
+  if wt_is_pr_worktree "$dir"; then
+    head=$(wt_git "$dir" rev-parse --verify --quiet HEAD 2>/dev/null) || return 1
+    [ -n "$head" ] || return 1
+    manifest="$manifest${WT_NL}commit $head"
+  fi
+  printf '%s\n' "$manifest" | wt_sha256
+}
+
+# True when what WT_APPROVAL_FP approved is still what is on disk in $1. For the scripts, which are
+# read from disk when they run: a background run fingerprints before its installs and seeds minutes
+# later, and a `git pull` in the live session meanwhile must not run an unapproved script on a stale
+# answer. Nothing to compare (the gate is off, or the profile runs nothing) is still approved.
+wt_approval_still() {  # $1 = run directory
+  local now
+  [ "${WT_APPROVAL:-}" = no ] && return 1
+  [ -n "${WT_APPROVAL_FP:-}" ] || return 0
+  now=$(wt_approval_fingerprint "$1") || return 1
+  [ "$now" = "$WT_APPROVAL_FP" ]
+}
+
+# True when the loaded profile names anything that would be executed: an install or verify
+# command, a seed or a teardown script. `shell` alone runs nothing — it only wraps those. A profile
+# that runs nothing (config copies, hardlinks, ports, env overrides) needs no approval.
+wt_profile_runs_commands() {
+  local rec body dir lock strategy install verify _cksum
+  [ "${PROFILE_PRESENT:-0}" = 1 ] || return 1
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && { [ -n "${PROFILE_RT_SEED:-}" ] || [ -n "${PROFILE_RT_TEARDOWN:-}" ]; }; then
+    return 0
+  fi
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    [ "$strategy" = skip ] && continue
+    { [ -n "$install" ] || [ -n "$verify" ]; } && return 0
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+  return 1
+}
+
+# Where the approved fingerprints are kept: the shared git directory, as seen from $1.
+wt_approvals_path() {  # $1 = any directory inside the repository
+  local common
+  common=$(wt_git_common_dir "${1:-$PWD}") || return 1
+  printf '%s/%s' "$common" "$WT_APPROVALS_FILENAME"
+}
+
+# True when the record $2 lists fingerprint $1. The first field of a line is the fingerprint; the
+# rest (when, and which profile) is for a human reading the file.
+wt_approval_known() {  # $1 = fingerprint, $2 = record file
+  [ -n "${1-}" ] && [ -f "${2-}" ] || return 1
+  awk -v f="$1" '$1 == f { found = 1 } END { exit !found }' "$2" 2>/dev/null
+}
+
+# Decide whether the loaded profile's commands may run in $1, into WT_APPROVAL (yes/no) and
+# WT_APPROVAL_FP. Called once the files it fingerprints are in place — after the config copy, which
+# is what brings a personal profile's scripts into a worktree. Says why on stderr when the answer is
+# no; never fails.
+wt_approval_check() {  # $1 = directory the profile's commands run in
+  local dir=${1%/} store
+  WT_APPROVAL=yes
+  WT_APPROVAL_FP=''
+  wt_profile_runs_commands || return 0
+  case ${PITLANE_TRUST_PROFILES:-} in
+    1 | yes | on | true) return 0 ;;
+  esac
+  if ! WT_APPROVAL_FP=$(wt_approval_fingerprint "$dir"); then
+    WT_APPROVAL=no
+    WT_APPROVAL_FP=''
+    wt_log "approval: cannot fingerprint $PROFILE_PATH (no sha256sum, shasum, openssl or python3 worked) — none of its commands will run"
+    return 0
+  fi
+  if store=$(wt_approvals_path "$dir") && wt_approval_known "$WT_APPROVAL_FP" "$store"; then
+    return 0
+  fi
+  WT_APPROVAL=no
+  wt_log "approval: the commands in $PROFILE_PATH (and the seed and teardown scripts it names) are not approved in this form — none of them will run. To see what they are, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
+  return 0
+}
+
+# Record $1 as approved for the repository $2 is in. Idempotent.
+wt_approval_record() {  # $1 = fingerprint, $2 = any directory inside the repository
+  local fp=${1-} store when
+  case $fp in
+    *[!0-9a-f]* | '') return 1 ;;
+  esac
+  [ "${#fp}" -eq 64 ] || return 1
+  store=$(wt_approvals_path "${2:-$PWD}") || return 1
+  wt_approval_known "$fp" "$store" && return 0
+  when=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || when=''
+  printf '%s %s %s\n' "$fp" "$when" "$(wt_visible "$PROFILE_PATH")" >>"$store" 2>/dev/null
+}
+
+# What the loaded profile would run in $1, for a human to read before approving it. stdout: this is
+# printed by `bootstrap.sh --review`, run by hand or by /pitlane-finish, never by a hook.
+wt_approval_describe() {  # $1 = run directory
+  local dir=${1%/} rec body ddir lock strategy install verify _cksum
+  printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
+  printf 'Everything below is text from the branch, shown with control characters as ?:\n'
+  [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r ddir lock strategy install verify _cksum <<<"$body" || true
+    [ "$strategy" = skip ] && continue
+    [ -n "$install" ] && printf '  %s (%s): install: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$install")"
+    [ -n "$verify" ] && printf '  %s (%s): verify: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$verify")"
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ]; then
+    [ -n "${PROFILE_RT_SEED:-}" ] && printf '  seed script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_SEED")"
+    [ -n "${PROFILE_RT_TEARDOWN:-}" ] && printf '  teardown script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_TEARDOWN")"
+  fi
+  if wt_is_pr_worktree "$dir"; then
+    printf 'This is a pull-request worktree: approving covers this commit only. An approved install runs the PR'"'"'s own package scripts and toolchain files too, so read the diff of those (package.json, composer.json, flake.nix, …) before approving.\n'
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -283,6 +554,12 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0
 
   [ -n "$cmd" ] || return 0
+  # THE BACKSTOP. Every caller that runs a profile's command checks the approval first and records
+  # what it skipped; this catches the one that someday forgets.
+  if [ "${WT_APPROVAL:-}" = no ]; then
+    wt_log "not running \"$cmd\": the profile's commands are not approved"
+    return "$WT_UNAPPROVED"
+  fi
   if [ ! -d "$dir" ]; then
     wt_log "cannot run in $dir: no such directory"
     return 1
@@ -1402,8 +1679,8 @@ wt_value_has_shell_syntax() {  # $1 = value
 # position must quote it itself." An install command is exactly that position. {slug} and {port}
 # are safe by construction ([a-z0-9_] and digits); {name}, {worktree} and {root} are raw text, and
 # {name} in particular comes from a DIFFERENT AND LESS TRUSTED PARTY than the profile does — the
-# profile is committed and reviewed, while a worktree name can be chosen by whoever opens a PR or
-# by a mid-session EnterWorktree call. A profile line as ordinary as `pnpm install --filter {name}`
+# profile's commands run only once the developer has approved them (wt_approval_check), while a
+# worktree name can be chosen by whoever opens a PR or by a mid-session EnterWorktree call. A profile line as ordinary as `pnpm install --filter {name}`
 # plus a branch called `q; rm -rf ~` would otherwise run the second command at session start.
 #
 # Refusing is chosen over auto-quoting because quoting cannot be done safely without knowing the
@@ -1667,6 +1944,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       continue
     fi
 
+    # Not approved: an install is left undone, before any lock is taken or anything cleared. Not
+    # recorded either — the state still says "not done", which is what the session is told.
+    if [ "${WT_APPROVAL:-}" = no ] && [ "$strategy" = install ]; then
+      wt_log "  $dir: not installed — the profile's commands are not approved"
+      continue
+    fi
+
     # Deferred: an install is the slow part, and the background run that follows does it.
     if [ "${WT_DEFER:-0}" = 1 ] && [ "$strategy" = install ]; then
       wt_log "  $dir: to be installed in the background"
@@ -1753,6 +2037,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     fi
 
     rc=0
+    # A hardlink that fell back to an install runs the install command like any other.
+    if [ "$effective" = install ] && [ "${WT_APPROVAL:-}" = no ]; then
+      wt_log "  $dir: not installed — the profile's commands are not approved"
+      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
     if [ "$effective" = install ]; then
       if [ -z "$install" ]; then
         wt_log "  $dir: no install command to run — leaving it empty"
@@ -1804,7 +2095,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # times on its first bootstrap, for nine `test -r` calls. The time bound is unchanged.
     if [ "$rc" -eq 0 ] && [ -n "$verify" ]; then
       left=$(wt_budget_left "$deadline")
-      if [ "$left" -le 0 ]; then
+      if [ "${WT_APPROVAL:-}" = no ]; then
+        wt_log "  $dir: its verify command is not approved, so it was not run — recording it as needing another look"
+        rc=1
+      elif [ "$left" -le 0 ]; then
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
         rc=1
       else
@@ -1860,7 +2154,7 @@ wt_bootstrap_pending() {  # $1 = worktree
 # stdout, which becomes the model's context. SILENT when everything is done: the bootstrap's normal
 # output stays out of the context, and only an incomplete worktree, which a session would otherwise
 # mistake for a ready one and "fix" by hand, earns a word.
-wt_bootstrap_notice() {  # $1 = pending items, one per line, $2 = "background" when a run is finishing them
+wt_bootstrap_notice() {  # $1 = pending items, one per line, $2 = "background" when a run is finishing them, "approval" when they wait on one
   local items=${1-} mode=${2-} list n=0 shown='' item
   [ -n "$items" ] || return 0
   while IFS= read -r item; do
@@ -1868,8 +2162,14 @@ wt_bootstrap_notice() {  # $1 = pending items, one per line, $2 = "background" w
     n=$((n + 1))
     [ "$n" -le 4 ] && shown=${shown:+$shown, }$item
   done <<<"$items"
-  list=$shown
+  list=$(wt_visible "$shown")
   [ "$n" -gt 4 ] && list="$list and $((n - 4)) more"
+  # Written for a model that may be reading a stranger's branch: it must neither approve on its own
+  # nor do the held-back steps by hand, which would run exactly what the gate held back.
+  if [ "$mode" = approval ]; then
+    printf 'Pitlane: this worktree'"'"'s setup commands were NOT run — still missing: %s. Its profile, or a seed or teardown script it names, is not approved in its current form, and this branch may not be the developer'"'"'s own. Do not approve it, run those commands, or install dependencies or create databases by hand. Tell the user; if they want it set up, run /pitlane-finish, which shows what it would run and needs their explicit approval.\n' "$list"
+    return 0
+  fi
   if [ "$mode" = background ]; then
     printf 'Pitlane: this worktree is still being set up in the background — in progress: %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$list"
     return 0
@@ -3294,7 +3594,13 @@ EOF
   # --- the seed ----------------------------------------------------------------------------------
   # Deferred like the installs: the env overrides above are cheap and are already written, so the
   # session knows its databases' names; making them is the background run's job.
-  if [ -n "${PROFILE_RT_SEED:-}" ] && [ "${WT_DEFER:-0}" != 1 ]; then
+  # Not approved: nothing recorded, so the seed stays "not done" and runs once it is approved.
+  if [ -n "${PROFILE_RT_SEED:-}" ] && [ "${WT_APPROVAL:-}" = no ]; then
+    wt_log "runtime: the seed ${PROFILE_RT_SEED} is not approved — not run"
+  elif [ -n "${PROFILE_RT_SEED:-}" ] && [ "${WT_DEFER:-0}" != 1 ] && ! wt_approval_still "$worktree"; then
+    WT_APPROVAL=no
+    wt_log "runtime: the profile or a script it names changed since it was approved — the seed is not run"
+  elif [ -n "${PROFILE_RT_SEED:-}" ] && [ "${WT_DEFER:-0}" != 1 ]; then
     wt_runtime_seed "$root" "$worktree" "$slug" "$port" "$envfiles" "$envstate" \
       "${PROFILE_RT_SEED}" "$deadline"
   fi

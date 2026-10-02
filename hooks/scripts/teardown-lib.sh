@@ -837,8 +837,9 @@ wt_read_allocation() {  # $1 = state file or empty, $2 = main checkout, $3 = led
 # since the seed ran would otherwise send the script after a database it never made.
 #
 # THE SCRIPT IS THE COMMITTED ONE. When the worktree is present the guard has just shown it clean,
-# so the file under it is what its branch committed — the same trust the seed ran under.
-# Once it is gone, $1 is the main checkout. A path that leaves $1 through a symlink is refused.
+# so the file under it is what its branch committed. Once it is gone, $1 is the main checkout. A
+# path that leaves $1 through a symlink is refused. Either way it runs only when that content is
+# approved (wt_approval_check): what a branch committed is not, by itself, something to run.
 wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 = main checkout, $4 = deadline (epoch seconds) or empty
   local rundir=${1-} wt=${2-} root=${3-} deadline=${4-} rel=${PROFILE_RT_TEARDOWN:-} esc secs left rc
 
@@ -871,6 +872,13 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
   fi
 
   WT_TD_STATUS=skipped
+  # Approved in the form it would run in HERE: the worktree's copy while it is present, the main
+  # checkout's once it is gone. Skipped keeps the ledger entry, so /pitlane-tidy can release it later.
+  wt_approval_check "$rundir"
+  if [ "$WT_APPROVAL" = no ]; then
+    wt_log "runtime: the teardown script $rel is not approved in $rundir — not run; /pitlane-tidy can release slug=$WT_TD_SLUG once it is"
+    return 0
+  fi
   if ! wt_is_safe_relpath "$rel" || wt_has_symlinked_parent "$rundir" "$rel" || [ -L "$rundir/$rel" ]; then
     wt_log "runtime: refusing to run the teardown script $rel — not a plain file inside $rundir"
     return 0
@@ -888,6 +896,12 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
   # `timeout 0` means no limit at all, so no time left is a skip, not a zero bound.
   if [ "$secs" -le 0 ]; then
     wt_log "runtime: no time left under the hook timeout to run the teardown script $rel — not run"
+    return 0
+  fi
+
+  # Once more, immediately before: the script is read from disk when it runs.
+  if ! wt_approval_still "$rundir"; then
+    wt_log "runtime: the teardown script $rel changed since it was approved — not run"
     return 0
   fi
 

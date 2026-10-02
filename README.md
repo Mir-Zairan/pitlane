@@ -16,7 +16,8 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Settings** | Copies `.env` and other ignored config into each copy |
 | **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk |
 | **Database & port** | Each copy gets its own, so sessions never clash |
-| **Pull requests** | `claude -w "#1234"` opens a PR, set up like any other copy |
+| **Pull requests** | `claude -w "#1234"` opens a PR in its own copy |
+| **Approved commands only** | Nothing a branch's setup would run is run until you approve it, so a PR can't run code on your machine just by being opened |
 | **Reopening** | A copy that's already set up opens in seconds |
 | **No waiting** | Installs and the database finish in the background, so your first prompt starts at once |
 | **Light on your machine** | Setup runs at low priority under a memory cap, so it can't freeze your desktop |
@@ -39,8 +40,10 @@ Your app's server is not started for you: each copy is ready, and you run it whe
    /pitlane-setup
    ```
 
-   Claude looks at your project, asks you a few questions, and saves the answers. You only do this once
-   per project.
+   Claude looks at your project, asks you a few questions, saves the answers, and shows you the
+   commands setup will run so you can approve them. You only do this once per project. If those
+   commands later change, in your branch or someone else's, Pitlane holds them back until you approve
+   the new version with `/pitlane-finish`.
 
 3. **Work as usual.** Start a session in its own copy with `claude -w my-task` and type your first
    prompt straight away. Settings, linked packages and the port are done before it; installs and the
@@ -49,7 +52,8 @@ Your app's server is not started for you: each copy is ready, and you run it whe
 
 4. **Only if you need it.** You never have to finish a setup by hand. Type `/pitlane-finish` only to
    wait for the background setup yourself, say before starting the server in the first few minutes, or
-   when the session says setup was held back (not enough memory, a toolchain that failed to start):
+   when the session says setup was held back (not enough memory, a toolchain that failed to start,
+   commands waiting for your approval):
 
    ```
    /pitlane-finish

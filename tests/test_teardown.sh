@@ -39,6 +39,10 @@ export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 # hand-off has its own tests, which turn it back on.
 PITLANE_BACKGROUND=off
 export PITLANE_BACKGROUND
+# The approval gate has its own section in test_bootstrap.sh; everywhere else the fixture profiles
+# are the suite's own, so they are trusted the way a developer who opens only their own branches would.
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
 unset XDG_CONFIG_HOME
 HOME=$SCRATCH/home
 mkdir -p "$HOME"

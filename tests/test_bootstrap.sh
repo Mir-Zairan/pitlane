@@ -22,6 +22,10 @@ export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 # hand-off has its own tests, which turn it back on.
 PITLANE_BACKGROUND=off
 export PITLANE_BACKGROUND
+# The approval gate has its own section in test_bootstrap.sh; everywhere else the fixture profiles
+# are the suite's own, so they are trusted the way a developer who opens only their own branches would.
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
 unset XDG_CONFIG_HOME
 # A corepack-managed pnpm keeps ITSELF in $HOME/.cache/node/corepack. Moving HOME makes corepack
 # think pnpm is not installed and try to download it, which fails offline and read as "pnpm cannot
@@ -1334,6 +1338,271 @@ contains '...and named in the notice' 'in progress: vendor' "$outB"
 eq '...and installed by the background run' installed "$(cat "$WBG/vendor/autoload.php" 2>/dev/null)"
 eq "...leaving the main checkout's copy alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
 git -C "$WBG" checkout -q composer.lock
+
+# ---------------------------------------------------------------------------
+# The approval gate: nothing a profile names runs until that content is approved
+# ---------------------------------------------------------------------------
+#
+# The threat is `claude -w "#N"`: the worktree is a stranger's pull request, and its profile and the
+# scripts that profile names are the stranger's files. Everything above trusts its fixtures with
+# PITLANE_TRUST_PROFILES; here it is unset, as it is for a real developer.
+
+gated_hook() ( unset PITLANE_TRUST_PROFILES; start_hook "$1" )
+gated_cli() ( unset PITLANE_TRUST_PROFILES; cd "$1" && shift && bash "$HOOK" "$@" 2>"$TMP/err" )
+fp_of() { sed -n 's/^NOT approved (fingerprint \([0-9a-f]*\)).*/\1/p'; }
+
+AP=$TMP/ap
+make_rt_repo "$AP" ',
+    "seed": ".claude/worktree-seed.sh",
+    "teardown": ".claude/worktree-teardown.sh"'
+printf 'seeded.txt\n' >> "$AP/.gitignore"
+# shellcheck disable=SC2016  # $WT_PATH must reach the seed script, not be expanded here.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$WT_SLUG" > "$WT_PATH/seeded.txt"\n' > "$AP/.claude/worktree-seed.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$AP/.claude/worktree-teardown.sh"
+chmod +x "$AP/.claude/worktree-seed.sh" "$AP/.claude/worktree-teardown.sh"
+git -C "$AP" add -A; git -C "$AP" commit -qm scripts
+APBASE=$(git -C "$AP" rev-parse HEAD)
+
+# A worktree of the developer's own, nothing approved yet: nothing runs, and the session is told
+# why in words that do not invite it to work around the gate.
+WAP=$AP/.claude/worktrees/own
+git -C "$AP" worktree add -q "$WAP" -b worktree-own 2>/dev/null
+outA=$(gated_hook "$WAP"); errA=$(cat "$TMP/err")
+eq 'approval: an unapproved install does not run' no "$([ -e "$WAP/vendor/marker" ] && echo yes || echo no)"
+eq 'approval: nor does an unapproved seed' no "$([ -e "$WAP/seeded.txt" ] && echo yes || echo no)"
+ne 'approval: the steps that run nothing still happen (the port)' '' "$(envval "$WAP" SERVER_PORT)"
+contains 'approval: stderr says the commands are not approved' 'not approved in this form' "$errA"
+contains 'approval: the session is told nothing was run' 'setup commands were NOT run — still missing: vendor, databases' "$outA"
+contains '...and not to do it by hand or approve on its own' 'Do not approve it, run those commands' "$outA"
+contains '...and where approval happens' '/pitlane-finish' "$outA"
+
+# --finish holds back too, and says so.
+outF=$(gated_cli "$WAP" --finish)
+contains 'approval: /pitlane-finish does not run unapproved commands' 'not run — the profile' "$outF"
+eq '...the install is still not done' no "$([ -e "$WAP/vendor/marker" ] && echo yes || echo no)"
+
+# Review shows what would run, and an approval must name exactly what was reviewed.
+outR=$(gated_cli "$WAP" --review)
+contains 'review: shows the install command' 'vendor (install): install: mkdir -p vendor' "$outR"
+contains 'review: shows the seed script' "seed script: $WAP/.claude/worktree-seed.sh" "$outR"
+contains 'review: shows the teardown script' "teardown script: $WAP/.claude/worktree-teardown.sh" "$outR"
+FP=$(printf '%s\n' "$outR" | fp_of)
+eq 'review: prints a sha256 fingerprint' 64 "${#FP}"
+outW=$(gated_cli "$WAP" --approve 0000000000000000000000000000000000000000000000000000000000000000)
+contains 'approve: a fingerprint that is not the current one is refused' 'is not the current fingerprint' "$outW"
+outW=$(gated_cli "$WAP" --approve)
+contains 'approve: no fingerprint at all is refused' 'is not the current fingerprint' "$outW"
+APSTORE=$(git -C "$AP" rev-parse --git-common-dir)/pitlane-approved
+case $APSTORE in /*) ;; *) APSTORE=$AP/$APSTORE ;; esac
+eq '...and records nothing' no "$([ -s "$APSTORE" ] && echo yes || echo no)"
+outW=$(gated_cli "$WAP" --approve "$FP")
+contains 'approve: the reviewed fingerprint is approved' 'Pitlane: approved' "$outW"
+contains 'approve: recorded in the shared git directory' "$FP" "$(cat "$APSTORE" 2>/dev/null)"
+eq '...and nothing lands in the checkout' '' "$(git -C "$WAP" status --porcelain)"
+contains 'review: now reports it approved' 'Approved: this exact content is approved' "$(gated_cli "$WAP" --review)"
+
+outF=$(gated_cli "$WAP" --finish)
+eq 'approval: once approved, /pitlane-finish completes the worktree' 'Pitlane: this worktree is fully set up.' "$outF"
+eq '...the install ran' ok "$(cat "$WAP/vendor/marker" 2>/dev/null)"
+eq '...and the seed' own "$(cat "$WAP/seeded.txt" 2>/dev/null)"
+
+# Approval is by content: a second worktree with the same bytes needs nothing more.
+WAP2=$AP/.claude/worktrees/own2
+git -C "$AP" worktree add -q "$WAP2" -b worktree-own2 2>/dev/null
+outA=$(gated_hook "$WAP2")
+eq 'approval: another worktree with the same content runs at once, silently' '' "$outA"
+eq '...its install ran' ok "$(cat "$WAP2/vendor/marker" 2>/dev/null)"
+
+# The developer's own edit to the profile needs approving again, like any other change.
+python3 - "$WAP2/.claude/worktree-profile.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"][0]["install"] = "mkdir -p vendor && printf edited > vendor/marker"
+json.dump(d, open(p, "w"), indent=2)
+EOF
+outA=$(gated_hook "$WAP2")
+eq 'approval: an edited install command does not run until re-approved' ok "$(cat "$WAP2/vendor/marker" 2>/dev/null)"
+contains '...and the session is told' 'setup commands were NOT run' "$outA"
+git -C "$WAP2" checkout -q .claude/worktree-profile.json
+
+# THE PULL REQUEST, the way `claude -w "#1"` checks it out: detached at the PR's head. Three PRs,
+# each changing one executable thing and leaving everything else as approved.
+pr_worktree() {  # $1 = PR number; the fixture's edits are made by the caller in $AP on a branch
+  git -C "$AP" commit -qam "pr $1"
+  git -C "$AP" update-ref "refs/pull/$1/head" HEAD
+  git -C "$AP" checkout -q --detach "$APBASE"
+  git -C "$AP" worktree add -q --detach "$AP/.claude/worktrees/pr-$1" "refs/pull/$1/head" 2>/dev/null
+}
+git -C "$AP" checkout -q -b pr-src-1 "$APBASE"
+python3 - "$AP/.claude/worktree-profile.json" <<EOF
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"][0]["install"] = "touch $TMP/pwned-install; mkdir -p vendor"
+json.dump(d, open(p, "w"), indent=2)
+EOF
+pr_worktree 1
+git -C "$AP" checkout -q -b pr-src-2 "$APBASE"
+printf '#!/usr/bin/env bash\ntouch %s/pwned-seed\n' "$TMP" > "$AP/.claude/worktree-seed.sh"
+pr_worktree 2
+git -C "$AP" checkout -q -b pr-src-3 "$APBASE"
+printf '#!/usr/bin/env bash\ntouch %s/pwned-teardown\n' "$TMP" > "$AP/.claude/worktree-teardown.sh"
+pr_worktree 3
+
+outP=$(gated_hook "$AP/.claude/worktrees/pr-1")
+eq "approval: a PR's rewritten install command does not run" no "$([ -e "$TMP/pwned-install" ] && echo yes || echo no)"
+contains '...and the reviewer is told' 'setup commands were NOT run' "$outP"
+outP=$(gated_hook "$AP/.claude/worktrees/pr-2")
+eq "approval: a PR that rewrites only the seed script does not get it run" no "$([ -e "$TMP/pwned-seed" ] && echo yes || echo no)"
+eq '...nor, since the gate is all-or-nothing, the approved install' no \
+  "$([ -e "$AP/.claude/worktrees/pr-2/vendor/marker" ] && echo yes || echo no)"
+contains '...and the reviewer is told' 'setup commands were NOT run' "$outP"
+
+# The teardown script is gated where it runs: a PR worktree that was seeded under an approved
+# script and then changed only its teardown script does not get the new one run on removal.
+TEARDOWN_HOOK=$(dirname "$HOOK")/teardown.sh
+WP3=$AP/.claude/worktrees/pr-3
+git -C "$WP3" checkout -q "$APBASE" -- .claude/worktree-teardown.sh
+gated_cli "$WP3" --approve "$(gated_cli "$WP3" --review | fp_of)" >/dev/null
+gated_hook "$WP3" >/dev/null
+eq '...(setup: the reviewer approved this PR commit with the original scripts, and it was seeded)' pr_3 "$(cat "$WP3/seeded.txt" 2>/dev/null)"
+git -C "$WP3" checkout -q HEAD -- .claude/worktree-teardown.sh
+( unset PITLANE_TRUST_PROFILES; cd "$AP" \
+  && printf '%s' "{\"hook_event_name\":\"WorktreeRemove\",\"worktree_path\":\"$WP3\",\"cwd\":\"$AP\"}" \
+  | bash "$TEARDOWN_HOOK" >/dev/null 2>"$TMP/err" ); errT=$(cat "$TMP/err")
+eq "approval: a PR's rewritten teardown script does not run on removal" no "$([ -e "$TMP/pwned-teardown" ] && echo yes || echo no)"
+contains '...and teardown says why' 'is not approved in' "$errT"
+
+# WorktreeCreate holds back the same way, and its stdout stays the path alone.
+git -C "$AP" checkout -q --detach "$APBASE"
+git -C "$AP" branch -q worktree-pr-4 refs/pull/1/head
+outC=$( ( unset PITLANE_TRUST_PROFILES; cd "$AP" \
+  && printf '%s' "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"pr-4\",\"cwd\":\"$AP\"}" \
+  | bash "$HOOK" 2>"$TMP/err" ) )
+eq 'approval: WorktreeCreate prints the path and nothing else' "$AP/.claude/worktrees/pr-4" "$outC"
+eq "...and does not run the branch's install" no "$([ -e "$TMP/pwned-install" ] && echo yes || echo no)"
+
+# No background run is started for work that is waiting on an approval: it could do nothing.
+outP=$( ( unset PITLANE_TRUST_PROFILES; PITLANE_BACKGROUND=on start_hook "$AP/.claude/worktrees/pr-1" ) )
+GDP1=$(git -C "$AP/.claude/worktrees/pr-1" rev-parse --absolute-git-dir)
+eq 'approval: no background run is started while approval is pending' no \
+  "$([ -e "$GDP1/worktree-bootstrap.pid" ] && echo yes || echo no)"
+contains '...and the session is told why, not that setup is under way' 'setup commands were NOT run' "$outP"
+
+# A PR that changes NOTHING Pitlane fingerprints still does not inherit the developer's approval: an
+# approved install would run its package scripts and toolchain files. A PR worktree's approval is
+# bound to its commit, and each push needs its own.
+git -C "$AP" checkout -q -b pr-src-5 "$APBASE"
+printf 'pr five\n' > "$AP/README"; git -C "$AP" add README
+pr_worktree 5
+WP5=$AP/.claude/worktrees/pr-5
+outP=$(gated_hook "$WP5")
+eq "approval: a PR with the developer's approved content is still held back" no "$([ -e "$WP5/vendor/marker" ] && echo yes || echo no)"
+contains '...and the reviewer is told' 'setup commands were NOT run' "$outP"
+outR=$(gated_cli "$WP5" --review)
+contains 'review: a PR worktree is flagged, with what an install would run' 'pull-request worktree: approving covers this commit only' "$outR"
+gated_cli "$WP5" --approve "$(printf '%s\n' "$outR" | fp_of)" >/dev/null
+gated_hook "$WP5" >/dev/null
+eq 'approval: once this PR commit is approved, it is set up' ok "$(cat "$WP5/vendor/marker" 2>/dev/null)"
+printf 'push two\n' >> "$WP5/README"; git -C "$WP5" commit -qam 'push two'
+rm -rf "$WP5/vendor"
+outP=$(gated_hook "$WP5")
+eq "approval: the PR's next push needs approving again" no "$([ -e "$WP5/vendor/marker" ] && echo yes || echo no)"
+
+# A fork's PR checked out with `gh pr checkout` into an ordinarily named worktree is a PR too: gh
+# records its upstream as the pull ref, in the shared config.
+WGH=$AP/.claude/worktrees/review
+# At the PR's second push, which nobody approved (its first commit was approved above, and that
+# approval rightly covers any worktree at that commit with that content).
+git -C "$AP" worktree add -q "$WGH" -b gh-pr-5 "$(git -C "$WP5" rev-parse HEAD)" 2>/dev/null
+git -C "$AP" config branch.gh-pr-5.merge refs/pull/5/head
+git -C "$AP" config branch.gh-pr-5.remote origin
+outP=$(gated_hook "$WGH")
+eq "approval: a gh-checked-out fork PR does not inherit the developer's approval" no "$([ -e "$WGH/vendor/marker" ] && echo yes || echo no)"
+contains 'review: it is flagged as a pull request' 'pull-request worktree' "$(gated_cli "$WGH" --review)"
+
+# The developer's re-approved edit does run.
+python3 - "$WAP2/.claude/worktree-profile.json" <<'EOF2'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"][0]["install"] = "mkdir -p vendor && printf edited > vendor/marker"
+json.dump(d, open(p, "w"), indent=2)
+EOF2
+gated_cli "$WAP2" --approve "$(gated_cli "$WAP2" --review | fp_of)" >/dev/null
+gated_hook "$WAP2" >/dev/null
+eq 'approval: a re-approved edit runs' edited "$(cat "$WAP2/vendor/marker" 2>/dev/null)"
+git -C "$WAP2" checkout -q .claude/worktree-profile.json
+
+# A script changed AFTER the check, before it runs (a pull in the live session while a background
+# run installs), is not run on the stale answer.
+LIB=$(dirname "$HOOK")/bootstrap-lib.sh
+# shellcheck disable=SC1090  # the library under test, found relative to the hook.
+still=$( ( unset PITLANE_TRUST_PROFILES; . "$LIB"
+  wt_load_profile_for "$WAP" "$AP"; wt_approval_check "$WAP" 2>/dev/null
+  printf '%s ' "$WT_APPROVAL"
+  wt_approval_still "$WAP" && printf 'still ' || printf 'changed '
+  printf '\n# appended\n' >> "$WAP/.claude/worktree-seed.sh"
+  wt_approval_still "$WAP" && printf 'still' || printf 'changed' ) )
+git -C "$WAP" checkout -q .claude/worktree-seed.sh
+eq 'approval: a script edited between the check and its run is caught' 'yes still changed' "$still"
+
+# The review screen shows branch text with control characters made visible, so a carriage return or
+# an escape sequence cannot make it show one command while another runs.
+CC=$TMP/cc
+make_repo "$CC" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"touch pwned\r\u001b[2Kmkdir -p vendor"}'
+outR=$(gated_cli "$CC" --review)
+contains 'review: control characters are shown as ?' '?[2Kmkdir -p vendor' "$outR"
+lacks '...no carriage return reaches the screen' $'\r' "$outR"
+lacks '...nor an escape' $'\033' "$outR"
+vis=$(bash -c '. "$1"; wt_visible "$2"' _ "$LIB" $'a\xe2\x80\xaeb\xc2\x9bc\xe2\x80\x8bd')
+eq 'review: bidi overrides, C1 controls and zero-width characters are shown as ?' 'a???b??c???d' "$vis"
+
+# A hardlink entry's verify is a command too: held back, reported pending, done once approved.
+HV=$TMP/hv
+make_repo "$HV" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor","verify":"test -f vendor/autoload.php"}'
+mkdir -p "$HV/vendor"; printf 'MAIN\n' > "$HV/vendor/autoload.php"
+WHV=$HV/.claude/worktrees/hv
+git -C "$HV" worktree add -q "$WHV" -b worktree-hv 2>/dev/null
+outH=$(gated_hook "$WHV"); errH=$(cat "$TMP/err")
+eq 'approval: the hardlink itself still happens' MAIN "$(cat "$WHV/vendor/autoload.php" 2>/dev/null)"
+contains '...its verify is held back' 'verify command is not approved' "$errH"
+contains '...and it is reported pending' 'still missing: vendor' "$outH"
+gated_cli "$WHV" --approve "$(gated_cli "$WHV" --review | fp_of)" >/dev/null
+eq '...and it is done once approved' 'Pitlane: this worktree is fully set up.' "$(gated_cli "$WHV" --finish)"
+
+# Every SHA-256 backend gives the same digest, and a broken one falls through to the next.
+printf 'pitlane\n' > "$TMP/sha-in"
+want=$(bash -c '. "$1"; wt_sha256 "$2"' _ "$LIB" "$TMP/sha-in")
+eq 'sha256: a well-formed digest' 64 "${#want}"
+hide=''
+for tool in sha256sum shasum openssl; do
+  hide="$hide $tool"
+  mkdir -p "$TMP/shim-$tool"
+  for h in $hide; do printf '#!/bin/sh\necho broken\nexit 1\n' > "$TMP/shim-$tool/$h"; chmod +x "$TMP/shim-$tool/$h"; done
+  got=$(PATH=$TMP/shim-$tool:$PATH bash -c '. "$1"; wt_sha256 "$2"' _ "$LIB" "$TMP/sha-in")
+  eq "sha256: with$hide broken, the next tool gives the same digest" "$want" "$got"
+done
+eq 'sha256: stdin and a file agree' "$want" "$(bash -c '. "$1"; wt_sha256' _ "$LIB" < "$TMP/sha-in")"
+
+# A profile that runs nothing needs no approval at all.
+NC=$TMP/nc
+make_repo "$NC" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}' '".env.extra"'
+printf 'EXTRA=1\n' > "$NC/.env.extra"
+WNC=$NC/.claude/worktrees/nc
+git -C "$NC" worktree add -q "$WNC" -b worktree-nc 2>/dev/null
+outN=$(gated_hook "$WNC")
+eq 'approval: a profile that runs no commands is set up without one' '' "$outN"
+eq '...and its config copied' 'EXTRA=1' "$(cat "$WNC/.env.extra" 2>/dev/null)"
+contains 'review: says such a profile needs no approval' 'runs no commands, so it needs no approval' "$(gated_cli "$WNC" --review)"
+
+# Approving from the main checkout covers a worktree carrying the same content.
+MC=$TMP/mc
+make_repo "$MC" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+FPM=$(gated_cli "$MC" --review | fp_of)
+gated_cli "$MC" --approve "$FPM" >/dev/null
+WMC=$MC/.claude/worktrees/mc
+git -C "$MC" worktree add -q "$WMC" -b worktree-mc 2>/dev/null
+eq 'approval: approved from the main checkout, a worktree starts silent' '' "$(gated_hook "$WMC")"
+eq '...and its install ran' ok "$(cat "$WMC/vendor/marker" 2>/dev/null)"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

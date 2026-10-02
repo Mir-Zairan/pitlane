@@ -282,6 +282,23 @@ bootstrap will take, and what — if anything — will be isolated. Then ask **w
   in the profile's `copy[]` so each worktree gets them; and write the agent note to `CLAUDE.local.md`,
   listed in `.worktreeinclude`, instead of the repo's shared instructions.
 
+### Approve what you wrote
+
+The hooks run none of the profile's commands — installs, verify checks, the seed and teardown
+scripts — until the developer approves that exact content, so a profile nobody approves sets up config
+and ports and nothing else. Once the profile **and the scripts it names** are written, run from the main
+checkout:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --review
+```
+
+Show the developer what it lists, and on their confirmation run the `--approve <fingerprint>` command it
+printed. Tell them that any later edit to the profile or to those scripts — theirs, a teammate's, a pull
+request's — needs approving again, which `/pitlane-finish` walks them through; and that the approval
+covers the commands Pitlane starts, not what an approved install runs from the branch's own manifests
+(package lifecycle scripts) or toolchain files.
+
 ### Propose a note for the repo's agent instructions
 
 A session cannot tell a bootstrapped worktree from a bare one — the hooks print nothing into its

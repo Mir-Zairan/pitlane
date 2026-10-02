@@ -61,6 +61,81 @@ if [ "${1-}" = --finish ]; then
 fi
 export WT_FINISH WT_BACKGROUND
 
+# `bootstrap.sh --review` and `bootstrap.sh --approve <fingerprint>`, run from a worktree or the main
+# checkout: show what the profile there would run, and approve exactly that content. Never run by a
+# hook, and /pitlane-finish runs --approve only on the user's explicit word. --approve takes the
+# fingerprint --review printed, so what is approved is what was shown: a file edited in between
+# changes the fingerprint and the approval is refused.
+wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approve
+  local mode=$1 want=${2-} here=$PWD worktree root rundir fp store
+  if ! wt_has_json; then
+    printf 'Pitlane: neither jq nor python3 is on PATH, so the profile cannot be read.\n'
+    return 0
+  fi
+  case "$here/" in
+    *"$WT_SUBPATH"*)
+      worktree=$(wt_repo_root "$here") || worktree=$here
+      root=$(wt_main_root "$here") || root=''
+      if [ -z "$root" ]; then
+        printf 'Pitlane: cannot find the main checkout for %s.\n' "$here"
+        return 0
+      fi
+      wt_load_profile_for "$worktree" "$root"
+      rundir=$worktree
+      ;;
+    *)
+      if ! root=$(wt_repo_root "$here"); then
+        printf 'Pitlane: %s is not inside a git repository.\n' "$here"
+        return 0
+      fi
+      wt_load_profile "$root"
+      rundir=$root
+      ;;
+  esac
+  if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
+    printf 'Pitlane: no usable profile at %s — nothing to approve.\n' "$PROFILE_PATH"
+    return 0
+  fi
+  if ! wt_profile_runs_commands; then
+    printf 'Pitlane: %s runs no commands, so it needs no approval.\n' "$PROFILE_PATH"
+    return 0
+  fi
+  if ! fp=$(wt_approval_fingerprint "$rundir"); then
+    printf 'Pitlane: cannot fingerprint %s — no sha256sum, shasum, openssl or python3 worked.\n' "$PROFILE_PATH"
+    return 0
+  fi
+  store=$(wt_approvals_path "$rundir") || store=''
+
+  if [ "$mode" = --review ]; then
+    wt_approval_describe "$rundir"
+    if wt_approval_known "$fp" "$store"; then
+      printf 'Approved: this exact content is approved (fingerprint %s).\n' "$fp"
+    else
+      printf 'NOT approved (fingerprint %s). Read the commands above and the scripts named, and approve only if you trust all of them:\n  bash "%s" --approve %s\n' "$fp" "$WT_BOOTSTRAP_SCRIPT" "$fp"
+    fi
+    case ${PITLANE_TRUST_PROFILES:-} in
+      1 | yes | on | true) printf 'PITLANE_TRUST_PROFILES is set, so the hooks run these without approval anyway.\n' ;;
+    esac
+    return 0
+  fi
+
+  if [ "$want" != "$fp" ]; then
+    printf 'Pitlane: not approved — %s is not the current fingerprint (%s). The profile or one of its scripts changed since it was reviewed; run --review again.\n' "${want:-<none given>}" "$fp"
+    return 0
+  fi
+  if [ -z "$store" ] || ! wt_approval_record "$fp" "$rundir"; then
+    printf 'Pitlane: could not record the approval in %s.\n' "${store:-the shared git directory}"
+    return 0
+  fi
+  printf 'Pitlane: approved %s for every worktree of this repository that carries this exact content. Run /pitlane-finish in the worktree to run the setup it held back.\n' "$PROFILE_PATH"
+}
+case ${1-} in
+  --review | --approve)
+    wt_approval_cli "$@"
+    exit 0
+    ;;
+esac
+
 wt_read_input
 
 # Probe the JSON backend explicitly and SAY SO when it is missing. Without this the hook
@@ -184,6 +259,10 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
     wt_report_drift "$worktree" \
       "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}" "$PROFILE_PATH"
   fi
+
+  # Decided AFTER the copy: it is what brings a personal profile's seed and teardown scripts into
+  # the worktree, and the fingerprint is of the files as they will run. Before anything executes.
+  wt_approval_check "$worktree"
 
   wt_bootstrap_deps "$root" "$worktree" "$deadline"
   # THE DEADLINE IS PASSED IN. `timeouts.seedSeconds` and `timeouts.bootstrapSeconds` run inside
@@ -404,13 +483,21 @@ case $event in
     if [ "${WT_FINISH:-}" = 1 ]; then
       if [ -z "$pending" ]; then
         printf 'Pitlane: this worktree is fully set up.\n'
+      elif [ "${WT_APPROVAL:-}" = no ]; then
+        # shellcheck disable=SC2016  # the backticks are text for the reader, not a substitution.
+        printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form. Missing: %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
+          "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" "$WT_BOOTSTRAP_SCRIPT"
       else
         printf 'Pitlane: still not complete — missing: %s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
       fi
       exit 0
     fi
     if [ -n "$pending" ]; then
-      if [ "$WT_DEFER" = 1 ] && wt_background_start "$worktree"; then
+      if [ "${WT_APPROVAL:-}" = no ]; then
+        # Nothing a background run could do: everything left needs the commands that are held back.
+        wt_log "not run, pending approval: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
+        wt_bootstrap_notice "$pending" approval
+      elif [ "$WT_DEFER" = 1 ] && wt_background_start "$worktree"; then
         wt_log "finishing in the background: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
         wt_bootstrap_notice "$pending" background
       else

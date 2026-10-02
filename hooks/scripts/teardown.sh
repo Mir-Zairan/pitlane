@@ -113,7 +113,8 @@ fi
 wt_read_allocation "$state" "$root" "$entry" "$worktree"
 
 # The profile the worktree was set up with: its own committed copy wins. Once the
-# directory is gone, the main checkout's is the only one left.
+# directory is gone, the main checkout's is the only one left. Either way its teardown script runs
+# only if that content is approved (wt_run_teardown_script checks).
 if [ "$present" = 1 ]; then
   rundir=$worktree
   wt_load_profile_for "$worktree" "$root"
