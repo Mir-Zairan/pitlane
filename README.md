@@ -42,13 +42,14 @@ Your app's server is not started for you: each copy is ready, and you run it whe
    Claude looks at your project, asks you a few questions, and saves the answers. You only do this once
    per project.
 
-3. **Work as usual.** Start a session in its own copy with `claude -w my-task`. It comes ready to run, with
-   its own database and address. Start as many as you like.
+3. **Work as usual.** Start a session in its own copy with `claude -w my-task` and type your first
+   prompt straight away. Settings, linked packages and the port are done before it; installs and the
+   database finish in the background a few minutes later, and Claude waits for them before running
+   anything that needs them. Start as many copies as you like.
 
-4. **Start working straight away.** In a new copy, Pitlane does the quick steps (settings, linked
-   packages, the port) before your first prompt, and finishes installs and the database in the
-   background. The session is told what is still in progress. To wait for it, or to finish a setup that
-   was held back, type:
+4. **Only if you need it.** You never have to finish a setup by hand. Type `/pitlane-finish` only to
+   wait for the background setup yourself, say before starting the server in the first few minutes, or
+   when the session says setup was held back (not enough memory, a toolchain that failed to start):
 
    ```
    /pitlane-finish
