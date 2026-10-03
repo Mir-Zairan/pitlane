@@ -335,6 +335,10 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
   port — and, from every `assign` record, which documented commands pin a variable inline and must
   be run **without** that prefix inside a worktree;
 - how to start the dev server on the worktree's port, when the port is taken by a flag;
+- when the profile has `runtime.serve`: start the app with `/pitlane-serve`, never the repo's own
+  start command (which does not know this worktree's port), and find it at `$WORKTREE_URL` — set in
+  the session's environment and in the env files named above — rather than at the main checkout's
+  usual address;
 - to make another worktree, use `EnterWorktree` or a subagent with `isolation: "worktree"` — not a
   raw `git worktree add` from inside a session, which no hook sees. The exception is checking out an
   *existing* branch, which neither can do: `git worktree add .claude/worktrees/<name> <branch>`, then

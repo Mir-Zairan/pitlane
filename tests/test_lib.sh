@@ -645,7 +645,9 @@ EOF
   printf '%s' '{"schemaVersion":1,
     "runtime":{"slug":"{slug}","port":{"var":"SERVER_PORT","base":4100,"span":200},
                "env":{"file":".env.worktree.local","vars":{"DATABASE_NAME":"demo_{slug}"}},
-               "seed":".claude/s.sh","teardown":".claude/t.sh"}}' >"$target"
+               "seed":".claude/s.sh","teardown":".claude/t.sh",
+               "serve":"bin/server --port={port}","stop":"bin/server --stop",
+               "url":"http://{slug}.localhost:{port}/"}}' >"$target"
   wt_load_profile "$pdir"
   eq 'runtime profile -> present'          '1'                      "$PROFILE_PRESENT"
   eq 'runtime profile -> has runtime'      '1'                      "$PROFILE_HAS_RUNTIME"
@@ -657,6 +659,9 @@ EOF
   eq 'runtime profile -> a string is a list of one' '.env.worktree.local' "$PROFILE_RT_ENVFILES"
   eq 'runtime profile -> seed path'        '.claude/s.sh'           "$PROFILE_RT_SEED"
   eq 'runtime profile -> teardown path'    '.claude/t.sh'           "$PROFILE_RT_TEARDOWN"
+  eq 'runtime profile -> serve, unexpanded' 'bin/server --port={port}' "$PROFILE_RT_SERVE"
+  eq 'runtime profile -> stop'             'bin/server --stop'      "$PROFILE_RT_STOP"
+  eq 'runtime profile -> url, unexpanded'  'http://{slug}.localhost:{port}/' "$PROFILE_RT_URL"
   # env.vars is published as COMPACT JSON, not as pairs: that answers "is there anything to write"
   # for free, and the pairs themselves arrive as group 3 of the same scan.
   eq 'runtime profile -> env vars as compact JSON' '{"DATABASE_NAME":"demo_{slug}"}' \
@@ -677,7 +682,7 @@ EOF
   wt_load_profile "$pdir" 2>/dev/null
   eq 'an unparseable profile -> not present' '0' "$PROFILE_PRESENT"
   eq 'an unparseable profile clears the RT fields left by the previous load' '' \
-    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN"
+    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN$PROFILE_RT_SERVE$PROFILE_RT_STOP$PROFILE_RT_URL"
 
   # An INVALID profile also exits early — no partial trust, so not even the fields that parsed.
   printf '%s' '{"schemaVersion":1,
@@ -709,7 +714,7 @@ EOF
   wt_load_profile "$pdir"
   eq 'no runtime block -> HAS_RUNTIME is 0' '0' "$PROFILE_HAS_RUNTIME"
   eq 'no runtime block -> every RT field is empty' '' \
-    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN"
+    "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN$PROFILE_RT_SERVE$PROFILE_RT_STOP$PROFILE_RT_URL"
 
   cp "$TMP/profile-minimal.json" "$target"
   wt_load_profile "$pdir"
@@ -1225,7 +1230,8 @@ EOF
  "runtime":{"seed":"F10_seed","teardown":"F11_teardown",
             "env":{"file":"F12_envfile","vars":{"F14_KEY":"F14_val"}},
             "slug":"F13_slug",
-            "port":{"var":"F17_PORTVAR","base":4100,"span":200}},
+            "port":{"var":"F17_PORTVAR","base":4100,"span":200},
+            "serve":"F21_serve","stop":"F22_stop","url":"F23_url"},
  "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
  "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
  "copy":["F15_copy"]}
@@ -1251,6 +1257,9 @@ JSON
   eq 'scalars field 18 is runtime.port.base'       '4100'             "$WT_PS_PORTBASE"
   eq 'scalars field 19 is runtime.port.span'       '200'              "$WT_PS_PORTSPAN"
   contains 'scalars field 20 is runtime.port as compact JSON' 'F17_PORTVAR' "$WT_PS_PORT"
+  eq 'scalars field 21 is runtime.serve'           'F21_serve'        "$WT_PS_SERVE"
+  eq 'scalars field 22 is runtime.stop'            'F22_stop'         "$WT_PS_STOP"
+  eq 'scalars field 23 is runtime.url'             'F23_url'          "$WT_PS_URL"
   # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
   # variables than the record has fields makes bash `read` pack the remainder into the last one —
   # but only visibly when the extra field is non-empty: `read` strips exactly one trailing
@@ -1258,9 +1267,9 @@ JSON
   # Counting the separators catches the scan list growing whether the new field has a value or not.
   scan_rec=$(wt_profile_scan "$SCP")
   scan_rec=${scan_rec%%"$RS"*}
-  eq 'the scalar record carries exactly 20 fields plus its tag' 20 \
+  eq 'the scalar record carries exactly 23 fields plus its tag' 23 \
     "$(printf '%s' "$scan_rec" | tr -cd "$US" | wc -c | tr -d ' ')"
-  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_PORT"
+  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_URL"
   # An absent field is EMPTY, not a shift of everything after it.
   wt_profile_scalars "$(printf '%s' '{"schemaVersion":1,"evidence":{"shellMarker":"only"}}' \
     | wt_json_scan schemaVersion shell shellArgs deps runtime \
@@ -1423,6 +1432,64 @@ JSON
   vw '{"schemaVersion":1,"runtime":{"slug":"{slug}_x","env":{"file":".e","vars":{"A":"1"}}}}'
   eq 'validate: a slug template mentioning {slug} is silent' '' \
     "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null | grep -c 'no per-worktree placeholder' | tr -d ' ' | sed 's/^0$//')"
+
+  # --- validate: runtime.serve / runtime.stop / runtime.url ------------------------------------
+  # All WARNINGS: each has a safe fallback (a bind collision; a URL not written), so none of them
+  # may discard the profile. Every case asserts both halves — no violation, and the warning.
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},"env":{"file":".e"},
+        "serve":"bin/server --port={port}","stop":"bin/server --stop","url":"http://localhost:{port}"}}'
+  eq 'validate: a well-formed serve/stop/url reports nothing' '' "$(vv)"
+  eq 'validate: ...and warns about nothing' '' "$(vpw)"
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},"env":{"file":".e"},
+        "serve":"bin/server"}}'
+  eq 'validate: serve without {port} but with port.var is fine (the app reads P)' '' "$(vpw)"
+  # shellcheck disable=SC2016  # the $(...) cases are payloads, kept literal.
+  for scase in \
+    '"port":{"base":4100,"span":200},"serve":"bin/server"|contains no {port} and runtime.port.var is not set' \
+    '"serve":"bin/server --port={port}"|uses {port}, but runtime.port has no base/span' \
+    '"stop":"bin/server --stop"|runtime.stop is set but runtime.serve is not' \
+    '"url":"localhost:{port}"|runtime.url: "localhost:1024" is not an http:// or https:// URL' \
+    '"url":"http://local host"|is not an http:// or https:// URL' \
+    '"url":"http://x/$(id)"|is not an http:// or https:// URL' \
+    '"url":"http://x/#a"|is not an http:// or https:// URL' \
+    '"url":"http://{host}:1"|is not an http:// or https:// URL' \
+    '"url":"http://{name}.localhost"|it may use only {port} and {slug}' \
+    '"url":"http://localhost/{worktree}"|it may use only {port} and {slug}' \
+    '"url":"http://localhost:{port}"|uses {port}, but runtime.port has no base/span'
+  do
+    sbody=${scase%%|*}; swant=${scase#*|}
+    vw '{"schemaVersion":1,"runtime":{'"$sbody"'}}'
+    eq "validate: serve/url case ($sbody) is not a violation" '' "$(vv)"
+    contains "validate: serve/url case ($sbody) warns instead" "$swant" "$(vpw)"
+  done
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},"env":{"file":".e"},
+        "url":"https://{slug}.localhost:{port}/app?x=1"}}'
+  eq 'validate: a url using {slug} in the host and a query is accepted' '' "$(vpw)"
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":200},"env":{"file":".e"},
+        "serve":"bin/server --port={prot}"}}'
+  contains 'validate: a botched placeholder in serve is reported' '{prot}' "$(vpw)"
+
+  # --- wt_is_safe_url / wt_expand_url ------------------------------------------------------------
+  for u in http://localhost:3828 https://a.b_c.localhost:1/x/y?q=1 http://127.0.0.1/ http://h/%20~@+=:; do
+    wt_is_safe_url "$u"
+    rc_is "safe url: $u" 0 $?
+  done
+  # shellcheck disable=SC2016  # the $(...) and backtick cases are payloads, kept literal.
+  for u in '' localhost:1 ftp://a http:// http://localhost: http://localhost:0 http://localhost:70000 \
+    'http://a b' 'http://a/$(x)' 'http://a/`x`' "http://a/'x'" 'http://a/"x"' 'http://a/x\y' \
+    'http://a/#x' 'http://-a' 'http://.a' 'http://a:1:2' 'http://a;b' "http://a/$(printf 'x\ny')"; do
+    wt_is_safe_url "$u"
+    rc_is "unsafe url refused: $u" 1 $?
+  done
+  eq 'expand_url: {port} and {slug} expand' 'http://feat_x.localhost:4123/' \
+    "$(WT_PORT=4123 WT_SLUG=feat_x wt_expand_url 'http://{slug}.localhost:{port}/')"
+  WT_PORT='' wt_expand_url 'http://localhost:{port}' >/dev/null
+  rc_is 'expand_url: {port} with no port is refused' 1 $?
+  WT_PORT='' wt_expand_url 'http://localhost:3000' >/dev/null
+  rc_is 'expand_url: a literal port needs no derived one' 0 $?
+  # {name} is refused BY TEMPLATE, not by value: even a harmless name does not pass.
+  WT_NAME=plain wt_expand_url 'http://{name}.localhost' >/dev/null
+  rc_is 'expand_url: {name} is refused even when its value is harmless' 1 $?
 
   # THE SHIPPED TEMPLATE MUST VALIDATE. It is what /pitlane-setup fills in and what a
   # developer copies, so a rule that rejects it is a rule that breaks every new repo. Checked with

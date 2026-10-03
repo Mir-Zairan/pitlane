@@ -926,6 +926,70 @@ wt_is_safe_relpath() {  # $1 = candidate
   return 0
 }
 
+# True if $1 is an http(s) URL that is safe to write unquoted into a dotenv file and to show the
+# session: `http://` or `https://`, a host of letters, digits, `.`, `_` and `-`, an optional port
+# within 1..65535, and a path, query or fragment-free tail from a conservative set.
+#
+# The set is what makes WORKTREE_URL safe BY CONSTRUCTION wherever it lands. It excludes whitespace,
+# quotes, `$`, backticks and `\` (which some dotenv dialects interpolate or execute), and `#`, which
+# starts a comment in several of them, so the value reads back as written. `_` is in the host
+# because {slug} may expand there (`http://{slug}.localhost:{port}`).
+wt_is_safe_url() {  # $1 = an EXPANDED URL
+  local LC_ALL=C u=${1-} rest hostport host port path
+  [ "${#u}" -le 512 ] || return 1
+  case $u in
+    http://*) rest=${u#http://} ;;
+    https://*) rest=${u#https://} ;;
+    *) return 1 ;;
+  esac
+  hostport=${rest%%/*}
+  path=${rest#"$hostport"}
+  host=${hostport%%:*}
+  if [ "$host" != "$hostport" ]; then
+    port=${hostport#*:}
+    wt_is_posint "$port" || return 1
+    [ "${#port}" -le 5 ] && [ "$((10#$port))" -le "$WT_PORT_MAX" ] || return 1
+  fi
+  case $host in
+    '' | [._-]* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  case $path in
+    *[!A-Za-z0-9._~/%?\&=+:@-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Expand the runtime.url template $1 from WT_PORT and WT_SLUG. Prints the URL and returns 0, or
+# prints what is wrong with it and returns 1.
+#
+# Only {port} and {slug} are allowed: both are constrained by construction, which is what lets the
+# result be written into an env file and the session's environment without quoting. {name},
+# {worktree} and {root} are raw text from a less trusted party (wt_expand says why) and are refused
+# outright rather than checked per worktree — a URL template has no use for them.
+wt_expand_url() {  # $1 = template
+  local tpl=${1-} url
+  case $tpl in
+    *'{name}'* | *'{worktree}'* | *'{root}'*)
+      printf 'it may use only {port} and {slug} — {name}, {worktree} and {root} are raw text that could put shell syntax into an env file'
+      return 1
+      ;;
+  esac
+  case $tpl in
+    *'{port}'*)
+      if [ -z "${WT_PORT-}" ]; then
+        printf 'it uses {port}, but this worktree has no port'
+        return 1
+      fi
+      ;;
+  esac
+  url=$(wt_expand "$tpl")
+  if ! wt_is_safe_url "$url"; then
+    printf '"%s" is not an http:// or https:// URL with a plain host (letters, digits, . _ -) and no spaces, quotes, $, ` or #' "$url"
+    return 1
+  fi
+  printf '%s' "$url"
+}
+
 # ---------------------------------------------------------------------------
 # Profile
 # ---------------------------------------------------------------------------
@@ -948,6 +1012,7 @@ wt_is_safe_relpath() {  # $1 = candidate
 #  16 evidence.shellMarker
 #  17 runtime.port.var                18 runtime.port.base            19 runtime.port.span
 #  20 runtime.port
+#  21 runtime.serve  22 runtime.stop                23 runtime.url
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
@@ -965,6 +1030,7 @@ wt_profile_scan() {  # $1 = profile path
     runtime.seed runtime.teardown runtime.env.file \
     runtime.slug runtime.env.vars copy evidence.shellMarker \
     runtime.port.var runtime.port.base runtime.port.span runtime.port \
+    runtime.serve runtime.stop runtime.url \
     -- deps dir lock strategy install verify lockChecksum \
     -- copy . \
     --kv runtime.env.vars \
@@ -1009,6 +1075,7 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_SEED WT_PS_TEARDOWN WT_PS_ENVFILE \
     WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
     WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
+    WT_PS_SERVE WT_PS_STOP WT_PS_URL \
     <<<"$body" || true
   WT_PS_ENVFILES=''
   case $WT_PS_ENVFILE in
@@ -1129,6 +1196,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local seedp downp envfile unk tok
   local portvar portbase portspan portobj ekey eval_ nkeys=0
   local ef efrest efseen efrebuilt efn
+  local serve stopcmd urltpl urlwhy
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1170,7 +1238,8 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   seedp=$WT_PS_SEED;        downp=$WT_PS_TEARDOWN;    envfile=$WT_PS_ENVFILE
   slug=$WT_PS_SLUG;         envvars=$WT_PS_ENVVARS;   copy=$WT_PS_COPY
   evshell=$WT_PS_EVSHELL;   portvar=$WT_PS_PORTVAR;   portbase=$WT_PS_PORTBASE
-  portspan=$WT_PS_PORTSPAN; portobj=$WT_PS_PORT
+  portspan=$WT_PS_PORTSPAN; portobj=$WT_PS_PORT;     serve=$WT_PS_SERVE
+  stopcmd=$WT_PS_STOP;      urltpl=$WT_PS_URL
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -1448,7 +1517,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       # are the docstring's own motivating example: `demo_{slugg}` reaching a database name
       # writes the literal text `demo_{slugg}` instead of isolating anything. env.vars is
       # scanned as its raw compact JSON, which is enough to find a brace in any of its values.
-      for tok in "$slug" "$envvars"; do
+      for tok in "$slug" "$envvars" "$serve" "$stopcmd" "$urltpl"; do
         [ -n "$tok" ] || continue
         unk=$(wt_unknown_placeholders "$tok") \
           || wt_log "runtime: \"$tok\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
@@ -1507,6 +1576,35 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         '' | 'null' | '{}' | '{'*'}') ;;
         *) printf 'runtime.port: must be an object with var/base/span, got %s\n' "$portobj"; bad=1 ;;
       esac
+
+      # --- runtime.serve / runtime.stop / runtime.url -------------------------------------------
+      # ALL WARNINGS, by the same rule as the port: each has a safe fallback. A server that cannot
+      # learn its port collides on a bind, loudly; a URL the engine cannot vouch for is simply not
+      # written (wt_expand_url is re-run on every write). Nothing here runs a command — serve and
+      # stop are run on request by /pitlane-serve and teardown, and only once approved (ADR-020).
+      if [ -n "$serve" ]; then
+        case $serve in
+          *'{port}'*) ;;
+          *)
+            [ -n "$portvar" ] \
+              || wt_log "runtime.serve contains no {port} and runtime.port.var is not set — nothing tells the server this worktree's port, so every worktree's server would try the same one"
+            ;;
+        esac
+      elif [ -n "$stopcmd" ]; then
+        wt_log "runtime.stop is set but runtime.serve is not — the plugin starts no server here, so it has nothing to stop"
+      fi
+      if [ -z "$portbase" ] || [ -z "$portspan" ]; then
+        for tok in "$serve" "$stopcmd" "$urltpl"; do
+          case $tok in
+            *'{port}'*) wt_log "runtime: \"$tok\" uses {port}, but runtime.port has no base/span to derive one from — it would expand to nothing" ;;
+          esac
+        done
+      fi
+      if [ -n "$urltpl" ]; then
+        # A stand-in port and slug: what is checked is the template's shape, not this worktree's.
+        urlwhy=$(WT_PORT=$WT_PORT_MIN WT_SLUG=wt wt_expand_url "$urltpl") \
+          || wt_log "runtime.url: $urlwhy — WORKTREE_URL will not be written"
+      fi
 
       # --- runtime.env.vars ---------------------------------------------------
       # EVERY KEY IS CHECKED, and this is the one runtime rule that is fatal on the key rather
@@ -1702,6 +1800,7 @@ wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are c
 #   PROFILE_BOOTSTRAP_TIMEOUT / PROFILE_SEED_TIMEOUT   seconds, validated
 #   PROFILE_RT_SLUG / PROFILE_RT_PORTVAR / PROFILE_RT_PORTBASE / PROFILE_RT_PORTSPAN
 #   PROFILE_RT_ENVFILE / PROFILE_RT_ENVFILES / PROFILE_RT_ENVVARS / PROFILE_RT_SEED / PROFILE_RT_TEARDOWN
+#   PROFILE_RT_SERVE / PROFILE_RT_STOP / PROFILE_RT_URL
 #                           the runtime block, published for the same reason the evidence block is:
 #                           layer 3 must not re-split the scalar record for itself. Two positional
 #                           readers of one record have to agree forever and nothing notices when
@@ -1720,6 +1819,9 @@ wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are c
 #                           by construction rather than by review; do not skip it. Validation only
 #                           WARNS when the template has no per-worktree placeholder at all, so a
 #                           consumer that wants the promised fallback must apply it itself.
+#                           PROFILE_RT_SERVE / _STOP are UNEXPANDED command templates, and
+#                           PROFILE_RT_URL an unexpanded URL template: expand the URL only with
+#                           wt_expand_url, and a command only after wt_unsafe_command_placeholder.
 #
 # SC2034: every PROFILE_* assignment below looks unused to shellcheck because they ARE
 # this function's return value — the callers that read them live in other files.
@@ -1749,6 +1851,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_ENVVARS=''
   PROFILE_RT_SEED=''
   PROFILE_RT_TEARDOWN=''
+  PROFILE_RT_SERVE=''
+  PROFILE_RT_STOP=''
+  PROFILE_RT_URL=''
 
   [ -e "$PROFILE_PATH" ] || return 0
 
@@ -1848,6 +1953,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_ENVVARS=$WT_PS_ENVVARS
   PROFILE_RT_SEED=$WT_PS_SEED
   PROFILE_RT_TEARDOWN=$WT_PS_TEARDOWN
+  PROFILE_RT_SERVE=$WT_PS_SERVE
+  PROFILE_RT_STOP=$WT_PS_STOP
+  PROFILE_RT_URL=$WT_PS_URL
 
   if [ -n "$boot" ]; then
     if wt_is_seconds "$boot"; then

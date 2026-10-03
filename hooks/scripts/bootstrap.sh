@@ -516,6 +516,9 @@ case $event in
       wt_bootstrap_status_line "$worktree" finish "$([ "${WT_APPROVAL:-}" = no ] && echo approval)"
       exit 0
     fi
+    # The session's own environment gets the port and URL too (ADR-021) — from the start-up hook
+    # only, since Claude Code reads CLAUDE_ENV_FILE once, when this hook exits.
+    wt_session_env_export "${CLAUDE_ENV_FILE:-}"
     how=''
     if [ -n "$pending" ]; then
       if [ "${WT_APPROVAL:-}" = no ]; then

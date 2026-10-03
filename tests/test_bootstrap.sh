@@ -27,6 +27,8 @@ export PITLANE_BACKGROUND
 PITLANE_TRUST_PROFILES=1
 export PITLANE_TRUST_PROFILES
 unset XDG_CONFIG_HOME
+# Claude Code sets this for a SessionStart hook; a test run must not append to a real session's file.
+unset CLAUDE_ENV_FILE
 # A corepack-managed pnpm keeps ITSELF in $HOME/.cache/node/corepack. Moving HOME makes corepack
 # think pnpm is not installed and try to download it, which fails offline and read as "pnpm cannot
 # produce a lockfile" — the long-standing failure of this suite. Only the tool's own cache is kept;
@@ -1768,6 +1770,80 @@ WMC=$MC/.claude/worktrees/mc
 git -C "$MC" worktree add -q "$WMC" -b worktree-mc 2>/dev/null
 eq 'approval: approved from the main checkout, a worktree starts silent' '' "$(gated_hook "$WMC")"
 eq '...and its install ran' ok "$(cat "$WMC/vendor/marker" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# runtime.serve / runtime.url: the session is told, WORKTREE_URL is set, and nothing is started
+# ---------------------------------------------------------------------------
+SV=$TMP/sv
+# The serve and stop commands would leave a marker if anything ran them; this task's hooks must not.
+make_rt_repo "$SV" ',
+    "serve": "touch '"$TMP"'/served; bin/server --port={port}",
+    "stop": "touch '"$TMP"'/stopped",
+    "url": "http://{slug}.localhost:{port}/"'
+WSV=$SV/.claude/worktrees/serve-me
+git -C "$SV" worktree add -q "$WSV" -b worktree-serve-me 2>/dev/null
+CEF=$TMP/session-env/sessionstart-hook-0.sh
+mkdir -p "${CEF%/*}"
+outS=$(CLAUDE_ENV_FILE="$CEF" start_hook "$WSV")
+SVPORT=$(envval "$WSV" SERVER_PORT)
+ne 'serve: the worktree has a port' '' "$SVPORT"
+eq 'serve: WORKTREE_URL is in the env block, expanded' "http://serve_me.localhost:$SVPORT/" "$(envval "$WSV" WORKTREE_URL)"
+eq 'serve: a complete worktree with a serve profile prints ONE line, naming /pitlane-serve and the URL' \
+  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/), not the repo's own start command." \
+  "$outS"
+eq 'serve: CLAUDE_ENV_FILE gets the port and the URL as exports' \
+  "export SERVER_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF" 2>/dev/null)"
+eq '...which the session'"'"'s shell reads back' "http://serve_me.localhost:$SVPORT/" \
+  "$(env -i bash -c ". '$CEF'; printf '%s' \"\$WORKTREE_URL\"")"
+eq 'serve: no hook started the server' no "$([ -e "$TMP/served" ] && echo yes || echo no)"
+eq '...nor ran stop' no "$([ -e "$TMP/stopped" ] && echo yes || echo no)"
+
+# A missing or unwritable CLAUDE_ENV_FILE costs nothing but the export.
+outS=$(CLAUDE_ENV_FILE="$TMP/no-such-dir/env.sh" start_hook "$WSV"); rcS=$?
+eq 'serve: an unwritable CLAUDE_ENV_FILE still exits 0' 0 "$rcS"
+contains '...still prints the status line' 'To run the app, use /pitlane-serve' "$outS"
+contains '...and warns on stderr' 'could not append to CLAUDE_ENV_FILE' "$(cat "$TMP/err")"
+outS=$(start_hook "$WSV")
+contains 'serve: without CLAUDE_ENV_FILE the session is still told' 'To run the app, use /pitlane-serve' "$outS"
+
+# /pitlane-finish does not write it: Claude Code reads the file only when the SessionStart hook exits.
+: >"$CEF"
+( cd "$WSV" && CLAUDE_ENV_FILE="$CEF" bash "$HOOK" --finish >/dev/null 2>&1 )
+eq 'serve: --finish does not append to CLAUDE_ENV_FILE' '' "$(cat "$CEF")"
+
+# WorktreeCreate: stdout is the path and nothing else, and CLAUDE_ENV_FILE is not touched.
+: >"$CEF"
+outC=$(CLAUDE_ENV_FILE="$CEF" run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"made\",\"cwd\":\"$SV\"}" "$SV")
+eq 'serve: WorktreeCreate prints only the path' "$SV/.claude/worktrees/made" "$outC"
+eq '...and writes nothing to CLAUDE_ENV_FILE' '' "$(cat "$CEF")"
+contains '...while its env block still carries WORKTREE_URL' 'http://made.localhost:' \
+  "$(envval "$SV/.claude/worktrees/made" WORKTREE_URL)"
+eq 'serve: nothing was started on any path' no "$([ -e "$TMP/served" ] || [ -e "$TMP/stopped" ] && echo yes || echo no)"
+
+# serve and stop are commands: a profile naming only them needs approval, and an edit to serve
+# needs approving again — the fingerprint is of the profile's bytes (ADR-020).
+SVA=$TMP/sva
+make_repo "$SVA" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+python3 - "$SVA/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["runtime"] = {"port": {"var": "SERVER_PORT", "base": 4100, "span": 200}, "serve": "bin/server --port={port}"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SVA" commit -qam serve
+contains 'approval: a profile whose only command is serve needs approving' 'NOT approved' "$(gated_cli "$SVA" --review)"
+contains '...and the review shows it' 'serve (run by /pitlane-serve): bin/server --port={port}' "$(gated_cli "$SVA" --review)"
+gated_cli "$SVA" --approve "$(gated_cli "$SVA" --review | fp_of)" >/dev/null
+contains 'approval: once approved, it reads approved' 'Approved: this exact content' "$(gated_cli "$SVA" --review)"
+python3 - "$SVA/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["runtime"]["serve"] += " --evil"
+json.dump(d, open(p, "w"), indent=2)
+PY
+outR=$(gated_cli "$SVA" --review)
+contains 'approval: an edited serve command needs approving again' 'NOT approved' "$outR"
+contains '...and the review shows the new one' 'bin/server --port={port} --evil' "$outR"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

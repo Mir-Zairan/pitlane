@@ -171,12 +171,26 @@
     "            REFUSED outright when any env file is developer-managed, when the other worktrees",
     "            cannot be enumerated, or when another live worktree already owns this slug.",
     "  teardown  repo-owned, same rule.",
+    "  serve     the command that starts the app on this worktree's port, run inside `shell` by",
+    "            /pitlane-serve on request — never by a hook. It must contain {port}, unless the",
+    "            server reads its port from runtime.port.var in the env files; one with neither",
+    "            warns, because every worktree's server would then try the same port. A repo whose",
+    "            start command hardcodes its port gets a serve with the flag spelled out here.",
+    "            OPTIONAL. It is a command, so the profile needs approving like an install.",
+    "  stop      OPTIONAL. The command that stops a server serve started, for one that daemonizes",
+    "            (teardown otherwise signals the process /pitlane-serve recorded, and nothing else).",
+    "  url       OPTIONAL. Where the app answers: a TEMPLATE using only {port} and {slug}, which must",
+    "            expand to http:// or https://, a host of letters, digits and . _ -, an optional",
+    "            port, and a path without spaces, quotes, $, ` or #. It is written as WORKTREE_URL",
+    "            into every env file's block and into the session's environment, and named in the",
+    "            session-start notice. One that breaks these rules warns and is not written.",
     "",
     "Placeholders: {name} the worktree name as given, {slug} the sanitised name, {port} the derived",
     "port, {worktree} the absolute worktree path, {root} the main checkout.",
     "SUBSTITUTION IS NOT QUOTING. {slug} and {port} are constrained by construction; {name}, {worktree}",
     "and {root} are raw text that can come from a colleague's branch name, so a consumer putting one in",
-    "command position must quote it itself."
+    "command position must quote it itself. The engine refuses to run an install, verify, serve or stop",
+    "command, or to write an env.vars value, whose {name}, {worktree} or {root} would carry shell syntax."
   ],
   "_comment_runtime_optout": [
     "Not a profile field: a file at `.claude/worktree-no-runtime` INSIDE a worktree makes the engine",
@@ -192,7 +206,9 @@
       "vars": { "DATABASE_NAME": "demo_{slug}" }
     },
     "seed": ".claude/worktree-seed.sh",
-    "teardown": ".claude/worktree-teardown.sh"
+    "teardown": ".claude/worktree-teardown.sh",
+    "serve": "pnpm run dev --port={port}",
+    "url": "http://localhost:{port}"
   },
 
   "_comment_timeouts": [

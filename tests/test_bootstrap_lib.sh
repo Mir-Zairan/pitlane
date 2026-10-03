@@ -1583,6 +1583,34 @@ contains '...and at start-up it is said, not swallowed' 'set up, with warnings �
   "$(status_line 'warn|c|peer warning' '' '' start)"
 eq 'status, complete and clean: silent at start-up' '' "$(status_line '' '' '' start)"
 eq '...and "fully set up" from --finish' 'Pitlane: this worktree is fully set up.' "$(status_line '' '' '' finish)"
+# A profile with runtime.serve names /pitlane-serve and the URL, so the session never reaches for
+# the repo's own start command: the ONE line a complete worktree then prints, and a clause on the
+# others — except the held-back line, where /pitlane-serve would refuse too.
+serve_line() {  # $1 = items, $2 = pending, $3 = attemptable, $4 = how, $5 = url
+  PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=1 PROFILE_RT_SERVE='bin/server --port={port}' WT_RUNTIME_URL=${5-} \
+    status_line "$1" "$2" "$3" start "${4-}"
+}
+eq 'status, complete with a serve profile: one line naming /pitlane-serve and the URL' \
+  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://localhost:4123), not the repo's own start command." \
+  "$(serve_line '' '' '' '' http://localhost:4123)"
+eq '...without a URL, the command alone' \
+  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve, not the repo's own start command." \
+  "$(serve_line '' '' '' '' '')"
+contains '...appended to a not-finished line' \
+  "Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup. To run the app, use /pitlane-serve (it serves at http://localhost:4123)" \
+  "$(serve_line 'missing|b|dirty' b b '' http://localhost:4123)"
+contains '...and to a background line' 'the background setup is doing it. To run the app, use /pitlane-serve' \
+  "$(serve_line 'missing|b|dirty' b b background http://localhost:4123)"
+contains '...and to a warnings line' 'tell the user if it matters for the task. To run the app' \
+  "$(serve_line 'warn|c|peer warning' '' '' '' http://localhost:4123)"
+contains '...and to a standing-failure line' 'Do not install dependencies by hand. To run the app' \
+  "$(serve_line 'standing|a|exit 1' a '' '' http://localhost:4123)"
+lacks '...but not to a held-back line' '/pitlane-serve' "$(serve_line 'missing|b|dirty' b b approval http://localhost:4123)"
+eq '...and it stays one line' 1 "$(serve_line 'missing|b|dirty' b b '' http://localhost:4123 | wc -l | tr -d ' ')"
+eq 'status, clean, a runtime-less profile with a stray serve: silent' '' \
+  "$(PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=0 PROFILE_RT_SERVE=x status_line '' '' '' start)"
+eq 'status, clean, no profile: silent even with a serve left in the environment' '' \
+  "$(PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=1 PROFILE_RT_SERVE=x status_line '' '' '' start)"
 contains 'status: a name the branch wrote is shown printable' 'x?[31m missing' \
   "$(status_line "missing|x"$'\033'"[31m|dirty" x x start)"
 WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE=''
@@ -3003,6 +3031,20 @@ eq 'a rewrite updates the port' 'SERVER_PORT=3999' "$(grep '^SERVER_PORT=' "$EW/
 eq 'and drops a variable the profile no longer names' 0 \
   "$(grep -c '^APP_ENV=' "$EW/$EF" | tr -d ' ')"
 
+# WORKTREE_URL rides in the same block, beside the port; it is re-checked at the writer, because the
+# line is unquoted in a file a dotenv parser reads.
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')" '' 'http://localhost:3999'
+eq 'the url is written into the block as WORKTREE_URL' 'WORKTREE_URL=http://localhost:3999' \
+  "$(grep '^WORKTREE_URL=' "$EW/$EF")"
+eq '...inside the block, before its end line' "$WT_ENV_END" "$(tail -1 "$EW/$EF")"
+# shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
+out=$(wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'A=1')" '' 'http://x/$(touch pwned)' 2>&1)
+eq 'an unsafe url is not written' 0 "$(grep -c '^WORKTREE_URL=' "$EW/$EF" | tr -d ' ')"
+contains '...and says why' 'skipping WORKTREE_URL' "$out"
+eq '...while the rest of the block still is' 'A=1' "$(grep '^A=' "$EW/$EF")"
+wt_runtime_env_write "$EW" "$EF" SERVER_PORT 3999 "$(mk_pairs 'DATABASE_NAME=demo_{slug}')"
+eq 'no url, no WORKTREE_URL line' 0 "$(grep -c '^WORKTREE_URL=' "$EW/$EF" | tr -d ' ')"
+
 # A FILE THE PLUGIN HAS NEVER WRITTEN GETS THE BLOCK APPENDED. It is the developer's
 # configuration, copied in, and the app loads it by name — so the overrides have to go INTO it,
 # after the developer's lines, where dotenv's last-assignment-wins resolves them for the plugin.
@@ -3753,6 +3795,96 @@ contains 'with a runtime block it reports the slug it settled on' 'runtime: slug
   "$(wt_runtime_handoff "$DREPO" "$DWT" '' 2>&1)"
 # shellcheck disable=SC2034
 PROFILE_HAS_RUNTIME=0
+
+# runtime.url is expanded once, here, and published for the session's environment and status line.
+PROFILE_HAS_RUNTIME=1 PROFILE_RT_URL='http://{slug}.localhost:3000/'
+WT_RUNTIME_URL=stale WT_RUNTIME_PORT=stale
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'hand-off: the url is expanded and published' "http://$WT_SLUG.localhost:3000/" "$WT_RUNTIME_URL"
+eq '...and no port is published when none was derived' '' "$WT_RUNTIME_PORT"
+PROFILE_RT_URL='http://localhost:{port}'
+out=$(wt_runtime_handoff "$DREPO" "$DWT" '' 2>&1)
+contains 'hand-off: a url needing a port this worktree lacks is not set, and says so' 'WORKTREE_URL is not set' "$out"
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq '...and publishes nothing' '' "$WT_RUNTIME_URL"
+PROFILE_HAS_RUNTIME=0 PROFILE_RT_URL='http://localhost:3000'
+WT_RUNTIME_URL=stale
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'hand-off: no runtime block clears a url left from an earlier run' '' "$WT_RUNTIME_URL"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_RT_URL=''
+
+# --- the session's own environment (CLAUDE_ENV_FILE) ---------------------------------------------
+CEF=$TMP/claude-env/sessionstart-hook-0.sh
+mkdir -p "${CEF%/*}"
+PROFILE_RT_PORTVAR=SERVER_PORT WT_RUNTIME_PORT=4123 WT_RUNTIME_URL='http://localhost:4123'
+wt_session_env_export "$CEF"
+eq 'session env: a file that did not exist is created with the exports' \
+  "export SERVER_PORT='4123'${NL_}export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
+# The exports must be read back by a shell as exactly these values.
+eq '...which a shell reads back as the values' 'http://localhost:4123 4123' \
+  "$(env -i bash -c ". '$CEF'; printf '%s %s' \"\$WORKTREE_URL\" \"\$SERVER_PORT\"")"
+printf 'export OTHER=1\n' >"$CEF"
+wt_session_env_export "$CEF"
+eq 'session env: additive — what was there stays first' 'export OTHER=1' "$(head -1 "$CEF")"
+eq '...and the exports follow' 3 "$(wc -l <"$CEF" | tr -d ' ')"
+eq 'session env: an empty CLAUDE_ENV_FILE does nothing, silently' '' "$(wt_session_env_export '' 2>&1)"
+out=$(wt_session_env_export "$TMP/no-such-dir/env.sh" 2>&1); rc=$?
+eq 'session env: an unwritable target is harmless' 0 "$rc"
+contains '...and warns' 'could not append to CLAUDE_ENV_FILE' "$out"
+eq '...creating nothing' no "$([ -e "$TMP/no-such-dir" ] && echo yes || echo no)"
+out=$(wt_session_env_export "$TMP/claude-env" 2>&1)
+contains 'session env: a directory is not written through' 'is not a regular file' "$out"
+: >"$CEF"
+# shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
+WT_RUNTIME_URL='http://x/$(touch pwned)' wt_session_env_export "$CEF"
+eq 'session env: an unsafe url is not exported (the port still is)' "export SERVER_PORT='4123'" "$(cat "$CEF")"
+: >"$CEF"
+PROFILE_RT_PORTVAR='A=1' wt_session_env_export "$CEF"
+eq 'session env: an illegal port var is not exported (the url still is)' \
+  "export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
+: >"$CEF"
+WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF"
+eq 'session env: nothing to export writes nothing' '' "$(cat "$CEF")"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_RT_PORTVAR='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
+
+# --- serve and stop are commands: approval, review, and the placeholder refusal -------------------
+# shellcheck disable=SC2034
+PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=1 PROFILE_RAW='' PROFILE_RT_SEED='' PROFILE_RT_TEARDOWN=''
+PROFILE_RT_SERVE='' PROFILE_RT_STOP=''
+wt_profile_runs_commands
+eq 'runs commands: a runtime with no command runs none' 1 $?
+PROFILE_RT_SERVE='bin/server --port={port}'
+wt_profile_runs_commands
+eq 'runs commands: serve alone is a command, so it needs approval' 0 $?
+PROFILE_RT_SERVE='' PROFILE_RT_STOP='bin/server --stop'
+wt_profile_runs_commands
+eq 'runs commands: stop alone too' 0 $?
+PROFILE_RT_SERVE='bin/server --port={port}'
+PROFILE_PATH=$TMP/describe-profile.json
+printf '{}' >"$PROFILE_PATH"
+out=$(wt_approval_describe "$DWT")
+contains 'review: shows the serve command' 'serve (run by /pitlane-serve): bin/server --port={port}' "$out"
+contains 'review: shows the stop command' 'stop (run by teardown): bin/server --stop' "$out"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_RT_SERVE='' PROFILE_RT_STOP=''
+# shellcheck disable=SC2034
+PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0
+
+eq 'runtime command: placeholders expand' 'bin/server --port=4123 --name=feat_x' \
+  "$(WT_PORT=4123 WT_SLUG=feat_x wt_runtime_command 'bin/server --port={port} --name={slug}')"
+out=$(WT_NAME='q; touch pwned' wt_runtime_command 'bin/server --tag={name}'); rc=$?
+eq 'runtime command: an unsafe {name} is refused' 1 "$rc"
+contains '...naming the placeholder' '{name}' "$out"
+lacks '...and printing no command' 'bin/server' "$out"
+eq 'runtime command: a harmless {name} expands' 'bin/server --tag=alice/fix-99' \
+  "$(WT_NAME='alice/fix-99' wt_runtime_command 'bin/server --tag={name}')"
+# shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
+WT_PATH='/tmp/a$(x)' wt_runtime_command 'cd {worktree} && run' >/dev/null
+eq 'runtime command: an unsafe {worktree} is refused' 1 $?
+wt_runtime_command '' >/dev/null
+eq 'runtime command: none in the profile is refused' 1 $?
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

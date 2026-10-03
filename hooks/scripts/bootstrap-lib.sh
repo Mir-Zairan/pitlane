@@ -248,12 +248,14 @@ wt_approval_still() {  # $1 = run directory
 }
 
 # True when the loaded profile names anything that would be executed: an install or verify
-# command, a seed or a teardown script. `shell` alone runs nothing — it only wraps those. A profile
-# that runs nothing (config copies, hardlinks, ports, env overrides) needs no approval.
+# command, a seed or a teardown script, a serve or stop command. `shell` alone runs nothing — it only
+# wraps those. A profile that runs nothing (config copies, hardlinks, ports, env overrides, a URL)
+# needs no approval.
 wt_profile_runs_commands() {
   local rec body dir lock strategy install verify _cksum
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 1
-  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && { [ -n "${PROFILE_RT_SEED:-}" ] || [ -n "${PROFILE_RT_TEARDOWN:-}" ]; }; then
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && { [ -n "${PROFILE_RT_SEED:-}" ] || [ -n "${PROFILE_RT_TEARDOWN:-}" ] \
+    || [ -n "${PROFILE_RT_SERVE:-}" ] || [ -n "${PROFILE_RT_STOP:-}" ]; }; then
     return 0
   fi
   while IFS= read -r -d "$WT_RS" rec; do
@@ -343,6 +345,8 @@ wt_approval_describe() {  # $1 = run directory
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ]; then
     [ -n "${PROFILE_RT_SEED:-}" ] && printf '  seed script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_SEED")"
     [ -n "${PROFILE_RT_TEARDOWN:-}" ] && printf '  teardown script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_TEARDOWN")"
+    [ -n "${PROFILE_RT_SERVE:-}" ] && printf '  serve (run by /pitlane-serve): %s\n' "$(wt_visible "$PROFILE_RT_SERVE")"
+    [ -n "${PROFILE_RT_STOP:-}" ] && printf '  stop (run by teardown): %s\n' "$(wt_visible "$PROFILE_RT_STOP")"
   fi
   if wt_is_pr_worktree "$dir"; then
     printf 'This is a pull-request worktree: approving covers this commit only. An approved install runs the PR'"'"'s own package scripts and toolchain files too, so read the diff of those (package.json, composer.json, flake.nix, …) before approving.\n'
@@ -1817,6 +1821,20 @@ wt_unsafe_command_placeholder() {  # $1 = the UNEXPANDED template
   return 0
 }
 
+# Expand the runtime command template $1 (`runtime.serve` or `runtime.stop`) for this worktree, by
+# the install command's rule: printed when every placeholder in it is safe here; refused — the
+# reason printed, return 1 — when one would carry shell syntax into command position. Runs nothing.
+wt_runtime_command() {  # $1 = the UNEXPANDED template
+  local tpl=${1-} bad
+  [ -n "$tpl" ] || { printf 'the profile has no such command'; return 1; }
+  bad=$(wt_unsafe_command_placeholder "$tpl")
+  if [ -n "$bad" ]; then
+    printf 'it interpolates {%s}, whose value here contains shell metacharacters' "$bad"
+    return 1
+  fi
+  wt_expand "$tpl"
+}
+
 # Resolve the two git-directory lookups ONCE, in the caller's own shell, so the memos inside
 # wt_state_path and wt_lock_path are actually populated when those run inside a command
 # substitution. Without this the caches are dead code: each of the ~4 calls per dependency forks
@@ -2695,11 +2713,13 @@ WT_STATUS_SHOWN=3
 # `<name> ready with warnings (<why>)`, and the count of tracked files an install changed — a count,
 # not the names, which are branch content; /pitlane-finish shows them. Still one line (ADR-017), and
 # at start-up a complete worktree with nothing to report prints NOTHING: stdout there is model
-# context. A worktree whose only gaps are failures that stand is not sent to /pitlane-finish as if
-# that would fix them: it would not retry them, and retrying is the user's call.
+# context — unless the profile has runtime.serve, when it prints one line naming /pitlane-serve and
+# the URL (ADR-021), a clause every other start-up line carries too. A worktree whose only gaps are
+# failures that stand is not sent to /pitlane-finish as if that would fix them: it would not retry
+# them, and retrying is the user's call.
 wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = background | approval | empty, $4 = deadline for asking git which changed files remain (empty = WT_STATUS_SECONDS)
   local worktree=${1%/} when=${2-} how=${3-} deadline=${4-} kind name detail why path n=0 nchanged=0 standing=0
-  local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary
+  local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary app=''
   local -a absent_items=() warned_items=()
   while IFS=$WT_US read -r kind name detail; do
     case $kind in
@@ -2768,19 +2788,27 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
     return 0
   fi
 
-  [ -n "$summary" ] || return 0
+  # The app clause, so a session never reaches for the repo's own start command, which knows nothing
+  # of this worktree's port. The held-back line does not carry it: /pitlane-serve would refuse there too.
+  if [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SERVE:-}" ]; then
+    app=" To run the app, use /pitlane-serve${WT_RUNTIME_URL:+ (it serves at $WT_RUNTIME_URL)}, not the repo's own start command."
+  fi
+  if [ -z "$summary" ]; then
+    [ -z "$app" ] || printf 'Pitlane: this worktree is set up.%s\n' "$app"
+    return 0
+  fi
   if [ -z "${WT_PENDING:-}" ]; then
-    printf 'Pitlane: this worktree is set up, with warnings — %s. It is usable; tell the user if it matters for the task.\n' "$summary"
+    printf 'Pitlane: this worktree is set up, with warnings — %s. It is usable; tell the user if it matters for the task.%s\n' "$summary" "$app"
   # Written for a model that may be reading a stranger's branch: it must neither approve on its own
   # nor do the held-back steps by hand, which would run exactly what the gate held back.
   elif [ "$how" = approval ]; then
     printf 'Pitlane: this worktree'"'"'s setup commands were NOT run — %s. Its profile, or a seed or teardown script it names, is not approved in its current form, and this branch may not be the developer'"'"'s own. Do not approve it, run those commands, or install dependencies or create databases by hand. Tell the user; if they want it set up, run /pitlane-finish, which shows what it would run and needs their explicit approval.\n' "$summary"
   elif [ "$how" = background ]; then
-    printf 'Pitlane: this worktree is still being set up in the background — %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$summary"
+    printf 'Pitlane: this worktree is still being set up in the background — %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.%s\n' "$summary" "$app"
   elif [ -z "${WT_PENDING_ATTEMPTABLE:-}" ]; then
-    printf 'Pitlane: this worktree is not fully set up — %s. An install that failed is not retried while its lockfile and install command are unchanged, so running /pitlane-finish will not fix this. Tell the user why it failed; if they say the cause is fixed, /pitlane-finish can retry on their word. Do not install dependencies by hand.\n' "$summary"
+    printf 'Pitlane: this worktree is not fully set up — %s. An install that failed is not retried while its lockfile and install command are unchanged, so running /pitlane-finish will not fix this. Tell the user why it failed; if they say the cause is fixed, /pitlane-finish can retry on their word. Do not install dependencies by hand.%s\n' "$summary" "$app"
   else
-    printf 'Pitlane: this worktree is not fully set up yet — %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$summary"
+    printf 'Pitlane: this worktree is not fully set up yet — %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.%s\n' "$summary" "$app"
   fi
 }
 
@@ -3546,8 +3574,8 @@ wt_runtime_env_put() {  # $1 = destination, $2 = content
 # override file that shows up as an untracked change is a bug — a developer commits it by accident
 # and every teammate's worktree then points at one database. The question is asked IN THE WORKTREE,
 # because that is the .gitignore that governs the file and a branch can legitimately differ.
-wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream, $6 = recorded disposition
-  local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-} recorded=${6-}
+wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream, $6 = recorded disposition, $7 = expanded runtime.url or empty
+  local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-} recorded=${6-} url=${7-}
   local dest parent state rec body key val block before='' after='' n=0 irc verb unsafe wtname scoped
 
   # SC2034: WT_ENV_WROTE is this function's result — the caller records it in the state file so
@@ -3667,6 +3695,14 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
     fi
   else
     pvar=''
+  fi
+  # Re-checked, not trusted: this line is unquoted in a file a dotenv parser reads.
+  if [ -n "$url" ]; then
+    if wt_is_safe_url "$url"; then
+      block=$block"WORKTREE_URL=$url$WT_NL"
+    else
+      wt_log "  runtime: skipping WORKTREE_URL — \"$url\" is not a plain http(s) URL"
+    fi
   fi
 
   # SCOPED KEYS: `<file>:<VAR>` sets VAR in that one file only, in place of the shared VAR there. So
@@ -4080,11 +4116,16 @@ wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, 
   done
 }
 
+# Layer 3 for one worktree: slug, port, env blocks, seed. Publishes WT_RUNTIME_PORT (the claimed
+# port, when runtime.port.var names a variable to carry it) and WT_RUNTIME_URL (runtime.url expanded,
+# when it is safe), for the session's environment and status line; both empty when nothing was set.
 wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport
-  local rest f prior fstate shown nfiles
+  local rest f prior fstate shown nfiles url
 
+  WT_RUNTIME_PORT=''
+  WT_RUNTIME_URL=''
   [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
 
   if [ -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
@@ -4154,6 +4195,18 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
   # Exported BEFORE the env file is written, because {port} in a value resolves from it.
   WT_PORT=$port
   export WT_PORT
+  if [ -n "$port" ] && [ -n "${PROFILE_RT_PORTVAR:-}" ] && wt_is_safe_envkey "$PROFILE_RT_PORTVAR"; then
+    WT_RUNTIME_PORT=$port
+  fi
+  url=''
+  if [ -n "${PROFILE_RT_URL:-}" ]; then
+    if url=$(wt_expand_url "$PROFILE_RT_URL"); then
+      WT_RUNTIME_URL=$url
+    else
+      wt_log "runtime: runtime.url — $url; WORKTREE_URL is not set"
+      url=''
+    fi
+  fi
 
   # --- the env override files ------------------------------------------------------------------
   # One managed block per file the app loads, each with its OWN recorded disposition: a
@@ -4185,7 +4238,7 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
         prior=theirs
         wt_log "runtime: $f is yours — it differs from the main checkout's copy, so it was set up in this worktree by hand; it will be left alone, and nothing will be seeded. To hand it to the plugin, add this line at its end: $WT_ENV_MARKER"
       fi
-      wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}" "$prior"
+      wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}" "$prior" "$url"
       case $WT_ENV_WROTE in
         written) fstate=ours ;;
         developer)
@@ -4260,6 +4313,33 @@ EOF
   # `env=` names only the files that ARE there: wt_runtime_env_write refuses a symlink, a
   # non-gitignored path and a failed write, and naming such a file would report isolation that did
   # not happen.
-  wt_log "runtime: slug=$slug${port:+ port=$port}${shown:+ env=$shown}"
+  wt_log "runtime: slug=$slug${port:+ port=$port}${url:+ url=$url}${shown:+ env=$shown}"
+  return 0
+}
+
+# Append this worktree's port and URL to the file Claude Code names in CLAUDE_ENV_FILE, as `export`
+# lines, so the session's own commands see them in their environment (ADR-021). SessionStart only,
+# and only before the hook exits: Claude Code reads the file once, when the hook returns, so a
+# background run's write never arrives. Additive — the app still reads its env files. A missing,
+# unwritable or non-regular target only warns. The values are constrained by construction (digits; a
+# URL wt_is_safe_url passed, which holds no quote), and single-quoted anyway.
+wt_session_env_export() {  # $1 = the file CLAUDE_ENV_FILE names (empty: do nothing)
+  local f=${1-} lines=''
+  [ -n "$f" ] || return 0
+  if [ -n "${WT_RUNTIME_PORT:-}" ] && wt_is_safe_envkey "${PROFILE_RT_PORTVAR:-}" \
+    && wt_is_posint "$WT_RUNTIME_PORT"; then
+    lines+="export $PROFILE_RT_PORTVAR='$WT_RUNTIME_PORT'$WT_NL"
+  fi
+  if [ -n "${WT_RUNTIME_URL:-}" ] && wt_is_safe_url "$WT_RUNTIME_URL"; then
+    lines+="export WORKTREE_URL='$WT_RUNTIME_URL'$WT_NL"
+  fi
+  [ -n "$lines" ] || return 0
+  if [ -d "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+    wt_log "runtime: CLAUDE_ENV_FILE ($f) is not a regular file — the session's environment does not get the port or the URL"
+    return 0
+  fi
+  if ! printf '%s' "$lines" >>"$f" 2>/dev/null; then
+    wt_log "runtime: could not append to CLAUDE_ENV_FILE ($f) — the session's environment does not get the port or the URL"
+  fi
   return 0
 }
