@@ -181,11 +181,23 @@ dir_digest() {  # $1 = directory
 }
 
 # What must not change in the main checkout: its commit, every tracked, untracked and ignored path
-# (an env file or a stray lockfile appearing there is a change), and its dependency trees' bytes.
+# (an env file or a stray lockfile appearing there is a change), the CONTENTS of every untracked and
+# ignored one — .env, .bundle/config, what .worktreeinclude copies: an edit through a hardlink or by
+# the env writer keeps the path list identical — and its dependency trees' bytes.
 main_snapshot() {  # $1 = repo
+  local d p
   git -C "$1" rev-parse HEAD
   git -C "$1" status --porcelain --ignored | grep -v '^!! \.claude/worktrees/$'
-  local d
+  # --directory collapses an ignored tree to one entry, so a dependency dir is one line, skipped here
+  # and digested below. An empty directory holds no content: `git worktree add` leaves one behind.
+  git -C "$1" ls-files --others --directory --no-empty-directory -z | tr '\0' '\n' | while IFS= read -r p; do
+    case " $STACK_DEPDIRS .claude/worktrees " in *" ${p%/} "*) continue ;; esac
+    if [ -d "$1/$p" ]; then
+      printf '%s %s\n' "$p" "$(dir_digest "$1/$p")"
+    else
+      printf '%s %s\n' "$p" "$(cksum <"$1/$p")"
+    fi
+  done
   for d in $STACK_DEPDIRS; do printf '%s %s\n' "$d" "$(dir_digest "$1/$d")"; done
 }
 
@@ -223,10 +235,25 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   [ -z "$out" ] || show_log "$logs/$name.start"
   out=$(cd "$w" && bash "$HOOK" --finish 2>"$logs/$name.finish")
   eq "$name: --finish reports the worktree fully set up" 'Pitlane: this worktree is fully set up.' "$out"
-  local d first
+  local d first f own
   for d in $STACK_LINKDIRS; do
     first=$(cd "$r" && find "$d" -type f | LC_ALL=C sort | head -n 1)
     eq "$name: $d is hardlinked from the main checkout, not reinstalled ($first)" "$(inode "$r/$first")" "$(inode "$w/$first")"
+  done
+  # The worktree is inside the main checkout, so a runtime that walks up parent directories finds
+  # main's tree: only a file in the worktree's own tree proves its install happened.
+  # SC2086: each entry is a glob, expanded on purpose, relative to the worktree.
+  # shellcheck disable=SC2086
+  for f in $STACK_OWNFILES; do
+    own=$(cd "$w" && for g in $f; do [ -e "$g" ] && { (cd -P "$(dirname "$g")" && pwd -P); break; }; done)
+    eq "$name: the worktree's own tree holds $f" yes "$(case $own/ in "$w"/*) echo yes ;; esac)"
+  done
+  for d in $STACK_DEPDIRS; do
+    case " $STACK_LINKDIRS " in *" $d "*) continue ;; esac
+    case " $(printf '%s' "$STACK_OWNFILES" | tr -s ' \n' '  ')" in
+      *" $d/"*) ;;
+      *) eq "$name: the fixture names a file the worktree's own $d must hold" "a file under $d/" "none" ;;
+    esac
   done
   eq "$name: the bootstrap left nothing untracked or modified, so teardown will not hold it" '' \
     "$(git -C "$w" status --porcelain)"
@@ -240,7 +267,9 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
 
   expect=${STACK_EXPECT//\{slug\}/$name}
   expect=${expect//\{port\}/$port}
-  out=$(tc "$w" "$STACK_PROBE" 2>"$logs/$name.probe")
+  # Nothing on the environment's search paths may stand in for the worktree's own tree.
+  out=$(tc "$w" "unset NODE_PATH PYTHONPATH RUBYLIB; export PROBE_ROOT=$(printf '%q' "$w"); $STACK_PROBE" \
+    2>"$logs/$name.probe")
   eq "$name: the stack's own runtime uses the dependencies in the worktree ($STACK_PROBE)" "$expect" "$out"
   [ "$out" = "$expect" ] || show_log "$logs/$name.probe"
 }
@@ -275,7 +304,8 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   local stack=$1 r logs before t0 fail0 p_alpha p_beta
   STACK=$stack
   t0=$SECONDS fail0=$fail
-  STACK_DEPDIRS='' STACK_LINKDIRS='' STACK_PROBE='' STACK_EXPECT='' STACK_ENVFILE=''
+  STACK_DEPDIRS='' STACK_LINKDIRS='' STACK_OWNFILES='' STACK_PROBE='' STACK_EXPECT='' STACK_ENVFILE=''
+  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
   r=$dir/repo logs=$dir/logs STACK_DB=$dir/databases
@@ -299,6 +329,9 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   git -C "$r" add -A
   git -C "$r" commit -qm 'fixture'
   before=$(main_snapshot "$r")
+  # The profile is detection's proposal, so a default that disagrees with the real tool fails here.
+  eq "detection's deps agree with the fixture (verify supplied only where withheld)" '' "$STACK_DETECT_ERRORS"
+  eq 'detection hardlinks exactly the dirs this stack expects' "$STACK_LINKDIRS" "$STACK_DETECTED_LINKDIRS"
 
   if [ "$stack" = noprofile ]; then
     run_noprofile "$r" "$logs"

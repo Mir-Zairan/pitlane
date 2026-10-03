@@ -12,12 +12,21 @@
 #                         (`docker=`) cannot be fetched, so the stack skips without it.
 #   fixture_<stack> <dir> writes the repository into an already `git init`ed <dir>, builds its
 #                         lockfile and the main checkout's dependency directory with the real tool
-#                         (network allowed), writes the profile with write_profile, and sets:
+#                         (network allowed), runs detect_deps for the deps[] /pitlane-setup would
+#                         propose, writes the profile with write_profile, and sets:
 #                           STACK_DEPDIRS   main-checkout dependency dirs that must stay byte-identical
-#                           STACK_LINKDIRS  those of them the profile hardlinks, which the worktree
-#                                           must share inodes with rather than reinstall
+#                           STACK_LINKDIRS  those of them the stack expects hardlinked, which the
+#                                           worktree must share inodes with rather than reinstall —
+#                                           checked against what detection chose
+#                           STACK_OWNFILES  files (globs allowed) the worktree's OWN installed tree
+#                                           must hold, at least one under every dependency dir that
+#                                           is not hardlinked: a worktree sits inside the main
+#                                           checkout, so a runtime that walks up the tree would
+#                                           find main's and pass without them
 #                           STACK_PROBE     shell run in a worktree, through the toolchain, that must
-#                                           print STACK_EXPECT when the dependencies are usable
+#                                           print STACK_EXPECT when the dependencies are usable. It
+#                                           gets PROBE_ROOT (the worktree) and checks that what it
+#                                           loaded resolved inside it, not in the main checkout
 #                           STACK_EXPECT    what STACK_PROBE prints; {slug} and {port} stand for the
 #                                           worktree's own
 #                           STACK_ENVFILE   the profile's env file ('' when there is no runtime)
@@ -27,8 +36,44 @@
 # Every name in here is invented. Dependencies are one tiny, dependency-free package per ecosystem.
 #
 # Expects from the sourcing suite: STACK_SHELL (the wrapper, '' for the host), tc (runs a command
-# string in a directory through that wrapper), STACK_DB (where seeds stand in for databases) and
-# STACK_PORT_BASE.
+# string in a directory through that wrapper), STACK_DB (where seeds stand in for databases),
+# STACK_PORT_BASE and SCRIPTS (the plugin's hooks/scripts).
+
+# The deps[] body /pitlane-setup would write for $1: every `dep` record detect.sh proposes, with its
+# dir, lock, strategy, install and verify as detected — so the suite proves the detection defaults
+# against real installs. Where detection withholds a verify (a `no default verify:` depNote), the
+# developer supplies one; here that is a `dir=verify` argument, and supplying one detection already
+# proposes is a fixture error. Sets STACK_DEPS (the JSON body), STACK_DETECTED_LINKDIRS (the dirs it
+# chose to hardlink) and STACK_DETECT_ERRORS ('' when the fixture and detection agree).
+detect_deps() {  # $1 = repo, $@ = dir=verify for the entries detection gives none
+  local repo=$1 out
+  shift
+  out=$(WT_SKIP_PROBES=1 bash "$SCRIPTS/detect.sh" "$repo" 2>/dev/null | python3 -c '
+import json, sys
+supplied = dict(a.split("=", 1) for a in sys.argv[1:])
+entries, links, errors = [], [], []
+for line in sys.stdin:
+    f = line.rstrip("\n").split("\t")
+    if f[0] != "dep":
+        continue
+    _, _, d, lock, strategy, install, verify = (f + [""] * 7)[:7]
+    if d in supplied:
+        if verify:
+            errors.append("detection proposes a verify for %s (%s); the fixture must not override it" % (d, verify))
+        verify = supplied.pop(d)
+    elif not verify and d and strategy != "skip":
+        errors.append("detection withholds a verify for %s and the fixture supplies none" % d)
+    if strategy == "hardlink":
+        links.append(d)
+    entries.append(json.dumps({"dir": d or None, "lock": lock, "strategy": strategy,
+                               "install": install, "verify": verify}))
+errors += ["the fixture supplies a verify for %s, which detection does not propose" % d for d in supplied]
+print(" ".join(links))
+print("; ".join(errors))
+print(",\n    ".join(entries))
+' "$@") || { STACK_DEPS='' STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='detect.sh or its conversion failed'; return 0; }
+  { read -r STACK_DETECTED_LINKDIRS; read -r STACK_DETECT_ERRORS; STACK_DEPS=$(cat); } <<<"$out"
+}
 
 # The profile every runtime-isolating stack gets: the toolchain wrapper, the deps given, a port and
 # an env file, and a seed/teardown pair that create and remove "$STACK_DB/<slug>" — a database stand-in
@@ -77,6 +122,24 @@ write_dev_config() {  # $1 = repo, $@ = further .gitignore lines
   printf 'APP_NAME=fixture\n' >"$repo/.env"
 }
 
+# Probes that pass only when the package resolved inside the worktree (PROBE_ROOT), not in the main
+# checkout a parent-directory lookup would reach.
+write_node_probe() {  # $1 = file; requires is-number
+  cat >"$1" <<'JS'
+const p = require.resolve("is-number");
+const own = p.startsWith(process.env.PROBE_ROOT + "/");
+process.stdout.write(own && require("is-number")(5) ? "ok" : "broken: " + p);
+JS
+}
+write_php_probe() {  # $1 = file; requires psr/log through composer's autoloader
+  cat >"$1" <<'PHP'
+<?php
+require __DIR__ . "/vendor/autoload.php";
+$file = (new ReflectionClass("Psr\\Log\\LoggerInterface"))->getFileName();
+echo strpos($file, getenv("PROBE_ROOT") . "/") === 0 ? "ok" : "broken: $file";
+PHP
+}
+
 # --- 1. pnpm workspace: two packages, one depending on the other through workspace:* ----------------
 
 stack_tools_pnpm() { echo node=nodejs pnpm=pnpm; }
@@ -91,11 +154,20 @@ fixture_pnpm() {
   printf 'module.exports = require("is-number");\n' >"$r/packages/lib/index.js"
   printf '{ "name": "@fixture/web", "version": "1.0.0", "dependencies": { "@fixture/lib": "workspace:*" } }\n' \
     >"$r/packages/web/package.json"
-  printf 'process.stdout.write(require("@fixture/lib")(5) ? "ok" : "broken");\n' >"$r/packages/web/probe.js"
+  # Both the workspace package and the registry package it uses must resolve inside the worktree.
+  cat >"$r/packages/web/probe.js" <<'JS'
+const path = require("path"), root = process.env.PROBE_ROOT + "/";
+const lib = require.resolve("@fixture/lib");
+const num = require.resolve("is-number", { paths: [path.dirname(lib)] });
+const own = lib.startsWith(root) && num.startsWith(root);
+process.stdout.write(own && require("@fixture/lib")(5) ? "ok" : "broken: " + lib + " " + num);
+JS
   tc "$r" 'pnpm install' || return 1
-  write_profile "$r" '{"dir":"node_modules","lock":"pnpm-lock.yaml","strategy":"install",
-    "install":"pnpm install --frozen-lockfile","verify":"test -d node_modules/.pnpm"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS='node_modules packages/lib/node_modules packages/web/node_modules'
+  STACK_OWNFILES='node_modules/.modules.yaml packages/lib/node_modules/is-number/package.json
+    packages/web/node_modules/@fixture/lib/package.json'
   STACK_PROBE='cd packages/web && node probe.js'
   STACK_EXPECT=ok
 }
@@ -108,10 +180,10 @@ fixture_npm() {
   write_dev_config "$r" 'node_modules/'
   printf '{ "name": "fixture-npm", "version": "1.0.0", "private": true, "dependencies": { "is-number": "7.0.0" } }\n' \
     >"$r/package.json"
-  printf 'process.stdout.write(require("is-number")(5) ? "ok" : "broken");\n' >"$r/probe.js"
+  write_node_probe "$r/probe.js"
   tc "$r" 'npm install --no-audit --no-fund' || return 1
-  write_profile "$r" '{"dir":"node_modules","lock":"package-lock.json","strategy":"hardlink",
-    "install":"npm ci --no-audit --no-fund","verify":"test -r node_modules/is-number/package.json"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=node_modules STACK_LINKDIRS=node_modules
   STACK_PROBE='node probe.js'
   STACK_EXPECT=ok
@@ -125,11 +197,14 @@ fixture_bun() {
   write_dev_config "$r" 'node_modules/'
   printf '{ "name": "fixture-bun", "version": "1.0.0", "private": true, "dependencies": { "is-number": "7.0.0" } }\n' \
     >"$r/package.json"
-  printf 'process.stdout.write(require("is-number")(5) ? "ok" : "broken");\n' >"$r/probe.js"
+  write_node_probe "$r/probe.js"
   tc "$r" 'bun install --save-text-lockfile' || return 1
-  write_profile "$r" '{"dir":"node_modules","lock":"bun.lock","strategy":"install",
-    "install":"bun install --frozen-lockfile"}' .env.local
+  # bun writes no marker of a finished install, so detection proposes no verify; the developer names
+  # a package this repo always installs, as /pitlane-setup asks them to.
+  detect_deps "$r" 'node_modules=test -f node_modules/is-number/package.json'
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=node_modules
+  STACK_OWNFILES=node_modules/is-number/package.json
   STACK_PROBE='bun probe.js'
   STACK_EXPECT=ok
 }
@@ -149,11 +224,16 @@ version = "0.1.0"
 requires-python = ">=3.8"
 dependencies = ["six"]
 TOML
-  printf 'import six, sys\nsys.stdout.write("ok" if six.PY3 else "broken")\n' >"$r/probe.py"
+  cat >"$r/probe.py" <<'PY'
+import os, six, sys
+own = six.__file__.startswith(os.environ["PROBE_ROOT"] + "/")
+sys.stdout.write("ok" if own and six.PY3 else "broken: " + six.__file__)
+PY
   tc "$r" 'uv lock -q && uv sync -q --frozen' || return 1
-  write_profile "$r" '{"dir":".venv","lock":"uv.lock","strategy":"install","install":"uv sync --frozen",
-    "verify":"test -x .venv/bin/python"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=.venv
+  STACK_OWNFILES='.venv/lib/python*/site-packages/six.py'
   STACK_PROBE='.venv/bin/python probe.py'
   STACK_EXPECT=ok
 }
@@ -165,11 +245,10 @@ fixture_composer() {
   local r=$1
   write_dev_config "$r" 'vendor/'
   printf '{ "name": "fixture/app", "require": { "psr/log": "^3.0" } }\n' >"$r/composer.json"
-  printf '<?php\nrequire __DIR__ . "/vendor/autoload.php";\necho interface_exists("Psr\\\\Log\\\\LoggerInterface") ? "ok" : "broken";\n' \
-    >"$r/probe.php"
+  write_php_probe "$r/probe.php"
   tc "$r" 'composer install --no-interaction --no-progress --quiet' || return 1
-  write_profile "$r" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
-    "install":"composer install --no-interaction --no-progress","verify":"test -r vendor/autoload.php"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=vendor STACK_LINKDIRS=vendor
   STACK_PROBE='php probe.php'
   STACK_EXPECT=ok
@@ -185,10 +264,15 @@ fixture_bundler() {
   write_dev_config "$r" 'vendor/bundle/' '.bundle/'
   printf '.bundle/config\n' >>"$r/.worktreeinclude"
   printf "source 'https://rubygems.org'\ngem 'rack', '~> 3.0'\n" >"$r/Gemfile"
-  printf 'require "rack"\nprint(defined?(Rack::RELEASE) ? "ok" : "broken")\n' >"$r/probe.rb"
+  cat >"$r/probe.rb" <<'RB'
+require "rack"
+gem = Gem.loaded_specs["rack"].full_gem_path
+own = gem.start_with?(ENV["PROBE_ROOT"] + "/")
+print(own && defined?(Rack::RELEASE) ? "ok" : "broken: #{gem}")
+RB
   tc "$r" 'bundle config set --local path vendor/bundle >/dev/null && bundle install --quiet' || return 1
-  write_profile "$r" '{"dir":"vendor/bundle","lock":"Gemfile.lock","strategy":"hardlink",
-    "install":"bundle install","verify":"test -d vendor/bundle/ruby"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=vendor/bundle STACK_LINKDIRS=vendor/bundle
   STACK_PROBE='bundle exec ruby probe.rb'
   STACK_EXPECT=ok
@@ -206,7 +290,8 @@ fixture_cargo() {
   printf 'fn main() {\n    let mut b = itoa::Buffer::new();\n    print!("{}", if b.format(5) == "5" { "ok" } else { "broken" });\n}\n' \
     >"$r/src/main.rs"
   tc "$r" 'cargo generate-lockfile -q && cargo fetch -q' || return 1
-  write_profile "$r" '{"dir":null,"lock":"Cargo.lock","strategy":"skip","install":"cargo fetch"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=''
   # --offline proves the worktree builds from the cache the main checkout filled, with nothing copied.
   STACK_PROBE='cargo run -q --offline'
@@ -223,7 +308,8 @@ fixture_go() {
   printf 'package main\n\nimport (\n\t"fmt"\n\n\t"github.com/google/uuid"\n)\n\nfunc main() {\n\tif uuid.Nil.String() == "00000000-0000-0000-0000-000000000000" {\n\t\tfmt.Print("ok")\n\t} else {\n\t\tfmt.Print("broken")\n\t}\n}\n' \
     >"$r/main.go"
   tc "$r" 'go get github.com/google/uuid@v1.6.0 >/dev/null 2>&1 && go mod tidy && go mod download' || return 1
-  write_profile "$r" '{"dir":null,"lock":"go.sum","strategy":"skip","install":"go mod download"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=''
   STACK_PROBE='GOPROXY=off go run .'
   STACK_EXPECT=ok
@@ -236,15 +322,14 @@ fixture_monorepo() {
   local r=$1
   write_dev_config "$r" 'vendor/' 'node_modules/'
   printf '{ "name": "fixture/shop", "require": { "psr/log": "^3.0" } }\n' >"$r/composer.json"
-  printf '<?php\nrequire __DIR__ . "/vendor/autoload.php";\necho interface_exists("Psr\\\\Log\\\\LoggerInterface") ? "ok" : "broken";\n' \
-    >"$r/probe.php"
+  write_php_probe "$r/probe.php"
   printf '{ "name": "fixture-shop-assets", "private": true, "dependencies": { "is-number": "7.0.0" } }\n' >"$r/package.json"
-  printf 'process.stdout.write(require("is-number")(5) ? "ok" : "broken");\n' >"$r/probe.js"
+  write_node_probe "$r/probe.js"
   tc "$r" 'composer install --no-interaction --no-progress --quiet && pnpm install' || return 1
-  write_profile "$r" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
-      "install":"composer install --no-interaction --no-progress","verify":"test -r vendor/autoload.php"},
-    {"dir":"node_modules","lock":"pnpm-lock.yaml","strategy":"install","install":"pnpm install --frozen-lockfile"}' .env.local
+  detect_deps "$r"
+  write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS='vendor node_modules' STACK_LINKDIRS=vendor
+  STACK_OWNFILES='node_modules/.modules.yaml node_modules/is-number/package.json'
   STACK_PROBE='php probe.php && node probe.js'
   STACK_EXPECT=okok
 }
