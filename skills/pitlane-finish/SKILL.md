@@ -41,6 +41,29 @@ It prints progress on stderr and one status line on stdout as its last word:
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
 
+## Tracked files an install changed
+
+Some package managers write into tracked files while they install (a placeholder in a workspace file,
+a reformatted manifest). Pitlane notices and logs it on stderr ("the install changed tracked files:
+…"), but it never undoes it: the background run overlaps this session, so a blind restore could
+throw away edits the session made. After every `--finish`, run, from the worktree's root:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --changed
+```
+
+It prints each tracked path an install changed that is still changed, one per line, and nothing when
+there is none. If it prints any:
+
+1. Show the user the paths and `git diff --stat -- <path>…` for them, and the diff itself if they ask.
+   An edit the session made to one of these files while the install ran can show up here too, so let
+   the user judge each one.
+2. Ask, path by path, whether to restore it. **Only for a path the user says yes to**, run
+   `git restore -- <path>` (or `git checkout -- <path>` on a git older than 2.23).
+   Never restore a path on your own judgement, and never all of them at once on a single yes unless
+   the user named them all.
+3. A path the user keeps is their call; say that the next install may change it again.
+
 ## Approval
 
 Pitlane runs none of a profile's commands — installs, verify checks, the seed and teardown scripts —

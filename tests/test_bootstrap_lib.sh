@@ -1668,6 +1668,83 @@ eq 'an install the guard refused is not rescued by a verify that passes on an ol
   "$(wt_state_status "$DWT" vendor)"
 rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
 
+# --- an install that changes tracked files ----------------------------------
+# A package manager that writes into a tracked file (a placeholder line in a workspace file) leaves
+# the worktree dirty. It is recorded and named, and never restored: the session may be editing too.
+mkdir -p "$DWT/conf"
+printf 'packages: []\n' > "$DWT/conf/work space.yaml"; printf 'a\n' > "$DWT/notes.txt"
+printf 'ignored.log\n' > "$DWT/.gitignore"
+git -C "$DWT" add conf notes.txt .gitignore && git -C "$DWT" commit -qm tracked
+changed_recs() {  # every `changed` record in the state file, US shown as |
+  local rec
+  while IFS= read -r -d "$RS_" rec; do
+    case $rec in "changed$US_"*) printf '%s\n' "${rec//"$US_"/|}" ;; esac
+  done <"$(wt_state_path "$DWT")"
+}
+TOUCHCMD="mkdir -p vendor && touch vendor/autoload.php && printf 'placeholder: 1\\n' >> 'conf/work space.yaml'"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$TOUCHCMD" 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'tracked: the install changing a tracked file is logged by name' \
+  'the install changed tracked files: conf/work space.yaml' "$out"
+eq '...recorded in the state, against its dependency' 'changed|vendor|conf/work space.yaml' "$(changed_recs)"
+eq '...and read back by wt_install_changed_paths' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
+contains '...and NOT restored' 'placeholder: 1' "$(cat "$DWT/conf/work space.yaml")"
+eq '...while the install still counts as done' "done" "$(wt_state_status "$DWT" vendor)"
+# An edit the session makes once the install is over is the session's, not the install's.
+printf 'b\n' >> "$DWT/notes.txt"
+eq '...a later edit by the session is never attributed to it' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
+# A re-install that finds the path still dirty does not forget who dirtied it.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$TOUCHCMD # v2" 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq '...a re-install keeps the earlier attribution while the path is still changed' \
+  'changed|vendor|conf/work space.yaml' "$(changed_recs)"
+lacks '...without claiming it changed it again, or taking the session'"'"'s edit' 'notes.txt' "$(changed_recs)$out"
+# Restored by the user: it drops out of what is reported.
+git -C "$DWT" checkout -q -- 'conf/work space.yaml' notes.txt
+eq '...and a path the user restored is no longer reported' '' "$(wt_install_changed_paths "$DWT")"
+# A path in two dependencies' records is reported once.
+printf 'placeholder: 2\n' >> "$DWT/conf/work space.yaml"
+wt_install_note_changes "$DWT" other '' 2>/dev/null
+eq '...a path two installs changed is reported once' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
+git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# Already changed before the install: the change is the session's, never offered for a restore.
+printf 'mine\n' >> "$DWT/conf/work space.yaml"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$TOUCHCMD" 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'tracked: a path already changed before the install is not attributed to it' 'changed tracked files' "$out"
+eq '...nor recorded' '' "$(changed_recs)"
+eq '...nor reported' '' "$(wt_install_changed_paths "$DWT")"
+git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# Untracked and ignored files are what an install is for.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && touch vendor/autoload.php new.txt && echo x > ignored.log' 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'tracked: an install writing only untracked and ignored files reports nothing' 'changed tracked files' "$out"
+eq '...and writes no record' '' "$(changed_recs)"
+rm -rf "$DWT/vendor" "$DWT/new.txt" "$DWT/ignored.log"; rm -f "$(wt_state_path "$DWT")"
+
+# Where git cannot say, nothing is recorded, and nothing is captured into the working tree.
+NOGIT=$TMP/nogit-wt
+mkdir -p "$NOGIT"; printf 'L\n' > "$NOGIT/composer.lock"
+# Without pipefail in the caller too: the engine must not depend on its entrypoint's options.
+eq 'no git: wt_tracked_changes says it cannot tell' 1 "$(set +o pipefail; wt_tracked_changes "$NOGIT"; echo $?)"
+eq '...the state falls back into the working tree' "$NOGIT/.claude/worktree-bootstrap-state" "$(wt_state_path "$NOGIT")"
+eq '...so there is no capture path' '1:' "$(p=$(wt_install_capture_path "$NOGIT" vendor); echo "$?:$p")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && echo nogit-progress" '')
+out=$(wt_bootstrap_deps "$NOGIT" "$NOGIT" "$FAR" 2>&1)
+eq '...the install still runs' "done" "$(wt_state_status "$NOGIT" vendor)"
+contains '...its output still on stderr' 'nogit-progress' "$out"
+eq '...and no install log is written inside the working tree' '' \
+  "$(find "$NOGIT" -name 'worktree-bootstrap.install.*' 2>/dev/null)"
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+
 # --- failure injection: the install hangs past the budget ------------------
 if command -v timeout >/dev/null 2>&1; then
   rm -rf "$DWT/vendor"

@@ -1390,6 +1390,30 @@ contains '...the output captured in the git dir' 'error: registry unreachable' \
 eq '...and nothing left in TMPDIR' '' "$(ls -A "$TMP/fld-tmp")"
 
 # ---------------------------------------------------------------------------
+# An install that changes a tracked file is named, and never restored
+# ---------------------------------------------------------------------------
+
+TRK=$TMP/trk
+make_repo "$TRK" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"mkdir -p vendor && touch vendor/autoload.php && echo '# placeholder' >> .gitignore\",\"verify\":\"test -r vendor/autoload.php\"},{\"dir\":\"node_modules\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"exit 1\"}"
+WTK=$TRK/.claude/worktrees/trk
+git -C "$TRK" worktree add -q "$WTK" -b worktree-trk 2>/dev/null
+start_hook "$WTK" >/dev/null
+contains 'tracked: the start-up run names the tracked file the install changed' \
+  'the install changed tracked files: .gitignore' "$(cat "$TMP/err")"
+contains '...and leaves it changed' '# placeholder' "$(cat "$WTK/.gitignore")"
+outF=$( cd "$WTK" && bash "$HOOK" --finish 2>/dev/null )
+eq 'tracked: the --finish summary names it beside what is missing' \
+  'Pitlane: still not complete — missing: node_modules; an install changed tracked files: .gitignore' "$outF"
+eq 'tracked: --changed prints it, one path per line' '.gitignore' "$( cd "$WTK" && bash "$HOOK" --changed 2>/dev/null )"
+eq '...from a subdirectory too' '.gitignore' "$( cd "$WTK/vendor" && bash "$HOOK" --changed 2>/dev/null )"
+git -C "$WTK" checkout -q -- .gitignore
+eq '...and nothing once the user restored it' '' "$( cd "$WTK" && bash "$HOOK" --changed 2>/dev/null )"
+outF=$( cd "$WTK" && bash "$HOOK" --finish 2>/dev/null )
+eq '...nor in the summary' 'Pitlane: still not complete — missing: node_modules' "$outF"
+contains 'tracked: --changed outside a repository says so' 'not inside a git repository' \
+  "$( cd "$TMP" && bash "$HOOK" --changed 2>/dev/null )"
+
+# ---------------------------------------------------------------------------
 # The approval gate: nothing a profile names runs until that content is approved
 # ---------------------------------------------------------------------------
 #

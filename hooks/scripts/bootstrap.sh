@@ -140,6 +140,17 @@ case ${1-} in
     wt_approval_cli "$@"
     exit 0
     ;;
+  # `bootstrap.sh --changed`, run from a worktree: each tracked path an install changed and that is
+  # still changed, one per line, nothing when there is none. /pitlane-finish reads it to offer
+  # restores; it never restores anything itself.
+  --changed)
+    if worktree=$(wt_repo_root "$PWD"); then
+      wt_install_changed_paths "$worktree"
+    else
+      printf 'Pitlane: %s is not inside a git repository.\n' "$PWD"
+    fi
+    exit 0
+    ;;
 esac
 
 wt_read_input
@@ -495,7 +506,9 @@ case $event in
         printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form. Missing: %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
           "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" "$WT_BOOTSTRAP_SCRIPT"
       else
-        printf 'Pitlane: still not complete — missing: %s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
+        changed=$(wt_install_changed_paths "$worktree")
+        printf 'Pitlane: still not complete — missing: %s%s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" \
+          "${changed:+; an install changed tracked files: $(printf '%s' "$changed" | paste -sd, - | sed 's/,/, /g')}"
       fi
       exit 0
     fi
