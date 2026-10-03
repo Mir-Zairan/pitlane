@@ -140,19 +140,30 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
 # recorded starting here. ONE line on stdout either way; non-zero when the app was not served or the
 # server would not stop. Never run by a hook.
 wt_serve_cli() {  # $1 = --serve or --serve-stop
-  local mode=$1 here=$PWD worktree root rc
+  local mode=$1 here=$PWD worktree root rc not_one
+  not_one='Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.'
   case "$here/" in
     *"$WT_SUBPATH"*) ;;
     *)
-      printf 'Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.\n'
+      printf '%s\n' "$not_one"
       return 1
       ;;
   esac
-  worktree=$(wt_repo_root "$here") || worktree=$here
+  if ! worktree=$(wt_repo_root "$here"); then
+    printf '%s\n' "$not_one"
+    return 1
+  fi
   if ! root=$(wt_main_root "$here"); then
     printf 'Pitlane: cannot find the main checkout for %s.\n' "$here"
     return 1
   fi
+  # A path under .claude/worktrees/ is not yet a worktree: from that directory itself, or a plain
+  # directory beneath it, git answers with the MAIN checkout, and serve would start (and record) the
+  # main checkout's app. Only a linked worktree that sits under <root>/.claude/worktrees/ qualifies.
+  case "$worktree/" in
+    "$root$WT_SUBPATH"?*) ;;
+    *) printf '%s\n' "$not_one"; return 1 ;;
+  esac
   WT_NAME=$(wt_name_from_path "$worktree")
   WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
   WT_PATH=$worktree
@@ -160,15 +171,43 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
   export WT_NAME WT_SLUG WT_PATH WT_ROOT
   wt_prime_paths "$root" "$worktree"
 
-  # Stopping runs nothing the profile names, so it needs neither the profile nor its approval.
+  # Stopping by signal runs nothing the profile names, so it needs neither the profile nor its
+  # approval. A server recorded as stopped by command is stopped by runtime.stop, which is the
+  # profile's command: that needs both, like serve itself.
   if [ "$mode" = --serve-stop ]; then
+    if wt_serve_record_read "$worktree" && [ "$WT_SERVE_STOPBY" = command ]; then
+      if ! wt_has_json; then
+        printf 'Pitlane: the server at %s was not stopped — only runtime.stop can stop it, and neither jq nor python3 is on PATH to read the profile.\n' "$WT_SERVE_URL"
+        return 1
+      fi
+      wt_load_profile_for "$worktree" "$root"
+      if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
+        printf 'Pitlane: the server at %s was not stopped — only runtime.stop can stop it, and there is no usable profile at %s.\n' "$WT_SERVE_URL" "$PROFILE_PATH"
+        return 1
+      fi
+      wt_approval_check "$worktree"
+      if [ "${WT_APPROVAL:-}" = no ]; then
+        wt_approval_held_line ''
+        return 1
+      fi
+    fi
     wt_serve_stop "$worktree"
     rc=$?
     case $rc in
-      0) printf 'Pitlane: stopped the server at %s (pid %s).\n' "$WT_SERVE_URL" "$WT_SERVE_PID" ;;
+      0)
+        if [ "$WT_SERVE_STOPBY" = command ]; then
+          printf 'Pitlane: stopped the server at %s (by runtime.stop).\n' "$WT_SERVE_URL"
+        else
+          printf 'Pitlane: stopped the server at %s (pid %s).\n' "$WT_SERVE_URL" "$WT_SERVE_PID"
+        fi
+        ;;
       1) printf 'Pitlane: no server started by Pitlane is recorded for this worktree — nothing stopped.\n' ;;
       2) printf 'Pitlane: the server Pitlane started here (pid %s) had already exited — nothing stopped.\n' "$WT_SERVE_PID" ;;
       3) printf 'Pitlane: pid %s now belongs to another process, not the server Pitlane started — left alone; nothing stopped.\n' "$WT_SERVE_PID" ;;
+      5)
+        printf 'Pitlane: the server at %s was not stopped — %s.\n' "$WT_SERVE_URL" "$WT_SERVE_STOP_WHY"
+        return 1
+        ;;
       *)
         printf 'Pitlane: the server at %s (pid %s) did not stop, even on SIGKILL.\n' "$WT_SERVE_URL" "$WT_SERVE_PID"
         return 1

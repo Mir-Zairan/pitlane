@@ -1957,10 +1957,14 @@ eq 'serve: before setup has run, it is refused and sent to /pitlane-finish' \
 ne '...non-zero' 0 "$SV_RC"
 eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
 
-( unset PITLANE_TRUST_PROFILES; serve_cli "$WSR" --serve; printf '%s' "$SV_RC" >"$TMP/rc" ); out=$(cat "$TMP/sv.out")
+# Not in a subshell, so a server a regression starts here is still remembered and stopped.
+unset PITLANE_TRUST_PROFILES
+serve_cli "$WSR" --serve; out=$SV_OUT
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
 contains 'serve: unapproved, the held-back line /pitlane-finish ends on' \
   "Pitlane: not run — the profile's commands are not approved in their current form. Run \`bash" "$out"
-ne '...non-zero' 0 "$(cat "$TMP/rc")"
+ne '...non-zero' 0 "$SV_RC"
 eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
 
 start_hook "$WSR" >/dev/null
@@ -1997,8 +2001,9 @@ eq 'serve: an unsafe {name} is refused' \
 eq '...and nothing ran' no "$([ -e "$TMP/sru-ran" ] || [ -e "$WSU/sru-injected" ] && echo yes || echo no)"
 
 # Something already answering at the URL would be mistaken for this app. /dev/tcp sees it too.
-python3 -m http.server "$SRVPORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+setsid python3 -m http.server "$SRVPORT" --bind 127.0.0.1 >/dev/null 2>&1 &
 squat=$!
+SV_KILL="$SV_KILL $squat"
 for _ in $(seq 1 50); do case $(answers "$SRVURL") in 'NO ANSWER'*) sleep 0.1 ;; *) break ;; esac; done
 WT_CURL='' serve_cli "$WSR" --serve; out=$SV_OUT
 eq 'serve: a port something else answers on is refused' \
@@ -2006,6 +2011,128 @@ eq 'serve: a port something else answers on is refused' \
 eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
 eq '...and nothing is recorded' '' "$(serve_record "$WSR")"
 kill "$squat" 2>/dev/null; wait "$squat" 2>/dev/null
+
+# Under .claude/worktrees/ is not the same as a worktree: from that directory itself, or a plain
+# directory beneath it, git resolves the MAIN checkout. Refused, with the main checkout untouched.
+GDMAIN=$(git -C "$SRV" rev-parse --absolute-git-dir)
+main_state() { cksum <"$GDMAIN/worktree-bootstrap-state" 2>/dev/null || echo absent; }
+mkdir -p "$SRV/.claude/worktrees/plain"
+before=$(main_state)
+for d in "$SRV/.claude/worktrees" "$SRV/.claude/worktrees/plain"; do
+  for mode in --serve --serve-stop; do
+    serve_cli "$d" "$mode"; out=$SV_OUT
+    eq "serve: $mode from ${d#"$SRV"/} is refused as not a worktree" \
+      'Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.' "$out"
+    eq '...exit 1' 1 "$SV_RC"
+  done
+done
+eq '...serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
+eq '...the main checkout has no serve record' '' "$(serve_record "$SRV")"
+eq '...and its state is untouched' "$before" "$(main_state)"
+eq '...nor a serve log' no "$([ -e "$GDMAIN/worktree-serve.log" ] && echo yes || echo no)"
+rmdir "$SRV/.claude/worktrees/plain"
+
+# Each refusal: its exact line, non-zero, serve not run, nothing recorded.
+refused() {  # $1 = label, $2 = worktree, $3 = expected line, $4 = marker serve would leave
+  eq "serve refusal: $1" "$3" "$SV_OUT"
+  ne '...non-zero' 0 "$SV_RC"
+  eq '...serve did not run' no "$([ -e "$4" ] && echo yes || echo no)"
+  eq '...nothing is recorded' '' "$(serve_record "$2")"
+}
+GDSR=$(git -C "$WSR" rev-parse --absolute-git-dir)
+
+# Too little free memory (a fake /proc/meminfo): the ADR-018 guard refuses before anything starts.
+printf 'MemTotal:       16777216 kB\nMemFree:        1 kB\nMemAvailable:   1572864 kB\n' >"$TMP/meminfo-low"
+WT_MEMINFO=$TMP/meminfo-low serve_cli "$WSR" --serve
+refused 'too little memory' "$WSR" \
+  'Pitlane: not served — too little memory is free to start it; close something heavy and run /pitlane-serve again (PITLANE_MEMORY_MAX=off skips this check)' \
+  "$TMP/srv-ran"
+
+# A log that cannot be written (the refusal above had already started one).
+rm -f "$GDSR/worktree-serve.log"
+mkdir "$GDSR/worktree-serve.log"
+serve_cli "$WSR" --serve
+refused 'an unwritable log' "$WSR" "Pitlane: not served — cannot write its log at $GDSR/worktree-serve.log" "$TMP/srv-ran"
+rmdir "$GDSR/worktree-serve.log"
+
+# Another /pitlane-serve holding the serve lock: refused once the wait is up, not started beside it.
+# shellcheck disable=SC2016  # $0 belongs to the inner shell.
+setsid bash -c 'exec 9>"$0"; flock -x 9; exec sleep 60' "$GDSR/worktree-serve.lock" </dev/null >/dev/null 2>&1 &
+holder=$!
+SV_KILL="$SV_KILL $holder"
+for _ in $(seq 1 50); do flock -n "$GDSR/worktree-serve.lock" true 2>/dev/null || break; sleep 0.1; done
+WT_SERVE_LOCK_SECONDS=1 serve_cli "$WSR" --serve
+refused 'the serve lock is held' "$WSR" \
+  'Pitlane: not served — another /pitlane-serve is still running here; wait for it to finish, then run /pitlane-serve again' \
+  "$TMP/srv-ran"
+kill -s KILL -- "-$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
+# A profile that does not parse.
+WSB=$SRV/.claude/worktrees/broken
+git -C "$SRV" worktree add -q "$WSB" -b worktree-broken 2>/dev/null
+printf '{ not json\n' >"$WSB/.claude/worktree-profile.json"
+serve_cli "$WSB" --serve
+refused 'no usable profile' "$WSB" \
+  "Pitlane: not served — there is no usable profile at $WSB/.claude/worktree-profile.json; /pitlane-setup writes one." \
+  "$TMP/srv-ran"
+
+# An install whose failure stands is named with its error line.
+SRF=$TMP/srf
+make_rt_repo "$SRF" ',
+    "serve": "touch '"$TMP"'/srf-ran; exec sleep 300"'
+python3 - "$SRF/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"][0]["install"] = "echo 'error: the registry is unreachable' >&2; exit 5"
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SRF" commit -qam failing
+WSF=$SRF/.claude/worktrees/failing
+git -C "$SRF" worktree add -q "$WSF" -b worktree-failing 2>/dev/null
+start_hook "$WSF" >/dev/null
+serve_cli "$WSF" --serve
+refused 'a standing install failure' "$WSF" \
+  "Pitlane: not served — this worktree's setup is not complete — vendor not installed (its install failed: error: the registry is unreachable); run /pitlane-finish first" \
+  "$TMP/srf-ran"
+
+# No port: {port} has nothing to expand to, and with no runtime.url there is no address at all.
+SNP=$TMP/snp
+make_rt_repo "$SNP"
+python3 - "$SNP/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+del d["runtime"]["port"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SNP" commit -qam portless
+WNP=$SNP/.claude/worktrees/portless
+git -C "$SNP" worktree add -q "$WNP" -b worktree-portless 2>/dev/null
+start_hook "$WNP" >/dev/null
+set_runtime() {  # $1 = worktree, $2 = JSON object merged into its own profile's runtime
+  python3 - "$1/.claude/worktree-profile.json" "$2" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["runtime"].update(json.loads(sys.argv[2]))
+d["runtime"] = {k: v for k, v in d["runtime"].items() if v is not None}
+json.dump(d, open(p, "w"), indent=2)
+PY
+}
+set_runtime "$WNP" '{"serve": "touch '"$TMP"'/np-ran; exec bin/server --port={port}"}'
+serve_cli "$WNP" --serve
+refused '{port} with no port' "$WNP" \
+  'Pitlane: not served — runtime.serve or runtime.url uses {port}, but this worktree has no port yet; run /pitlane-finish first' \
+  "$TMP/np-ran"
+set_runtime "$WNP" '{"serve": "touch '"$TMP"'/np-ran; exec sleep 300"}'
+serve_cli "$WNP" --serve
+refused 'no runtime.url and no port' "$WNP" \
+  'Pitlane: not served — the profile has no runtime.url and this worktree no port, so there is no address to check the app at' \
+  "$TMP/np-ran"
+set_runtime "$WNP" '{"url": "ftp://localhost/"}'
+serve_cli "$WNP" --serve
+refused 'an unusable runtime.url' "$WNP" \
+  'Pitlane: not served — runtime.url is unusable: "ftp://localhost/" is not an http:// or https:// URL with a plain host (letters, digits, . _ -) and no spaces, quotes, $, ` or #' \
+  "$TMP/np-ran"
 
 # Served: one line, the app answers from the worktree on its own port, and it outlives the command.
 serve_cli "$WSR" --serve; out=$SV_OUT; errS=$(cat "$TMP/err")
@@ -2023,7 +2150,10 @@ eq 'serve: the record is pid|group|start identity|url' \
   "$SPID|$SPID|stat:$(awk '{ print $22 }' "/proc/$SPID/stat" 2>/dev/null)|$SRVURL" "$rec"
 eq 'serve: it leads its own session, so the Bash tool can end without it' "$SPID" "$(ps -o sid= -p "$SPID" | tr -d ' ')"
 eq 'serve: it runs in the worktree' "$WSR" "$(readlink "/proc/$SPID/cwd")"
-eq 'serve: it runs niced (ADR-018)' 10 "$(ps -o ni= -p "$SPID" | tr -d ' ')"
+ambient=$(ps -o ni= -p $$ | tr -d ' ')
+want_ni=$((ambient + 10))
+[ "$want_ni" -le 19 ] || want_ni=19
+eq 'serve: it runs niced (ADR-018), 10 above this shell' "$want_ni" "$(ps -o ni= -p "$SPID" | tr -d ' ')"
 if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
   contains 'serve: in a memory-capped transient scope, which outlived the systemd-run that made it' '.scope' \
     "$(cat "/proc/$SPID/cgroup" 2>/dev/null)"
@@ -2139,6 +2269,129 @@ eq 'serve: a server that exits is reported with its log' \
   "Pitlane: not served — the server exited before http://localhost:$(envval "$WST" SERVER_PORT)/ answered (log: $LOG)" "$out"
 eq '...its output is in the log' yes "$(grep -q 'the app failed to boot' "$LOG" && echo yes || echo no)"
 eq '...and nothing is recorded' '' "$(serve_record "$WST")"
+
+# A leader that exits while its group lives on — node under npm, php under a nix shell — leaves a
+# child holding the port. That child is still the server Pitlane started: --serve-stop stops it.
+SLG=$TMP/slg
+make_rt_repo "$SLG" ',
+    "serve": "python3 -m http.server {port} --bind 127.0.0.1 & sleep 3",
+    "url": "http://localhost:{port}/"'
+WLG=$SLG/.claude/worktrees/leader
+git -C "$SLG" worktree add -q "$WLG" -b worktree-leader 2>/dev/null
+start_hook "$WLG" >/dev/null
+LURL="http://localhost:$(envval "$WLG" SERVER_PORT)/"
+leader_gone() {  # $1 = pid; waits up to 6s for it to exit
+  for _ in $(seq 1 60); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
+  return 1
+}
+serve_cli "$WLG" --serve; out=$SV_OUT
+eq 'serve: a server whose leader forks the app is served' "Pitlane: serving at $LURL" "$out"
+LPID=$(serve_pid "$WLG")
+leader_gone "$LPID"
+eq '...its leader exits' no "$(kill -0 "$LPID" 2>/dev/null && echo yes || echo no)"
+eq '...while its child, in its group, still answers' 1 "$(pgrep -g "$LPID" 2>/dev/null | wc -l | tr -d ' ')"
+serve_cli "$WLG" --serve; out=$SV_OUT; errS=$(cat "$TMP/err")
+eq 'serve: asked again, what the old group left is stopped and a new one started' "Pitlane: serving at $LURL" "$out"
+contains '...saying so' 'processes of its group are still running — stopping them' "$errS"
+eq '...the old group is gone' 0 "$(pgrep -g "$LPID" 2>/dev/null | wc -l | tr -d ' ')"
+LPID=$(serve_pid "$WLG")
+leader_gone "$LPID"
+child=$(pgrep -g "$LPID" 2>/dev/null)
+ne '...the new leader exited too, leaving its child' '' "$child"
+serve_cli "$WLG" --serve-stop; out=$SV_OUT
+eq 'serve-stop: the leader exited, but its child holding the port is stopped' \
+  "Pitlane: stopped the server at $LURL (pid $LPID)." "$out"
+eq '...exit 0' 0 "$SV_RC"
+eq '...the child is gone' no "$(kill -0 "$child" 2>/dev/null && echo yes || echo no)"
+contains '...the URL no longer answers' 'NO ANSWER' "$(answers "$LURL")"
+eq '...and the record is cleared' '' "$(serve_record "$WLG")"
+
+# A serve that DAEMONIZES: it forks the server off in a session of its own and exits 0. With
+# runtime.stop, that is served and recorded as stopped by command; --serve-stop runs runtime.stop.
+serve_stopby() {  # $1 = worktree; the record's stopby field
+  python3 - "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" <<'PY'
+import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve":
+        print(f[7] if len(f) > 7 else "")
+PY
+}
+SDM=$TMP/sdm
+# shellcheck disable=SC2016  # $! and $(…) belong to the profile's commands.
+make_rt_repo "$SDM" ',
+    "serve": "setsid python3 -m http.server {port} --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! >'"$TMP"'/daemon.pid; exit 0",
+    "stop": "kill $(cat '"$TMP"'/daemon.pid)",
+    "url": "http://localhost:{port}/"'
+WDM=$SDM/.claude/worktrees/daemon
+git -C "$SDM" worktree add -q "$WDM" -b worktree-daemon 2>/dev/null
+start_hook "$WDM" >/dev/null
+DURL="http://localhost:$(envval "$WDM" SERVER_PORT)/"
+serve_cli "$WDM" --serve; out=$SV_OUT; errS=$(cat "$TMP/err")
+DPID=$(cat "$TMP/daemon.pid" 2>/dev/null)
+SV_KILL="$SV_KILL $DPID"
+eq 'serve: a daemonizing serve with runtime.stop is served' "Pitlane: serving at $DURL" "$out"
+eq '...exit 0' 0 "$SV_RC"
+contains '...stderr says its command exited 0' 'exited 0 — it may have started the server in the background' "$errS"
+eq '...recorded as stopped by command' command "$(serve_stopby "$WDM")"
+eq '...the daemon runs' yes "$(kill -0 "$DPID" 2>/dev/null && echo yes || echo no)"
+serve_cli "$WDM" --serve; out=$SV_OUT
+eq 'serve: asked again, it is already serving' "Pitlane: already serving at $DURL" "$out"
+eq '...exit 0' 0 "$SV_RC"
+eq '...and no second daemon was started' "$DPID" "$(cat "$TMP/daemon.pid")"
+
+set_runtime "$WDM" '{"stop": "echo cannot stop >&2; exit 7"}'
+serve_cli "$WDM" --serve-stop; out=$SV_OUT
+eq 'serve-stop: a runtime.stop that fails is reported' \
+  "Pitlane: the server at $DURL was not stopped — runtime.stop failed (exit 7)." "$out"
+eq '...exit 1' 1 "$SV_RC"
+eq '...the record is kept, to try again' command "$(serve_stopby "$WDM")"
+eq '...and the daemon was not signalled' yes "$(kill -0 "$DPID" 2>/dev/null && echo yes || echo no)"
+
+# shellcheck disable=SC2016  # $(…) belongs to the profile's command.
+set_runtime "$WDM" '{"stop": "kill $(cat '"$TMP"'/daemon.pid)"}'
+unset PITLANE_TRUST_PROFILES
+serve_cli "$WDM" --serve-stop; out=$SV_OUT
+PITLANE_TRUST_PROFILES=1
+export PITLANE_TRUST_PROFILES
+contains 'serve-stop: runtime.stop is the profile'"'"'s command, so it waits for approval' \
+  "Pitlane: not run — the profile's commands are not approved in their current form." "$out"
+eq '...exit 1' 1 "$SV_RC"
+eq '...and the daemon runs on' yes "$(kill -0 "$DPID" 2>/dev/null && echo yes || echo no)"
+
+serve_cli "$WDM" --serve-stop; out=$SV_OUT
+eq 'serve-stop: runtime.stop stops a daemonized server' "Pitlane: stopped the server at $DURL (by runtime.stop)." "$out"
+eq '...exit 0' 0 "$SV_RC"
+for _ in $(seq 1 30); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
+eq '...the daemon is gone' no "$(kill -0 "$DPID" 2>/dev/null && echo yes || echo no)"
+contains '...the URL no longer answers' 'NO ANSWER' "$(answers "$DURL")"
+eq '...and the record is cleared' '' "$(serve_record "$WDM")"
+
+# Without runtime.stop the same server answers, but nothing can stop it: said so, nothing recorded.
+set_runtime "$WDM" '{"stop": null}'
+serve_cli "$WDM" --serve; out=$SV_OUT
+DPID=$(cat "$TMP/daemon.pid" 2>/dev/null)
+SV_KILL="$SV_KILL $DPID"
+eq 'serve: a daemonizing serve without runtime.stop is reported as one Pitlane cannot stop' \
+  "Pitlane: serving at $DURL, but the server detached from its serve command and the profile has no runtime.stop, so Pitlane cannot stop it — add runtime.stop with /pitlane-setup (or make runtime.serve stay in the foreground)" "$out"
+eq '...exit 0: the app answers' 0 "$SV_RC"
+eq '...nothing is recorded' '' "$(serve_record "$WDM")"
+kill -s KILL -- "-$DPID" 2>/dev/null
+for _ in $(seq 1 30); do case $(answers "$DURL") in 'NO ANSWER'*) break ;; esac; sleep 0.1; done
+
+# A serve that exits 0 and leaves nothing answering: not served, once its time is up.
+set_runtime "$WDM" '{"serve": "exit 0", "stop": "true"}'
+PITLANE_SERVE_TIMEOUT=2 serve_cli "$WDM" --serve; out=$SV_OUT
+DLOG=$(git -C "$WDM" rev-parse --absolute-git-dir)/worktree-serve.log
+eq 'serve: a serve that exits 0 with nothing answering is not served' \
+  "Pitlane: not served — the serve command exited and $DURL did not answer in time; --serve-stop runs runtime.stop in case it left something starting (log: $DLOG)" "$out"
+ne '...non-zero' 0 "$SV_RC"
+serve_cli "$WDM" --serve-stop; out=$SV_OUT
+eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server at $DURL (by runtime.stop)." "$out"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

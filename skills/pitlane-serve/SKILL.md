@@ -27,6 +27,9 @@ in one line:
 
 - `Pitlane: serving at <url>` — the app answers there. Use that URL for the browser check or the
   tests, not a port from the repo's docs or the main checkout.
+- `Pitlane: serving at <url>, but the server detached … Pitlane cannot stop it …` — the app answers
+  and can be used, but its serve command daemonized and the profile has no `runtime.stop`. Tell the
+  user that `--serve-stop` cannot stop it, and suggest /pitlane-setup to add `runtime.stop`.
 - `Pitlane: already serving at <url>` — Pitlane's server for this worktree was already running. Use it.
 - `Pitlane: already started at <url> (pid …), but it does not answer yet (log: …)` — it is still
   starting, or stuck. Read the end of the log. Run `--serve` again later, or restart it (below).
@@ -34,9 +37,10 @@ in one line:
   running. Relay the reason. Then:
   - `this worktree's setup is not complete — …` or `… has no port yet`: run /pitlane-finish, which
     completes the setup, then run `--serve` again.
-  - `… did not answer within …s; the server is still running …` or `the server exited before …
-    answered`: read the end of the log the line names and tell the user what it says. Do not keep
-    retrying.
+  - `… did not answer within …s; the server is still running …`, `the server exited before …
+    answered` or `the serve command exited and … did not answer in time`: read the end of the log
+    the line names and tell the user what it says. Do not keep retrying.
+  - `another /pitlane-serve is still running here`: wait for that run to finish, then try once more.
   - `something is already answering at <url>`: another process holds this worktree's port. Pitlane
     did not start it and will not stop it. Tell the user.
   - `the profile names no runtime.serve`, or `runtime.serve is refused`, or `runtime.url is unusable`:
@@ -56,9 +60,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --serve-stop
 ```
 
 It stops the server only if the process is still the one Pitlane recorded starting, checked by its
-process start time. It never stops a process by its port. Its one line says what happened:
-`stopped the server at <url>`, `no server … is recorded`, `… had already exited`, or `pid … now belongs
-to another process … left alone`. Then run `--serve` again to restart, for example after a config
+process start time, together with what its process group left running. A server whose serve command
+detached it is stopped by the profile's `runtime.stop` instead, which needs the profile approved like
+`--serve`. It never stops a process by its port. Its one line says what happened:
+`stopped the server at <url>`, `no server … is recorded`, `… had already exited`, `pid … now belongs
+to another process … left alone`, or `the server at <url> was not stopped — <why>` (relay the why). Then run `--serve` again to restart, for example after a config
 change the server does not reload. Offer a restart when the user wants one.
 
 ## The rules

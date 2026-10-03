@@ -4072,6 +4072,107 @@ time.sleep(5)' "$TMP/zombie.pid" &
   sleep 0.2
   wt_serve_probe "http://127.0.0.1:$sport/" "$gp" 5
   eq 'probe: a process that is gone is 2, at once' 2 $?
+
+  # A record the reader cannot trust is no record: a live process named in it is never signalled.
+  SVR=$TMP/serve-corrupt
+  mkdir -p "$SVR"
+  wt_runtime_state_set "$SVR" sv 4321 derived .env ours none '' 2>/dev/null
+  SVRF=$(wt_state_path "$SVR")
+  victim=$(sv_group "$TMP/victim.pid" 'exec sleep 300')
+  vid=$(wt_proc_identity "$victim")
+  US=$'\x1f' RS=$'\x1e'
+  corrupt() {  # $1 = label, $2 = the whole state file
+    printf '%s' "$2" >"$SVRF"
+    wt_serve_record_read "$SVR"
+    eq "record: $1 is not read" 1 $?
+    eq '...and leaves no PID' '' "$WT_SERVE_PID"
+    PITLANE_SERVE_STOP_SECONDS=1 wt_serve_stop "$SVR"
+    eq '...stop finds nothing recorded' 1 $?
+    eq '...and does not signal the process named in it' yes "$(wt_pid_alive "$victim" && echo yes || echo no)"
+  }
+  rec="serve$US$victim$US$victim$US$vid${US}ck${US}http://localhost:4321/${US}1$US"
+  corrupt 'a wrong state version' "wtstate${US}99$RS$rec$RS"
+  corrupt 'a serve record before the header' "$rec${RS}wtstate$US$WT_STATE_VERSION$RS"
+  corrupt 'a non-numeric pid' "wtstate$US$WT_STATE_VERSION${RS}serve${US}12a$US$victim$US$vid${US}ck${US}http://localhost:4321/${US}1$RS"
+  corrupt 'an unknown stopby' "wtstate$US$WT_STATE_VERSION$RS${rec}reboot$RS"
+  printf '%s' "wtstate$US$WT_STATE_VERSION$RS${rec}signal$RS" >"$SVRF"
+  wt_serve_record_read "$SVR"
+  eq 'record: the same record, well formed, is read' "$victim|signal" "$WT_SERVE_PID|$WT_SERVE_STOPBY"
+  printf '%s' "wtstate$US$WT_STATE_VERSION$RS$rec$RS" >"$SVRF"
+  wt_serve_record_read "$SVR"
+  eq 'record: one written before stopby existed reads as signal' "$victim|signal" "$WT_SERVE_PID|$WT_SERVE_STOPBY"
+  kill -s KILL -- "-$victim" 2>/dev/null
+
+  # The group is ours only while the process holding its id is the recorded one: a group whose id
+  # has passed to another process — simulated by a wrong identity — is neither signalled nor
+  # counted as left, so a stop treats it as stopped.
+  gp=$(sv_group "$TMP/g6.pid" 'sleep 300 & exec sleep 300')
+  WT_SERVE_PID=$gp WT_SERVE_PGID=$gp WT_SERVE_IDENTITY='stat:1'
+  eq 'group: a live id with another identity is not ours' no "$(wt_serve_group_ours && echo yes || echo no)"
+  eq '...is not what is left of the server' no "$(wt_serve_remains && echo yes || echo no)"
+  wt_serve_signal KILL
+  sleep 0.2
+  eq '...and a SIGKILL meant for the group is not sent' 2 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  WT_SERVE_IDENTITY=$(wt_proc_identity "$gp")
+  eq 'group: with its identity it is ours' yes "$(wt_serve_group_ours && echo yes || echo no)"
+  kill -s KILL "$gp" 2>/dev/null
+  sleep 0.2
+  eq 'group: once its leader exits, the members it left are still ours' yes \
+    "$(wt_serve_group_ours && echo yes || echo no)"
+  kill -s KILL -- "-$gp" 2>/dev/null
+  sleep 0.2
+  eq 'group: and with none left it is not' no "$(wt_serve_group_ours && echo yes || echo no)"
+
+  # With no group recorded, a PID that ignores TERM is SIGKILLed alone, after its identity is proved.
+  gp=$(sv_group "$TMP/g7.pid" 'trap "" TERM; sleep 300 & while :; do sleep 1; done')
+  wt_serve_record_write "$SVW" "$gp" '' "$(wt_proc_identity "$gp")" 'ck 1' 'http://localhost:4321/'
+  PITLANE_SERVE_STOP_SECONDS=1 wt_serve_stop "$SVW" 2>"$TMP/stop.err"
+  eq 'stop: no group, TERM ignored: stopped by SIGKILL to the PID' 0 $?
+  contains '...and says so' 'sending SIGKILL' "$(cat "$TMP/stop.err")"
+  eq '...the PID is gone' no "$(wt_pid_alive "$gp" && echo yes || echo no)"
+  eq '...and only it: its group keeps its other member' 1 "$(pgrep -g "$gp" -f 'sleep 300' 2>/dev/null | wc -l | tr -d ' ')"
+  kill -s KILL -- "-$gp" 2>/dev/null
+
+  # A stopped-by-command record is not checked as a process, and a stop runs runtime.stop.
+  wt_serve_record_write "$SVW" 99999999 '' '' 'ck 1' 'http://127.0.0.1:1/' command
+  wt_serve_check "$SVW"
+  eq 'check: a stopped-by-command record is 4' 4 $?
+  PROFILE_RT_STOP='' wt_serve_stop "$SVW"
+  eq 'stop: by command, with no runtime.stop, cannot stop it' 5 $?
+  contains '...saying why' 'the profile names none' "$WT_SERVE_STOP_WHY"
+  wt_serve_record_read "$SVW"
+  eq '...and keeps the record' command "$WT_SERVE_STOPBY"
+  PROFILE_SHELL='' PROFILE_SHELLARGS='' PROFILE_RT_STOP='touch stopped-{port}' WT_GUARD=off wt_serve_stop "$SVW" 2>/dev/null
+  eq 'stop: by command runs runtime.stop, expanded, in the worktree' 0 $?
+  eq '...{port} from the rt record' yes "$([ -e "$SVW/stopped-4321" ] && echo yes || echo no)"
+  wt_serve_record_read "$SVW"
+  eq '...and clears the record' 1 $?
+
+  # The /dev/tcp fallback: a bracketed IPv6 host is unbracketed; one never closed is refused aloud.
+  if python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.bind(("::1", 0))' 2>/dev/null; then
+    sport6=$(python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.bind(("::1", 0)); print(s.getsockname()[1])')
+    gp=$(sv_group "$TMP/g8.pid" "exec python3 -m http.server $sport6 --bind ::1")
+    for _ in $(seq 1 50); do WT_CURL='' wt_serve_answers "http://[::1]:$sport6/" && break; sleep 0.1; done
+    eq 'answers: /dev/tcp reaches a bracketed IPv6 host' 0 "$(WT_CURL='' wt_serve_answers "http://[::1]:$sport6/x"; echo $?)"
+    kill -s KILL -- "-$gp" 2>/dev/null
+  else
+    printf 'SKIP IPv6 probe: no ::1 on this host\n' >&2
+  fi
+  out=$(WT_CURL='' wt_serve_answers 'http://[::1:8080/' 2>&1); rc=$?
+  eq 'answers: an unclosed [ is refused' 1 "$rc"
+  contains '...saying so' 'opens an IPv6 [ and never closes it' "$out"
+  out=$(WT_CURL='' wt_serve_answers 'http://localhost:http/' 2>&1); rc=$?
+  eq 'answers: a port that is not a number is refused' 1 "$rc"
+  contains '...saying so' 'no host and port to connect to' "$out"
+  # A host that drops the connection attempt: given 2s, never the OS's own minutes-long timeout.
+  t0=$(date +%s)
+  WT_CURL='' wt_serve_answers 'http://10.255.255.1:81/'
+  eq 'answers: an unreachable host does not answer' 1 $?
+  eq '...within the 2s bound' yes "$([ $(( $(date +%s) - t0 )) -le 3 ] && echo yes || echo no)"
+
+  # The probe with no process: only the time limit, and the URL is asked at least once.
+  wt_serve_probe 'http://127.0.0.1:1/' '' 0
+  eq 'probe: no process, out of time is 1' 1 $?
 else
   printf 'SKIP serve bookkeeping: needs /proc and setsid\n' >&2
 fi
