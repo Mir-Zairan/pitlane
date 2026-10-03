@@ -1704,6 +1704,11 @@ lacks '...without claiming it changed it again, or taking the session'"'"'s edit
 # Restored by the user: it drops out of what is reported.
 git -C "$DWT" checkout -q -- 'conf/work space.yaml' notes.txt
 eq '...and a path the user restored is no longer reported' '' "$(wt_install_changed_paths "$DWT")"
+# ...and out of the record, at the next install of that dir that leaves it alone.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && touch vendor/autoload.php # v3' 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...a re-install after the restore drops it from the record' 'changed|vendor' "$(changed_recs)"
 # A path in two dependencies' records is reported once.
 printf 'placeholder: 2\n' >> "$DWT/conf/work space.yaml"
 wt_install_note_changes "$DWT" other '' 2>/dev/null
@@ -1719,6 +1724,106 @@ lacks 'tracked: a path already changed before the install is not attributed to i
 eq '...nor recorded' '' "$(changed_recs)"
 eq '...nor reported' '' "$(wt_install_changed_paths "$DWT")"
 git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# Staged and not in the working tree any more: still a change against HEAD.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && touch vendor/autoload.php && echo staged >> notes.txt && git add notes.txt" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'tracked: a change the install only staged is recorded' 'changed|vendor|notes.txt' "$(changed_recs)"
+wt_install_restore "$DWT" notes.txt >/dev/null
+eq '...and restoring it resets the index too, not only the file' '' "$(git -C "$DWT" status --porcelain -- notes.txt)"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# A staged rename names both sides, on a git that cannot turn rename detection off.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && touch vendor/autoload.php && git mv notes.txt moved.txt" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'tracked: a staged rename records the new path and the old one' "moved.txt${NL_}notes.txt" \
+  "$(wt_install_changed_paths "$DWT" | LC_ALL=C sort)"
+git -C "$DWT" mv moved.txt notes.txt; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# A newline in a name is folded by the record into a name that may be another file, so it is named
+# in the log but never recorded; a control byte is shown quoted, never raw.
+NLNAME="conf/nl${NL_}name"
+printf 'x\n' > "$DWT/$NLNAME"; printf 'x\n' > "$DWT/conf/nl name"; printf 'x\n' > "$DWT/conf/esc"$'\033'"[31m"
+git -C "$DWT" add conf && git -C "$DWT" commit -qm 'odd names'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && touch vendor/autoload.php && printf y >> 'conf/nl'\"\$(printf '\\nname')\" && printf y >> 'conf/esc'\"\$(printf '\\033')\"'[31m'" 'test -r vendor/autoload.php')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'tracked: the install did change the file with a newline in its name' "x${NL_}y" "$(cat "$DWT/$NLNAME")"
+contains '...it is named in the log, quoted' "\$'conf/nl\\nname' cannot be recorded by name" "$out"
+eq '...and never recorded, so never offered as the other file it would fold into' \
+  "changed|vendor|conf/esc"$'\033'"[31m" "$(changed_recs)"
+lacks '...an ESC never reaches the log raw' $'\033' "$out"
+contains '...it is shown quoted instead' "\$'conf/esc\\E[31m'" "$out"
+eq '...and quoted by wt_paths_display' "\$'conf/esc\\E[31m'" "$(wt_paths_display "$(wt_install_changed_paths "$DWT")")"
+git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# Restoring is one literal path, and only one an install changed.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$TOUCHCMD && echo z >> notes.txt" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+printf 'mine\n' >> "$DWT/.gitignore"
+out=$(wt_install_restore "$DWT" .gitignore); rc=$?
+eq 'restore: a path no install changed is refused' 1 "$rc"
+contains '...saying why' 'not a tracked file an install changed' "$out"
+contains '...and left alone' 'mine' "$(cat "$DWT/.gitignore")"
+out=$(wt_install_restore "$DWT" "conf/nl${NL_}name"); rc=$?
+eq 'restore: a name with a control byte is refused' 1 "$rc"
+contains '...shown quoted' "\$'conf/nl\\nname'" "$out"
+eq 'restore: an empty path is refused' 1 "$(wt_install_restore "$DWT" '' >/dev/null; echo $?)"
+out=$(wt_install_restore "$DWT" notes.txt); rc=$?
+eq 'restore: a path an install changed is restored' 0 "$rc"
+contains '...said so' 'restored notes.txt' "$out"
+eq '...to its committed content' 'a' "$(cat "$DWT/notes.txt")"
+eq '...and only that path' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
+git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# The set operations compare whole lines as bytes, in the order given.
+eq 'lines: in keeps the order of the lines, and treats * literally' "b${NL_}*" \
+  "$(wt_lines_in "*${NL_}a${NL_}b" "b${NL_}x${NL_}*${NL_}")"
+eq 'lines: not-in drops empty lines and keeps the rest in order' "x${NL_}c" \
+  "$(wt_lines_not_in "a${NL_}b" "x${NL_}${NL_}a${NL_}c")"
+eq 'lines: an empty set keeps every line' "a${NL_}b" "$(wt_lines_not_in '' "a${NL_}b")"
+eq 'lines: nothing is in an empty set' '' "$(wt_lines_in '' "a${NL_}b")"
+
+# Bounded: no budget left is "cannot tell", said once per run, never a status run with no limit.
+SPENT=$(( $(date +%s) - 5 ))
+out=$( { WT_TRACKING_SKIP_LOGGED=''; wt_tracked_changes "$DWT" "$SPENT"; echo "rc=$?"; wt_tracked_changes "$DWT" "$SPENT"; } 2>&1 )
+contains 'status: no budget left means it cannot tell' 'rc=1' "$out"
+eq '...said once, not per call' 1 "$(printf '%s\n' "$out" | grep -c 'not checking which tracked files')"
+FAKEGIT=$TMP/fakegit
+mkdir -p "$FAKEGIT"
+REALGIT=$(command -v git)
+# A git whose status hangs, and one too old for --no-optional-locks, put where the engine runs git.
+printf '#!/bin/sh\ncase " $* " in *" status "*) sleep 5 ;; esac\nexec "%s" "$@"\n' "$REALGIT" > "$FAKEGIT/slow"
+printf '#!/bin/sh\ncase " $* " in *" --no-optional-locks "*) echo "unknown option" >&2; exit 129 ;; esac\nexec "%s" "$@"\n' "$REALGIT" > "$FAKEGIT/old"
+chmod +x "$FAKEGIT/slow" "$FAKEGIT/old"
+# shellcheck disable=SC2034  # all read by the sourced engine
+out=$( { WT_GIT_OPTIONAL_LOCKS='' WT_TRACKING_SKIP_LOGGED='' WT_GIT_CMD=("$FAKEGIT/old")
+  wt_tracked_changes "$DWT" "$FAR"; echo "rc=$?"; } 2>&1 )
+contains 'status: a git without --no-optional-locks is not asked' 'rc=1' "$out"
+contains '...and that is said, not silent' 'older than 2.15' "$out"
+if command -v timeout >/dev/null 2>&1; then
+  start=$(date +%s)
+  # shellcheck disable=SC2034  # read by the sourced engine
+  out=$( { WT_TRACKING_SKIP_LOGGED='' WT_GIT_CMD=("$FAKEGIT/slow")
+    wt_tracked_changes "$DWT" $(( $(date +%s) + 1 )); echo "rc=$?"; } 2>&1 )
+  contains 'status: one that outruns the budget is stopped and cannot tell' 'rc=1' "$out"
+  contains '...said' 'git status took longer' "$out"
+  eq '...within the budget, not after the slow status' yes "$([ $(( $(date +%s) - start )) -lt 4 ] && echo yes)"
+  # The snapshot spent what was left: the install is not started on a budget of nothing.
+  rm -f "$CNT"
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock install "printf x >> '$CNT'" '')
+  # shellcheck disable=SC2034  # read by the sourced engine
+  out=$( { WT_TRACKING_SKIP_LOGGED='' WT_GIT_CMD=("$FAKEGIT/slow")
+    wt_bootstrap_deps "$DREPO" "$DWT" $(( $(date +%s) + 2 )); } 2>&1 )
+  eq 'status: a snapshot that spent the budget leaves the install unstarted' '' "$(cat "$CNT" 2>/dev/null)"
+  contains '...said' 'the budget ran out before the install could start' "$out"
+  eq '...and left to retry' dirty "$(wt_state_status "$DWT" vendor)"
+  rm -f "$CNT" "$(wt_state_path "$DWT")"
+fi
 
 # Untracked and ignored files are what an install is for.
 # shellcheck disable=SC2034
@@ -1742,6 +1847,19 @@ eq '...the install still runs' "done" "$(wt_state_status "$NOGIT" vendor)"
 contains '...its output still on stderr' 'nogit-progress' "$out"
 eq '...and no install log is written inside the working tree' '' \
   "$(find "$NOGIT" -name 'worktree-bootstrap.install.*' 2>/dev/null)"
+# With no git to ask, the record is reported as stored — each path once.
+NGSTATE=$(wt_state_path "$NOGIT")
+printf 'wtstate%s%s%schanged%svendor%sa%schanged%sother%sa%sb%s' "$US_" "$WT_STATE_VERSION" "$RS_" \
+  "$US_" "$US_" "$RS_" "$US_" "$US_" "$US_" "$RS_" > "$NGSTATE"
+eq 'no git: the stored record is printed as is, each path once' "a${NL_}b" "$(wt_install_changed_paths "$NOGIT")"
+# A record the reader cannot vouch for is no record at all.
+printf 'wtstate%s%s%schanged%svendor%sa%s' "$US_" "$((WT_STATE_VERSION + 1))" "$RS_" "$US_" "$US_" "$RS_" > "$NGSTATE"
+eq 'changed: a state file of another version yields nothing' '' "$(wt_install_changed_recorded "$NOGIT")"
+printf 'changed%svendor%sa%swtstate%s%s%s' "$US_" "$US_" "$RS_" "$US_" "$WT_STATE_VERSION" "$RS_" > "$NGSTATE"
+eq 'changed: a record before the header yields nothing' '' "$(wt_install_changed_recorded "$NOGIT")"
+printf 'wtstate%s%s%schanged%svendor%sa%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$US_" "$US_" "$RS_" > "$NGSTATE"
+eq '...while the same record after it is read' 'a' "$(wt_install_changed_recorded "$NOGIT")"
+rm -f "$NGSTATE"
 # shellcheck disable=SC2034
 PROFILE_RAW=''
 

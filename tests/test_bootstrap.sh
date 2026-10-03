@@ -1410,8 +1410,32 @@ git -C "$WTK" checkout -q -- .gitignore
 eq '...and nothing once the user restored it' '' "$( cd "$WTK" && bash "$HOOK" --changed 2>/dev/null )"
 outF=$( cd "$WTK" && bash "$HOOK" --finish 2>/dev/null )
 eq '...nor in the summary' 'Pitlane: still not complete — missing: node_modules' "$outF"
-contains 'tracked: --changed outside a repository says so' 'not inside a git repository' \
-  "$( cd "$TMP" && bash "$HOOK" --changed 2>/dev/null )"
+eq 'tracked: --changed outside a repository prints no path' '' "$( cd "$TMP" && bash "$HOOK" --changed 2>"$TMP/err" )"
+contains '...and says why on stderr' 'not inside a git repository' "$(cat "$TMP/err")"
+
+# A tracked file named `*` or `:(glob)*` is one file to restore, not a pattern matching every file.
+STAR=$TMP/star
+NL_=$'\n'
+make_repo "$STAR" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"mkdir -p vendor && touch vendor/autoload.php && echo x >> '*' && echo x >> ':(glob)*' && echo x >> other.txt\",\"verify\":\"test -r vendor/autoload.php\"}"
+printf 'star\n' > "$STAR/*"; printf 'glob\n' > "$STAR/:(glob)*"; printf 'other\n' > "$STAR/other.txt"
+git -C "$STAR" --literal-pathspecs add -- '*' ':(glob)*' other.txt; git -C "$STAR" commit -qm files
+WTS=$STAR/.claude/worktrees/star
+git -C "$STAR" worktree add -q "$WTS" -b worktree-star 2>/dev/null
+start_hook "$WTS" >/dev/null
+eq 'restore: every file the install changed is listed' "*${NL_}:(glob)*${NL_}other.txt" \
+  "$( cd "$WTS" && bash "$HOOK" --changed 2>/dev/null | LC_ALL=C sort )"
+outR=$( cd "$WTS" && bash "$HOOK" --restore '*' 2>/dev/null ); rc=$?
+eq 'restore: --restore of the file named * succeeds' 0 "$rc"
+contains '...and says what it restored' 'restored *' "$outR"
+eq '...that one file is back to its committed content' 'star' "$(cat "$WTS/*")"
+eq '...and the other file is untouched' "other${NL_}x" "$(cat "$WTS/other.txt")"
+eq '...and still listed' ":(glob)*${NL_}other.txt" "$( cd "$WTS" && bash "$HOOK" --changed 2>/dev/null | LC_ALL=C sort )"
+# Pathspec magic is not obeyed either: without --literal-pathspecs this one restores every file.
+( cd "$WTS" && bash "$HOOK" --restore ':(glob)*' >/dev/null 2>&1 )
+eq 'restore: the file named :(glob)* is restored' 'glob' "$(cat "$WTS/:(glob)*")"
+eq '...and the other file is still untouched' "other${NL_}x" "$(cat "$WTS/other.txt")"
+( cd "$WTS" && bash "$HOOK" --restore .gitignore >/dev/null 2>&1 ); rc=$?
+eq 'restore: a path no install changed is refused with exit 1' 1 "$rc"
 
 # ---------------------------------------------------------------------------
 # The approval gate: nothing a profile names runs until that content is approved

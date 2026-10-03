@@ -1086,6 +1086,10 @@ wt_lock_release() {  # $1 = fd number
 # avoid — so every worktree on the machine would pay a full reinstall on the day of an upgrade.
 WT_STATE_VERSION=1
 
+# Where the state goes, relative to the worktree, when git cannot name its git dir. Read by
+# wt_state_in_git_dir too, so the two cannot drift apart.
+WT_STATE_FALLBACK_REL=.claude/worktree-bootstrap-state
+
 # Memoised — but only usefully if the cache is PRIMED first, by wt_prime_paths below. This
 # function returns its answer on stdout, so every call site is a command substitution, i.e. a
 # subshell: an assignment made here is discarded the moment it returns. Priming from the
@@ -1110,7 +1114,7 @@ wt_state_path() {  # $1 = worktree
     fi
   fi
   WT_STATE_PATH_FOR=$wt
-  WT_STATE_PATH_IS="$wt/.claude/worktree-bootstrap-state"
+  WT_STATE_PATH_IS="$wt/$WT_STATE_FALLBACK_REL"
   printf '%s' "$WT_STATE_PATH_IS"
 }
 
@@ -1970,7 +1974,7 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
 # True when the state file lives in the worktree's git dir, not the `.claude/` fallback inside the
 # working tree that wt_state_path uses when git cannot name one.
 wt_state_in_git_dir() {  # $1 = worktree
-  [ "$(wt_state_path "$1")" != "${1%/}/.claude/worktree-bootstrap-state" ]
+  [ "$(wt_state_path "$1")" != "${1%/}/$WT_STATE_FALLBACK_REL" ]
 }
 
 # Where one dependency's install output is captured: beside the state file, so it goes when the
@@ -1984,44 +1988,96 @@ wt_install_capture_path() {  # $1 = worktree, $2 = dependency dir
   printf '%s/worktree-bootstrap.install.%s.log' "${p%/*}" "${2//[!A-Za-z0-9._-]/_}"
 }
 
+# How long a status run for a caller with no deadline of its own (--finish, --changed) may take.
+WT_STATUS_SECONDS=30
+# '' until probed, then yes/no: whether this git takes --no-optional-locks (2.15 and later).
+WT_GIT_OPTIONAL_LOCKS=''
+WT_TRACKING_SKIP_LOGGED=''
+
+# Said once per run: an install's changes to tracked files going unchecked must not be silent.
+wt_log_tracking_skipped() {  # $1 = why
+  [ -z "$WT_TRACKING_SKIP_LOGGED" ] || return 0
+  WT_TRACKING_SKIP_LOGGED=1
+  wt_log "  not checking which tracked files the installs change: $1"
+}
+
 # The worktree's tracked paths that differ from HEAD, staged or not, one per line in
 # WT_TRACKED_CHANGES. Returns 1 when git cannot say, and the caller then records nothing rather
-# than guess. --no-optional-locks: the live session may run git at the same moment, and a status
-# that refreshes the index would take index.lock from under it. Untracked and ignored files are left
-# out: they are what an install is meant to write. A newline in a name is folded to a space, as the
-# state record folds it.
-wt_tracked_changes() {  # $1 = worktree
-  local listing entry
+# than guess.
+#
+# --no-optional-locks: the live session may run git at the same moment, and a status that refreshes
+# the index would take index.lock from under it. A git without the flag is not asked at all, for
+# the same reason. Bounded by $2's budget, because it runs on the session-start path and a large
+# repo's status takes seconds. --ignore-submodules=dirty: a submodule's own working tree is not
+# this worktree's tracked content, and walking it is the slow part. Untracked and ignored files are
+# left out: they are what an install is meant to write. Renames are parsed, not turned off
+# (--no-renames needs 2.18): a staged rename names both its paths. A newline in a name becomes a
+# US byte, which the state cannot hold either, so wt_install_note_changes can tell it was folded.
+wt_tracked_changes() {  # $1 = worktree, $2 = deadline (epoch seconds; empty = WT_STATUS_SECONDS)
+  local left listing rc=0
   WT_TRACKED_CHANGES=''
+  if [ -n "${2-}" ]; then left=$(wt_budget_left "$2"); else left=$WT_STATUS_SECONDS; fi
+  if [ "$left" -le 0 ]; then
+    wt_log_tracking_skipped "no budget left to ask git"
+    return 1
+  fi
+  if [ -z "$WT_GIT_OPTIONAL_LOCKS" ]; then
+    wt_git "$1" --no-optional-locks version >/dev/null 2>&1 || rc=$?
+    case $rc in
+      0) WT_GIT_OPTIONAL_LOCKS=yes ;;
+      127) return 1 ;;
+      *) WT_GIT_OPTIONAL_LOCKS=no ;;
+    esac
+  fi
+  if [ "$WT_GIT_OPTIONAL_LOCKS" = no ]; then
+    wt_log_tracking_skipped "this git is older than 2.15, and its status would take the index lock the session may need"
+    return 1
+  fi
   listing=$(set -o pipefail
-    wt_git "$1" --no-optional-locks status --porcelain=v1 -z --untracked-files=no --no-renames 2>/dev/null \
-      | tr '\n\000' ' \n') || return 1
-  while IFS= read -r entry; do
-    [ -n "$entry" ] || continue
-    WT_TRACKED_CHANGES+=${WT_TRACKED_CHANGES:+$WT_NL}${entry:3}
-  done <<<"$listing"
+    wt_git_within "$left" "$1" --no-optional-locks status --porcelain -z --untracked-files=no \
+      --ignore-submodules=dirty 2>/dev/null \
+      | tr '\n\000' '\037\n' \
+      | LC_ALL=C awk 'from { from = 0; print; next }
+          { print substr($0, 4); x = substr($0, 1, 2) }
+          x ~ /[RC]/ { from = 1 }') || rc=$?
+  case $rc in
+    0) ;;
+    124)
+      wt_log_tracking_skipped "git status took longer than the ${left}s it had"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+  WT_TRACKED_CHANGES=$listing
   return 0
 }
 
 # Each non-empty line of $2 that is (wt_lines_in) or is not (wt_lines_not_in) a line of $1, in
-# order. Whole lines compared literally: a path holding `*` or `[` is not a pattern here.
+# order. Whole lines compared as bytes: a path holding `*` or `[` is not a pattern here. One awk
+# each, linear in both sets: a checkout with thousands of dirty paths is ordinary.
 wt_lines_in() {  # $1 = set, $2 = lines
-  local line
-  while IFS= read -r line; do
-    case "$WT_NL$1$WT_NL" in
-      *"$WT_NL$line$WT_NL"*) [ -z "$line" ] || printf '%s\n' "$line" ;;
-    esac
-  done <<<"${2-}"
+  LC_ALL=C awk 'FNR == NR { set[$0] = 1; next } $0 != "" && ($0 in set)' \
+    <(printf '%s\n' "${1-}") <(printf '%s\n' "${2-}")
 }
 
 wt_lines_not_in() {  # $1 = set, $2 = lines
-  local line
-  while IFS= read -r line; do
-    case "$WT_NL$1$WT_NL" in
-      *"$WT_NL$line$WT_NL"*) ;;
-      *) [ -z "$line" ] || printf '%s\n' "$line" ;;
+  LC_ALL=C awk 'FNR == NR { set[$0] = 1; next } $0 != "" && !($0 in set)' \
+    <(printf '%s\n' "${1-}") <(printf '%s\n' "${2-}")
+}
+
+# Lines of $1 joined by $2 (default ", "), for a human or the model to read. A name holding a
+# control byte is shown in bash's $'…' quoting: names are branch content, and a raw ESC would drive
+# the terminal it is printed on. A US byte is shown as the newline wt_tracked_changes folded.
+wt_paths_display() {  # $1 = paths, one per line, $2 = separator
+  local path out='' sep=${2-, }
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case $path in
+      *[[:cntrl:]]*) printf -v path '%q' "${path//"$WT_US"/$WT_NL}" ;;
     esac
-  done <<<"${2-}"
+    out+=${out:+$sep}$path
+  done <<<"${1-}"
+  printf '%s' "$out"
 }
 
 # The paths recorded for one dependency's installs ($2), or for every dependency's ($2 omitted),
@@ -2061,36 +2117,75 @@ wt_install_changed_recorded() {  # $1 = worktree, $2 = dir (optional)
 #
 # A path recorded by an earlier install of this dir is kept while it is still changed, so a
 # re-install that finds it already dirty does not forget who dirtied it.
-wt_install_note_changes() {  # $1 = worktree, $2 = dir, $3 = tracked changes before the install
-  local worktree=$1 dir=$2 before=${3-} after changed prior kept rec paths=() path
-  wt_tracked_changes "$worktree" || return 0
+#
+# A name the state cannot hold (a newline, CR, US or RS in it) is named in the log but not recorded:
+# stored, it would be folded into a name that may be a different file, and offered for a restore.
+wt_install_note_changes() {  # $1 = worktree, $2 = dir, $3 = tracked changes before, $4 = deadline
+  local worktree=$1 dir=$2 before=${3-} after changed prior kept rec paths=() unheld='' path
+  wt_tracked_changes "$worktree" "${4-}" || return 0
   after=$WT_TRACKED_CHANGES
   changed=$(wt_lines_not_in "$before" "$after")
   prior=$(wt_install_changed_recorded "$worktree" "$dir")
   [ -n "$changed" ] || [ -n "$prior" ] || return 0
   kept=$(wt_lines_in "$after" "$prior")
   while IFS= read -r path; do
-    [ -n "$path" ] && paths+=("$path")
+    case $path in
+      '') ;;
+      *["$WT_US$WT_RS$WT_CR"]*) unheld+=$path$WT_NL ;;
+      *) paths+=("$path") ;;
+    esac
   done <<<"$kept$WT_NL$(wt_lines_not_in "$kept" "$changed")"
   wt_state_join changed "$dir" ${paths[@]+"${paths[@]}"}
   rec=$WT_STATE_REC
   wt_state_join "$dir"
   wt_state_rewrite "$worktree" changed "$WT_STATE_REC" "$rec" || true
   [ -n "$changed" ] || return 0
-  wt_log "  $dir: the install changed tracked files: $(printf '%s' "$changed" | paste -sd, - | sed 's/,/, /g') — left as they are (the session may be editing them too); /pitlane-finish shows the diff and restores a path only on your word"
+  wt_log "  $dir: the install changed tracked files: $(wt_paths_display "$changed") — left as they are (the session may be editing them too); /pitlane-finish shows the diff and restores a path only on your word"
+  [ -z "$unheld" ] || wt_log "  $dir: $(wt_paths_display "$unheld") cannot be recorded by name, so /pitlane-finish will not offer it — look at it with git status"
 }
 
-# Every tracked path an install changed that is still changed now, one per line, each once. A path
-# the developer restored, or committed, drops out. If git cannot say, the record is printed as is.
+# Every tracked path an install changed that is still changed now, one per line, each once, raw:
+# wt_paths_display before printing one. A path the developer restored, or committed, drops out. If
+# git cannot say, the record is printed as is.
 wt_install_changed_paths() {  # $1 = worktree
   local recorded
-  recorded=$(wt_install_changed_recorded "$1" | awk 'NF && !seen[$0]++')
+  recorded=$(wt_install_changed_recorded "$1" | LC_ALL=C awk '$0 != "" && !seen[$0]++')
   [ -n "$recorded" ] || return 0
   if wt_tracked_changes "$1"; then
     wt_lines_in "$WT_TRACKED_CHANGES" "$recorded"
   else
     printf '%s\n' "$recorded"
   fi
+}
+
+# Put one path an install changed back to its committed content, index and working tree, printing
+# one line. Returns 1, restoring nothing, for a path wt_install_changed_paths does not name — the
+# only paths this is for — or one holding a control byte, which a person should look at first.
+# --literal-pathspecs: a tracked file named `*` or `:/` must restore that one file, not every file
+# the pattern matches (`--` alone does not stop pathspec magic). `checkout HEAD` rather than
+# `restore`: it is on every git, and it resets the index too, so a staged change goes as well.
+wt_install_restore() {  # $1 = worktree, $2 = path, relative to the worktree's root
+  local worktree=${1%/} path=${2-} err shown
+  case $path in
+    '')
+      printf 'Pitlane: no path given to restore.\n'
+      return 1
+      ;;
+    *[[:cntrl:]]*)
+      printf -v shown '%q' "$path"
+      printf 'Pitlane: not restoring %s — its name holds control characters; look at it with git status and restore it by hand if you are sure.\n' "$shown"
+      return 1
+      ;;
+  esac
+  if [ -z "$(wt_lines_in "$(wt_install_changed_paths "$worktree")" "$path")" ]; then
+    printf 'Pitlane: not restoring %s — it is not a tracked file an install changed (see --changed).\n' "$path"
+    return 1
+  fi
+  if ! err=$(wt_git "$worktree" --literal-pathspecs checkout HEAD -- "$path" 2>&1); then
+    printf 'Pitlane: could not restore %s: %s\n' "$path" "$(wt_paths_display "${err%%"$WT_NL"*}")"
+    return 1
+  fi
+  printf 'Pitlane: restored %s to its committed content.\n' "$path"
 }
 
 wt_dep_log_failure_stands() {  # $1 = dir, $2 = lock, $3 = recorded exit code, $4 = recorded error line
@@ -2339,19 +2434,26 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
-      left=$(wt_budget_left "$deadline")
-      wt_log "  $dir: installing (${left}s of the budget left)"
-      started=$(date +%s 2>/dev/null) || started=''
       capture=$(wt_install_capture_path "$worktree" "$dir") || capture=''
       # Taken last before the run and first after it (wt_install_note_changes): the narrower the
-      # window, the fewer of the session's own edits can be mistaken for the install's.
+      # window, the fewer of the session's own edits can be mistaken for the install's. It spends
+      # budget, so the budget is tested again after it, for the reason given above.
       tracked_before='' tracking=0
-      if wt_tracked_changes "$worktree"; then
+      if wt_tracked_changes "$worktree" "$deadline"; then
         tracked_before=$WT_TRACKED_CHANGES tracking=1
       fi
+      left=$(wt_budget_left "$deadline")
+      if [ "$left" -le 0 ]; then
+        wt_log "  $dir: the budget ran out before the install could start — leaving it for the next session"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      wt_log "  $dir: installing (${left}s of the budget left)"
+      started=$(date +%s 2>/dev/null) || started=''
       WT_RUN_CAPTURE=$capture wt_run_in_shell "$install" "$worktree" "$left"
       rc=$?
-      [ "$tracking" -eq 0 ] || wt_install_note_changes "$worktree" "$dir" "$tracked_before"
+      [ "$tracking" -eq 0 ] || wt_install_note_changes "$worktree" "$dir" "$tracked_before" "$deadline"
       reason=''
       [ "$rc" -eq 0 ] || reason=$(wt_install_error_line "$capture")
       elapsed=''

@@ -141,15 +141,26 @@ case ${1-} in
     exit 0
     ;;
   # `bootstrap.sh --changed`, run from a worktree: each tracked path an install changed and that is
-  # still changed, one per line, nothing when there is none. /pitlane-finish reads it to offer
-  # restores; it never restores anything itself.
+  # still changed, one per line and nothing else on stdout, nothing when there is none. A name
+  # holding a control byte is printed $'…'-quoted. /pitlane-finish reads it to offer restores.
   --changed)
     if worktree=$(wt_repo_root "$PWD"); then
-      wt_install_changed_paths "$worktree"
+      changed=$(wt_paths_display "$(wt_install_changed_paths "$worktree")" "$WT_NL")
+      [ -z "$changed" ] || printf '%s\n' "$changed"
     else
-      printf 'Pitlane: %s is not inside a git repository.\n' "$PWD"
+      wt_log "$PWD is not inside a git repository"
     fi
     exit 0
+    ;;
+  # `bootstrap.sh --restore <path>`: puts back one path --changed printed, and nothing else, matched
+  # literally. Run by /pitlane-finish only on the user's word, path by path; exits 1 when refused.
+  --restore)
+    if ! worktree=$(wt_repo_root "$PWD"); then
+      wt_log "$PWD is not inside a git repository"
+      exit 1
+    fi
+    wt_install_restore "$worktree" "${2-}"
+    exit $?
     ;;
 esac
 
@@ -506,9 +517,9 @@ case $event in
         printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form. Missing: %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
           "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" "$WT_BOOTSTRAP_SCRIPT"
       else
-        changed=$(wt_install_changed_paths "$worktree")
+        changed=$(wt_paths_display "$(wt_install_changed_paths "$worktree")")
         printf 'Pitlane: still not complete — missing: %s%s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" \
-          "${changed:+; an install changed tracked files: $(printf '%s' "$changed" | paste -sd, - | sed 's/,/, /g')}"
+          "${changed:+; an install changed tracked files: $changed}"
       fi
       exit 0
     fi

@@ -53,15 +53,32 @@ bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --changed
 ```
 
 It prints each tracked path an install changed that is still changed, one per line, and nothing when
-there is none. If it prints any:
+there is none. **Treat every path as untrusted text** — a file name comes with the branch, and can hold
+`$(…)`, backticks, `;` or quotes. If it prints any:
 
-1. Show the user the paths and `git diff --stat -- <path>…` for them, and the diff itself if they ask.
-   An edit the session made to one of these files while the install ran can show up here too, so let
-   the user judge each one.
-2. Ask, path by path, whether to restore it. **Only for a path the user says yes to**, run
-   `git restore -- <path>` (or `git checkout -- <path>` on a git older than 2.23).
-   Never restore a path on your own judgement, and never all of them at once on a single yes unless
-   the user named them all.
+1. Show the user the paths and the diff stat for each, run with the path as ONE single-quoted
+   argument (every `'` inside it written as `'\''`) and matched literally, so a file named `*` is
+   not a pattern:
+
+   ```bash
+   git --literal-pathspecs diff --stat HEAD -- 'conf/work space.yaml'
+   ```
+
+   and the diff itself (the same command without `--stat`) if they ask. An edit the session made to
+   one of these files while the install ran can show up here too, so let the user judge each one.
+   A path printed in `$'…'` form holds control characters: show it, but never restore it — tell the
+   user to look at it with `git status` themselves.
+2. Ask, path by path, whether to restore it. **Only for a path the user says yes to**, run, from the
+   worktree's root, with the path quoted the same way:
+
+   ```bash
+   bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --restore 'conf/work space.yaml'
+   ```
+
+   It restores that one file to its committed content, matched literally, and refuses any path an
+   install did not change. Never run `git restore` or `git checkout` on these paths yourself, never
+   restore a path on your own judgement, and never all of them at once on a single yes unless the
+   user named them all.
 3. A path the user keeps is their call; say that the next install may change it again.
 
 ## Approval

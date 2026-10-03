@@ -99,10 +99,24 @@ wt_log() {
 # hooks launch from the user's host shell, and GIT_DIR is exported by every git hook and
 # by `git rebase --exec`: a `claude` started from inside one would otherwise bootstrap
 # the worktree against the wrong repo.
+WT_GIT_CMD=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git)
 wt_git() {  # $1 = directory, $@ = git arguments
   local dir=$1
   shift
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$dir" "$@"
+  "${WT_GIT_CMD[@]}" -C "$dir" "$@"
+}
+
+# wt_git stopped after $1 seconds (exit 124), for a git that runs on the session-start path. With
+# no coreutils `timeout` it runs unbounded, as the installs beside it do. $1 must be above 0:
+# `timeout 0` means no limit.
+wt_git_within() {  # $1 = seconds, $2 = directory, $@ = git arguments
+  local secs=$1 dir=$2
+  shift 2
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "${WT_GIT_CMD[@]}" -C "$dir" "$@"
+  else
+    "${WT_GIT_CMD[@]}" -C "$dir" "$@"
+  fi
 }
 
 # ---------------------------------------------------------------------------
