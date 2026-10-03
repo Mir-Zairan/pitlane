@@ -563,17 +563,47 @@ run_suite() {
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'npm start\n' >>"$r/README.md"; done
   commit_all "$r"
   eq 'start: at most startLinesPerFile lines per file' 10 "$(det "$r" | grep -c '^start|README.md|')"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'p%s: bin/run\n' "$i" >>"$r/Procfile"; done
+  # A multi-line script is folded before it is cut, so one record carries at most 160 characters.
+  long=$(printf '%0200d' 0)
+  printf '{"scripts":{"dev":"vite %s\\n%s"}}' "$long" "$long" >"$r/package.json"
+  commit_all "$r"
+  out=$(det "$r")
+  eq 'start: a Procfile is capped like a start source' 10 "$(printf '%s\n' "$out" | grep -c '^start|Procfile|')"
+  eq 'start: a long multi-line command is one record' 1 "$(printf '%s\n' "$out" | grep -c '^start|package.json|')"
+  eq 'start: and is cut at 160 characters' 160 \
+    "$(printf '%s\n' "$out" | grep '^start|package.json|' | cut -d'|' -f5 | tr -d '\n' | wc -c | tr -d ' ')"
+
+  # A committed symlink must not carry a file from outside the checkout into the records: the model
+  # reading them would see whatever it points at.
+  r=$(mkrepo startlinks composer.lock)
+  outside="$TMP/$BACKEND/outside"
+  mkdir -p "$outside/docs"
+  printf 'web: s3cret-procfile\nnpm start s3cret-readme\nAPP_ENV=s3cretenv\nTENANT_ID=s3cret\n' >"$outside/secret.txt"
+  printf '{"scripts":{"dev":"s3cret-manifest","post":"APP_ENV=s3cretjson"}}' >"$outside/secret.json"
+  cp "$outside/secret.txt" "$outside/docs/README.md"
+  ln -s "$outside/secret.txt" "$r/Procfile"
+  ln -s "$outside/secret.txt" "$r/README.md"
+  ln -s "$outside/secret.txt" "$r/Makefile"
+  ln -s "$outside/secret.txt" "$r/.env.x"
+  ln -s "$outside/secret.json" "$r/package.json"
+  ln -s "$outside/docs" "$r/docs"
+  commit_all "$r"
+  out=$(det "$r")
+  hasnt 'symlink: no record carries text from a file outside the repo' 's3cret' "$out"
+  has 'symlink: the scan still ran' 'ignore|' "$out"
 
   # --- EVERY ENVIRONMENT the repo runs in --------------------------------------
   # Isolating development and leaving test or e2e shared is the profile that looks right; each
   # environment the repo names is reported so setup has to answer for it.
-  r=$(mkrepo envs composer.lock .env .env.local .env.test .env.test.local .env.e2e.local .env.example .env.prod.dist)
+  r=$(mkrepo envs composer.lock .env .env.local .env.test .env.test.local .env.e2e.local .env.example .env.prod.dist \
+    .env.local.php '.env.a;b')
   printf '.env*\n!.env.test\n!.env.example\n!.env.prod.dist\nnode_modules/\n' >"$r/.gitignore"
   mkdir -p "$r/e2e" "$r/node_modules/x"
   printf '<phpunit><php><server name="APP_ENV" value="test" force="true"/></php></phpunit>\n' >"$r/phpunit.xml.dist"
   printf 'export default { webServer: { command: "APP_ENV=e2e php -S localhost:9000" } }\n' >"$r/e2e/playwright.config.ts"
   printf '[pytest]\nDJANGO_SETTINGS_MODULE = proj.settings.ci\n' >"$r/pytest.ini"
-  printf 'test:\n\tbin/console --env=test cache:clear\n\tdocker run --env=FOO=bar img\n\tRAILS_ENV="staging" rake\n' >"$r/Makefile"
+  printf 'test:\n\tbin/console --env=test cache:clear\n\tdocker run --env=FOO=bar img\n\tRAILS_ENV="staging" rake\n\tbin/console --env=test lint\n' >"$r/Makefile"
   printf 'APP_ENV=vendored\n' >"$r/node_modules/x/phpunit.xml"
   commit_all "$r"
   git -C "$r" add -f node_modules/x/phpunit.xml >/dev/null 2>&1
@@ -584,6 +614,9 @@ run_suite() {
   hasnt 'env: .env.local is an overlay, not an environment' 'env|local|' "$out"
   hasnt 'env: an example file is not an environment' 'env|example|' "$out"
   hasnt 'env: nor a .dist one' 'env|prod|' "$out"
+  hasnt 'env: .env.local.php is the local overlay, not an environment' '.env.local.php' "$out"
+  hasnt 'env: a .env.<name> whose name is not a plain word is dropped' '.env.a;b' "$out"
+  eq 'env: the same environment twice in one file is one record' 1 "$(printf '%s\n' "$out" | grep -c '^env|test|Makefile|--env$')"
   has 'env: a phpunit server variable' 'env|test|phpunit.xml.dist|APP_ENV' "$out"
   has 'env: a selector set inside a nested test config' 'env|e2e|e2e/playwright.config.ts|APP_ENV' "$out"
   has 'env: an ini assignment with spaces round the =' 'env|proj.settings.ci|pytest.ini|DJANGO_SETTINGS_MODULE' "$out"
@@ -594,6 +627,12 @@ run_suite() {
   has 'testConfig: a nested e2e config is found' 'testConfig|e2e/playwright.config.ts' "$out"
   has 'testConfig: and a root one' 'testConfig|phpunit.xml.dist' "$out"
   hasnt 'testConfig: but never under node_modules' 'testConfig|node_modules/' "$out"
+  hasnt 'testConfig: twenty or fewer need no warning' 'test configs are listed' "$out"
+  for i in $(seq -w 1 22); do mkdir -p "$r/pkg$i"; : >"$r/pkg$i/jest.config.js"; done
+  commit_all "$r"
+  out=$(det "$r")
+  eq 'testConfig: at most twenty records' 20 "$(printf '%s\n' "$out" | grep -c '^testConfig|')"
+  has 'testConfig: and the cut is announced' 'warn|only the first 20 of 25 test configs are listed' "$out"
   eq 'env: records come out sorted, so two runs agree' \
     "$(printf '%s\n' "$out" | grep '^env|' | LC_ALL=C sort -t'|' -k2,2 -k3,3 -k4,4)" "$(printf '%s\n' "$out" | grep '^env|')"
 

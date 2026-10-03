@@ -222,8 +222,8 @@ emit shellReason "$SHELL_REASON"
 # ---------------------------------------------------------------------------
 
 # Read one key out of a manifest, rendered as text.
-manifest_value() {  # $1 = manifest path, $2 = dotted key
-  wt_json_get "$2" <"$1" 2>/dev/null || printf ''
+manifest_value() {  # $1 = manifest path, $@ = dotted keys (several come back joined by WT_US)
+  wt_json_get "${@:2}" <"$1" 2>/dev/null || printf ''
 }
 
 # Resolve a manifest script to the whole chain of things it invokes, and print the
@@ -431,9 +431,22 @@ corroborate_candidates() {  # $1 = source entry
       [ -L "$f" ] && continue
       printf '%s\n' "$f"
     done
-  elif [ -f "$ROOT/$src" ]; then
+  elif is_repo_file "$src"; then
     printf '%s\n' "$ROOT/$src"
   fi
+}
+
+# Whether a repo-relative path is a regular file that belongs to this checkout: not a symlink, and
+# not reached through a symlinked directory. Every reader whose text reaches a record goes through
+# this, because a committed `Procfile -> ~/.git-credentials` would otherwise put a secret in front of
+# the model that reads the records.
+is_repo_file() {  # $1 = repo-relative path
+  local dir
+  [ -f "$ROOT/$1" ] && [ ! -L "$ROOT/$1" ] || return 1
+  dir=$(cd "$(dirname "$ROOT/$1")" && pwd -P) || return 1
+  case $dir/ in "$ROOT"/*) return 0 ;; esac
+  wt_log "ignoring $1 because it resolves outside the repository"
+  return 1
 }
 
 # The keepFlags present ON THE LINES THAT INVOKE $1, not merely somewhere in the file.
@@ -887,11 +900,11 @@ done < <(json_array_items "$(wt_json_get runtimeHints.serviceSources <"$WT_DETEC
 # nothing else. One record per name and file: how often, and the first place it appears.
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  [ -f "$ROOT/$f" ] || continue
+  is_repo_file "$f" || continue
   for name in $HINT_NAMES; do
     hits=$(grep -nE "(^|[^A-Za-z0-9_])$name=[^[:space:]=]" "$ROOT/$f" 2>/dev/null) || continue
     count=$(printf '%s\n' "$hits" | grep -c .)
-    first=$(printf '%s\n' "$hits" | head -1 | cut -c1-160)
+    first=$(printf '%s\n' "$hits" | head -1 | tr '\t\r' '  ' | cut -c1-160)
     emit assign "$name" "$f" "$count" "$first"
   done
 done < <(json_array_items "$(wt_json_get runtimeHints.assignSources <"$WT_DETECTION_JSON")")
@@ -907,36 +920,53 @@ START_PAT=$(wt_json_get runtimeHints.startCommandPattern <"$WT_DETECTION_JSON") 
 START_LINES=$(wt_json_get runtimeHints.startLinesPerFile <"$WT_DETECTION_JSON") || START_LINES=''
 wt_is_posint "$START_LINES" || START_LINES=10
 
+# Folded onto one line BEFORE the cut: `cut` works per line, and emit then joins the lines, so a
+# multi-line command would come out as several 160-character pieces. The JSON layer already folds a
+# manifest value; this keeps the cap true for every source.
 emit_start() {  # $1 = file, $2 = where in it, $3 = the command
-  local port=''
-  [ -n "$START_PORT_PAT" ] && port=$(printf '%s\n' "$3" | grep -oE -- "$START_PORT_PAT" 2>/dev/null | head -1)
-  emit start "$1" "$2" "$port" "$(printf '%s' "$3" | cut -c1-160)"
+  local port='' cmd
+  cmd=$(printf '%s' "$3" | tr '\t\r\n' '   ' | cut -c1-160)
+  [ -n "$START_PORT_PAT" ] && port=$(printf '%s\n' "$cmd" | grep -oE -- "$START_PORT_PAT" 2>/dev/null | head -1)
+  emit start "$1" "$2" "$port" "$cmd"
 }
 
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  [ -f "$ROOT/$f" ] || continue
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    cmd=$(manifest_value "$ROOT/$f" "scripts.$name")
-    [ -n "$cmd" ] && emit_start "$f" "scripts.$name" "$cmd"
-  done < <(json_array_items "$(wt_json_get runtimeHints.startScriptNames <"$WT_DETECTION_JSON")")
-done < <(json_array_items "$(wt_json_get runtimeHints.startManifests <"$WT_DETECTION_JSON")")
+# One backend call per manifest for every start script: wt_json_get returns the values joined by
+# WT_US in the order the paths were named.
+START_SCRIPT_NAMES=$(json_array_items "$(wt_json_get runtimeHints.startScriptNames <"$WT_DETECTION_JSON")" | tr '\n' ' ')
+START_SCRIPT_PATHS=()
+for name in $START_SCRIPT_NAMES; do START_SCRIPT_PATHS+=("scripts.$name"); done
+
+if [ "${#START_SCRIPT_PATHS[@]}" -gt 0 ]; then
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    is_repo_file "$f" || continue
+    IFS=$WT_US read -r -a cmds < <(manifest_value "$ROOT/$f" "${START_SCRIPT_PATHS[@]}"; printf '\n')
+    i=0
+    for name in $START_SCRIPT_NAMES; do
+      [ -n "${cmds[$i]:-}" ] && emit_start "$f" "scripts.$name" "${cmds[$i]}"
+      i=$((i + 1))
+    done
+  done < <(json_array_items "$(wt_json_get runtimeHints.startManifests <"$WT_DETECTION_JSON")")
+fi
 
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  [ -f "$ROOT/$f" ] || continue
+  is_repo_file "$f" || continue
+  procs=0
   while IFS=: read -r proc cmd || [ -n "$proc" ]; do
     case $proc in '' | '#'* | *[!A-Za-z0-9_-]*) continue ;; esac
     cmd=${cmd#"${cmd%%[![:space:]]*}"}
-    [ -n "$cmd" ] && emit_start "$f" "$proc" "$cmd"
+    [ -n "$cmd" ] || continue
+    emit_start "$f" "$proc" "$cmd"
+    procs=$((procs + 1))
+    [ "$procs" -lt "$START_LINES" ] || break
   done <"$ROOT/$f"
 done < <(json_array_items "$(wt_json_get runtimeHints.startProcfiles <"$WT_DETECTION_JSON")")
 
 if [ -n "$START_PAT" ]; then
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    [ -f "$ROOT/$f" ] || continue
+    is_repo_file "$f" || continue
     while IFS=: read -r lineno text; do
       [ -n "$lineno" ] || continue
       emit_start "$f" "line $lineno" "${text#"${text%%[![:space:]]*}"}"
@@ -961,17 +991,26 @@ for f in "$ROOT"/.env.*; do
   envname=${envname%.local}
   claimed "$ENV_SKIP" "${envname##*.}" && continue
   envname=${envname%%.*}
+  # Checked again on the bare name: `.env.local.php` ends in php, and is still an overlay.
+  claimed "$ENV_SKIP" "$envname" && continue
   case $envname in '' | *[!A-Za-z0-9_-]*) continue ;; esac
   ENV_LINES="$ENV_LINES$envname$TAB${f##*/}${TAB}file"$'\n'
 done
 
 TEST_CONFIGS=''
+TEST_CONFIG_MAX=20
+TEST_CONFIGS_TRUNCATED=0
 if [ "$IS_GIT" = 1 ]; then
   while IFS= read -r g; do
     [ -n "$g" ] || continue
     TEST_CONFIGS="$TEST_CONFIGS$(wt_git "$ROOT" ls-files -- ":(glob)**/$g" 2>/dev/null)"$'\n'
   done < <(json_array_items "$(wt_json_get runtimeHints.testConfigGlobs <"$WT_DETECTION_JSON")")
-  TEST_CONFIGS=$(printf '%s' "$TEST_CONFIGS" | grep -vE '(^|/)(node_modules|vendor)/' | grep . | LC_ALL=C sort -u | head -20)
+  TEST_CONFIGS=$(printf '%s' "$TEST_CONFIGS" | grep -vE '(^|/)(node_modules|vendor)/' | grep . | LC_ALL=C sort -u)
+  test_config_count=$(printf '%s\n' "$TEST_CONFIGS" | grep -c .)
+  if [ "$test_config_count" -gt "$TEST_CONFIG_MAX" ]; then
+    TEST_CONFIGS=$(printf '%s\n' "$TEST_CONFIGS" | head -n "$TEST_CONFIG_MAX")
+    TEST_CONFIGS_TRUNCATED=$test_config_count
+  fi
 fi
 
 # `--env=` takes a lowercase value only: `docker run --env=NAME=value` passes a variable, not an
@@ -979,7 +1018,7 @@ fi
 if [ -n "$ENV_VAR_PAT" ]; then
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    [ -f "$ROOT/$f" ] || continue
+    is_repo_file "$f" || continue
     while IFS= read -r m; do
       case $m in
         *--env=*)
@@ -1010,6 +1049,9 @@ done < <(printf '%s' "$ENV_LINES" | LC_ALL=C sort -u)
 while IFS= read -r f; do
   [ -n "$f" ] && emit testConfig "$f"
 done <<<"$TEST_CONFIGS"
+if [ "$TEST_CONFIGS_TRUNCATED" -gt 0 ]; then
+  warn "only the first $TEST_CONFIG_MAX of $TEST_CONFIGS_TRUNCATED test configs are listed; the rest need the same environment question"
+fi
 
 # ---------------------------------------------------------------------------
 # The plugin's own paths inside a checkout
