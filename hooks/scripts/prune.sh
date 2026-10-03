@@ -577,35 +577,15 @@ wt_find_stale_admin_dirs() {
   done
 }
 
+# wt_allocation_holder over the survey's live worktrees.
+wt_prune_allocation_holder() {  # $1 = port, $2 = slug
+  wt_allocation_holder "$WT_PRUNE_ROOT" "${1-}" "${2-}" ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}
+}
+
 # Judge serve mirror file $1 into WT_PRUNE_VERDICT and WT_PRUNE_WHY, with WT_SERVE_* and
 # WT_SERVE_MIRROR_* loaded. Returns 1 when the record is still its live worktree's own — the state
 # file there holds the same record — which is /pitlane-serve's to stop, not an item at all.
 #
-# The live worktree whose allocation now holds port $1 or slug $2 — by its ledger entry or its own
-# state file's `rt` record — on stdout, or return 1. Either can be handed out again once its
-# worktree is gone, and an app answering on a reused port is that worktree's.
-wt_prune_allocation_holder() {  # $1 = port, $2 = slug
-  local port=${1-} slug=${2-} path held_slug held_port live state
-  [ -n "$port" ] || [ -n "$slug" ] || return 1
-  while IFS=$WT_US read -r -d "$WT_RS" _ path _ _ held_slug held_port _; do
-    wt_prune_is_live "$(wt_physical_path "$path")" || continue
-    if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
-      printf '%s' "$path"
-      return 0
-    fi
-  done < <(wt_ledger_entries "$WT_PRUNE_ROOT" 2>/dev/null)
-  for live in ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
-    state=$(wt_state_path "$live") || continue
-    held_port=$(wt_runtime_state_read "$state" port 2>/dev/null) || held_port=''
-    held_slug=$(wt_runtime_state_read "$state" slug 2>/dev/null) || held_slug=''
-    if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
-      printf '%s' "$live"
-      return 0
-    fi
-  done
-  return 1
-}
-
 # A `command` record names no process, so nothing proves what answers at its URL is that server:
 # for one whose path is a live worktree again, or whose port or slug a live worktree now holds,
 # runtime.stop would stop that worktree's app, and it is refused.

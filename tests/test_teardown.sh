@@ -852,6 +852,47 @@ eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
 eq '...the mirror is forgotten' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
 contains '...and stderr says why' 'record dropped, runtime.stop not run' "$err"
 
+# Removed natively while its daemon still answers, after a live worktree was handed its port: the
+# main checkout's runtime.stop, expanded with that port, could stop the live worktree's app. It is
+# refused, the mirror kept for /pitlane-tidy, and the teardown still completes.
+python3 - "$SVR/.claude/worktree-profile.json" "$STOP_CMD" <<'PY'
+import json, sys
+p, stop = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["runtime"]["stop"] = stop
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SVR" commit -qam stop
+daemon_worktree daemon-reallocated "$STOP_CMD"
+WL=$(create "$SVR" holder)
+# shellcheck disable=SC1091  # the engine itself, sourced to read the live worktree's allocation
+held_port=$( . "$SCRIPTS/bootstrap-lib.sh"
+  wt_runtime_state_read "$(wt_state_path "$WL")" port )
+eq 'reallocated fixture: the live worktree holds a port' yes "$([ -n "$held_port" ] && echo yes || echo no)"
+python3 - "$MIRRORS" "$held_port" <<'PY'
+import os, sys
+d, port = sys.argv[1], sys.argv[2]
+(name,) = os.listdir(d)
+recs = open(os.path.join(d, name), encoding="latin-1").read().split("\x1e")
+for i, rec in enumerate(recs):
+    f = rec.split("\x1f")
+    if f[0] == "worktree":
+        f[5] = port
+        recs[i] = "\x1f".join(f)
+open(os.path.join(d, name), "w", encoding="latin-1").write("\x1e".join(recs))
+PY
+git -C "$SVR" worktree remove --force "$WC"
+out=$(remove "$(remove_payload "$WC" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'gone, reallocated port: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...the app is left running' yes "$(alive "$dpid")"
+contains '...and stderr names the worktree that holds the port' "is now $WL's" "$err"
+eq '...its mirror is kept for /pitlane-tidy' 1 "$(count_in "$MIRRORS")"
+kill "$dpid" 2>/dev/null
+rm -f "$MIRRORS"/*
+remove "$(remove_payload "$WL" "$SVR")" "$SVR" >/dev/null
+
 # Removed natively first (directory and admin dir gone, as Claude Code does): the hook that
 # fires after finds the server through its mirror.
 WN=$(create "$SVR" native)

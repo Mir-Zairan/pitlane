@@ -951,6 +951,53 @@ wt_acquire_serve_lock() {  # $1 = worktree, $2 = fd number
   return 1
 }
 
+# Every linked worktree `git worktree list` gives for the repository at $1 whose directory exists,
+# physical, into WT_TD_LIVE. The main checkout is not one. Returns 1 when git cannot list them.
+WT_TD_LIVE=()
+wt_list_live_worktrees() {  # $1 = main checkout
+  local listed line wt physical n=0
+  WT_TD_LIVE=()
+  listed=$(wt_git "$1" worktree list --porcelain 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    case $line in 'worktree '*) ;; *) continue ;; esac
+    wt=${line#worktree }
+    n=$((n + 1))
+    [ "$n" -gt 1 ] && [ -d "$wt" ] || continue
+    physical=$(cd -P "$wt" 2>/dev/null && pwd -P) || continue
+    WT_TD_LIVE[${#WT_TD_LIVE[@]}]=$physical
+  done <<<"$listed"
+  return 0
+}
+
+# The live worktree whose allocation now holds port $2 or slug $3 — by its ledger entry or its own
+# state file's `rt` record — on stdout, or return 1. Either can be handed out again once its
+# worktree is gone, and an app answering on a reused port is that worktree's.
+wt_allocation_holder() {  # $1 = main checkout, $2 = port, $3 = slug, $4... = every live linked worktree, physical
+  local root=$1 port=${2-} slug=${3-} path physical held_slug held_port live state
+  shift 3
+  [ -n "$port" ] || [ -n "$slug" ] || return 1
+  while IFS=$WT_US read -r -d "$WT_RS" _ path _ _ held_slug held_port _; do
+    physical=$(wt_physical_path "$path") || continue
+    for live in "$@"; do
+      [ "$live" = "$physical" ] || continue
+      if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
+        printf '%s' "$path"
+        return 0
+      fi
+    done
+  done < <(wt_ledger_entries "$root" 2>/dev/null)
+  for live in "$@"; do
+    state=$(wt_state_path "$live") || continue
+    held_port=$(wt_runtime_state_read "$state" port 2>/dev/null) || held_port=''
+    held_slug=$(wt_runtime_state_read "$state" slug 2>/dev/null) || held_slug=''
+    if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
+      printf '%s' "$live"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Stop the server /pitlane-serve recorded for the worktree at $1, and nothing else: by its recorded
 # process group, proved by its start identity, or by runtime.stop for one that daemonized (ADR-021).
 # Never by port or cwd. Present ($3 = 1), the record is in its state file and runtime.stop runs in
@@ -989,6 +1036,9 @@ wt_stop_one_server() {  # $1 = state|mirror, $2 = worktree or mirror file, $3 = 
       wt_log "nothing answers at $url, where /pitlane-serve started the app — record dropped, runtime.stop not run"
       return 0
     fi
+    if [ "$source" = mirror ] && ! wt_mirror_allocation_free "$rundir" "$url"; then
+      return 0
+    fi
     if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
       wt_log "not stopping the app at $url: only runtime.stop can stop it, and no usable profile is loaded — /pitlane-tidy lists it"
       return 0
@@ -1018,6 +1068,21 @@ wt_stop_one_server() {  # $1 = state|mirror, $2 = worktree or mirror file, $3 = 
     5) wt_log "the app /pitlane-serve started at $url was not stopped — $WT_SERVE_STOP_WHY; carrying on with the teardown; /pitlane-tidy lists it" ;;
   esac
   return 0
+}
+
+# Whether the port and slug of the mirror loaded in WT_SERVE_MIRROR_* are no live worktree's, so
+# runtime.stop expanded with them can reach only the gone worktree's app; warns when not. Unproven —
+# git cannot list the worktrees — is not free.
+wt_mirror_allocation_free() {  # $1 = main checkout, $2 = the app's url
+  local holder
+  if ! wt_list_live_worktrees "$1"; then
+    wt_log "not stopping the app at $2: git cannot list the worktrees, so nothing proves its port or slug is not another's now — /pitlane-tidy lists it"
+    return 1
+  fi
+  holder=$(wt_allocation_holder "$1" "$WT_SERVE_MIRROR_PORT" "$WT_SERVE_MIRROR_SLUG" \
+    ${WT_TD_LIVE[@]+"${WT_TD_LIVE[@]}"}) || return 0
+  wt_log "not stopping the app at $2: its port or slug is now $holder's, so runtime.stop could stop that worktree's app — stop it by hand; /pitlane-tidy lists it"
+  return 1
 }
 
 # Take the plugin's block out of every override file the record says is `ours`. $2 and
