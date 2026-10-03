@@ -2704,6 +2704,14 @@ wt_dep_recorded_reason() {
   [ "${#WT_DEP_SHOWN_REASON}" -le 80 ] || WT_DEP_SHOWN_REASON="${WT_DEP_SHOWN_REASON:0:77}..."
 }
 
+# The line /pitlane-finish and /pitlane-serve both end on when the profile's commands are held back
+# for approval (ADR-020), so the skills read one wording. $1, when given, names what was held back.
+wt_approval_held_line() {  # $1 = summary or empty
+  # shellcheck disable=SC2016  # the backticks are text for the reader, not a substitution.
+  printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form%s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
+    "${1:+ — $1}" "${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}"
+}
+
 # How many imperfect items the status line names before it says "and N more".
 WT_STATUS_SHOWN=3
 
@@ -2775,9 +2783,7 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
     elif [ -z "${WT_PENDING:-}" ]; then
       printf 'Pitlane: this worktree is set up, with warnings — %s.\n' "$summary"
     elif [ "$how" = approval ]; then
-      # shellcheck disable=SC2016  # the backticks are text for the reader, not a substitution.
-      printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form — %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
-        "$summary" "$script"
+      wt_approval_held_line "$summary"
     elif [ "$standing" -gt 0 ]; then
       # shellcheck disable=SC2016
       printf 'Pitlane: still not complete — %s. A failed install is not retried while its lockfile and install command are unchanged; retry it with `bash "%s" --finish --retry-failed` only on the user'"'"'s word.\n' \
@@ -2926,6 +2932,463 @@ wt_background_wait() {  # $1 = worktree
   done
   wt_log "the background setup finished after ${waited}s more"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Serving the worktree's app on request (ADR-021) — `bootstrap.sh --serve` and `--serve-stop`
+# ---------------------------------------------------------------------------
+#
+# NO HOOK EVER CALLS THIS. A server is long-lived and depends on setup that finishes in the
+# background; /pitlane-serve starts it when the session asks, and only then.
+#
+# THE PLUGIN STOPS ONLY WHAT IT STARTED. The server runs detached in a session of its own, so its
+# PID is also its process group and session id, and that PID is recorded with a START IDENTITY: the
+# process's start time, which a recycled PID does not share. Every stop re-reads the identity and
+# signals only on a match, so a PID the kernel has since handed to an unrelated process is never
+# signalled. Nothing is ever stopped by its port or its working directory.
+#
+# THE `serve` RECORD, kind `serve`, a single slot in the worktree's state file (fields after the
+# kind; the format is documented for teardown in docs/02-architecture.md):
+#   1 pid        the server's process — the leader of its own process group and session
+#   2 pgid       the group to signal: equal to pid when the leader still led its group when
+#                recorded; empty when it did not, and then only the pid is signalled
+#   3 identity   `stat:<ticks>` (field 22 of /proc/<pid>/stat) or `lstart:<text>` (`ps -o lstart=`,
+#                where /proc is missing): wt_proc_identity, compared byte for byte
+#   4 cmdcksum   cksum of the EXPANDED serve command it was started with
+#   5 url        the URL it was probed at
+#   6 when       epoch seconds it was started
+
+# The start identity of process $1 on stdout: `stat:<starttime>` from /proc, else `lstart:<text>`
+# from ps. Returns 1, printing nothing, when the process is gone or neither source can say.
+wt_proc_identity() {  # $1 = pid
+  local pid=${1-} stat rest out
+  local -a fields
+  wt_is_posint "$pid" || return 1
+  if [ -d /proc/self ]; then
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    # comm, in brackets, may hold spaces and `)`: the fields that follow start after the LAST `) `.
+    rest=${stat##*) }
+    read -r -a fields <<<"$rest"
+    wt_is_posint "${fields[19]:-}" || return 1
+    printf 'stat:%s' "${fields[19]}"
+    return 0
+  fi
+  out=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  out=$(printf '%s' "$out" | tr -s ' \t\n' '   ' | sed 's/^ //; s/ $//')
+  [ -n "$out" ] || return 1
+  printf 'lstart:%s' "$out"
+}
+
+# The process group of $1 on stdout, or return 1.
+wt_proc_pgrp() {  # $1 = pid
+  local pid=${1-} stat rest out
+  local -a fields
+  wt_is_posint "$pid" || return 1
+  if [ -d /proc/self ]; then
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    rest=${stat##*) }
+    read -r -a fields <<<"$rest"
+    out=${fields[2]:-}
+  else
+    out=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' \t\n') || return 1
+  fi
+  wt_is_posint "$out" || return 1
+  printf '%s' "$out"
+}
+
+# True when $1 is a live process. A zombie is not: kill -0 succeeds on one until its parent reaps
+# it, and the server's parent is this script for as long as it probes.
+wt_pid_alive() {  # $1 = pid
+  local pid=${1-} st stat
+  wt_is_posint "$pid" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -d /proc/self ]; then
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    st=${stat##*) }
+    st=${st%% *}
+  else
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' \t\n') || st=''
+  fi
+  case $st in Z*) return 1 ;; esac
+  return 0
+}
+
+wt_serve_logfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-serve.log' "${p%/*}"
+}
+
+wt_serve_lockfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-serve.lock' "${p%/*}"
+}
+
+# Read this worktree's `serve` record into WT_SERVE_PID, _PGID, _IDENTITY, _CKSUM, _URL and _WHEN.
+# Returns 1, with them all empty, when there is none — by the state file's no-partial-trust rules.
+wt_serve_record_read() {  # $1 = worktree
+  local file rec kind rest seen=0
+  WT_SERVE_PID='' WT_SERVE_PGID='' WT_SERVE_IDENTITY='' WT_SERVE_CKSUM='' WT_SERVE_URL='' WT_SERVE_WHEN=''
+  file=$(wt_state_path "${1%/}")
+  [ -r "$file" ] || return 1
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    case $kind in
+      wtstate)
+        [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
+        seen=1
+        ;;
+      serve)
+        [ "$seen" = 1 ] || return 1
+        # SC2034: _CKSUM and _WHEN are for the reader of the record (teardown), not this file.
+        # shellcheck disable=SC2034
+        IFS=$WT_US read -r WT_SERVE_PID WT_SERVE_PGID WT_SERVE_IDENTITY WT_SERVE_CKSUM WT_SERVE_URL WT_SERVE_WHEN \
+          <<<"$rest" || true
+        wt_is_posint "$WT_SERVE_PID" || { WT_SERVE_PID=''; return 1; }
+        return 0
+        ;;
+    esac
+  done <"$file"
+  return 1
+}
+
+# Write (or, with no pid, remove) the `serve` record, under the worktree's bootstrap lock so it
+# cannot interleave with a session's own state write and be lost — a lost record is a server
+# nothing will ever stop.
+wt_serve_record_write() {  # $1 = worktree, $2 = pid ('' removes), $3 = pgid, $4 = identity, $5 = cmdcksum, $6 = url
+  local wt=${1%/} rec='' held=0 when
+  if [ -n "${2-}" ]; then
+    when=$(date +%s 2>/dev/null) || when=0
+    wt_state_join serve "$2" "${3-}" "${4-}" "${5-}" "${6-}" "$when"
+    rec=$WT_STATE_REC
+  fi
+  wt_lock_acquire "$(wt_state_path "$wt").lock" 10 8 && held=1
+  wt_state_rewrite "$wt" serve '' "$rec"
+  local rc=$?
+  [ "$held" -eq 1 ] && wt_lock_release 8
+  return "$rc"
+}
+
+# Is the recorded server still the process this plugin started? Reads the record into WT_SERVE_*.
+#   0  yes: alive, and its start identity matches
+#   1  nothing is recorded
+#   2  it has exited
+#   3  the PID is alive but is not it — recycled, or its identity cannot be read to prove it is
+wt_serve_check() {  # $1 = worktree
+  local now
+  wt_serve_record_read "$1" || return 1
+  wt_pid_alive "$WT_SERVE_PID" || return 2
+  now=$(wt_proc_identity "$WT_SERVE_PID") || return 3
+  [ -n "$WT_SERVE_IDENTITY" ] && [ "$now" = "$WT_SERVE_IDENTITY" ] || return 3
+  return 0
+}
+
+# Send signal $1 to the recorded server: to its whole group when it was recorded as the group's
+# leader and still leads it, otherwise to the PID alone. Call only right after wt_serve_check said 0.
+wt_serve_signal() {  # $1 = signal name
+  local sig=$1 pg
+  if [ -n "$WT_SERVE_PGID" ] && [ "$WT_SERVE_PGID" = "$WT_SERVE_PID" ] \
+    && pg=$(wt_proc_pgrp "$WT_SERVE_PID") && [ "$pg" = "$WT_SERVE_PGID" ]; then
+    kill -s "$sig" -- "-$WT_SERVE_PGID" 2>/dev/null
+  else
+    kill -s "$sig" "$WT_SERVE_PID" 2>/dev/null
+  fi
+}
+
+# True while any process of the recorded server is left: any member of its group, when it has one —
+# a group id is not reused while any member lives (POSIX), so this cannot match a stranger — else
+# its PID.
+wt_serve_remains() {
+  if [ -n "$WT_SERVE_PGID" ] && [ "$WT_SERVE_PGID" = "$WT_SERVE_PID" ]; then
+    kill -0 -- "-$WT_SERVE_PGID" 2>/dev/null
+    return
+  fi
+  wt_pid_alive "$WT_SERVE_PID"
+}
+
+# Stop the server this plugin recorded for worktree $1, and only it: SIGTERM to its group, then,
+# after PITLANE_SERVE_STOP_SECONDS (default 10), SIGKILL to what is left of the group. The record
+# is cleared whenever there is nothing of ours left to stop. Sets WT_SERVE_* from the record.
+#   0  stopped
+#   1  nothing is recorded
+#   2  it had already exited (record cleared)
+#   3  its PID now belongs to another process, which is left alone (record cleared)
+#   4  it would not stop (record kept)
+wt_serve_stop() {  # $1 = worktree
+  local wt=${1%/} grace=${PITLANE_SERVE_STOP_SECONDS:-10} i rc
+  wt_is_seconds "$grace" || grace=10
+  wt_serve_check "$wt"
+  rc=$?
+  case $rc in
+    0) ;;
+    1) return 1 ;;
+    *) wt_serve_record_write "$wt" ''; return "$rc" ;;
+  esac
+  wt_serve_signal TERM
+  i=0
+  while wt_serve_remains && [ "$i" -lt $((grace * 5)) ]; do
+    sleep 0.2 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  if wt_serve_remains; then
+    wt_log "the server (pid $WT_SERVE_PID) did not stop within ${grace}s of SIGTERM — sending SIGKILL"
+    # The leader may have exited and its PID been reused meanwhile: the group is signalled only by
+    # the rule above, and a lone PID only after its identity is proved again.
+    if [ -n "$WT_SERVE_PGID" ] && [ "$WT_SERVE_PGID" = "$WT_SERVE_PID" ]; then
+      kill -s KILL -- "-$WT_SERVE_PGID" 2>/dev/null
+    elif wt_serve_check "$wt"; then
+      kill -s KILL "$WT_SERVE_PID" 2>/dev/null
+    fi
+    i=0
+    while wt_serve_remains && [ "$i" -lt 10 ]; do
+      sleep 0.2 2>/dev/null || sleep 1
+      i=$((i + 1))
+    done
+    wt_serve_remains && return 4
+  fi
+  wt_serve_record_write "$wt" ''
+  return 0
+}
+
+# True when something answers at URL $1 — any HTTP status counts, an error page included: the
+# question is whether a server is listening, not whether the app is healthy. curl when there is one
+# (WT_CURL overrides, '' forces the fallback); else a TCP connect through bash's /dev/tcp to the
+# URL's host and port, `localhost` and `*.localhost` taken as the loopback address.
+wt_serve_answers() {  # $1 = url
+  local url=$1 curl=${WT_CURL-curl} code rest hostport host port
+  if [ -n "$curl" ] && command -v "$curl" >/dev/null 2>&1; then
+    code=$("$curl" -s -k -o /dev/null --noproxy '*' --max-time 2 -w '%{http_code}' "$url" 2>/dev/null) || code=''
+    case $code in '' | 000) return 1 ;; esac
+    return 0
+  fi
+  rest=${url#*://}
+  hostport=${rest%%/*}
+  host=${hostport%%:*}
+  if [ "$host" != "$hostport" ]; then
+    port=${hostport#*:}
+  else
+    case $url in https://*) port=443 ;; *) port=80 ;; esac
+  fi
+  case $host in localhost | *.localhost) host=127.0.0.1 ;; esac
+  # shellcheck disable=SC2016  # $0 and $1 belong to the inner shell.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$host" "$port" 2>/dev/null
+  else
+    bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$host" "$port" 2>/dev/null
+  fi
+}
+
+# Wait for URL $1 to answer while process $2 lives, at most $3 seconds.
+#   0  it answers   1  out of time, the process still alive   2  the process exited
+wt_serve_probe() {  # $1 = url, $2 = pid, $3 = seconds
+  local url=$1 pid=$2 secs=$3 start now
+  start=$(date +%s)
+  while :; do
+    wt_pid_alive "$pid" || return 2
+    wt_serve_answers "$url" && return 0
+    now=$(date +%s)
+    [ $((now - start)) -lt "$secs" ] || return 1
+    sleep 0.5 2>/dev/null || sleep 1
+  done
+}
+
+# Start the expanded command $2 detached in worktree $1, inside the profile's shell and under the
+# resource guard (ADR-018), output appended to log $3. Sets WT_SERVE_STARTED to its PID.
+# Returns WT_GUARD_REFUSED when memory is short, WT_UNAPPROVED when the gate is closed, 1 otherwise.
+#
+# DETACHED: setsid gives it a session and process group of its own, so the Bash tool that ran
+# /pitlane-serve, and its process group, can end without it; its PID is the group's id, which is
+# what a stop signals. A memory-capped transient scope outlives the systemd-run that made it
+# (measured: the scope's process is the command itself, exec'd, and lives on after this script
+# exits). The PID is written by the process itself after setsid, so it is right even where setsid
+# had to fork.
+wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
+  local wt=${1%/} cmd=$2 log=$3 pidf pid='' i detach
+  WT_SERVE_STARTED=''
+  if [ "${WT_APPROVAL:-}" = no ]; then
+    wt_log "not running \"$cmd\": the profile's commands are not approved"
+    return "$WT_UNAPPROVED"
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    detach=(setsid)
+  elif command -v python3 >/dev/null 2>&1; then
+    detach=(python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
+  else
+    wt_log "neither setsid nor python3 is on PATH, so the server cannot be detached from this command"
+    return 1
+  fi
+  if wt_nix_shell_missing "$wt"; then
+    wt_log "the profile's shell is \"$PROFILE_SHELL\" but this branch has no flake.nix/shell.nix — running on the host shell instead"
+    WT_CMD_ARGV=(bash -lc "$cmd")
+  else
+    wt_build_shell_argv "$cmd"
+  fi
+  if [ "${WT_GUARD:-on}" != off ]; then
+    wt_guard_argv "$cmd" || return "$WT_GUARD_REFUSED"
+  fi
+  pidf="$log.pid"
+  rm -f "$pidf" 2>/dev/null
+  # Descriptors 7 and 8 hold the serve lock and the bootstrap lock: a server inheriting either
+  # would hold it for as long as it runs.
+  ( exec 7>&- 8>&-
+    cd "$wt" 2>/dev/null || exit 1
+    # shellcheck disable=SC2016  # $$, $1 and $@ belong to the inner shell.
+    exec "${detach[@]}" bash -c 'printf "%s\n" "$$" >"$1" || exit 1; shift; exec "$@"' pitlane-serve "$pidf" "${WT_CMD_ARGV[@]}"
+  ) </dev/null >>"$log" 2>&1 &
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    pid=$({ tr -cd '0-9' <"$pidf"; } 2>/dev/null) || pid=''
+    [ -n "$pid" ] && break
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  rm -f "$pidf" 2>/dev/null
+  wt_is_posint "$pid" || { wt_log "the server did not start — see $log"; return 1; }
+  WT_SERVE_STARTED=$pid
+  return 0
+}
+
+# What the app needs and this worktree lacks, joined for one line, into WT_SERVE_MISSING: each
+# dependency not installed (a `warn` one is installed, and does not count) and an unseeded database.
+wt_serve_missing() {  # $1 = worktree
+  local kind name detail
+  WT_SERVE_MISSING=''
+  wt_bootstrap_pending "$1"
+  while IFS=$WT_US read -r kind name detail; do
+    case $kind in
+      missing) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not installed" ;;
+      standing) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not installed (its install failed: $detail)" ;;
+      seed) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not seeded (seed: $detail)" ;;
+    esac
+  done <<<"${WT_STATUS_ITEMS:-}"
+  WT_SERVE_MISSING=$(wt_visible "$WT_SERVE_MISSING")
+}
+
+# `bootstrap.sh --serve`, once the profile is loaded and approved and any background setup has
+# finished: check the pieces, start runtime.serve, record it, probe it. Prints ONE line on stdout —
+# `Pitlane: serving at <url>`, `Pitlane: already serving at <url>`, or `Pitlane: not served — <why>`
+# — and returns 0 only when the app answers (or a server it started already runs).
+wt_serve_start() {  # $1 = worktree
+  local wt=${1%/} port slug cmd why='' url='' log secs rc pid identity pgid held=0
+  secs=${PITLANE_SERVE_TIMEOUT:-60}
+  wt_is_seconds "$secs" || secs=60
+  log=$(wt_serve_logfile "$wt")
+
+  # Two /pitlane-serve runs at once would start two servers; the second waits for the first's probe.
+  wt_lock_acquire "$(wt_serve_lockfile "$wt")" $((secs + 30)) 7 && held=1
+
+  wt_serve_check "$wt"
+  rc=$?
+  case $rc in
+    0)
+      [ "$held" -eq 1 ] && wt_lock_release 7
+      if wt_serve_answers "$WT_SERVE_URL"; then
+        printf 'Pitlane: already serving at %s\n' "$WT_SERVE_URL"
+      else
+        printf 'Pitlane: already started at %s (pid %s), but it does not answer yet (log: %s)\n' \
+          "$WT_SERVE_URL" "$WT_SERVE_PID" "$log"
+        return 1
+      fi
+      return 0
+      ;;
+    2)
+      wt_log "the server started here before (pid $WT_SERVE_PID) has exited — starting it again"
+      wt_serve_record_write "$wt" ''
+      ;;
+    3)
+      wt_log "pid $WT_SERVE_PID, recorded for the server started here before, now belongs to another process — leaving it alone and starting a new server"
+      wt_serve_record_write "$wt" ''
+      ;;
+  esac
+
+  # The pieces the app needs. The slug and port are the ones the runtime recorded, which is what the
+  # env files say: re-deriving them could pick another port than the app's config reads.
+  slug=$(wt_runtime_state_get "$wt" slug) || slug=''
+  port=$(wt_runtime_state_get "$wt" port) || port=''
+  WT_PORT=$port
+  export WT_PORT
+  wt_serve_missing "$wt"
+  [ -z "$slug" ] || { WT_SLUG=$slug; export WT_SLUG; }
+  if [ -n "$WT_SERVE_MISSING" ]; then
+    why="this worktree's setup is not complete — $WT_SERVE_MISSING; run /pitlane-finish first"
+  else
+    case $PROFILE_RT_SERVE$PROFILE_RT_URL in
+      *'{port}'*) [ -n "$port" ] || why='runtime.serve or runtime.url uses {port}, but this worktree has no port yet; run /pitlane-finish first' ;;
+    esac
+  fi
+  if [ -z "${why:-}" ] && ! cmd=$(wt_runtime_command "$PROFILE_RT_SERVE"); then
+    why="runtime.serve is refused: $cmd"
+  fi
+  if [ -z "${why:-}" ]; then
+    if [ -n "${PROFILE_RT_URL:-}" ]; then
+      url=$(wt_expand_url "$PROFILE_RT_URL") || why="runtime.url is unusable: $url"
+    elif [ -n "$port" ]; then
+      url="http://localhost:$port/"
+    else
+      why='the profile has no runtime.url and this worktree no port, so there is no address to check the app at'
+    fi
+  fi
+  # Something already answering would be taken for this app: another worktree's server, or the main
+  # checkout's on a port the profile hardcodes.
+  if [ -z "${why:-}" ] && wt_serve_answers "$url"; then
+    why="something is already answering at $url, and it is not a server Pitlane started here"
+  fi
+  if [ -n "${why:-}" ]; then
+    [ "$held" -eq 1 ] && wt_lock_release 7
+    printf 'Pitlane: not served — %s\n' "$why"
+    return 1
+  fi
+
+  { printf '%s serving %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$wt" "$(wt_visible "$cmd")"; } >"$log" 2>/dev/null \
+    || { [ "$held" -eq 1 ] && wt_lock_release 7; printf 'Pitlane: not served — cannot write its log at %s\n' "$log"; return 1; }
+  wt_log "starting the app: $(wt_visible "$cmd") — output in $log"
+  wt_serve_launch "$wt" "$cmd" "$log"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$held" -eq 1 ] && wt_lock_release 7
+    if [ "$rc" -eq "$WT_GUARD_REFUSED" ]; then
+      printf 'Pitlane: not served — too little memory is free to start it; close something heavy and run /pitlane-serve again (PITLANE_MEMORY_MAX=off skips this check)\n'
+    else
+      printf 'Pitlane: not served — it could not be started (log: %s)\n' "$log"
+    fi
+    return 1
+  fi
+  pid=$WT_SERVE_STARTED
+
+  # Recorded BEFORE the probe, so a run killed while it waits still leaves a server teardown can stop.
+  if ! identity=$(wt_proc_identity "$pid"); then
+    if wt_pid_alive "$pid"; then
+      # Unprovable later means unstoppable later: stop it now, while its PID is certainly ours.
+      kill -s TERM -- "-$pid" 2>/dev/null || kill -s TERM "$pid" 2>/dev/null
+      [ "$held" -eq 1 ] && wt_lock_release 7
+      printf 'Pitlane: not served — its start time cannot be read on this system (no /proc, no ps), so Pitlane could not stop it safely later; it was stopped\n'
+      return 1
+    fi
+    identity=''
+  fi
+  pgid=$(wt_proc_pgrp "$pid") || pgid=''
+  [ "$pgid" = "$pid" ] || pgid=''
+  [ -z "$identity" ] || wt_serve_record_write "$wt" "$pid" "$pgid" "$identity" "$(wt_cksum_string "$cmd")" "$url" \
+    || wt_log "could not record the server (pid $pid) in $(wt_state_path "$wt") — teardown will not know to stop it"
+
+  wt_serve_probe "$url" "$pid" "$secs"
+  rc=$?
+  [ "$held" -eq 1 ] && wt_lock_release 7
+  case $rc in
+    0)
+      printf 'Pitlane: serving at %s\n' "$url"
+      return 0
+      ;;
+    1)
+      printf 'Pitlane: not served — %s did not answer within %ss; the server is still running (pid %s) and may still be starting — run /pitlane-serve again to check, or --serve-stop to stop it (log: %s)\n' \
+        "$url" "$secs" "$pid" "$log"
+      ;;
+    *)
+      wt_serve_record_write "$wt" ''
+      printf 'Pitlane: not served — the server exited before %s answered (log: %s)\n' "$url" "$log"
+      ;;
+  esac
+  return 1
 }
 
 # ---------------------------------------------------------------------------

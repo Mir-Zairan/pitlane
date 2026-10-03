@@ -3919,5 +3919,162 @@ eq 'runtime command: an unsafe {worktree} is refused' 1 $?
 wt_runtime_command '' >/dev/null
 eq 'runtime command: none in the profile is refused' 1 $?
 
+# ---------------------------------------------------------------------------
+# /pitlane-serve's process bookkeeping: identity, liveness, the `serve` record, stop, probe
+# ---------------------------------------------------------------------------
+# Every process started here is a group of its own, killed on the way out whatever happened.
+SV_GROUPS=''
+stop_test_servers() {
+  local g
+  for g in $SV_GROUPS; do kill -s KILL -- "-$g" 2>/dev/null; done
+}
+trap 'stop_test_servers; rm -rf "$TMP"' EXIT
+sv_group() {  # $1 = pid file, $2 = inner script; starts it in a session of its own and prints its pid
+  local pid=''
+  rm -f "$1"
+  # shellcheck disable=SC2016  # $$ belongs to the inner shell.
+  setsid bash -c 'printf "%s\n" "$$" >"$0"; eval "$1"' "$1" "$2" </dev/null >/dev/null 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    pid=$(cat "$1" 2>/dev/null)
+    [ -n "$pid" ] && break
+    sleep 0.1
+  done
+  SV_GROUPS="$SV_GROUPS $pid"
+  printf '%s' "$pid"
+}
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+
+if [ -r /proc/self/stat ] && command -v setsid >/dev/null 2>&1; then
+  eq 'identity: field 22 of /proc/<pid>/stat, tagged' "stat:$(awk '{ print $22 }' "/proc/$$/stat")" "$(wt_proc_identity $$)"
+  # A command name holding `) ` must not shift the fields: they start after the LAST `) `.
+  cp "$(command -v sleep)" "$TMP/x) 1 2"
+  "$TMP/x) 1 2" 30 &
+  odd=$!
+  want=$(python3 -c 'import sys; s=open("/proc/%s/stat" % sys.argv[1]).read(); print("stat:" + s[s.rindex(")") + 2:].split()[19])' "$odd")
+  eq 'identity: a command name holding ") " does not shift the fields' "$want" "$(wt_proc_identity "$odd")"
+  eq 'pgrp: field 5, past the command name' "$(python3 -c 'import os,sys; print(os.getpgid(int(sys.argv[1])))' "$odd")" "$(wt_proc_pgrp "$odd")"
+  kill "$odd" 2>/dev/null; wait "$odd" 2>/dev/null
+  wt_proc_identity "$odd" >/dev/null
+  eq 'identity: a process that is gone has none' 1 $?
+  wt_proc_identity 'x1' >/dev/null
+  eq 'identity: a non-number is refused' 1 $?
+
+  # A zombie answers kill -0 but is not alive.
+  python3 -c '
+import os, sys, time
+p = os.fork()
+if p == 0:
+    os._exit(0)
+open(sys.argv[1], "w").write(str(p))
+time.sleep(5)' "$TMP/zombie.pid" &
+  zparent=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/zombie.pid" ] && break; sleep 0.1; done
+  sleep 0.2
+  zpid=$(cat "$TMP/zombie.pid")
+  eq 'alive: the zombie still answers kill -0' yes "$(kill -0 "$zpid" 2>/dev/null && echo yes || echo no)"
+  eq 'alive: but is not alive' no "$(wt_pid_alive "$zpid" && echo yes || echo no)"
+  eq 'alive: this shell is' yes "$(wt_pid_alive $$ && echo yes || echo no)"
+  kill "$zparent" 2>/dev/null; wait "$zparent" 2>/dev/null
+
+  # The record: one slot, carried beside every other kind.
+  SVW=$TMP/serve-wt
+  mkdir -p "$SVW"
+  wt_runtime_state_set "$SVW" sv 4321 derived .env ours none '' 2>/dev/null
+  wt_serve_record_read "$SVW"
+  eq 'record: none yet' 1 $?
+  wt_serve_check "$SVW"
+  eq 'check: nothing recorded is 1' 1 $?
+  gp=$(sv_group "$TMP/g1.pid" 'sleep 300 & exec sleep 300')
+  gid=$(wt_proc_identity "$gp")
+  wt_serve_record_write "$SVW" "$gp" "$gp" "$gid" 'ck 1' 'http://localhost:4321/'
+  wt_serve_record_read "$SVW"
+  eq 'record: read back' "$gp|$gp|$gid|ck 1|http://localhost:4321/" \
+    "$WT_SERVE_PID|$WT_SERVE_PGID|$WT_SERVE_IDENTITY|$WT_SERVE_CKSUM|$WT_SERVE_URL"
+  eq 'record: the rt record beside it is kept' 4321 "$(wt_runtime_state_get "$SVW" port)"
+  wt_serve_check "$SVW"
+  eq 'check: alive with its identity is 0' 0 $?
+
+  # PID reuse, simulated: the PID is alive but its start time is not the recorded one.
+  wt_serve_record_write "$SVW" "$gp" "$gp" 'stat:1' 'ck 1' 'http://localhost:4321/'
+  wt_serve_check "$SVW"
+  eq 'check: a live PID with another identity is 3' 3 $?
+  wt_serve_stop "$SVW"
+  eq 'stop: a recycled PID is reported as such' 3 $?
+  eq 'stop: and is NOT signalled' yes "$(wt_pid_alive "$gp" && echo yes || echo no)"
+  eq '...nor is its group' 2 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  wt_serve_record_read "$SVW"
+  eq 'stop: its record is cleared' 1 $?
+  eq '...and the rt record kept' 4321 "$(wt_runtime_state_get "$SVW" port)"
+
+  # The real thing: TERM to the whole group, the leader's child included.
+  wt_serve_record_write "$SVW" "$gp" "$gp" "$gid" 'ck 1' 'http://localhost:4321/'
+  t0=$(date +%s)
+  PITLANE_SERVE_STOP_SECONDS=5 wt_serve_stop "$SVW" 2>"$TMP/stop.err"
+  eq 'stop: its own server is stopped' 0 $?
+  # SIGTERM reaches the leader's child too, so nothing waits out the grace for a SIGKILL.
+  eq '...by SIGTERM to the whole group, well inside the grace' yes "$([ $(( $(date +%s) - t0 )) -lt 3 ] && echo yes || echo no)"
+  eq '...with no SIGKILL' '' "$(cat "$TMP/stop.err")"
+  sleep 0.2
+  eq 'stop: the leader is gone' no "$(wt_pid_alive "$gp" && echo yes || echo no)"
+  eq '...and every process of its group' 0 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  wt_serve_record_read "$SVW"
+  eq 'stop: the record is gone' 1 $?
+  wt_serve_stop "$SVW"
+  eq 'stop: nothing recorded is 1' 1 $?
+
+  # Exited: a dead PID is not signalled, and the record goes.
+  wt_serve_record_write "$SVW" "$gp" "$gp" "$gid" 'ck 1' 'http://localhost:4321/'
+  wt_serve_check "$SVW"
+  eq 'check: an exited server is 2' 2 $?
+  wt_serve_stop "$SVW"
+  eq 'stop: an exited server is 2' 2 $?
+  wt_serve_record_read "$SVW"
+  eq '...and its record is cleared' 1 $?
+
+  # One that ignores TERM is killed once the grace is up.
+  gp=$(sv_group "$TMP/g2.pid" 'trap "" TERM; sleep 300 & while :; do sleep 1; done')
+  wt_serve_record_write "$SVW" "$gp" "$gp" "$(wt_proc_identity "$gp")" 'ck 1' 'http://localhost:4321/'
+  t0=$(date +%s)
+  PITLANE_SERVE_STOP_SECONDS=1 wt_serve_stop "$SVW" 2>"$TMP/stop.err"
+  eq 'stop: a server that ignores TERM is stopped by KILL' 0 $?
+  contains '...and says so' 'sending SIGKILL' "$(cat "$TMP/stop.err")"
+  eq '...after the grace, not the default 10s' yes "$([ $(( $(date +%s) - t0 )) -lt 6 ] && echo yes || echo no)"
+  eq '...and nothing of its group is left' 0 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+
+  # A leader recorded without a group of its own is signalled alone.
+  gp=$(sv_group "$TMP/g3.pid" 'sleep 300 & exec sleep 300')
+  wt_serve_record_write "$SVW" "$gp" '' "$(wt_proc_identity "$gp")" 'ck 1' 'http://localhost:4321/'
+  wt_serve_stop "$SVW"
+  eq 'stop: with no group recorded, the PID is stopped' 0 $?
+  sleep 0.2
+  eq '...and only the PID: its group keeps its other member' 1 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  kill -s KILL -- "-$gp" 2>/dev/null
+
+  # The probe: any HTTP answer counts; curl, or /dev/tcp with *.localhost taken as loopback.
+  sport=$(free_port)
+  gp=$(sv_group "$TMP/g4.pid" "exec python3 -m http.server $sport --bind 127.0.0.1")
+  for _ in $(seq 1 50); do WT_CURL='' wt_serve_answers "http://127.0.0.1:$sport/" && break; sleep 0.1; done
+  eq 'answers: /dev/tcp reaches a listening port' 0 "$(WT_CURL='' wt_serve_answers "http://127.0.0.1:$sport/"; echo $?)"
+  eq 'answers: /dev/tcp takes *.localhost as loopback' 0 "$(WT_CURL='' wt_serve_answers "http://alpha.localhost:$sport/x"; echo $?)"
+  if command -v curl >/dev/null 2>&1; then
+    eq 'answers: curl, and a 404 is an answer' 0 "$(wt_serve_answers "http://127.0.0.1:$sport/no-such-page"; echo $?)"
+  fi
+  wt_serve_probe "http://127.0.0.1:$sport/" "$gp" 5
+  eq 'probe: answers while its process lives' 0 $?
+  kill -s KILL -- "-$gp" 2>/dev/null
+  sleep 0.2
+  eq 'answers: /dev/tcp, nothing listening' 1 "$(WT_CURL='' wt_serve_answers "http://127.0.0.1:$sport/"; echo $?)"
+  eq 'answers: curl, nothing listening' 1 "$(wt_serve_answers "http://127.0.0.1:$sport/"; echo $?)"
+  gp=$(sv_group "$TMP/g5.pid" 'exec sleep 300')
+  wt_serve_probe "http://127.0.0.1:$sport/" "$gp" 1
+  eq 'probe: out of time while the process lives is 1' 1 $?
+  kill -s KILL -- "-$gp" 2>/dev/null
+  sleep 0.2
+  wt_serve_probe "http://127.0.0.1:$sport/" "$gp" 5
+  eq 'probe: a process that is gone is 2, at once' 2 $?
+else
+  printf 'SKIP serve bookkeeping: needs /proc and setsid\n' >&2
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

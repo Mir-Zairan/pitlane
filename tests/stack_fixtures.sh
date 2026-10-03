@@ -30,6 +30,11 @@
 #                           STACK_EXPECT    what STACK_PROBE prints; {slug} and {port} stand for the
 #                                           worktree's own
 #                           STACK_ENVFILE   the profile's env file ('' when there is no runtime)
+#                           STACK_SERVE     runtime.serve, set BEFORE write_profile, which then adds
+#                                           it with `url` http://localhost:{port}/ ('' = no serve)
+#                           STACK_SERVE_PATH, STACK_SERVE_EXPECT
+#                                           what /pitlane-serve's app must answer at that path of
+#                                           its URL; {port} stands for the worktree's own
 #                         It returns non-zero when the tool could not build the fixture (offline, a
 #                         registry down), which the suite reports as a SKIP, not a plugin failure.
 #
@@ -79,8 +84,11 @@ print(",\n    ".join(entries))
 # an env file, and a seed/teardown pair that create and remove "$STACK_DB/<slug>" — a database stand-in
 # outside the worktree, so "allocated" and "released" are both observable after the directory is gone.
 write_profile() {  # $1 = repo, $2 = deps[] body, $3 = env file, $4 = extra env.vars body (may be '')
-  local repo=$1 deps=$2 envfile=$3 extra=${4-}
+  local repo=$1 deps=$2 envfile=$3 extra=${4-} serve=''
   mkdir -p "$repo/.claude"
+  [ -z "${STACK_SERVE:-}" ] || serve=",
+    \"serve\": \"$STACK_SERVE\",
+    \"url\": \"http://localhost:{port}/\""
   cat >"$repo/.claude/worktree-profile.json" <<JSON
 {
   "schemaVersion": 1,
@@ -93,7 +101,7 @@ write_profile() {  # $1 = repo, $2 = deps[] body, $3 = env file, $4 = extra env.
     "port": { "var": "APP_PORT", "base": $STACK_PORT_BASE, "span": 200 },
     "env": { "file": "$envfile", "vars": { "APP_DATABASE": "fixture_{slug}"$extra } },
     "seed": ".claude/worktree-seed.sh",
-    "teardown": ".claude/worktree-teardown.sh"
+    "teardown": ".claude/worktree-teardown.sh"$serve
   },
   "timeouts": { "bootstrapSeconds": 420, "seedSeconds": 120 }
 }
@@ -181,8 +189,17 @@ fixture_npm() {
   printf '{ "name": "fixture-npm", "version": "1.0.0", "private": true, "dependencies": { "is-number": "7.0.0" } }\n' \
     >"$r/package.json"
   write_node_probe "$r/probe.js"
+  # The app /pitlane-serve starts: it answers only if is-number resolves inside its own checkout.
+  cat >"$r/server.js" <<'JS'
+const port = Number(process.argv[2]);
+require("http").createServer((req, res) => {
+  const p = require.resolve("is-number");
+  res.end((p.startsWith(process.cwd() + "/") ? "ok" : "broken: " + p) + " " + port);
+}).listen(port, "127.0.0.1");
+JS
   tc "$r" 'npm install --no-audit --no-fund' || return 1
   detect_deps "$r"
+  STACK_SERVE='node server.js {port}' STACK_SERVE_PATH=/ STACK_SERVE_EXPECT='ok {port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=node_modules STACK_LINKDIRS=node_modules
   STACK_PROBE='node probe.js'
@@ -231,6 +248,9 @@ sys.stdout.write("ok" if own and six.PY3 else "broken: " + six.__file__)
 PY
   tc "$r" 'uv lock -q && uv sync -q --frozen' || return 1
   detect_deps "$r"
+  # The worktree's own venv serves the worktree, whose env file names its own port.
+  STACK_SERVE='.venv/bin/python -m http.server {port} --bind 127.0.0.1'
+  STACK_SERVE_PATH=/.env.local STACK_SERVE_EXPECT='APP_PORT={port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=.venv
   STACK_OWNFILES='.venv/lib/python*/site-packages/six.py'
@@ -246,8 +266,16 @@ fixture_composer() {
   write_dev_config "$r" 'vendor/'
   printf '{ "name": "fixture/app", "require": { "psr/log": "^3.0" } }\n' >"$r/composer.json"
   write_php_probe "$r/probe.php"
+  cat >"$r/serve.php" <<'PHP'
+<?php
+require __DIR__ . "/vendor/autoload.php";
+$file = (new ReflectionClass("Psr\\Log\\LoggerInterface"))->getFileName();
+echo (strpos($file, __DIR__ . "/") === 0 ? "ok" : "broken: $file") . " " . $_SERVER["SERVER_PORT"];
+PHP
   tc "$r" 'composer install --no-interaction --no-progress --quiet' || return 1
   detect_deps "$r"
+  # Through the profile's nix shell: php is not on the host.
+  STACK_SERVE='php -S 127.0.0.1:{port} serve.php' STACK_SERVE_PATH=/ STACK_SERVE_EXPECT='ok {port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=vendor STACK_LINKDIRS=vendor
   STACK_PROBE='php probe.php'

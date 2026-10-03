@@ -46,7 +46,11 @@ done
 SCRATCH=$(mktemp -d)
 SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
 # Go writes its module cache read-only, so plain rm -rf cannot clear it.
+# Every app /pitlane-serve started is stopped by its recorded group, whatever happened.
+SERVED_GROUPS=''
 cleanup() {
+  local g
+  for g in $SERVED_GROUPS; do kill -s KILL -- "-$g" 2>/dev/null; done
   if [ -n "${PITLANE_STACKS_KEEP:-}" ]; then
     printf 'kept %s\n' "$SCRATCH" >&2
     return
@@ -225,14 +229,60 @@ approve() {  # $1 = repo
   contains 'approve: records the reviewed fingerprint' 'approved' "$(cd "$1" && bash "$HOOK" --approve "$fp" 2>&1)"
 }
 
+# What the app at URL $1 answers, or `NO ANSWER: <why>`.
+fetch() {
+  python3 -c 'import sys, urllib.request
+try:
+    print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())
+except Exception as e:
+    print("NO ANSWER: %s" % e)' "$1"
+}
+
+# The PID of the server recorded in worktree $1's state, or nothing.
+served_pid() {  # $1 = worktree
+  python3 -c 'import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve":
+        print(f[1])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state"
+}
+
+# /pitlane-serve in worktree $1 on port $2: the stack's own app, through the profile's shell, answers
+# on the worktree's port from the worktree's checkout. It is left running; serve_stop stops it.
+serve_check() {  # $1 = worktree, $2 = its port, $3 = log
+  local w=$1 port=$2 name=${1##*/} out pid expect
+  out=$(cd "$w" && bash "$HOOK" --serve 2>"$3")
+  pid=$(served_pid "$w")
+  [ -z "$pid" ] || SERVED_GROUPS="$SERVED_GROUPS $pid"
+  eq "$name: /pitlane-serve starts the app on the worktree's port" "Pitlane: serving at http://localhost:$port/" "$out"
+  [ "$out" = "Pitlane: serving at http://localhost:$port/" ] || show_log "$3"
+  expect=${STACK_SERVE_EXPECT//\{port\}/$port}
+  contains "$name: the app answers from the worktree's own checkout ($STACK_SERVE)" "$expect" \
+    "$(fetch "http://localhost:$port$STACK_SERVE_PATH")"
+}
+
+serve_stop() {  # $1 = worktree, $2 = its port, $3 = log
+  local w=$1 port=$2 name=${1##*/} out
+  out=$(cd "$w" && bash "$HOOK" --serve-stop 2>>"$3")
+  contains "$name: --serve-stop stops it" "Pitlane: stopped the server at http://localhost:$port/" "$out"
+  contains "$name: and its port no longer answers" 'NO ANSWER' "$(fetch "http://localhost:$port/")"
+}
+
 # One worktree through start-up and --finish, with every per-worktree assertion. Sets WT_PORT_SEEN.
 exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 logs=$3 w out port expect
   w=$r/.claude/worktrees/$name
   git -C "$r" worktree add -q "$w" -b "worktree-$name" 2>/dev/null
   out=$(session_start "$w" "$logs/$name.start")
-  eq "$name: SessionStart leaves stdout empty, so the worktree is fully set up" '' "$out"
-  [ -z "$out" ] || show_log "$logs/$name.start"
+  # Fully set up: stdout is empty, or, with a serve profile, the one line naming /pitlane-serve (ADR-021).
+  expect=''
+  [ -z "$STACK_SERVE" ] || expect="Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://localhost:$(envval "$w" "$STACK_ENVFILE" APP_PORT)/), not the repo's own start command."
+  eq "$name: SessionStart reports the worktree fully set up" "$expect" "$out"
+  [ "$out" = "$expect" ] || show_log "$logs/$name.start"
   out=$(cd "$w" && bash "$HOOK" --finish 2>"$logs/$name.finish")
   eq "$name: --finish reports the worktree fully set up" 'Pitlane: this worktree is fully set up.' "$out"
   local d first f own
@@ -272,6 +322,7 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
     2>"$logs/$name.probe")
   eq "$name: the stack's own runtime uses the dependencies in the worktree ($STACK_PROBE)" "$expect" "$out"
   [ "$out" = "$expect" ] || show_log "$logs/$name.probe"
+  [ -z "$STACK_SERVE" ] || serve_check "$w" "$port" "$logs/$name.serve"
 }
 
 remove_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
@@ -305,6 +356,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   STACK=$stack
   t0=$SECONDS fail0=$fail
   STACK_DEPDIRS='' STACK_LINKDIRS='' STACK_OWNFILES='' STACK_PROBE='' STACK_EXPECT='' STACK_ENVFILE=''
+  STACK_SERVE='' STACK_SERVE_PATH='' STACK_SERVE_EXPECT=''
   STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
@@ -342,6 +394,13 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
     exercise_worktree "$r" beta "$logs"
     p_beta=$WT_PORT_SEEN
     ne 'two worktrees get distinct ports' "$p_alpha" "$p_beta"
+    if [ -n "$STACK_SERVE" ]; then
+      # Both apps at once, each on its own port: the case a hardcoded start command cannot serve.
+      contains "alpha's app still answers beside beta's" "${STACK_SERVE_EXPECT//\{port\}/$p_alpha}" \
+        "$(fetch "http://localhost:$p_alpha$STACK_SERVE_PATH")"
+      serve_stop "$r/.claude/worktrees/alpha" "$p_alpha" "$logs/alpha.serve"
+      serve_stop "$r/.claude/worktrees/beta" "$p_beta" "$logs/beta.serve"
+    fi
     eq 'the main checkout is unchanged while worktrees are live' "$before" "$(main_snapshot "$r")"
     remove_worktree "$r" alpha "$logs"
     remove_worktree "$r" beta "$logs"

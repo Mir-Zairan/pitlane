@@ -1880,5 +1880,265 @@ PY
   contains '...and the allocated port arrives as WORKTREE_PORT' "export WORKTREE_PORT='" "$(cat "$CEFU" 2>/dev/null)"
 done
 
+# ---------------------------------------------------------------------------
+# /pitlane-serve: `bootstrap.sh --serve` and `--serve-stop`
+# ---------------------------------------------------------------------------
+# Every server a test starts is stopped on the way out, by its recorded group, whatever happened.
+SV_KILL=''
+stop_test_servers() {
+  local g
+  for g in $SV_KILL; do kill -s KILL -- "-$g" 2>/dev/null; done
+}
+trap 'stop_test_servers; rm -rf "$TMP"' EXIT
+serve_cli() {  # $1 = directory, $@ = arguments; sets SV_OUT (stdout) and SV_RC, stderr to $TMP/err
+  local d=$1
+  shift
+  SV_RC=0
+  ( cd "$d" && bash "$HOOK" "$@" >"$TMP/sv.out" 2>"$TMP/err" ) || SV_RC=$?
+  SV_OUT=$(cat "$TMP/sv.out")
+  # Whatever the run says, a server it recorded is stopped on the way out — even one a refusal
+  # should have prevented.
+  remember_server "$d"
+}
+# The recorded server's fields, `pid|pgid|identity|url`, from the state file as written.
+serve_record() {  # $1 = worktree
+  python3 - "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" <<'PY'
+import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve":
+        print("|".join([f[1], f[2], f[3], f[5]]))
+PY
+}
+serve_pid() { serve_record "$1" | cut -d'|' -f1; }
+remember_server() { local p; p=$(serve_pid "$1"); [ -z "$p" ] || SV_KILL="$SV_KILL $p"; }
+answers() { python3 -c 'import sys, urllib.request
+try:
+    print(urllib.request.urlopen(sys.argv[1], timeout=3).read().decode())
+except Exception as e:
+    print("NO ANSWER: %s" % e)' "$1"; }
+
+SRV=$TMP/srv
+# A warn dependency (installed, exit 3, verify passes) counts as present; the app is the stdlib's
+# file server, which shows the worktree's own env file — proof of its cwd and its port.
+make_rt_repo "$SRV" ',
+    "serve": "touch '"$TMP"'/srv-ran; exec python3 -m http.server {port} --bind 127.0.0.1",
+    "url": "http://localhost:{port}/"'
+python3 - "$SRV/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["deps"][0]["install"] = "mkdir -p vendor && printf ok > vendor/marker; exit 3"
+d["deps"][0]["verify"] = "test -f vendor/marker"
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SRV" commit -qam serve
+
+# Refusals, each one line, none starting anything.
+serve_cli "$SRV" --serve; out=$SV_OUT
+eq 'serve: outside a worktree, one line naming where to run it' \
+  'Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.' "$out"
+eq '...and exits non-zero' 1 "$SV_RC"
+
+WSN=$RT/.claude/worktrees/alice
+serve_cli "$WSN" --serve; out=$SV_OUT
+eq 'serve: a profile with no runtime.serve is refused in one line' \
+  'Pitlane: not served — the profile names no runtime.serve, so Pitlane does not know how this app starts; /pitlane-setup can add one.' "$out"
+ne '...non-zero' 0 "$SV_RC"
+
+WSR=$SRV/.claude/worktrees/srv
+git -C "$SRV" worktree add -q "$WSR" -b worktree-srv 2>/dev/null
+serve_cli "$WSR" --serve; out=$SV_OUT
+eq 'serve: before setup has run, it is refused and sent to /pitlane-finish' \
+  "Pitlane: not served — this worktree's setup is not complete — vendor not installed; run /pitlane-finish first" "$out"
+ne '...non-zero' 0 "$SV_RC"
+eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
+
+( unset PITLANE_TRUST_PROFILES; serve_cli "$WSR" --serve; printf '%s' "$SV_RC" >"$TMP/rc" ); out=$(cat "$TMP/sv.out")
+contains 'serve: unapproved, the held-back line /pitlane-finish ends on' \
+  "Pitlane: not run — the profile's commands are not approved in their current form. Run \`bash" "$out"
+ne '...non-zero' 0 "$(cat "$TMP/rc")"
+eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
+
+start_hook "$WSR" >/dev/null
+SRVPORT=$(envval "$WSR" SERVER_PORT)
+SRVURL="http://localhost:$SRVPORT/"
+ne 'serve: the worktree has its port' '' "$SRVPORT"
+
+# A seed that did not run is a missing piece too.
+SRS=$TMP/srs
+make_rt_repo "$SRS" ',
+    "seed": ".claude/worktree-seed.sh",
+    "serve": "touch '"$TMP"'/srs-ran; exec python3 -m http.server {port}"'
+printf '#!/usr/bin/env bash\nexit 4\n' >"$SRS/.claude/worktree-seed.sh"
+chmod +x "$SRS/.claude/worktree-seed.sh"
+git -C "$SRS" add -A; git -C "$SRS" commit -qm seed
+WSS=$SRS/.claude/worktrees/seedless
+git -C "$SRS" worktree add -q "$WSS" -b worktree-seedless 2>/dev/null
+start_hook "$WSS" >/dev/null
+serve_cli "$WSS" --serve; out=$SV_OUT
+eq 'serve: an unseeded database is a missing piece' \
+  "Pitlane: not served — this worktree's setup is not complete — databases not seeded (seed: failed); run /pitlane-finish first" "$out"
+eq '...and serve did not run' no "$([ -e "$TMP/srs-ran" ] && echo yes || echo no)"
+
+# A worktree name carrying shell syntax into serve's command position is refused, not run.
+SRU=$TMP/sru
+make_rt_repo "$SRU" ',
+    "serve": "touch '"$TMP"'/sru-ran; echo {name}"'
+WSU="$SRU/.claude/worktrees/q;touch sru-injected"
+git -C "$SRU" worktree add -q "$WSU" -b worktree-unsafe 2>/dev/null
+start_hook "$WSU" >/dev/null
+serve_cli "$WSU" --serve; out=$SV_OUT
+eq 'serve: an unsafe {name} is refused' \
+  'Pitlane: not served — runtime.serve is refused: it interpolates {name}, whose value here contains shell metacharacters' "$out"
+eq '...and nothing ran' no "$([ -e "$TMP/sru-ran" ] || [ -e "$WSU/sru-injected" ] && echo yes || echo no)"
+
+# Something already answering at the URL would be mistaken for this app. /dev/tcp sees it too.
+python3 -m http.server "$SRVPORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+squat=$!
+for _ in $(seq 1 50); do case $(answers "$SRVURL") in 'NO ANSWER'*) sleep 0.1 ;; *) break ;; esac; done
+WT_CURL='' serve_cli "$WSR" --serve; out=$SV_OUT
+eq 'serve: a port something else answers on is refused' \
+  "Pitlane: not served — something is already answering at $SRVURL, and it is not a server Pitlane started here" "$out"
+eq '...and serve did not run' no "$([ -e "$TMP/srv-ran" ] && echo yes || echo no)"
+eq '...and nothing is recorded' '' "$(serve_record "$WSR")"
+kill "$squat" 2>/dev/null; wait "$squat" 2>/dev/null
+
+# Served: one line, the app answers from the worktree on its own port, and it outlives the command.
+serve_cli "$WSR" --serve; out=$SV_OUT; errS=$(cat "$TMP/err")
+remember_server "$WSR"
+eq 'serve: ONE line, where it answers' "Pitlane: serving at $SRVURL" "$out"
+eq '...exit 0' 0 "$SV_RC"
+contains '...stderr names the log' 'worktree-serve.log' "$errS"
+contains 'serve: the app answers from the worktree (its own env file, its own port)' "SERVER_PORT=$SRVPORT" \
+  "$(answers "${SRVURL}.env.worktree.local")"
+rec=$(serve_record "$WSR")
+SPID=${rec%%|*}
+ne 'serve: a pid is recorded' '' "$SPID"
+eq 'serve: the server outlives bootstrap.sh' yes "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)"
+eq 'serve: the record is pid|group|start identity|url' \
+  "$SPID|$SPID|stat:$(awk '{ print $22 }' "/proc/$SPID/stat" 2>/dev/null)|$SRVURL" "$rec"
+eq 'serve: it leads its own session, so the Bash tool can end without it' "$SPID" "$(ps -o sid= -p "$SPID" | tr -d ' ')"
+eq 'serve: it runs in the worktree' "$WSR" "$(readlink "/proc/$SPID/cwd")"
+eq 'serve: it runs niced (ADR-018)' 10 "$(ps -o ni= -p "$SPID" | tr -d ' ')"
+if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet --collect true </dev/null >/dev/null 2>&1; then
+  contains 'serve: in a memory-capped transient scope, which outlived the systemd-run that made it' '.scope' \
+    "$(cat "/proc/$SPID/cgroup" 2>/dev/null)"
+  scope=$(sed -n 's|.*/\([^/]*\.scope\)$|\1|p' "/proc/$SPID/cgroup")
+  eq '...with a MemoryMax' yes \
+    "$(v=$(systemctl --user show -p MemoryMax --value "$scope" 2>/dev/null); case $v in '' | infinity) echo no ;; *) echo yes ;; esac)"
+fi
+eq 'serve: its log holds the server'"'"'s own output' yes \
+  "$(grep -q 'GET /.env.worktree.local' "$(git -C "$WSR" rev-parse --absolute-git-dir)/worktree-serve.log" && echo yes || echo no)"
+
+# The server inherits neither lock: holding one would block the next /pitlane-serve, or a session's setup.
+GDSR=$(git -C "$WSR" rev-parse --absolute-git-dir)
+eq 'serve: the server does not hold the serve lock' free \
+  "$(flock -n "$GDSR/worktree-serve.lock" true 2>/dev/null && echo free || echo held)"
+eq '...nor the worktree'"'"'s bootstrap lock' free \
+  "$(flock -n "$GDSR/worktree-bootstrap-state.lock" true 2>/dev/null && echo free || echo held)"
+
+serve_cli "$WSR" --serve; out=$SV_OUT
+eq 'serve: a second call reports the running server' "Pitlane: already serving at $SRVURL" "$out"
+eq '...exit 0' 0 "$SV_RC"
+eq '...and starts no second one' "$SPID" "$(serve_pid "$WSR")"
+
+# --serve-stop never signals a PID that is not the server it started: an unrelated process given
+# the recorded PID (a recycled one) is left alone.
+setsid sleep 300 </dev/null >/dev/null 2>&1 &
+other=$!
+SV_KILL="$SV_KILL $other"
+sleep 0.2
+python3 - "$(git -C "$WSR" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$other" <<'PY'
+import sys
+p, pid = sys.argv[1], sys.argv[2]
+recs = open(p, encoding="latin-1").read().split("\x1e")
+for i, rec in enumerate(recs):
+    f = rec.split("\x1f")
+    if f[0] == "serve":
+        f[1], f[2], f[3] = pid, pid, "stat:1"
+        recs[i] = "\x1f".join(f)
+open(p, "w", encoding="latin-1").write("\x1e".join(recs))
+PY
+serve_cli "$WSR" --serve-stop; out=$SV_OUT
+eq 'serve-stop: a recycled PID is reported and not stopped' \
+  "Pitlane: pid $other now belongs to another process, not the server Pitlane started — left alone; nothing stopped." "$out"
+eq '...the unrelated process lives' yes "$(kill -0 "$other" 2>/dev/null && echo yes || echo no)"
+eq '...its record is cleared' '' "$(serve_record "$WSR")"
+kill "$other" 2>/dev/null
+
+# The server itself, with its identity: stopped, group and all, and the URL stops answering.
+python3 - "$(git -C "$WSR" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$rec" <<'PY'
+import sys, time
+p, rec = sys.argv[1], sys.argv[2].split("|")
+data = open(p, encoding="latin-1").read()
+data += "\x1f".join(["serve", rec[0], rec[1], rec[2], "ck", rec[3], str(int(time.time()))]) + "\x1e"
+open(p, "w", encoding="latin-1").write(data)
+PY
+serve_cli "$WSR" --serve-stop; out=$SV_OUT
+eq 'serve-stop: stops the server it started' "Pitlane: stopped the server at $SRVURL (pid $SPID)." "$out"
+eq '...exit 0' 0 "$SV_RC"
+eq '...it is gone' no "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)"
+contains '...and the URL no longer answers' 'NO ANSWER' "$(answers "$SRVURL")"
+serve_cli "$WSR" --serve-stop; out=$SV_OUT
+eq 'serve-stop: then there is nothing to stop' \
+  'Pitlane: no server started by Pitlane is recorded for this worktree — nothing stopped.' "$out"
+
+# A server that died on its own is started again; the probe works without curl too.
+WT_CURL='' serve_cli "$WSR" --serve; out=$SV_OUT
+remember_server "$WSR"
+eq 'serve: through /dev/tcp when there is no curl' "Pitlane: serving at $SRVURL" "$out"
+SPID2=$(serve_pid "$WSR")
+kill -s KILL -- "-$SPID2" 2>/dev/null
+sleep 0.3
+serve_cli "$WSR" --serve; out=$SV_OUT; errS=$(cat "$TMP/err")
+remember_server "$WSR"
+eq 'serve: after the server died, a new one is started' "Pitlane: serving at $SRVURL" "$out"
+contains '...saying the old one had exited' 'has exited — starting it again' "$errS"
+ne '...as a new process' "$SPID2" "$(serve_pid "$WSR")"
+serve_cli "$WSR" --serve-stop >/dev/null
+
+# Never answers: out of time, still running, said so, and still stoppable.
+SRT=$TMP/srt
+make_rt_repo "$SRT" ',
+    "serve": "exec sleep 300",
+    "url": "http://localhost:{port}/"'
+WST=$SRT/.claude/worktrees/slow
+git -C "$SRT" worktree add -q "$WST" -b worktree-slow 2>/dev/null
+start_hook "$WST" >/dev/null
+t0=$(date +%s)
+PITLANE_SERVE_TIMEOUT=2 serve_cli "$WST" --serve; out=$SV_OUT
+remember_server "$WST"
+TPID=$(serve_pid "$WST")
+LOG=$(git -C "$WST" rev-parse --absolute-git-dir)/worktree-serve.log
+eq 'serve: a URL that never answers times out in one line, naming the live server and the log' \
+  "Pitlane: not served — http://localhost:$(envval "$WST" SERVER_PORT)/ did not answer within 2s; the server is still running (pid $TPID) and may still be starting — run /pitlane-serve again to check, or --serve-stop to stop it (log: $LOG)" "$out"
+ne '...non-zero' 0 "$SV_RC"
+eq '...after the override, not the 60s default' yes "$([ $(( $(date +%s) - t0 )) -lt 10 ] && echo yes || echo no)"
+eq '...the server is left running' yes "$(kill -0 "$TPID" 2>/dev/null && echo yes || echo no)"
+serve_cli "$WST" --serve; out=$SV_OUT
+contains 'serve: asked again, it says it started but does not answer' "Pitlane: already started at http://localhost:" "$out"
+ne '...non-zero' 0 "$SV_RC"
+serve_cli "$WST" --serve-stop; out=$SV_OUT
+contains '...and --serve-stop stops it' 'Pitlane: stopped the server at' "$out"
+eq '...gone' no "$(kill -0 "$TPID" 2>/dev/null && echo yes || echo no)"
+
+# Exits at once: said so, and nothing is left recorded.
+# The worktree's own profile is the one that runs (ADR-008).
+python3 - "$WST/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["runtime"]["serve"] = "echo the app failed to boot; exit 3"
+json.dump(d, open(p, "w"), indent=2)
+PY
+serve_cli "$WST" --serve; out=$SV_OUT
+eq 'serve: a server that exits is reported with its log' \
+  "Pitlane: not served — the server exited before http://localhost:$(envval "$WST" SERVER_PORT)/ answered (log: $LOG)" "$out"
+eq '...its output is in the log' yes "$(grep -q 'the app failed to boot' "$LOG" && echo yes || echo no)"
+eq '...and nothing is recorded' '' "$(serve_record "$WST")"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

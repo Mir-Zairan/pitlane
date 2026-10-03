@@ -135,10 +135,78 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
   fi
   printf 'Pitlane: approved %s for every worktree of this repository that carries this exact content. Run /pitlane-finish in the worktree to run the setup it held back.\n' "$PROFILE_PATH"
 }
+# `bootstrap.sh --serve` and `--serve-stop`, run from a worktree by /pitlane-serve (ADR-021): start
+# the profile's runtime.serve detached and say where it answers, or stop the one server Pitlane
+# recorded starting here. ONE line on stdout either way; non-zero when the app was not served or the
+# server would not stop. Never run by a hook.
+wt_serve_cli() {  # $1 = --serve or --serve-stop
+  local mode=$1 here=$PWD worktree root rc
+  case "$here/" in
+    *"$WT_SUBPATH"*) ;;
+    *)
+      printf 'Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.\n'
+      return 1
+      ;;
+  esac
+  worktree=$(wt_repo_root "$here") || worktree=$here
+  if ! root=$(wt_main_root "$here"); then
+    printf 'Pitlane: cannot find the main checkout for %s.\n' "$here"
+    return 1
+  fi
+  WT_NAME=$(wt_name_from_path "$worktree")
+  WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
+  WT_PATH=$worktree
+  WT_ROOT=$root
+  export WT_NAME WT_SLUG WT_PATH WT_ROOT
+  wt_prime_paths "$root" "$worktree"
+
+  # Stopping runs nothing the profile names, so it needs neither the profile nor its approval.
+  if [ "$mode" = --serve-stop ]; then
+    wt_serve_stop "$worktree"
+    rc=$?
+    case $rc in
+      0) printf 'Pitlane: stopped the server at %s (pid %s).\n' "$WT_SERVE_URL" "$WT_SERVE_PID" ;;
+      1) printf 'Pitlane: no server started by Pitlane is recorded for this worktree — nothing stopped.\n' ;;
+      2) printf 'Pitlane: the server Pitlane started here (pid %s) had already exited — nothing stopped.\n' "$WT_SERVE_PID" ;;
+      3) printf 'Pitlane: pid %s now belongs to another process, not the server Pitlane started — left alone; nothing stopped.\n' "$WT_SERVE_PID" ;;
+      *)
+        printf 'Pitlane: the server at %s (pid %s) did not stop, even on SIGKILL.\n' "$WT_SERVE_URL" "$WT_SERVE_PID"
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  if ! wt_has_json; then
+    printf 'Pitlane: not served — neither jq nor python3 is on PATH, so the profile cannot be read.\n'
+    return 1
+  fi
+  wt_load_profile_for "$worktree" "$root"
+  if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
+    printf 'Pitlane: not served — there is no usable profile at %s; /pitlane-setup writes one.\n' "$PROFILE_PATH"
+    return 1
+  fi
+  if [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || [ -z "${PROFILE_RT_SERVE:-}" ]; then
+    printf 'Pitlane: not served — the profile names no runtime.serve, so Pitlane does not know how this app starts; /pitlane-setup can add one.\n'
+    return 1
+  fi
+  wt_approval_check "$worktree"
+  if [ "${WT_APPROVAL:-}" = no ]; then
+    wt_approval_held_line ''
+    return 1
+  fi
+  wt_background_wait "$worktree"
+  wt_serve_start "$worktree"
+}
+
 case ${1-} in
   --review | --approve)
     wt_approval_cli "$@"
     exit 0
+    ;;
+  --serve | --serve-stop)
+    wt_serve_cli "$1"
+    exit $?
     ;;
   # `bootstrap.sh --changed`, run from a worktree: each tracked path an install changed and that is
   # still changed, one per line and nothing else on stdout, nothing when there is none. A name
