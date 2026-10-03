@@ -1607,6 +1607,20 @@ contains '...and to a standing-failure line' 'Do not install dependencies by han
   "$(serve_line 'standing|a|exit 1' a '' '' http://localhost:4123)"
 lacks '...but not to a held-back line' '/pitlane-serve' "$(serve_line 'missing|b|dirty' b b approval http://localhost:4123)"
 eq '...and it stays one line' 1 "$(serve_line 'missing|b|dirty' b b '' http://localhost:4123 | wc -l | tr -d ' ')"
+# An unapproved profile gets no app clause on ANY line — serve is a command the branch chose, and
+# /pitlane-serve would refuse it — not even the clean one, which then stays silent.
+eq 'status, unapproved, complete with a serve profile: silent' '' \
+  "$(WT_APPROVAL=no serve_line '' '' '' '' http://localhost:4123)"
+for how in '' background approval; do
+  lacks "...nor on a not-finished line (how=${how:-none})" '/pitlane-serve' \
+    "$(WT_APPROVAL=no serve_line 'missing|b|dirty' b b "$how" http://localhost:4123)"
+done
+lacks '...nor on a warnings line' '/pitlane-serve' \
+  "$(WT_APPROVAL=no serve_line 'warn|c|peer warning' '' '' '' http://localhost:4123)"
+lacks '...nor on a standing-failure line' '/pitlane-serve' \
+  "$(WT_APPROVAL=no serve_line 'standing|a|exit 1' a '' '' http://localhost:4123)"
+contains '...while an approved one keeps it' 'To run the app' \
+  "$(WT_APPROVAL=yes serve_line '' '' '' '' http://localhost:4123)"
 eq 'status, clean, a runtime-less profile with a stray serve: silent' '' \
   "$(PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=0 PROFILE_RT_SERVE=x status_line '' '' '' start)"
 eq 'status, clean, no profile: silent even with a serve left in the environment' '' \
@@ -3819,11 +3833,26 @@ CEF=$TMP/claude-env/sessionstart-hook-0.sh
 mkdir -p "${CEF%/*}"
 PROFILE_RT_PORTVAR=SERVER_PORT WT_RUNTIME_PORT=4123 WT_RUNTIME_URL='http://localhost:4123'
 wt_session_env_export "$CEF"
-eq 'session env: a file that did not exist is created with the exports' \
-  "export SERVER_PORT='4123'${NL_}export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
+eq 'session env: a file that did not exist is created with the two fixed exports' \
+  "export WORKTREE_PORT='4123'${NL_}export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
 # The exports must be read back by a shell as exactly these values.
 eq '...which a shell reads back as the values' 'http://localhost:4123 4123' \
-  "$(env -i bash -c ". '$CEF'; printf '%s %s' \"\$WORKTREE_URL\" \"\$SERVER_PORT\"")"
+  "$(env -i bash -c ". '$CEF'; printf '%s %s' \"\$WORKTREE_URL\" \"\$WORKTREE_PORT\"")"
+# The file is sourced before every Bash call, approved profile or not: runtime.port.var never names
+# an export, or a branch could set it to BASH_ENV or PATH and run its own code (ADR-021).
+for pv in SERVER_PORT BASH_ENV PATH NODE_OPTIONS; do
+  : >"$CEF"
+  PROFILE_RT_PORTVAR=$pv wt_session_env_export "$CEF"
+  eq "session env: port.var=$pv is never exported" 0 "$(grep -c "^export $pv=" "$CEF" | tr -d ' ')"
+  eq "...only the two fixed names appear (port.var=$pv)" 'WORKTREE_PORT WORKTREE_URL' \
+    "$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CEF" | tr '\n' ' ' | sed 's/ $//')"
+  eq "...and nothing else is written (port.var=$pv)" 2 "$(wc -l <"$CEF" | tr -d ' ')"
+done
+# A port var spelled to break out of the line changes nothing either.
+: >"$CEF"
+PROFILE_RT_PORTVAR='A=1; touch pwned #' wt_session_env_export "$CEF"
+eq 'session env: a hostile port var leaves the exports as they were' \
+  "export WORKTREE_PORT='4123'${NL_}export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
 printf 'export OTHER=1\n' >"$CEF"
 wt_session_env_export "$CEF"
 eq 'session env: additive — what was there stays first' 'export OTHER=1' "$(head -1 "$CEF")"
@@ -3831,17 +3860,21 @@ eq '...and the exports follow' 3 "$(wc -l <"$CEF" | tr -d ' ')"
 eq 'session env: an empty CLAUDE_ENV_FILE does nothing, silently' '' "$(wt_session_env_export '' 2>&1)"
 out=$(wt_session_env_export "$TMP/no-such-dir/env.sh" 2>&1); rc=$?
 eq 'session env: an unwritable target is harmless' 0 "$rc"
-contains '...and warns' 'could not append to CLAUDE_ENV_FILE' "$out"
+# The ONLY stderr is the plugin's own warning: bash's "No such file or directory" for the failed open
+# must not leak beside it.
+eq '...and the only output is the plugin'"'"'s warning' 1 "$(printf '%s\n' "$out" | grep -c .)"
+contains '...which says so' 'could not append to CLAUDE_ENV_FILE' "$out"
+lacks '...and bash'"'"'s own error does not leak' 'No such file' "$out"
 eq '...creating nothing' no "$([ -e "$TMP/no-such-dir" ] && echo yes || echo no)"
 out=$(wt_session_env_export "$TMP/claude-env" 2>&1)
 contains 'session env: a directory is not written through' 'is not a regular file' "$out"
 : >"$CEF"
 # shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
 WT_RUNTIME_URL='http://x/$(touch pwned)' wt_session_env_export "$CEF"
-eq 'session env: an unsafe url is not exported (the port still is)' "export SERVER_PORT='4123'" "$(cat "$CEF")"
+eq 'session env: an unsafe url is not exported (the port still is)' "export WORKTREE_PORT='4123'" "$(cat "$CEF")"
 : >"$CEF"
-PROFILE_RT_PORTVAR='A=1' wt_session_env_export "$CEF"
-eq 'session env: an illegal port var is not exported (the url still is)' \
+WT_RUNTIME_PORT='4123x' wt_session_env_export "$CEF"
+eq 'session env: a port that is not a number is not exported (the url still is)' \
   "export WORKTREE_URL='http://localhost:4123'" "$(cat "$CEF")"
 : >"$CEF"
 WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF"

@@ -1791,10 +1791,17 @@ eq 'serve: WORKTREE_URL is in the env block, expanded' "http://serve_me.localhos
 eq 'serve: a complete worktree with a serve profile prints ONE line, naming /pitlane-serve and the URL' \
   "Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/), not the repo's own start command." \
   "$outS"
-eq 'serve: CLAUDE_ENV_FILE gets the port and the URL as exports' \
-  "export SERVER_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF" 2>/dev/null)"
+eq 'serve: CLAUDE_ENV_FILE gets WORKTREE_PORT and WORKTREE_URL, never the profile'"'"'s port var' \
+  "export WORKTREE_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF" 2>/dev/null)"
 eq '...which the session'"'"'s shell reads back' "http://serve_me.localhost:$SVPORT/" \
   "$(env -i bash -c ". '$CEF'; printf '%s' \"\$WORKTREE_URL\"")"
+# A second session in the same worktree gets its own, fresh file, and the same exports and clause.
+CEF2=$TMP/session-env-2/sessionstart-hook-0.sh
+mkdir -p "${CEF2%/*}"
+outS2=$(CLAUDE_ENV_FILE="$CEF2" start_hook "$WSV")
+eq 'serve: a second SessionStart with a fresh CLAUDE_ENV_FILE gets both exports again' \
+  "export WORKTREE_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF2" 2>/dev/null)"
+contains '...and the URL clause again' "use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/)" "$outS2"
 eq 'serve: no hook started the server' no "$([ -e "$TMP/served" ] && echo yes || echo no)"
 eq '...nor ran stop' no "$([ -e "$TMP/stopped" ] && echo yes || echo no)"
 
@@ -1803,6 +1810,7 @@ outS=$(CLAUDE_ENV_FILE="$TMP/no-such-dir/env.sh" start_hook "$WSV"); rcS=$?
 eq 'serve: an unwritable CLAUDE_ENV_FILE still exits 0' 0 "$rcS"
 contains '...still prints the status line' 'To run the app, use /pitlane-serve' "$outS"
 contains '...and warns on stderr' 'could not append to CLAUDE_ENV_FILE' "$(cat "$TMP/err")"
+lacks '...without bash'"'"'s own error leaking beside it' 'No such file' "$(cat "$TMP/err")"
 outS=$(start_hook "$WSV")
 contains 'serve: without CLAUDE_ENV_FILE the session is still told' 'To run the app, use /pitlane-serve' "$outS"
 
@@ -1844,6 +1852,33 @@ PY
 outR=$(gated_cli "$SVA" --review)
 contains 'approval: an edited serve command needs approving again' 'NOT approved' "$outR"
 contains '...and the review shows the new one' 'bin/server --port={port} --evil' "$outR"
+
+# Unapproved, the start-up hook neither names /pitlane-serve nor exports anything a branch chose:
+# CLAUDE_ENV_FILE is sourced before every Bash call, so port.var=BASH_ENV would run the branch's code.
+for pv in BASH_ENV PATH; do
+  SVU=$TMP/svu-$pv
+  make_repo "$SVU" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+  printf '.env.worktree.local\n' >>"$SVU/.gitignore"
+  python3 - "$SVU/.claude/worktree-profile.json" "$pv" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["runtime"] = {"port": {"var": sys.argv[2], "base": 4300, "span": 200},
+                "env": {"file": ".env.worktree.local"},
+                "serve": "bin/server --port={port}", "url": "http://localhost:{port}/"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+  git -C "$SVU" commit -qam serve
+  WSVU=$SVU/.claude/worktrees/pr-1
+  git -C "$SVU" worktree add -q "$WSVU" -b worktree-pr-1 2>/dev/null
+  CEFU=$TMP/session-env-$pv/sessionstart-hook-0.sh
+  mkdir -p "${CEFU%/*}"
+  outU=$( (unset PITLANE_TRUST_PROFILES; CLAUDE_ENV_FILE="$CEFU" start_hook "$WSVU") )
+  lacks "unapproved serve-only profile (port.var=$pv): no app clause" '/pitlane-serve' "$outU"
+  eq "...and CLAUDE_ENV_FILE never exports $pv" 0 "$(grep -c "^export $pv=" "$CEFU" 2>/dev/null | tr -d ' ')"
+  eq '...only the two fixed names appear' '' \
+    "$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CEFU" 2>/dev/null | grep -v -x -e WORKTREE_PORT -e WORKTREE_URL)"
+  contains '...and the allocated port arrives as WORKTREE_PORT' "export WORKTREE_PORT='" "$(cat "$CEFU" 2>/dev/null)"
+done
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

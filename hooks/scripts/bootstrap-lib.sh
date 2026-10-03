@@ -2789,8 +2789,10 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
   fi
 
   # The app clause, so a session never reaches for the repo's own start command, which knows nothing
-  # of this worktree's port. The held-back line does not carry it: /pitlane-serve would refuse there too.
-  if [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SERVE:-}" ]; then
+  # of this worktree's port. Never for an unapproved profile, on any line: /pitlane-serve would refuse
+  # there too, and serve is a command the branch chose.
+  if [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SERVE:-}" ] \
+    && [ "${WT_APPROVAL:-}" != no ]; then
     app=" To run the app, use /pitlane-serve${WT_RUNTIME_URL:+ (it serves at $WT_RUNTIME_URL)}, not the repo's own start command."
   fi
   if [ -z "$summary" ]; then
@@ -4320,15 +4322,19 @@ EOF
 # Append this worktree's port and URL to the file Claude Code names in CLAUDE_ENV_FILE, as `export`
 # lines, so the session's own commands see them in their environment (ADR-021). SessionStart only,
 # and only before the hook exits: Claude Code reads the file once, when the hook returns, so a
-# background run's write never arrives. Additive — the app still reads its env files. A missing,
-# unwritable or non-regular target only warns. The values are constrained by construction (digits; a
-# URL wt_is_safe_url passed, which holds no quote), and single-quoted anyway.
+# background run's write never arrives. A missing, unwritable or non-regular target only warns.
+#
+# Only the two fixed names WORKTREE_PORT and WORKTREE_URL, never runtime.port.var: the file is
+# sourced before every Bash call, approved profile or not, so a profile-chosen name (BASH_ENV, PATH,
+# NODE_OPTIONS) would run a branch's code unapproved; and the repo's own port var in the process
+# environment would override its env files, which dotenv loaders do not override. The values are
+# constrained by construction (digits; a URL wt_is_safe_url passed, which holds no quote), and
+# single-quoted anyway.
 wt_session_env_export() {  # $1 = the file CLAUDE_ENV_FILE names (empty: do nothing)
   local f=${1-} lines=''
   [ -n "$f" ] || return 0
-  if [ -n "${WT_RUNTIME_PORT:-}" ] && wt_is_safe_envkey "${PROFILE_RT_PORTVAR:-}" \
-    && wt_is_posint "$WT_RUNTIME_PORT"; then
-    lines+="export $PROFILE_RT_PORTVAR='$WT_RUNTIME_PORT'$WT_NL"
+  if [ -n "${WT_RUNTIME_PORT:-}" ] && wt_is_posint "$WT_RUNTIME_PORT"; then
+    lines+="export WORKTREE_PORT='$WT_RUNTIME_PORT'$WT_NL"
   fi
   if [ -n "${WT_RUNTIME_URL:-}" ] && wt_is_safe_url "$WT_RUNTIME_URL"; then
     lines+="export WORKTREE_URL='$WT_RUNTIME_URL'$WT_NL"
@@ -4338,7 +4344,8 @@ wt_session_env_export() {  # $1 = the file CLAUDE_ENV_FILE names (empty: do noth
     wt_log "runtime: CLAUDE_ENV_FILE ($f) is not a regular file — the session's environment does not get the port or the URL"
     return 0
   fi
-  if ! printf '%s' "$lines" >>"$f" 2>/dev/null; then
+  # Braced so a failed open is silenced too: `>>f 2>/dev/null` lets bash report the open first.
+  if ! { printf '%s' "$lines" >>"$f"; } 2>/dev/null; then
     wt_log "runtime: could not append to CLAUDE_ENV_FILE ($f) — the session's environment does not get the port or the URL"
   fi
   return 0

@@ -1481,6 +1481,25 @@ JSON
     wt_is_safe_url "$u"
     rc_is "unsafe url refused: $u" 1 $?
   done
+  # The cap is in BYTES: exactly 512 passes, 520 does not.
+  u512="http://localhost/$(printf '%495s' '' | tr ' ' a)"
+  eq 'safe url: the test URL is 512 bytes' 512 "$(printf '%s' "$u512" | wc -c | tr -d ' ')"
+  wt_is_safe_url "$u512"
+  rc_is 'safe url: exactly 512 bytes is accepted' 0 $?
+  wt_is_safe_url "${u512}aaaaaaaa"
+  rc_is 'unsafe url refused: 520 bytes' 1 $?
+  # Non-ASCII under a UTF-8 locale. There `[a-z]` collates letters such as U+0101 inside the range,
+  # which is what the function's own LC_ALL=C prevents; the caller's locale must not change the answer.
+  utf8_locale=$(locale -a 2>/dev/null | grep -i -x -m1 -e 'en_US.UTF-8' -e 'en_US.utf8')
+  if [ -n "$utf8_locale" ]; then
+    a_macron=$(printf '\304\201')
+    for u in "http://${a_macron}.localhost/" "http://localhost/${a_macron}" "http://localhost:3000/x${a_macron}y"; do
+      ( LC_ALL=$utf8_locale; wt_is_safe_url "$u" )
+      rc_is "unsafe url refused under $utf8_locale: non-ASCII in $u" 1 $?
+    done
+  else
+    printf 'SKIP: no en_US UTF-8 locale; the non-ASCII url cases did not run\n' >&2
+  fi
   eq 'expand_url: {port} and {slug} expand' 'http://feat_x.localhost:4123/' \
     "$(WT_PORT=4123 WT_SLUG=feat_x wt_expand_url 'http://{slug}.localhost:{port}/')"
   WT_PORT='' wt_expand_url 'http://localhost:{port}' >/dev/null
