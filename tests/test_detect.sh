@@ -564,6 +564,39 @@ run_suite() {
   commit_all "$r"
   eq 'start: at most startLinesPerFile lines per file' 10 "$(det "$r" | grep -c '^start|README.md|')"
 
+  # --- EVERY ENVIRONMENT the repo runs in --------------------------------------
+  # Isolating development and leaving test or e2e shared is the profile that looks right; each
+  # environment the repo names is reported so setup has to answer for it.
+  r=$(mkrepo envs composer.lock .env .env.local .env.test .env.test.local .env.e2e.local .env.example .env.prod.dist)
+  printf '.env*\n!.env.test\n!.env.example\n!.env.prod.dist\nnode_modules/\n' >"$r/.gitignore"
+  mkdir -p "$r/e2e" "$r/node_modules/x"
+  printf '<phpunit><php><server name="APP_ENV" value="test" force="true"/></php></phpunit>\n' >"$r/phpunit.xml.dist"
+  printf 'export default { webServer: { command: "APP_ENV=e2e php -S localhost:9000" } }\n' >"$r/e2e/playwright.config.ts"
+  printf '[pytest]\nDJANGO_SETTINGS_MODULE = proj.settings.ci\n' >"$r/pytest.ini"
+  printf 'test:\n\tbin/console --env=test cache:clear\n\tdocker run --env=FOO=bar img\n\tRAILS_ENV="staging" rake\n' >"$r/Makefile"
+  printf 'APP_ENV=vendored\n' >"$r/node_modules/x/phpunit.xml"
+  commit_all "$r"
+  git -C "$r" add -f node_modules/x/phpunit.xml >/dev/null 2>&1
+  git -C "$r" commit -qm vendored >/dev/null 2>&1
+  out=$(det "$r")
+  has 'env: a .env.<name> file names an environment' 'env|test|.env.test|file' "$out"
+  has 'env: so does a .env.<name>.local, under its own name' 'env|e2e|.env.e2e.local|file' "$out"
+  hasnt 'env: .env.local is an overlay, not an environment' 'env|local|' "$out"
+  hasnt 'env: an example file is not an environment' 'env|example|' "$out"
+  hasnt 'env: nor a .dist one' 'env|prod|' "$out"
+  has 'env: a phpunit server variable' 'env|test|phpunit.xml.dist|APP_ENV' "$out"
+  has 'env: a selector set inside a nested test config' 'env|e2e|e2e/playwright.config.ts|APP_ENV' "$out"
+  has 'env: an ini assignment with spaces round the =' 'env|proj.settings.ci|pytest.ini|DJANGO_SETTINGS_MODULE' "$out"
+  has 'env: a --env= flag' 'env|test|Makefile|--env' "$out"
+  has 'env: a quoted value loses its quote' 'env|staging|Makefile|RAILS_ENV' "$out"
+  hasnt 'env: docker --env=NAME=value passes a variable, not an environment' 'env|FOO|' "$out"
+  hasnt 'env: vendored files are not the repo speaking' 'vendored' "$out"
+  has 'testConfig: a nested e2e config is found' 'testConfig|e2e/playwright.config.ts' "$out"
+  has 'testConfig: and a root one' 'testConfig|phpunit.xml.dist' "$out"
+  hasnt 'testConfig: but never under node_modules' 'testConfig|node_modules/' "$out"
+  eq 'env: records come out sorted, so two runs agree' \
+    "$(printf '%s\n' "$out" | grep '^env|' | LC_ALL=C sort -t'|' -k2,2 -k3,3 -k4,4)" "$(printf '%s\n' "$out" | grep '^env|')"
+
   # --- THE PLUGIN'S OWN PATHS must be gitignored --------------------------------
   r=$(mkrepo ignores composer.lock)
   out=$(det "$r")

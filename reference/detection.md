@@ -379,6 +379,15 @@ does not produce a broken worktree. It corrupts a colleague's data.
   `PORT=4000`), or nothing. A port in that field is usually a hardcoded one, which is exactly why a
   port variable alone may isolate nothing. Which command is the dev server, and how it takes a port,
   is setup's question.
+- **`env`** — an environment the repo runs in, and where it was seen: a `.env.<name>` or
+  `.env.<name>.local` file at the root (not `.env.local`, `.env.example`, `.dist` and the like, which
+  are overlays and examples), or a value assigned to an environment selector — `APP_ENV`, `RAILS_ENV`,
+  `NODE_ENV`, `DJANGO_SETTINGS_MODULE` and their kin, a phpunit `name="APP_ENV" value="test"`, a
+  `--env=test` — in the repo's docs, task runners, manifests and test configs. Setup must isolate each
+  one or record it as deliberately shared; isolating only development is the failure that looks right.
+- **`testConfig`** — a tracked test or e2e runner config (Playwright, Cypress, PHPUnit, Jest, Vitest,
+  pytest, Behat, …). The environment it runs in, and the database and port it reaches, is a question:
+  an e2e config often starts its own server or pins its own database.
 - **`ignore`** — whether each path the plugin itself creates inside a checkout
   (`.claude/worktrees/`, `.claude/worktree-no-runtime`) is gitignored. An untracked one is work to the
   teardown guard, so the worktree it sits in is never torn down.

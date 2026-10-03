@@ -60,7 +60,9 @@ human-readable companion to the table the script used.
 | `config` | Gitignored config a fresh checkout would miss. |
 | `hint` | Layer-3 candidates. **Hints beside a question, never defaults.** |
 | `compose` | What names each compose project, and how many host ports it publishes. Raise it in step 5. |
-| `assign` | A `NAME=value` for a hinted variable in the repo's own docs or scripts — *possibly* an inline pin. Read the line: a command prefix, an `export`, or a `-e NAME=…` passed to a container sets the process environment and beats every env file; a code block showing `.env` contents does not. Raise the real ones in step 5 and in the agent note. |
+| `assign` | A `NAME=value` for a hinted variable in the repo's own docs or scripts — *possibly* an inline pin. Read the line: a command prefix, an `export`, or a `-e NAME=…` passed to a container sets the process environment and beats every env file; a code block showing `.env` contents does not. A real pin of a database or port variable **stops setup** — see *Inline pins* in step 5. |
+| `env` | An environment the repo runs in (`.env.<name>` file, or a selector such as `APP_ENV`/`NODE_ENV` set to it in a script or config). Every one is isolated or recorded as shared — see *Every environment* in step 5. |
+| `testConfig` | A test or e2e runner config. Read it: the environment, database and port it runs against are part of *Every environment*, and one that starts its own server or pins a database is an inline pin. |
 | `start` | A start command the repo writes down (a manifest script, a `Procfile` process, a documented server invocation) and the first port literal or flag in it. Evidence for how the server takes its port — see *How the app starts* in step 5. A port in that field is usually hardcoded. |
 | `ignore` | Whether a path the plugin creates in a checkout is gitignored. `missing` — offer the `.gitignore` line in step 4. |
 | `warn` | Show it. |
@@ -209,26 +211,54 @@ as **options to choose from, never as pre-filled defaults**. Ask about:
   if that file is tracked the plugin cannot set `COMPOSE_PROJECT_NAME` for it, and a per-worktree
   stack needs the start command to pass `-p`. Sharing one database server between worktrees is
   normal — isolation is then the seed's job, one database per slug;
-- **the `assign` records for the variables chosen above.** Read each line before claiming anything:
-  when the repo's own instructions pin the variable as a command prefix, an `export` or a value
-  passed into a container, that sets it in the process environment and beats every env file — so a
-  session following them inside a worktree runs against the shared state. The fix is in the agent
-  note below, not in the profile;
+- **the `assign` records for the variables chosen above** — each real one stops setup, by the rule
+  in *Inline pins* below;
 - **whether a seed step is needed** — does a fresh database need populating before the app runs?
 - **whether a teardown step is needed** — see the rule about it below.
 
 ### Every environment, not just the default one
 
-A repo commonly keeps separate **development, test and CI** state, and isolating only the
+A repo commonly keeps separate **development, test, e2e and CI** state, and isolating only the
 development database is the "looks right, is subtly wrong" failure in its purest form: a test runner
 that recreates its databases wholesale will destroy a parallel session's test run regardless of how
 well the dev database is isolated, and it will do it invisibly, mid-suite.
 
-So surface **every** environment the `hint` records came from and let the developer pick which ones
-need their own state. Every confirmed environment needs its env file in `runtime.env.file`, and the
-seed must create every store the app derives from the selector in that environment — a test env that
-appends `_test` to a database name needs that database cloned too. "Only development" is a fine
-answer — but it has to be an answer, not an omission you made for them.
+So **enumerate every environment the repo runs in** before writing `runtime`: every `env` record
+(`.env.<name>` files, and the values its scripts and configs give `APP_ENV`, `RAILS_ENV`, `NODE_ENV`,
+`DJANGO_SETTINGS_MODULE` and their kin), every `testConfig` record, and anything the repo's docs or
+CI name that detection missed. Show the developer the list, with where each was seen, and for **each
+one** get one of two answers:
+
+- **isolated** — its env file goes in `runtime.env.file`, and the seed must create every store the
+  app derives from the selector in that environment (a test env that appends `_test` to a database
+  name needs that database cloned too). Confirm which files that environment's loader actually reads;
+  an e2e runner that starts its own server may read none of them, in which case it is a pin (below);
+- **deliberately shared** — say plainly what that costs (two sessions running it at once collide on
+  its database or port) and put it in the agent note, so a session knows not to run it in parallel.
+
+"Only development" is a fine answer — but it has to be an answer for each environment, not an
+omission you made for the developer. An environment left out of both lists is a setup that is not
+finished.
+
+### Inline pins stop setup
+
+An `assign` record that is a real pin — a command prefix, an `export`, a `-e NAME=…` into a container,
+or a test config's own server or database setting — **of a database or port variable** is not a
+caveat to mention in passing. It sets the variable in the process environment, which beats every env
+file the plugin writes, so a session that follows the repo's own instructions in a worktree runs
+against the main checkout's database or port. Stop on each one before writing the profile:
+
+1. Show the command, with the file and line.
+2. Say what it does in a worktree: it bypasses the worktree's overrides and reaches the shared state.
+3. Propose a worktree-safe invocation for the agent note — usually the same command without the
+   prefix, so the env files supply the worktree's value; a port passed as `$WORKTREE_PORT` (set in the
+   session's environment); or, when the pin is inside a script the command runs, the steps run by hand
+   with the worktree's values, or "do not run this in a worktree" when nothing else is safe.
+4. Go on only when the developer accepts that note text, or says the command is never run from a
+   worktree.
+
+**Never edit the repo's scripts** to remove a pin. That change is the repo's business; the plugin
+reports it and works around it.
 
 ### How the app starts — a port nothing reads is a setup error
 
@@ -372,6 +402,7 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
 - the env files named in `runtime.env.file` already point this worktree at its own database and
   port — and, from every `assign` record, which documented commands pin a variable inline and must
   be run **without** that prefix inside a worktree;
+- which environments are deliberately shared, so must not be run from two worktrees at once;
 - how to start the dev server on the worktree's port, when the port is taken by a flag;
 - which additional servers stay on their fixed ports, and so collide with the main checkout's while
   both run;
@@ -379,6 +410,13 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
   start command (which does not know this worktree's port), and find it at `$WORKTREE_URL` — set in
   the session's environment and in the env files named above — rather than at the main checkout's
   usual address;
+- a worktree lives inside the main checkout, and dependency resolution can reach back into it: Node
+  walks up the directory tree to the main checkout's `node_modules`, and a Python command can pick up
+  the main checkout's virtualenv (an activated one, or one a tool finds above the worktree). When the
+  worktree's own `node_modules` or virtualenv is missing or incomplete, an import can silently load
+  the **main checkout's** packages. So a test or build that "works" in a
+  worktree may be running against main's dependencies — check that `/pitlane-finish` says the
+  worktree is ready before trusting it;
 - to make another worktree, use `EnterWorktree` or a subagent with `isolation: "worktree"` — not a
   raw `git worktree add` from inside a session, which no hook sees. The exception is checking out an
   *existing* branch, which neither can do: `git worktree add .claude/worktrees/<name> <branch>`, then

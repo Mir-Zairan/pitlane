@@ -57,6 +57,9 @@
 #                    variable: it beats every env file, so it bypasses the overrides)
 #   start            <file> scripts.<name>|<process>|line <n> <port literal or flag, or ""> <command>
 #                    (a documented start command: how the app may take its port, never a decision)
+#   env              <name> <file> file|<VAR>|--env   (an environment the repo runs in: a .env.<name>
+#                    file, or <name> assigned to an environment selector in its scripts or configs)
+#   testConfig       <file>                     (a tracked test or e2e runner config)
 #   ignore          <path> ok|missing           (a path the plugin creates in a checkout)
 #   warn             <message>
 #
@@ -940,6 +943,73 @@ if [ -n "$START_PAT" ]; then
     done < <(grep -nE -- "$START_PAT" "$ROOT/$f" 2>/dev/null | head -n "$START_LINES")
   done < <(json_array_items "$(wt_json_get runtimeHints.startSources <"$WT_DETECTION_JSON")")
 fi
+
+# ---------------------------------------------------------------------------
+# Every environment the repo runs in
+# ---------------------------------------------------------------------------
+# Isolating development while the test or e2e environment stays on shared state is the profile that
+# looks right and is not: a suite that recreates its databases destroys a parallel session's run.
+# One `env` record per environment name and the place it was seen, sorted so two runs agree; one
+# `testConfig` per tracked test or e2e runner config, whose environment setup must ask about.
+ENV_SKIP=" $(json_array_items "$(wt_json_get runtimeHints.envFileSkip <"$WT_DETECTION_JSON")" | tr '\n' ' ')"
+ENV_VAR_PAT=$(wt_json_get runtimeHints.envVarPattern <"$WT_DETECTION_JSON") || ENV_VAR_PAT=''
+ENV_LINES=''
+
+for f in "$ROOT"/.env.*; do
+  [ -f "$f" ] || continue
+  envname=${f##*/.env.}
+  envname=${envname%.local}
+  claimed "$ENV_SKIP" "${envname##*.}" && continue
+  envname=${envname%%.*}
+  case $envname in '' | *[!A-Za-z0-9_-]*) continue ;; esac
+  ENV_LINES="$ENV_LINES$envname$TAB${f##*/}${TAB}file"$'\n'
+done
+
+TEST_CONFIGS=''
+if [ "$IS_GIT" = 1 ]; then
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    TEST_CONFIGS="$TEST_CONFIGS$(wt_git "$ROOT" ls-files -- ":(glob)**/$g" 2>/dev/null)"$'\n'
+  done < <(json_array_items "$(wt_json_get runtimeHints.testConfigGlobs <"$WT_DETECTION_JSON")")
+  TEST_CONFIGS=$(printf '%s' "$TEST_CONFIGS" | grep -vE '(^|/)(node_modules|vendor)/' | grep . | LC_ALL=C sort -u | head -20)
+fi
+
+# `--env=` takes a lowercase value only: `docker run --env=NAME=value` passes a variable, not an
+# environment, and uppercase is how it spells one.
+if [ -n "$ENV_VAR_PAT" ]; then
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$ROOT/$f" ] || continue
+    while IFS= read -r m; do
+      case $m in
+        *--env=*)
+          envvar='--env'
+          envname=${m#*--env=}
+          envname=${envname%%[!A-Za-z0-9_-]*}
+          ;;
+        name=*)
+          envvar=${m#name=\"}
+          envvar=${envvar%%\"*}
+          envname=${m##*value=\"}
+          ;;
+        *)
+          envvar=$(printf '%s' "${m%%=*}" | sed 's/^[^A-Z]*//; s/[[:space:]]*$//')
+          envname=$(printf '%s' "${m#*=}" | sed 's/^[[:space:]]*//; s/^["'"'"']//')
+          ;;
+      esac
+      [ -n "$envname" ] && ENV_LINES="$ENV_LINES$envname$TAB$f$TAB$envvar"$'\n'
+    done < <(grep -oE -- "(^|[^A-Za-z0-9_])${ENV_VAR_PAT}[[:space:]]*=[[:space:]]*[\"']?[A-Za-z0-9_.-]+|name=\"$ENV_VAR_PAT\"[[:space:]]+value=\"[A-Za-z0-9_.-]+|(^|[[:space:]])--env=[a-z][A-Za-z0-9_-]*([^=A-Za-z0-9_-]|$)" \
+               "$ROOT/$f" 2>/dev/null | sed 's/^[[:space:]]*//')
+  done < <({ json_array_items "$(wt_json_get runtimeHints.envSources <"$WT_DETECTION_JSON")"
+             printf '%s\n' "$TEST_CONFIGS"; } | awk '!seen[$0]++')
+fi
+
+while IFS=$TAB read -r envname f envvar; do
+  [ -n "$envname" ] && emit env "$envname" "$f" "$envvar"
+done < <(printf '%s' "$ENV_LINES" | LC_ALL=C sort -u)
+while IFS= read -r f; do
+  [ -n "$f" ] && emit testConfig "$f"
+done <<<"$TEST_CONFIGS"
 
 # ---------------------------------------------------------------------------
 # The plugin's own paths inside a checkout
