@@ -285,8 +285,9 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # and nothing would notice if the two drifted apart.
   if [ "$(wt_budget_left "$deadline")" -gt 0 ]; then
     wt_report_drift "$worktree" \
-      "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}" "$PROFILE_PATH"
+      "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}" "$PROFILE_PATH" "$root"
   fi
+  wt_warn_hardlinked_venvs "$root"
 
   # Decided AFTER the copy: it is what brings a personal profile's seed and teardown scripts into
   # the worktree, and the fingerprint is of the files as they will run. Before anything executes.
@@ -503,40 +504,31 @@ case $event in
       done
     fi
 
-    # stdout is the model's context here, so it stays EMPTY when the worktree is complete — and gets
-    # one short notice when it is not, because a session that mistakes a half-set-up worktree for a
+    # stdout is the model's context here, so it stays EMPTY when the worktree is complete and clean —
+    # and gets one short notice when it is not, because a session that mistakes a half-set-up worktree for a
     # ready one goes on to install and clone by hand (measured: it is what sessions did before this
     # plugin existed). /pitlane-finish reads the same list as a plain status line.
     wt_bootstrap_pending "$worktree"
     pending=$WT_PENDING
     if [ "${WT_FINISH:-}" = 1 ]; then
-      if [ -z "$pending" ]; then
-        printf 'Pitlane: this worktree is fully set up.\n'
-      elif [ "${WT_APPROVAL:-}" = no ]; then
-        # shellcheck disable=SC2016  # the backticks are text for the reader, not a substitution.
-        printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form. Missing: %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
-          "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" "$WT_BOOTSTRAP_SCRIPT"
-      else
-        changed=$(wt_paths_display "$(wt_install_changed_paths "$worktree")")
-        printf 'Pitlane: still not complete — missing: %s%s\n' "$(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')" \
-          "${changed:+; an install changed tracked files: $changed}"
-      fi
+      wt_bootstrap_status_line "$worktree" finish "$([ "${WT_APPROVAL:-}" = no ] && echo approval)"
       exit 0
     fi
+    how=''
     if [ -n "$pending" ]; then
       if [ "${WT_APPROVAL:-}" = no ]; then
         # Nothing a background run could do: everything left needs the commands that are held back.
         wt_log "not run, pending approval: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
-        wt_bootstrap_notice "$pending" approval
+        how=approval
       # A run is started only for work it would attempt: an install whose failure stands is not.
       elif [ "$WT_DEFER" = 1 ] && [ -n "$WT_PENDING_ATTEMPTABLE" ] && wt_background_start "$worktree"; then
         wt_log "finishing in the background: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
-        wt_bootstrap_notice "$pending" background
+        how=background
       else
         wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
-        wt_bootstrap_notice "$pending"
       fi
     fi
+    wt_bootstrap_status_line "$worktree" start "$how"
     exit 0
     ;;
 

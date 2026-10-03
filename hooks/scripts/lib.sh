@@ -1623,8 +1623,9 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   return 0
 }
 
-# Report how the profile's recorded LOCKFILE CHECKSUMS differ from the checkout in front of it,
-# one line per difference, returning 1 if anything drifted.
+# Report how the profile's recorded LOCKFILE CHECKSUMS differ from the checkout $2, one line per
+# difference, returning 1 if anything drifted. Pass the MAIN checkout, which is what calibration
+# read: a worktree's lockfile differing from it is a branch, not drift (wt_report_drift).
 #
 # Scope, stated precisely because the field is called `evidence` and it would be easy to assume
 # more: this reads `deps[].lockChecksum` ONLY. `evidence.markers`, `evidence.shellMarker` and
@@ -1642,7 +1643,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
 # anything meaningful changing, and — worse — that a hazard can appear in composer.json's
 # scripts section without touching any lockfile, producing no warning exactly where one
 # would matter most. It is a net for the common case, not a guarantee.
-wt_profile_drifted() {  # $1 = profile path, $2 = repo root
+wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are compared
   local file=${1-} root=${2-} n=0 drift=0 lock cksum now
   [ -f "$file" ] && [ -r "$file" ] || return 0
   [ -n "$root" ] || return 0

@@ -22,20 +22,26 @@ Run it **in the background** (`run_in_background: true`) and wait for it to fini
 background setup, download a toolchain or clone databases, which can take many minutes, longer than a
 foreground command may run. Work that needs none of the missing pieces can go on meanwhile.
 
-It prints progress on stderr and one status line on stdout as its last word:
+It prints progress on stderr and one status line on stdout as its last word. The line names each
+imperfect piece by its state — `<name> missing (<why>)` or `<name> ready with warnings (<why>)`, the
+first three and then "and N more" — and, when an install changed tracked files, how many:
 
 - `Pitlane: this worktree is fully set up.` — done. Say so in one line.
-- `Pitlane: still not complete — missing: …` — show the user that line and the stderr lines that
+- `Pitlane: this worktree is set up, with warnings — …` — everything is present. A piece `ready with
+  warnings` installed but its install exited non-zero (the reason is in brackets); it counts as
+  installed. Tell the user in one line. If the line says an install changed tracked files, see
+  **Tracked files an install changed** below.
+- `Pitlane: still not complete — …` — show the user that line and the stderr lines that
   explain each missing item (they say why: a toolchain that failed to start, a seed that refused, a
   command that failed). Do not retry in a loop; one more run only if the reason was time.
   If the reason was **memory** ("memory is free", "memory cap"), Pitlane held the step back so it could
   not freeze the desktop: tell the user to close something heavy and run it again, or to set
   `PITLANE_MEMORY_MAX` (e.g. `PITLANE_MEMORY_MAX=12G`) if the step genuinely needs more.
-  If stderr says **"the recorded failure stands"**, an earlier install of that dependency failed and
-  Pitlane will not re-run it, automatically, until its lockfile or install command changes. Tell the
-  user which dependency failed and the recorded reason (the exit code and error line in brackets on
-  that line). If it looks transient (a network outage, a toolchain not on PATH, a full disk) and it
-  has been fixed, offer to retry it; **only if the user says yes**, run
+  A piece `missing (install failed: …)` is a failure that stands: an earlier install failed and
+  Pitlane will not re-run it, automatically, until its lockfile or install command changes (stderr
+  says "the recorded failure stands"). Tell the user which dependency failed and the recorded reason
+  in the brackets. If it looks transient (a network outage, a toolchain not on PATH, a full disk) and
+  it has been fixed, offer to retry it; **only if the user says yes**, run
   `bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --finish --retry-failed`, in the background
   as above.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
@@ -44,9 +50,10 @@ It prints progress on stderr and one status line on stdout as its last word:
 ## Tracked files an install changed
 
 Some package managers write into tracked files while they install (a placeholder in a workspace file,
-a reformatted manifest). Pitlane notices and logs it on stderr ("the install changed tracked files:
-…"), but it never undoes it: the background run overlaps this session, so a blind restore could
-throw away edits the session made. After every `--finish`, run, from the worktree's root:
+a reformatted manifest). Pitlane notices, logs it on stderr ("the install changed tracked files:
+…") and counts it in the status line ("an install changed N tracked files"), but it never undoes
+it: the background run overlaps this session, so a blind restore could throw away edits the session
+made. After every `--finish`, run, from the worktree's root:
 
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --changed

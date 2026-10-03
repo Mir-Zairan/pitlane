@@ -175,7 +175,7 @@ inject() {  # $1 = label, $2 = repo, $3 = worktree
   eq "$1: the hook still exits 0" 0 "$rc"
   # stdout is model context: nothing, or the one-line "not fully set up" notice — never a stray byte.
   case $out in
-    '' | 'Pitlane: this worktree is not fully set up yet'*) pass=$((pass + 1)) ;;
+    '' | 'Pitlane: this worktree is not fully set up'*) pass=$((pass + 1)) ;;
     *) fail=$((fail + 1)); printf 'FAIL %s: stdout is neither empty nor the notice\n      actual: %q\n' "$1" "$out" >&2 ;;
   esac
   eq "$1: and stdout is at most one line" 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
@@ -187,8 +187,8 @@ make_repo "$R2" '{"dir":"vendor","lock":"composer.lock","strategy":"install","in
 W2=$R2/.claude/worktrees/f2
 git -C "$R2" worktree add -q "$W2" -b worktree-f2 2>/dev/null
 inject 'an install that fails' "$R2" "$W2"
-contains 'a failed install is named in the SessionStart notice' 'still missing: vendor' "$INJECT_OUT"
-contains '...which points at /pitlane-finish' '/pitlane-finish' "$INJECT_OUT"
+contains 'a failed install is named in the SessionStart notice, with its reason' 'vendor missing (install failed: exit 1)' "$INJECT_OUT"
+contains '...which says /pitlane-finish can retry it only on the user'"'"'s word' 'retry it on their word' "$INJECT_OUT"
 contains 'an install that fails: says so' 'install command failed' "$(cat "$TMP/err")"
 
 R3=$TMP/r3
@@ -1070,7 +1070,7 @@ WS=$RS/.claude/worktrees/s1
 git -C "$RS" worktree add -q "$WS" -b worktree-s1 2>/dev/null
 outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
 contains 'a failing seed still leaves a usable session (only the notice on stdout)' \
-  'still missing: databases (seed: failed)' "$outS"
+  'databases missing (seed: failed)' "$outS"
 contains 'and it says the seed failed' 'the seed failed' "$errS"
 eq 'and the worktree still got its dependencies' 'ok' "$(cat "$WS/vendor/marker" 2>/dev/null)"
 eq 'and its port and database' 'demo_s1' "$(envval "$WS" DATABASE_NAME)"
@@ -1089,7 +1089,7 @@ json.dump(d, open(f, "w"))
 PYJ
   outS=$(start_hook "$WS"); errS=$(cat "$TMP/err")
   contains 'a HANGING seed still leaves a usable session (only the notice on stdout)' \
-    'still missing: databases (seed: timeout)' "$outS"
+    'databases missing (seed: timeout)' "$outS"
   contains 'and the hang is stopped and reported' 'was stopped' "$errS"
   contains 'and the bootstrap still finishes' 'bootstrap finished in' "$errS"
 fi
@@ -1149,7 +1149,7 @@ PYJ
   eq 'slow toolchain: the install that needs it was left alone' no \
     "$([ -e "$WF/node_modules/m" ] && echo yes || echo no)"
   contains 'slow toolchain: the session is told what is missing on stdout' \
-    'still missing: node_modules.' "$outF"
+    'node_modules missing (not installed yet).' "$outF"
   lacks '...and only what is missing — the hardlinked vendor is not named' 'vendor' "$outF"
   contains '...and how to finish it' 'Run /pitlane-finish' "$outF"
   eq '...in a single line of model context' 1 "$(printf '%s\n' "$outF" | wc -l | tr -d ' ')"
@@ -1196,7 +1196,7 @@ PYJ
   outSB=$(start_hook "$WSB")
   eq 'the seed still runs when installs use up the whole bootstrap budget' seeded \
     "$(cat "$WSB/seeded.txt" 2>/dev/null)"
-  contains '...and the notice names only the install' 'still missing: vendor.' "$outSB"
+  contains '...and the notice names only the install' '— vendor missing (not installed yet).' "$outSB"
   lacks '...not the databases, which are done' 'databases (seed' "$outSB"
 fi
 
@@ -1228,7 +1228,7 @@ eq 'low memory: the toolchain and the install are not started' no \
   "$([ -e "$WLM/node_modules/m" ] && echo yes || echo no)"
 contains 'low memory: stderr says why' 'MiB of memory is free' "$errL"
 lacks '...and does not call the toolchain broken' 'failed to start' "$errL"
-contains 'low memory: the session is told what is missing' 'still missing: node_modules.' "$outL"
+contains 'low memory: the session is told what is missing' '— node_modules missing (not installed yet).' "$outL"
 
 outL=$(WT_MEMINFO=$TMP/meminfo.ok start_hook "$WLM")
 eq 'with memory back, the next session completes it' ok "$(cat "$WLM/node_modules/m" 2>/dev/null)"
@@ -1276,7 +1276,7 @@ eq 'background: the hardlink is done before the session starts' MAIN "$(cat "$WB
 ne 'background: so is the port' '' "$(envval "$WBG" SERVER_PORT)"
 eq 'background: the install is not done in the hook' no "$([ -e "$WBG/node_modules/m" ] && echo yes || echo no)"
 eq 'background: nor is the seed' no "$([ -e "$WBG/seeded.txt" ] && echo yes || echo no)"
-contains 'background: the session is told it is in progress' 'still being set up in the background — in progress: node_modules, databases' "$outB"
+contains 'background: the session is told it is in progress' 'still being set up in the background — node_modules missing (still installing), databases missing (seeding).' "$outB"
 contains '...and what to run before work that needs it' '/pitlane-finish' "$outB"
 lacks '...and is not told it is broken' 'not fully set up yet' "$outB"
 contains 'background: stderr names the log' 'worktree-bootstrap.log' "$errB"
@@ -1333,7 +1333,7 @@ fi
 printf 'CHANGED\n' > "$WBG/composer.lock"
 outB=$(PITLANE_BACKGROUND=on start_hook "$WBG"); errB=$(cat "$TMP/err")
 contains 'background: a hardlink falling back to an install is deferred' 'vendor: to be installed in the background' "$errB"
-contains '...and named in the notice' 'in progress: vendor' "$outB"
+contains '...and named in the notice' 'vendor missing (still installing)' "$outB"
 ( cd "$WBG" && bash "$HOOK" --finish >/dev/null 2>&1 )
 eq '...and installed by the background run' installed "$(cat "$WBG/vendor/autoload.php" 2>/dev/null)"
 eq "...leaving the main checkout's copy alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
@@ -1349,10 +1349,12 @@ make_repo "$WRN" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"
 WWR=$WRN/.claude/worktrees/wrn
 git -C "$WRN" worktree add -q "$WWR" -b worktree-wrn 2>/dev/null
 outW=$(start_hook "$WWR"); errW=$(cat "$TMP/err")
-eq 'warn: an install that exits 1 with a passing verify leaves a session told nothing is missing' '' "$outW"
+eq 'warn: an install that exits 1 with a passing verify is named as ready with warnings, with its reason' \
+  'Pitlane: this worktree is set up, with warnings — vendor ready with warnings (ERR_FAKE_IGNORED_BUILDS). It is usable; tell the user if it matters for the task.' "$outW"
 contains '...and stderr says it installed with warnings' 'installed with warnings' "$errW"
 outF=$( cd "$WWR" && bash "$HOOK" --finish 2>"$TMP/err" )
-eq 'warn: /pitlane-finish reports the worktree complete' 'Pitlane: this worktree is fully set up.' "$outF"
+eq 'warn: /pitlane-finish reports it set up, but not as a bare "fully set up"' \
+  'Pitlane: this worktree is set up, with warnings — vendor ready with warnings (ERR_FAKE_IGNORED_BUILDS).' "$outF"
 eq '...without re-running the install' x "$(cat "$TMP/wrn-count")"
 
 # One that exits 1 having installed nothing: failed, and /pitlane-finish does not pay for it again.
@@ -1361,9 +1363,17 @@ make_repo "$FLD" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"
 WFL=$FLD/.claude/worktrees/fld
 git -C "$FLD" worktree add -q "$WFL" -b worktree-fld 2>/dev/null
 outW=$(start_hook "$WFL")
-contains 'failed: the session is told the dependency is missing' 'still missing: vendor' "$outW"
+contains 'failed: the session is told the dependency is missing, and why' \
+  'not fully set up — vendor missing (install failed: error: registry unreachable).' "$outW"
+# Only a standing failure is left, which /pitlane-finish would not retry: the session must not be
+# sent there as if it would fix it.
+lacks '...and is not told /pitlane-finish will complete it' 'Run /pitlane-finish to complete it' "$outW"
+contains '...but that it can retry it on the user'"'"'s word' '/pitlane-finish can retry it on their word' "$outW"
+eq '...in one line' 1 "$(printf '%s\n' "$outW" | wc -l | tr -d ' ')"
 outF=$( cd "$WFL" && bash "$HOOK" --finish 2>"$TMP/err" ); errF=$(cat "$TMP/err")
-eq 'failed: /pitlane-finish still reports it missing' 'Pitlane: still not complete — missing: vendor' "$outF"
+contains 'failed: /pitlane-finish still reports it missing, with the recorded reason' \
+  'Pitlane: still not complete — vendor missing (install failed: error: registry unreachable).' "$outF"
+contains '...and names the retry as the user'"'"'s call' '--finish --retry-failed` only on the user'"'"'s word' "$outF"
 eq '...without re-running an install that would fail the same way' x "$(cat "$TMP/fld-count")"
 contains '...saying why, and what would make a retry worth it' 'error: registry unreachable) — not retrying' "$errF"
 # With the hand-off on, a standing failure starts no background run that would only repeat that.
@@ -1383,7 +1393,7 @@ contains '...and names the retry' '--finish --retry-failed' "$errF"
 mkdir -p "$TMP/fld-tmp"
 outR=$( cd "$WFL" && TMPDIR=$TMP/fld-tmp bash "$HOOK" --finish --retry-failed 2>"$TMP/err" ); errR=$(cat "$TMP/err")
 eq 'failed: --finish --retry-failed re-runs it' xxx "$(cat "$TMP/fld-count")"
-eq '...reporting it still missing' 'Pitlane: still not complete — missing: vendor' "$outR"
+contains '...reporting it still missing' 'Pitlane: still not complete — vendor missing (install failed: error: registry unreachable)' "$outR"
 contains "...with the install's own output in the log" 'error: registry unreachable' "$errR"
 contains '...the output captured in the git dir' 'error: registry unreachable' \
   "$(cat "$GDFL/worktree-bootstrap.install.vendor.log" 2>/dev/null)"
@@ -1402,16 +1412,71 @@ contains 'tracked: the start-up run names the tracked file the install changed' 
   'the install changed tracked files: .gitignore' "$(cat "$TMP/err")"
 contains '...and leaves it changed' '# placeholder' "$(cat "$WTK/.gitignore")"
 outF=$( cd "$WTK" && bash "$HOOK" --finish 2>/dev/null )
-eq 'tracked: the --finish summary names it beside what is missing' \
-  'Pitlane: still not complete — missing: node_modules; an install changed tracked files: .gitignore' "$outF"
+contains 'tracked: the --finish summary counts it beside what is missing' \
+  'Pitlane: still not complete — node_modules missing (install failed: exit 1); an install changed 1 tracked file (bash "' "$outF"
+contains '...and says how to see them' '--changed lists them)' "$outF"
+lacks '...without the name, which is branch content' '.gitignore' "$outF"
 eq 'tracked: --changed prints it, one path per line' '.gitignore' "$( cd "$WTK" && bash "$HOOK" --changed 2>/dev/null )"
 eq '...from a subdirectory too' '.gitignore' "$( cd "$WTK/vendor" && bash "$HOOK" --changed 2>/dev/null )"
 git -C "$WTK" checkout -q -- .gitignore
 eq '...and nothing once the user restored it' '' "$( cd "$WTK" && bash "$HOOK" --changed 2>/dev/null )"
 outF=$( cd "$WTK" && bash "$HOOK" --finish 2>/dev/null )
-eq '...nor in the summary' 'Pitlane: still not complete — missing: node_modules' "$outF"
+contains '...nor in the summary' 'Pitlane: still not complete — node_modules missing (install failed: exit 1).' "$outF"
+lacks '...which no longer mentions changed files' 'tracked file' "$outF"
 eq 'tracked: --changed outside a repository prints no path' '' "$( cd "$TMP" && bash "$HOOK" --changed 2>"$TMP/err" )"
 contains '...and says why on stderr' 'not inside a git repository' "$(cat "$TMP/err")"
+
+# A worktree that is complete but whose install changed a tracked file is not "clean": the start-up
+# notice and the --finish line both say so, with the count, until the file is restored.
+TRC=$TMP/trc
+make_repo "$TRC" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"mkdir -p vendor && touch vendor/autoload.php && echo '# placeholder' >> .gitignore && echo '# x' >> .worktreeinclude\",\"verify\":\"test -r vendor/autoload.php\"}"
+WTC=$TRC/.claude/worktrees/trc
+git -C "$TRC" worktree add -q "$WTC" -b worktree-trc 2>/dev/null
+outS=$(start_hook "$WTC")
+eq 'changed, complete: the session is told how many tracked files an install changed' \
+  "Pitlane: this worktree is set up, with warnings — an install changed 2 tracked files (/pitlane-finish lists them, and restores one only on the user's word). It is usable; tell the user if it matters for the task." "$outS"
+outF=$( cd "$WTC" && bash "$HOOK" --finish 2>/dev/null )
+eq 'changed, complete: --finish does not call it fully set up' \
+  "Pitlane: this worktree is set up, with warnings — an install changed 2 tracked files (bash \"$HOOK\" --changed lists them)." "$outF"
+git -C "$WTC" checkout -q -- .gitignore
+contains '...and counts only what is still changed' 'an install changed 1 tracked file (' "$(start_hook "$WTC")"
+git -C "$WTC" checkout -q -- .worktreeinclude
+eq '...and once restored, a clean complete worktree starts silent' '' "$(start_hook "$WTC")"
+eq '...and --finish says fully set up' 'Pitlane: this worktree is fully set up.' \
+  "$( cd "$WTC" && bash "$HOOK" --finish 2>/dev/null )"
+
+# Lockfile drift is the MAIN checkout's lockfile moving on from what calibration read; a branch's own
+# lockfile differing is not drift. And a hardlinked virtualenv is called out, once.
+DRF=$TMP/drf
+LCK=$(printf 'LOCK\n' | cksum)
+make_repo "$DRF" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"mkdir -p vendor\",\"lockChecksum\":\"$LCK\"},
+  {\"dir\":\".venv\",\"lock\":\"composer.lock\",\"strategy\":\"hardlink\",\"install\":\"mkdir -p .venv\"}"
+printf '.venv/\n' >> "$DRF/.gitignore"; git -C "$DRF" commit -qam venv
+WDR=$DRF/.claude/worktrees/drf
+git -C "$DRF" worktree add -q "$WDR" -b worktree-drf 2>/dev/null
+printf 'BRANCH\n' > "$WDR/composer.lock"
+start_hook "$WDR" >/dev/null; errD=$(cat "$TMP/err")
+lacks "drift: a branch whose lockfile differs from main's is not told to re-run setup" 'changed since calibration' "$errD"
+eq 'venv: a hardlinked .venv is warned about, once' 1 "$(printf '%s\n' "$errD" | grep -c 'Python virtualenv')"
+printf 'MAIN2\n' > "$DRF/composer.lock"
+start_hook "$WDR" >/dev/null
+contains "drift: the main checkout's lockfile moving on is reported" \
+  'composer.lock in the main checkout has changed since calibration' "$(cat "$TMP/err")"
+
+# The list is capped, so the line stays short however many dependencies are missing.
+CAP=$TMP/cap
+make_repo "$CAP" '{"dir":"d1","lock":"composer.lock","strategy":"install","install":"exit 1"},
+  {"dir":"d2","lock":"composer.lock","strategy":"install","install":"exit 2"},
+  {"dir":"d3","lock":"composer.lock","strategy":"install","install":"exit 3"},
+  {"dir":"d4","lock":"composer.lock","strategy":"install","install":"exit 4"},
+  {"dir":"d5","lock":"composer.lock","strategy":"install","install":"exit 5"}'
+WCP=$CAP/.claude/worktrees/cap
+git -C "$CAP" worktree add -q "$WCP" -b worktree-cap 2>/dev/null
+outC=$(start_hook "$WCP")
+contains 'cap: the first three are named, then a count' \
+  '— d1 missing (install failed: exit 1), d2 missing (install failed: exit 2), d3 missing (install failed: exit 3) and 2 more.' "$outC"
+lacks '...and the fourth is not' 'd4' "$outC"
+eq '...in one line' 1 "$(printf '%s\n' "$outC" | wc -l | tr -d ' ')"
 
 # A tracked file named `*` or `:(glob)*` is one file to restore, not a pattern matching every file.
 STAR=$TMP/star
@@ -1470,7 +1535,7 @@ eq 'approval: an unapproved install does not run' no "$([ -e "$WAP/vendor/marker
 eq 'approval: nor does an unapproved seed' no "$([ -e "$WAP/seeded.txt" ] && echo yes || echo no)"
 ne 'approval: the steps that run nothing still happen (the port)' '' "$(envval "$WAP" SERVER_PORT)"
 contains 'approval: stderr says the commands are not approved' 'not approved in this form' "$errA"
-contains 'approval: the session is told nothing was run' 'setup commands were NOT run — still missing: vendor, databases' "$outA"
+contains 'approval: the session is told nothing was run' 'setup commands were NOT run — vendor missing (held back), databases missing (held back).' "$outA"
 contains '...and not to do it by hand or approve on its own' 'Do not approve it, run those commands' "$outA"
 contains '...and where approval happens' '/pitlane-finish' "$outA"
 
@@ -1663,7 +1728,7 @@ git -C "$HV" worktree add -q "$WHV" -b worktree-hv 2>/dev/null
 outH=$(gated_hook "$WHV"); errH=$(cat "$TMP/err")
 eq 'approval: the hardlink itself still happens' MAIN "$(cat "$WHV/vendor/autoload.php" 2>/dev/null)"
 contains '...its verify is held back' 'verify command is not approved' "$errH"
-contains '...and it is reported pending' 'still missing: vendor' "$outH"
+contains '...and it is reported pending' 'vendor missing (held back)' "$outH"
 gated_cli "$WHV" --approve "$(gated_cli "$WHV" --review | fp_of)" >/dev/null
 eq '...and it is done once approved' 'Pitlane: this worktree is fully set up.' "$(gated_cli "$WHV" --finish)"
 

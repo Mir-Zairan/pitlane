@@ -2527,11 +2527,15 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty means the
 # worktree is complete. It is what the session is told, so it reads the state the steps recorded
 # rather than guessing. WT_PENDING_ATTEMPTABLE is the same list less each dependency whose failure
-# stands: what a run would actually try, which decides whether one is worth starting. Globals, not
-# output, so one walk answers both: each item costs an expand and two checksums.
+# stands: what a run would actually try, which decides whether one is worth starting.
+# WT_STATUS_ITEMS is every imperfect item with what the state says about it, for
+# wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
+# failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
+# seed's status) or `warn` (present, installed with warnings; detail its reason). Globals, not
+# output, so one walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
   local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed
-  WT_PENDING='' WT_PENDING_ATTEMPTABLE=''
+  WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
@@ -2546,15 +2550,26 @@ wt_bootstrap_pending() {  # $1 = worktree
     install=$(wt_expand "$install")
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
-    wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" && continue
+    if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      if wt_state_dep_read "$worktree" "$dir" && [ "$WT_DEP_STATUS" = warn ]; then
+        WT_STATUS_ITEMS+=warn$WT_US$dir$WT_US$(wt_dep_recorded_reason)$WT_NL
+      fi
+      continue
+    fi
     WT_PENDING+=${WT_PENDING:+$'\n'}$dir
-    wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" && continue
+    # wt_state_failure_stands reads the record either way, so WT_DEP_STATUS is this dir's below.
+    if wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      WT_STATUS_ITEMS+=standing$WT_US$dir$WT_US$(wt_dep_recorded_reason)$WT_NL
+      continue
+    fi
+    WT_STATUS_ITEMS+=missing$WT_US$dir$WT_US$WT_DEP_STATUS$WT_NL
     WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$dir
   done < <(printf '%s' "${PROFILE_RAW:-}")
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ] \
     && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
     seed=$(wt_runtime_state_get "$worktree" seedstatus) || seed=none
     if [ "$seed" != "done" ]; then
+      WT_STATUS_ITEMS+=seed${WT_US}databases$WT_US${seed:-none}$WT_NL
       seed="databases (seed: ${seed:-none})"
       WT_PENDING+=${WT_PENDING:+$'\n'}$seed
       WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$seed
@@ -2563,31 +2578,107 @@ wt_bootstrap_pending() {  # $1 = worktree
   return 0
 }
 
-# The one-paragraph notice a session gets when its worktree is not finished — on SessionStart's
-# stdout, which becomes the model's context. SILENT when everything is done: the bootstrap's normal
-# output stays out of the context, and only an incomplete worktree, which a session would otherwise
-# mistake for a ready one and "fix" by hand, earns a word.
-wt_bootstrap_notice() {  # $1 = pending items, one per line, $2 = "background" when a run is finishing them, "approval" when they wait on one
-  local items=${1-} mode=${2-} list n=0 shown='' item
-  [ -n "$items" ] || return 0
-  while IFS= read -r item; do
-    [ -n "$item" ] || continue
+# The reason recorded for the dependency wt_state_dep_read last read: its error line, else its exit
+# code. Capped well below the record's 160: it shares one status line with everything else.
+wt_dep_recorded_reason() {
+  local why=${WT_DEP_REASON:-exit ${WT_DEP_RC:-?}}
+  [ "${#why}" -le 80 ] || why="${why:0:77}..."
+  printf '%s' "$why"
+}
+
+# How many imperfect items the status line names before it says "and N more".
+WT_STATUS_SHOWN=3
+
+# THE ONE LINE on stdout that tells the session (SessionStart) or /pitlane-finish (--finish) the
+# worktree's state, from the globals wt_bootstrap_pending has just set. Every ending goes through
+# here so that all of them name states alike: each imperfect item as `<name> missing (<why>)` or
+# `<name> ready with warnings (<why>)`, and the count of tracked files an install changed — a count,
+# not the names, which are branch content; /pitlane-finish shows them. Still one line (ADR-017), and
+# at start-up a complete worktree with nothing to report prints NOTHING: stdout there is model
+# context. A worktree whose only gaps are failures that stand is not sent to /pitlane-finish as if
+# that would fix them: it would not retry them, and retrying is the user's call.
+wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = background | approval | empty
+  local worktree=${1%/} when=${2-} how=${3-} kind name detail why path n=0 nchanged=0 standing=0
+  local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary
+  local -a absent_items=() warned_items=()
+  while IFS=$WT_US read -r kind name detail; do
+    case $kind in
+      standing)
+        standing=$((standing + 1))
+        absent_items+=("$name missing (install failed: $detail)")
+        ;;
+      missing)
+        case $how:$when in
+          approval:*) why='held back' ;;
+          background:*) why='still installing' ;;
+          *:finish) why='not installed; stderr says why' ;;
+          *) why='not installed yet' ;;
+        esac
+        absent_items+=("$name missing ($why)")
+        ;;
+      seed)
+        case $how in
+          approval) why='held back' ;;
+          background) why='seeding' ;;
+          *) why="seed: $detail" ;;
+        esac
+        absent_items+=("$name missing ($why)")
+        ;;
+      warn) warned_items+=("$name ready with warnings ($detail)") ;;
+    esac
+  done <<<"${WT_STATUS_ITEMS:-}"
+  for summary in ${absent_items[@]+"${absent_items[@]}"} ${warned_items[@]+"${warned_items[@]}"}; do
     n=$((n + 1))
-    [ "$n" -le 4 ] && shown=${shown:+$shown, }$item
-  done <<<"$items"
-  list=$(wt_visible "$shown")
-  [ "$n" -gt 4 ] && list="$list and $((n - 4)) more"
+    [ "$n" -le "$WT_STATUS_SHOWN" ] && list+=${list:+, }$summary
+  done
+  [ "$n" -le "$WT_STATUS_SHOWN" ] || list+=" and $((n - WT_STATUS_SHOWN)) more"
+  list=$(wt_visible "$list")
+  while IFS= read -r path; do
+    [ -z "$path" ] || nchanged=$((nchanged + 1))
+  done <<<"$(wt_install_changed_paths "$worktree")"
+  if [ "$nchanged" -gt 0 ]; then
+    changed="an install changed $nchanged tracked file$([ "$nchanged" -eq 1 ] || echo s)"
+    if [ "$when" = finish ]; then
+      changed+=" (bash \"$script\" --changed lists them)"
+    else
+      changed+=" (/pitlane-finish lists them, and restores one only on the user's word)"
+    fi
+  fi
+  summary=$list${list:+${changed:+; }}$changed
+
+  if [ "$when" = finish ]; then
+    if [ -z "$summary" ]; then
+      printf 'Pitlane: this worktree is fully set up.\n'
+    elif [ -z "${WT_PENDING:-}" ]; then
+      printf 'Pitlane: this worktree is set up, with warnings — %s.\n' "$summary"
+    elif [ "$how" = approval ]; then
+      # shellcheck disable=SC2016  # the backticks are text for the reader, not a substitution.
+      printf 'Pitlane: not run — the profile'"'"'s commands are not approved in their current form — %s. Run `bash "%s" --review` here, show the user what it would run, and approve only on their explicit word.\n' \
+        "$summary" "$script"
+    elif [ "$standing" -gt 0 ]; then
+      # shellcheck disable=SC2016
+      printf 'Pitlane: still not complete — %s. A failed install is not retried while its lockfile and install command are unchanged; retry it with `bash "%s" --finish --retry-failed` only on the user'"'"'s word.\n' \
+        "$summary" "$script"
+    else
+      printf 'Pitlane: still not complete — %s.\n' "$summary"
+    fi
+    return 0
+  fi
+
+  [ -n "$summary" ] || return 0
+  if [ -z "${WT_PENDING:-}" ]; then
+    printf 'Pitlane: this worktree is set up, with warnings — %s. It is usable; tell the user if it matters for the task.\n' "$summary"
   # Written for a model that may be reading a stranger's branch: it must neither approve on its own
   # nor do the held-back steps by hand, which would run exactly what the gate held back.
-  if [ "$mode" = approval ]; then
-    printf 'Pitlane: this worktree'"'"'s setup commands were NOT run — still missing: %s. Its profile, or a seed or teardown script it names, is not approved in its current form, and this branch may not be the developer'"'"'s own. Do not approve it, run those commands, or install dependencies or create databases by hand. Tell the user; if they want it set up, run /pitlane-finish, which shows what it would run and needs their explicit approval.\n' "$list"
-    return 0
+  elif [ "$how" = approval ]; then
+    printf 'Pitlane: this worktree'"'"'s setup commands were NOT run — %s. Its profile, or a seed or teardown script it names, is not approved in its current form, and this branch may not be the developer'"'"'s own. Do not approve it, run those commands, or install dependencies or create databases by hand. Tell the user; if they want it set up, run /pitlane-finish, which shows what it would run and needs their explicit approval.\n' "$summary"
+  elif [ "$how" = background ]; then
+    printf 'Pitlane: this worktree is still being set up in the background — %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$summary"
+  elif [ -z "${WT_PENDING_ATTEMPTABLE:-}" ]; then
+    printf 'Pitlane: this worktree is not fully set up — %s. That failure stands: it is not retried while the lockfile and install command are unchanged, so running /pitlane-finish will not fix it. Tell the user the reason; if they say the cause is fixed, /pitlane-finish can retry it on their word. Do not install dependencies by hand.\n' "$summary"
+  else
+    printf 'Pitlane: this worktree is not fully set up yet — %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$summary"
   fi
-  if [ "$mode" = background ]; then
-    printf 'Pitlane: this worktree is still being set up in the background — in progress: %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$list"
-    return 0
-  fi
-  printf 'Pitlane: this worktree is not fully set up yet — still missing: %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$list"
 }
 
 # ---------------------------------------------------------------------------
@@ -2749,11 +2840,24 @@ else
   WT_DETECTION_JSON_DEFAULT=${WT_BLIB_DIR:+$WT_BLIB_DIR/reference/detection.json}
 fi
 
-wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = shellMarker, $5 = profile path (only needed when no profile is loaded)
-  local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-} profile=${5-}
+wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = shellMarker, $5 = profile path (only needed when no profile is loaded), $6 = main checkout (found from $1 when empty)
+  local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-} profile=${5-} main=${6-}
   local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT}
   local raw rec body curdet m rdir gained='' lost='' curshell='' seen='' problems
-  local lock cksum now n=0
+  local lock cksum now n=0 locks where=''
+
+  # WHOSE LOCKFILE: THE MAIN CHECKOUT'S. lockChecksum is what calibration saw there, so main's
+  # lockfile moving on is the case where the recorded install command may be out of date. A
+  # worktree's own lockfile differing is just a branch that touches dependencies — every such branch
+  # was told to re-run setup, for nothing (wt_bootstrap_deps already installs for the worktree's own
+  # lockfile). Only when there is no main checkout to find is the checkout itself compared.
+  [ -n "$main" ] || main=$(wt_main_root "$tree" 2>/dev/null) || main=''
+  locks=${main%/}
+  if [ -n "$locks" ]; then
+    where=' in the main checkout'
+  else
+    locks=$tree
+  fi
 
   # THE LOCKFILE CHECKSUMS FIRST, and OUTSIDE every guard below. They live in deps[], not in
   # `evidence`, and they need neither the evidence block nor the detection table — so gating them
@@ -2769,7 +2873,7 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
   # than reimplemented. tests/test_bootstrap_lib.sh asserts the two agree on the same profile,
   # because two routes to one answer is exactly the shape that drifts apart.
   if [ -z "${PROFILE_RAW:-}" ] && [ -n "$profile" ]; then
-    problems=$(wt_profile_drifted "$profile" "$tree") || {
+    problems=$(wt_profile_drifted "$profile" "$locks") || {
       wt_log "$problems"
       wt_log "run /pitlane-setup if the dependency set really changed"
     }
@@ -2784,13 +2888,13 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
       n=$((n + 1))
       [ -n "$lock" ] && [ -n "$cksum" ] || continue
       wt_is_safe_relpath "$lock" || continue
-      if [ ! -f "$tree/$lock" ]; then
-        wt_log "$lock no longer exists, but the profile was calibrated against it — run /pitlane-setup"
+      if [ ! -f "$locks/$lock" ]; then
+        wt_log "$lock no longer exists$where, but the profile was calibrated against it — run /pitlane-setup"
         continue
       fi
-      now=$(cksum <"$tree/$lock" 2>/dev/null) || continue
+      now=$(cksum <"$locks/$lock" 2>/dev/null) || continue
       if [ "$now" != "$cksum" ]; then
-        wt_log "$lock has changed since calibration — the recorded install command may be for a different dependency set; run /pitlane-setup if so"
+        wt_log "$lock$where has changed since calibration — the recorded install command may be out of date; run /pitlane-setup if so"
       fi
     done < <(printf '%s' "$PROFILE_RAW")
   fi
@@ -2862,6 +2966,36 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
     wt_log "this plugin's detection table is now version $curdet, the profile was written against $evdet — /pitlane-setup may propose better answers"
   fi
   return 0
+}
+
+# A Python virtualenv must never be hardlinked: its scripts' shebangs, `activate` and an editable
+# install's path mapping all name the main checkout, so pip in the worktree installs into the main
+# checkout's venv and imports load the main checkout's source. Detection no longer proposes it, but a
+# profile calibrated before may still say so. Only warned about, since the profile is the
+# developer's; once per run, however many rounds a background run goes.
+WT_VENV_HARDLINK_WARNED=''
+wt_warn_hardlinked_venvs() {  # $1 = main checkout
+  local root=${1%/} rec body dir strategy venvs=''
+  [ -z "$WT_VENV_HARDLINK_WARNED" ] && [ -n "${PROFILE_RAW:-}" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    dir=${body%%"$WT_US"*}
+    strategy=${body#*"$WT_US"*"$WT_US"}
+    strategy=${strategy%%"$WT_US"*}
+    [ "$strategy" = hardlink ] && [ -n "$dir" ] || continue
+    case /${dir%/} in
+      */.venv) ;;
+      *) { wt_is_safe_relpath "$dir" && [ -f "$root/$dir/pyvenv.cfg" ]; } || continue ;;
+    esac
+    venvs+=${venvs:+, }$dir
+  done < <(printf '%s' "$PROFILE_RAW")
+  [ -n "$venvs" ] || return 0
+  WT_VENV_HARDLINK_WARNED=1
+  wt_log "$(wt_visible "$venvs"): hardlinked, but a Python virtualenv — its scripts and paths name the main checkout, so installs here go into the main checkout's venv and imports load its source. Run /pitlane-setup to install it per worktree instead."
 }
 
 # True when a detection rule is already accounted for by the recorded evidence — either one of its

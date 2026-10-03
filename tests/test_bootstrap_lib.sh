@@ -1527,6 +1527,63 @@ contains '...because it is up to date' 'already up to date' "$out"
 # shellcheck disable=SC2034
 PROFILE_PRESENT=1
 eq '...nor is it pending' '' "$(pending_all "$DWT")"
+status_items() { wt_bootstrap_pending "$1"; printf '%s' "${WT_STATUS_ITEMS//"$US_"/|}"; }
+eq '...but it is a status item, with its recorded reason' \
+  'warn|vendor|ERR_FAKE_IGNORED_BUILDS one build  not allowed' "$(status_items "$DWT")"
+
+# --- the status line ------------------------------------------------------
+# One helper renders every ending. A directory with no state, so no install changed anything.
+SLW=$TMP/statusline
+mkdir -p "$SLW"
+status_line() {  # $1 = items (kind|name|detail lines), $2 = pending, $3 = attemptable, $4 = when, $5 = how
+  WT_STATUS_ITEMS=${1//|/$US_} WT_PENDING=$2 WT_PENDING_ATTEMPTABLE=$3 \
+    wt_bootstrap_status_line "$SLW" "$4" "${5-}"
+}
+ALL='standing|a|exit 1
+missing|b|dirty
+seed|databases|failed
+warn|c|peer warning'
+PEND=$'a\nb\ndatabases (seed: failed)'
+ATT=$'b\ndatabases (seed: failed)'
+out=$(status_line "$ALL" "$PEND" "$ATT" start)
+contains 'status: each item named by state, missing before warnings, capped at three' \
+  'not fully set up yet — a missing (install failed: exit 1), b missing (not installed yet), databases missing (seed: failed) and 1 more.' "$out"
+contains '...and sends the session to /pitlane-finish, which would retry b' 'Run /pitlane-finish to complete it' "$out"
+# shellcheck disable=SC2034  # read by wt_bootstrap_status_line
+WT_STATUS_SHOWN=4
+contains 'status: within the cap, a warning reads "ready with warnings"' \
+  ', c ready with warnings (peer warning).' "$(status_line "$ALL" "$PEND" "$ATT" start)"
+# shellcheck disable=SC2034  # read by wt_bootstrap_status_line
+WT_STATUS_SHOWN=3
+out=$(status_line "$ALL" "$PEND" "$ATT" start background)
+contains 'status, background: what the run does reads as in progress' \
+  'in the background — a missing (install failed: exit 1), b missing (still installing), databases missing (seeding)' "$out"
+out=$(status_line "$ALL" "$PEND" "$ATT" start approval)
+contains 'status, approval: held back' 'NOT run — a missing (install failed: exit 1), b missing (held back), databases missing (held back)' "$out"
+out=$(status_line "$ALL" "$PEND" "$ATT" finish approval)
+contains 'status, --finish held back: the approval line, with states' \
+  "not run — the profile's commands are not approved in their current form — a missing (install failed: exit 1), b missing (held back)" "$out"
+out=$(status_line "$ALL" "$PEND" "$ATT" finish)
+contains 'status, --finish: what is left, and where the reason is' \
+  'Pitlane: still not complete — a missing (install failed: exit 1), b missing (not installed; stderr says why)' "$out"
+contains '...and a standing failure is retried only on the user'"'"'s word' '--retry-failed` only on the user' "$out"
+out=$(status_line 'missing|b|dirty' b b finish)
+eq 'status, --finish with nothing standing: no retry advice' 'Pitlane: still not complete — b missing (not installed; stderr says why).' "$out"
+# Only failures that stand: /pitlane-finish would not retry them, so it is not offered as the fix.
+out=$(status_line 'standing|a|error: registry unreachable' a '' start)
+contains 'status, only standing failures: named with the reason' 'a missing (install failed: error: registry unreachable).' "$out"
+lacks '...not sent to /pitlane-finish as if it would complete it' 'Run /pitlane-finish to complete it' "$out"
+contains '...told /pitlane-finish retries only on the user'"'"'s word' '/pitlane-finish can retry it on their word' "$out"
+eq 'status, complete with a warning: not a bare "fully set up"' \
+  'Pitlane: this worktree is set up, with warnings — c ready with warnings (peer warning).' \
+  "$(status_line 'warn|c|peer warning' '' '' finish)"
+contains '...and at start-up it is said, not swallowed' 'set up, with warnings — c ready with warnings' \
+  "$(status_line 'warn|c|peer warning' '' '' start)"
+eq 'status, complete and clean: silent at start-up' '' "$(status_line '' '' '' start)"
+eq '...and "fully set up" from --finish' 'Pitlane: this worktree is fully set up.' "$(status_line '' '' '' finish)"
+contains 'status: a name the branch wrote is shown printable' 'x?[31m missing' \
+  "$(status_line "missing|x"$'\033'"[31m|dirty" x x start)"
+WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE=''
 
 # The reason is one bounded line of printable ASCII: nothing that could break the record.
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
@@ -2339,6 +2396,87 @@ eq 'a matching profile with no evidence block says nothing' '' \
 # It must never block, whatever it finds.
 wt_report_drift "$DRTREE" 0 '["composer.lock"]' 'flake.nix' >/dev/null 2>&1
 eq 'drift reporting always succeeds — it warns, it never blocks' 0 $?
+
+# WHOSE LOCKFILE IS COMPARED: the main checkout's, which is what calibration read. A worktree whose
+# own lockfile differs is a branch that touches dependencies, not drift.
+DMR=$TMP/driftmain
+git init -q "$DMR"
+git -C "$DMR" config user.email t@example.com
+git -C "$DMR" config user.name t
+printf 'MAINLOCK\n' > "$DMR/composer.lock"
+git -C "$DMR" add composer.lock; git -C "$DMR" commit -qm init
+DMW=$DMR/.claude/worktrees/branch
+git -C "$DMR" worktree add -q "$DMW" -b wt-branch 2>/dev/null
+MCK=$(wt_cksum_file "$DMR/composer.lock")
+printf 'BRANCHLOCK\n' > "$DMW/composer.lock"
+cat > "$DMR/p-main.json" <<JSON
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install",
+ "install":"x","lockChecksum":"$MCK"}]}
+JSON
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$MCK")
+eq "a branch whose lockfile differs from main's gets no drift warning" '' \
+  "$(wt_report_drift "$DMW" '' '' '' '' "$DMR" 2>&1)"
+eq '...nor when the main checkout is found from the worktree' '' "$(wt_report_drift "$DMW" '' '' '' 2>&1)"
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+eq '...nor by the file route' '' "$(wt_report_drift "$DMW" '' '' '' "$DMR/p-main.json" "$DMR" 2>&1)"
+# The main checkout's lockfile moved on since calibration, while this worktree's still matches it.
+printf 'MAINLOCK\n' > "$DMW/composer.lock"
+printf 'MAINLOCK2\n' > "$DMR/composer.lock"
+out=$(wt_report_drift "$DMW" '' '' '' "$DMR/p-main.json" "$DMR" 2>&1)
+contains "main's lockfile changed since calibration: the file route warns" 'has changed since calibration' "$out"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_with "$MCK")
+out2=$(wt_report_drift "$DMW" '' '' '' '' "$DMR" 2>&1)
+contains '...and so does the loaded-profile route, naming the main checkout' \
+  'composer.lock in the main checkout has changed since calibration' "$out2"
+contains '...and pointing at the fix' '/pitlane-setup' "$out2"
+contains '...with the main checkout found from the worktree too' 'in the main checkout has changed' \
+  "$(wt_report_drift "$DMW" '' '' '' 2>&1)"
+eq '...and both routes agree' \
+  "$(printf '%s' "$out" | grep -c 'changed since calibration')" \
+  "$(printf '%s' "$out2" | grep -c 'changed since calibration')"
+rm -f "$DMR/composer.lock"
+contains "a lockfile gone from the main checkout is reported as such" 'composer.lock no longer exists in the main checkout' \
+  "$(wt_report_drift "$DMW" '' '' '' '' "$DMR" 2>&1)"
+printf 'MAINLOCK\n' > "$DMR/composer.lock"
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+
+# A Python virtualenv calibrated as a hardlink: its scripts name the main checkout, so the worktree
+# would install into, and import from, the main checkout. Warned about, once per run.
+VNR=$TMP/venvwarn
+mkdir -p "$VNR/env" "$VNR/vendor"
+: > "$VNR/env/pyvenv.cfg"
+venv_warning() {  # $@ = dir:strategy pairs; prints what wt_warn_hardlinked_venvs logs
+  local pair raw
+  raw=$(printf '0%s%s' "$US_" "$RS_")
+  for pair in "$@"; do
+    raw+=$(printf '1%s%s%scomposer.lock%s%s%sx%s%s%s' "$US_" "${pair%%:*}" "$US_" "$US_" "${pair#*:}" "$US_" "$US_" "$US_" "$RS_")
+  done
+  PROFILE_RAW=$raw WT_VENV_HARDLINK_WARNED='' wt_warn_hardlinked_venvs "$VNR" 2>&1
+}
+out=$(venv_warning .venv:hardlink)
+contains 'a hardlinked .venv is warned about' '.venv: hardlinked, but a Python virtualenv' "$out"
+contains '...naming the danger' "installs here go into the main checkout's venv" "$out"
+contains '...and the fix' '/pitlane-setup' "$out"
+contains 'a nested one too' 'services/api/.venv: hardlinked' "$(venv_warning services/api/.venv:hardlink)"
+contains 'and one known by its pyvenv.cfg in the main checkout' 'env: hardlinked' "$(venv_warning env:hardlink)"
+eq 'a hardlinked vendor is not' '' "$(venv_warning vendor:hardlink)"
+eq 'nor an installed .venv' '' "$(venv_warning .venv:install)"
+eq 'nor a dir merely ending in venv' '' "$(venv_warning my.venv:hardlink)"
+contains 'several are named in one line' '.venv, env: hardlinked' "$(venv_warning .venv:hardlink vendor:hardlink env:hardlink)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%s.venv%scomposer.lock%shardlink%sx%s%s%s' "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+# shellcheck disable=SC2034  # read by wt_warn_hardlinked_venvs
+WT_VENV_HARDLINK_WARNED=''
+wt_warn_hardlinked_venvs "$VNR" 2>"$TMP/venv1"
+wt_warn_hardlinked_venvs "$VNR" 2>"$TMP/venv2"
+contains 'once per run: the first call warns' 'Python virtualenv' "$(cat "$TMP/venv1")"
+eq '...and a second round says nothing' '' "$(cat "$TMP/venv2")"
+# shellcheck disable=SC2034
+PROFILE_RAW=''
 # shellcheck disable=SC2034
 PROFILE_RAW=''
 
