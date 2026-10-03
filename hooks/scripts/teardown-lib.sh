@@ -933,6 +933,84 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
   return 0
 }
 
+# Take worktree $1's serve lock on descriptor $2 and keep it until exit, so no /pitlane-serve can
+# start a server between teardown reading the record and removing the worktree. Returns 1, with
+# the reason in WT_TD_KEEP_REASON, when a /pitlane-serve still holds it: the server it is starting
+# may not be recorded yet. No flock at all is 0, for wt_acquire_teardown_lock's reason.
+wt_acquire_serve_lock() {  # $1 = worktree, $2 = fd number
+  local rc
+  WT_TD_KEEP_REASON=''
+  command -v flock >/dev/null 2>&1 || return 0
+  wt_lock_acquire "$(wt_serve_lockfile "$1")" 5 "$2"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) WT_TD_KEEP_REASON='a /pitlane-serve is starting the app in it' ;;
+    *) WT_TD_KEEP_REASON='could not check for a running /pitlane-serve: its lock file cannot be opened' ;;
+  esac
+  return 1
+}
+
+# Stop the server /pitlane-serve recorded for the worktree at $1, and nothing else: by its recorded
+# process group, proved by its start identity, or by runtime.stop for one that daemonized (ADR-021).
+# Never by port or cwd. Present ($3 = 1), the record is in its state file and runtime.stop runs in
+# it with its own profile; gone, the serve mirror is the only record left and runtime.stop runs in
+# the main checkout ($2) — the profile the caller loaded either way.
+#
+# ALWAYS RETURNS 0. A server holds no work, so one that will not stop, or whose runtime.stop is not
+# approved, is warned about and teardown carries on (ADR-003): its record stays, and once the admin
+# dir is gone its mirror is what /pitlane-tidy lists.
+wt_stop_served_app() {  # $1 = worktree, $2 = main checkout, $3 = 1 if the worktree is present
+  local wt=${1%/} root=${2-} present=${3:-0} common file
+  if [ "$present" = 1 ]; then
+    wt_serve_record_read "$wt" && wt_stop_one_server state "$wt" "$wt"
+    return 0
+  fi
+  common=$(wt_git_common_dir "$root") || return 0
+  for file in "$common/$WT_SERVE_MIRROR_DIRNAME"/*; do
+    case ${file##*/} in "$WT_SERVE_MIRROR_TMP_PREFIX"*) continue ;; esac
+    wt_serve_mirror_parse "$file" && [ "$WT_SERVE_MIRROR_PATH" = "$wt" ] || continue
+    wt_stop_one_server mirror "$file" "$root"
+  done
+  return 0
+}
+
+# One recorded server, loaded into WT_SERVE_*, for wt_stop_served_app. $2 is the worktree for a
+# `state` record, the mirror file for a `mirror` one; $3 the directory runtime.stop runs in.
+wt_stop_one_server() {  # $1 = state|mirror, $2 = worktree or mirror file, $3 = directory runtime.stop runs in
+  local source=$1 key=$2 rundir=$3 url=$WT_SERVE_URL pid=$WT_SERVE_PID
+  if [ "$WT_SERVE_STOPBY" = command ]; then
+    if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
+      wt_log "not stopping the app at $url: only runtime.stop can stop it, and no usable profile is loaded — /pitlane-tidy lists it"
+      return 0
+    fi
+    wt_approval_check "$rundir"
+    if [ "$WT_APPROVAL" = no ]; then
+      wt_log "not stopping the app at $url: runtime.stop is not approved in $rundir — not run; /pitlane-tidy can stop it once it is"
+      return 0
+    fi
+  fi
+  if [ "$source" = state ]; then
+    wt_serve_stop "$key"
+  else
+    wt_serve_stop_mirrored "$key" "$rundir"
+  fi
+  case $? in
+    0)
+      if [ "$WT_SERVE_STOPBY" = command ]; then
+        wt_log "stopped the app /pitlane-serve started at $url (by runtime.stop)"
+      else
+        wt_log "stopped the app /pitlane-serve started at $url (pid $pid)"
+      fi
+      ;;
+    2) wt_log "the app /pitlane-serve started at $url (pid $pid) had already exited — record dropped" ;;
+    3) wt_log "pid $pid, recorded for the app /pitlane-serve started, now belongs to another process — not ours, left alone; record dropped" ;;
+    4) wt_log "the app /pitlane-serve started at $url (pid $pid) did not stop, even on SIGKILL — carrying on with the teardown; /pitlane-tidy lists it" ;;
+    5) wt_log "the app /pitlane-serve started at $url was not stopped — $WT_SERVE_STOP_WHY; carrying on with the teardown; /pitlane-tidy lists it" ;;
+  esac
+  return 0
+}
+
 # Take the plugin's block out of every override file the record says is `ours`. $2 and
 # $3 are the record's `:`-joined, aligned file list and dispositions; a file whose slot is `theirs`
 # or empty is the developer's, or was never written, and is not opened at all. The recorded list,

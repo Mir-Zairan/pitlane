@@ -17,7 +17,8 @@
 #   id  kind  path  bytes  action  reason
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
-#   kind    orphan-dir | stale-admin | runtime-leftover | ledger-junk | abandoned | held; `store` is reserved
+#   kind    orphan-dir | stale-admin | server-leftover | runtime-leftover | ledger-junk | abandoned | held;
+#           `store` is reserved
 #           for a future finder of unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
@@ -25,7 +26,11 @@
 #           teardown  run the main checkout's runtime.teardown with the recorded environment, then
 #                     forget the ledger entry. For an `abandoned` worktree: run teardown.sh on it,
 #                     exactly as Claude Code would have — guard, release, remove.
-#           forget    forget the entry without running anything: the profile has no teardown script.
+#           forget    forget the entry without running anything: the profile has no teardown script,
+#                     or a server-leftover has nothing left to stop.
+#           stop      stop the server /pitlane-serve recorded starting in a worktree that is gone: its
+#                     process group, re-proved by its recorded start identity before each signal, or
+#                     the main checkout's approved runtime.stop for one that daemonized (ADR-021).
 #           refuse    not safe now, and the reason says why. Still accepted by --apply, which
 #                     re-judges it — an item waiting on another (a leftover whose directory is
 #                     still there) becomes applicable once that one is gone.
@@ -54,8 +59,11 @@
 #     ones a WorktreeCreate hook created, and fires no WorktreeRemove for them (measured, 2.1.286);
 #     its periodic sweep skips them too. Nothing else would ever reap them, or the database a seed
 #     made for each. Applying one runs teardown.sh on it, so the guard is the teardown hook's own.
-#   * no process is killed; the repo's teardown script is the only thing that may stop what its
-#     seed started.
+#   * no process is killed but a server-leftover's, and that only on --apply: the one server
+#     /pitlane-serve recorded starting in a worktree now gone, found through its serve mirror
+#     (bootstrap-lib.sh), signalled only while its recorded start identity matches. Never a process
+#     found by its port or working directory. The repo's teardown script is the only thing that may
+#     stop what its seed started.
 #   * no shared state is removed: the main checkout a dependency was hardlinked from, package
 #     caches, <common>/worktree-locks/ (only lock files are created there: this script's own, and
 #     the per-entry allocation locks it shares with teardown.sh), and no repository-wide
@@ -112,6 +120,7 @@ WT_PRUNE_ABANDONED_MINUTES=${WT_PRUNE_ABANDONED_MINUTES:-60}
 WT_PRUNE_FINDERS=(
   wt_find_orphan_dirs
   wt_find_stale_admin_dirs
+  wt_find_server_leftovers
   wt_find_runtime_leftovers
   wt_find_ledger_junk
   wt_find_abandoned_worktrees
@@ -126,7 +135,7 @@ WT_PRUNE_FINDERS=(
 # ---------------------------------------------------------------------------
 
 # One discovery's items, index-aligned. PRUNE_KEY is what the applier acts on (a physical path,
-# `ledger:<entry>` or `state:<state file>`); PRUNE_MEASURE is the path whose size the item frees,
+# `ledger:<entry>`, `state:<state file>` or `server:<serve mirror file name>`); PRUNE_MEASURE is the path whose size the item frees,
 # or empty.
 PRUNE_ID=() PRUNE_KIND=() PRUNE_PATH=() PRUNE_BYTES=() PRUNE_ACTION=() PRUNE_REASON=()
 PRUNE_KEY=() PRUNE_MEASURE=()
@@ -568,6 +577,85 @@ wt_find_stale_admin_dirs() {
   done
 }
 
+# Judge serve mirror file $1 into WT_PRUNE_VERDICT and WT_PRUNE_WHY, with WT_SERVE_* and
+# WT_SERVE_MIRROR_* loaded. Returns 1 when the record is still its live worktree's own — the state
+# file there holds the same record — which is /pitlane-serve's to stop, not an item at all.
+#
+# A `command` record names no process, so nothing proves what answers at its URL is that server:
+# for one whose path is a live worktree again, runtime.stop would stop that worktree's app, and it
+# is refused.
+wt_prune_judge_server() {  # $1 = mirror file
+  local file=$1 wt raw where rc reentered=0
+  WT_PRUNE_VERDICT=refuse WT_PRUNE_WHY=''
+  if ! wt_serve_mirror_parse "$file"; then
+    WT_PRUNE_VERDICT=none
+    WT_PRUNE_WHY='a serve record this version cannot read — perhaps a newer format; nothing is stopped, and it is not deleted'
+    return 0
+  fi
+  wt=$WT_SERVE_MIRROR_PATH
+  where="a server /pitlane-serve started for $wt, which no longer exists"
+  if wt_prune_is_live "$(wt_physical_path "$wt")"; then
+    if raw=$(wt_serve_record_raw "$wt") \
+      && [ "$(wt_serve_mirror_name "$WT_SERVE_MIRROR_ADMIN" "$raw")" = "${file##*/}" ]; then
+      return 1
+    fi
+    reentered=1
+    where="a server /pitlane-serve started for an earlier worktree at $wt, which no longer records it"
+  fi
+  where="$where (pid $WT_SERVE_PID, $WT_SERVE_URL)"
+  if [ "$WT_SERVE_STOPBY" = command ]; then
+    if [ "$reentered" = 1 ]; then
+      WT_PRUNE_WHY="$where; it detached from its serve command, so only runtime.stop can stop it, and that cannot tell it from the app of the worktree now at that path — stop it by hand"
+    elif ! wt_serve_answers "$WT_SERVE_URL"; then
+      WT_PRUNE_VERDICT=forget
+      WT_PRUNE_WHY="$where; nothing answers at $WT_SERVE_URL any more — forget drops the record without running anything"
+    elif [ "${PROFILE_PRESENT:-0}" != 1 ] || [ -z "${PROFILE_RT_STOP:-}" ]; then
+      WT_PRUNE_WHY="$where; it detached from its serve command, so only runtime.stop can stop it, and the main checkout's profile names none — stop it by hand"
+    elif wt_approval_check "$WT_PRUNE_ROOT"; [ "$WT_APPROVAL" != yes ]; then
+      WT_PRUNE_WHY="$where; only runtime.stop can stop it, and the main checkout's profile is not approved — approve it with /pitlane-finish there first"
+    else
+      WT_PRUNE_VERDICT=stop
+      WT_PRUNE_WHY="$where; still answering — stop runs the main checkout's runtime.stop"
+    fi
+    return 0
+  fi
+  wt_serve_judge
+  rc=$?
+  case $rc in
+    0)
+      WT_PRUNE_VERDICT=stop
+      WT_PRUNE_WHY="$where; still running — stop signals its process group, proved by its recorded start identity before each signal"
+      ;;
+    2)
+      if wt_serve_group_ours; then
+        WT_PRUNE_VERDICT=stop
+        WT_PRUNE_WHY="$where; its first process exited, but processes of its group still run — stop signals that group"
+      else
+        WT_PRUNE_VERDICT=forget
+        WT_PRUNE_WHY="$where; it has exited, and nothing of its process group is left — forget drops the record"
+      fi
+      ;;
+    *)
+      WT_PRUNE_VERDICT=forget
+      WT_PRUNE_WHY="$where; that pid now belongs to another process (its start identity differs), which is never signalled — forget drops the record"
+      ;;
+  esac
+  return 0
+}
+
+wt_find_server_leftovers() {
+  local dir=$WT_PRUNE_COMMON/$WT_SERVE_MIRROR_DIRNAME file shown
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+  for file in "$dir"/*; do
+    [ -e "$file" ] || continue
+    case ${file##*/} in "$WT_SERVE_MIRROR_TMP_PREFIX"*) continue ;; esac
+    wt_ledger_is_entry_name "${file##*/}" || continue
+    wt_prune_judge_server "$file" || continue
+    shown=${WT_SERVE_MIRROR_PATH:-$file}
+    wt_prune_add server-leftover "server:${file##*/}" "$shown" - "$WT_PRUNE_VERDICT" "$WT_PRUNE_WHY" ''
+  done
+}
+
 wt_find_runtime_leftovers() {
   local entry path admin slug rest holds why waits_on
   while IFS=$WT_US read -r -d "$WT_RS" entry path admin _ slug rest; do
@@ -863,6 +951,49 @@ wt_prune_release_allocation() {  # $1 = item index
   esac
 }
 
+# Stop, or forget, the server a serve mirror records, as judged by the discovery made just before.
+# Stopping re-proves the process against its recorded identity right before each signal.
+wt_apply_server_leftover() {  # $1 = item index
+  local name=${PRUNE_KEY[$1]#server:} file pid
+  file=$WT_PRUNE_COMMON/$WT_SERVE_MIRROR_DIRNAME/$name
+  if ! wt_ledger_is_entry_name "$name" || [ -L "$file" ] || [ ! -f "$file" ]; then
+    WT_PRUNE_DETAIL="$file is no longer a serve record"
+    return 1
+  fi
+  if [ "${PRUNE_ACTION[$1]}" = forget ]; then
+    if ! wt_serve_mirror_forget "$file"; then
+      WT_PRUNE_DETAIL="could not remove $file"
+      return 1
+    fi
+    WT_PRUNE_DETAIL='record forgotten; nothing was signalled or run'
+    return 0
+  fi
+  if wt_serve_mirror_parse "$file" && [ "$WT_SERVE_STOPBY" = command ]; then
+    wt_approval_check "$WT_PRUNE_ROOT"
+    if [ "$WT_APPROVAL" = no ]; then
+      WT_PRUNE_DETAIL="runtime.stop is not approved in $WT_PRUNE_ROOT — nothing run; the record is kept"
+      return 1
+    fi
+  fi
+  pid=$WT_SERVE_PID
+  wt_serve_stop_mirrored "$file" "$WT_PRUNE_ROOT"
+  case $? in
+    0)
+      if [ "$WT_SERVE_STOPBY" = command ]; then
+        WT_PRUNE_DETAIL="stopped by runtime.stop ($WT_SERVE_URL); record forgotten"
+      else
+        WT_PRUNE_DETAIL="stopped (pid $pid, $WT_SERVE_URL); record forgotten"
+      fi
+      ;;
+    2) WT_PRUNE_DETAIL="it had already exited; record forgotten" ;;
+    3) WT_PRUNE_DETAIL="pid $pid now belongs to another process — left alone; record forgotten" ;;
+    4) WT_PRUNE_DETAIL="pid $pid did not stop, even on SIGKILL; the record is kept"; return 1 ;;
+    5) WT_PRUNE_DETAIL="not stopped — $WT_SERVE_STOP_WHY; the record is kept"; return 1 ;;
+    *) WT_PRUNE_DETAIL="its record cannot be read now"; return 1 ;;
+  esac
+  return 0
+}
+
 wt_apply_ledger_junk() {  # $1 = item index
   local file=${PRUNE_KEY[$1]}
   case ${file##*/} in
@@ -899,7 +1030,7 @@ wt_prune_report() {
       "$(wt_prune_printable "${PRUNE_PATH[i]}")" "${PRUNE_BYTES[i]}" "${PRUNE_ACTION[i]}" \
       "$(wt_prune_printable "${PRUNE_REASON[i]}")"
     case ${PRUNE_ACTION[i]} in
-      delete | teardown | forget)
+      delete | teardown | forget | stop)
         applicable[${#applicable[@]}]=${PRUNE_ID[i]}
         wt_is_posint "${PRUNE_BYTES[i]}" && total=$((total + PRUNE_BYTES[i]))
         ;;
@@ -913,7 +1044,7 @@ wt_prune_report() {
     printf '# nothing to apply\n'
     return 0
   fi
-  printf '# applying them frees %d bytes by du (hardlinked files counted in full), plus any runtime allocation the teardown script releases\n' "$total"
+  printf '# applying them frees %d bytes by du (hardlinked files counted in full), plus any runtime allocation the teardown script releases and any server stopped\n' "$total"
   printf '# to apply: %s\n' "$(wt_prune_command_for "${applicable[@]}")"
 }
 

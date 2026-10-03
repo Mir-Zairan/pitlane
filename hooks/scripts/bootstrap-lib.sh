@@ -3033,9 +3033,18 @@ wt_serve_lockfile() {  # $1 = worktree
 # _STOPBY (`signal` or `command`). Returns 1, with the PID empty, when there is none — by the state
 # file's no-partial-trust rules.
 wt_serve_record_read() {  # $1 = worktree
-  local file rec kind rest seen=0
+  local rest
   WT_SERVE_PID='' WT_SERVE_PGID='' WT_SERVE_IDENTITY='' WT_SERVE_CKSUM='' WT_SERVE_URL='' WT_SERVE_WHEN=''
   WT_SERVE_STOPBY=''
+  rest=$(wt_serve_record_raw "$1") || return 1
+  wt_serve_record_parse "$rest"
+}
+
+# The `serve` record of worktree $1's state file as stored — its fields after the kind, still
+# US-joined — on stdout, or return 1 when there is none by the no-partial-trust rules. Touches no
+# WT_SERVE_* global, so a writer can look at the record it is replacing.
+wt_serve_record_raw() {  # $1 = worktree
+  local file rec kind rest seen=0
   file=$(wt_state_path "${1%/}")
   [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
@@ -3048,16 +3057,7 @@ wt_serve_record_read() {  # $1 = worktree
         ;;
       serve)
         [ "$seen" = 1 ] || return 1
-        # SC2034: _CKSUM and _WHEN are for the reader of the record (teardown), not this file.
-        # shellcheck disable=SC2034
-        IFS=$WT_US read -r WT_SERVE_PID WT_SERVE_PGID WT_SERVE_IDENTITY WT_SERVE_CKSUM WT_SERVE_URL WT_SERVE_WHEN \
-          WT_SERVE_STOPBY <<<"$rest" || true
-        wt_is_posint "$WT_SERVE_PID" || { WT_SERVE_PID=''; return 1; }
-        case $WT_SERVE_STOPBY in
-          '' | signal) WT_SERVE_STOPBY=signal ;;
-          command) ;;
-          *) WT_SERVE_PID=''; return 1 ;;
-        esac
+        printf '%s' "$rest"
         return 0
         ;;
     esac
@@ -3065,21 +3065,167 @@ wt_serve_record_read() {  # $1 = worktree
   return 1
 }
 
+# Load the fields of a `serve` record ($1, after the kind) into WT_SERVE_*. Returns 1, with the PID
+# empty, for a record nothing it names may be signalled from: a non-numeric pid or an unknown stopby.
+wt_serve_record_parse() {  # $1 = the record's fields, US-joined
+  # SC2034: _CKSUM and _WHEN are for the reader of the record (teardown), not this file.
+  # shellcheck disable=SC2034
+  IFS=$WT_US read -r WT_SERVE_PID WT_SERVE_PGID WT_SERVE_IDENTITY WT_SERVE_CKSUM WT_SERVE_URL WT_SERVE_WHEN \
+    WT_SERVE_STOPBY <<<"${1-}" || true
+  wt_is_posint "$WT_SERVE_PID" || { WT_SERVE_PID=''; return 1; }
+  case $WT_SERVE_STOPBY in
+    '' | signal) WT_SERVE_STOPBY=signal ;;
+    command) ;;
+    *) WT_SERVE_PID=''; return 1 ;;
+  esac
+  return 0
+}
+
 # Write (or, with no pid, remove) the `serve` record, under the worktree's bootstrap lock so it
 # cannot interleave with a session's own state write and be lost — a lost record is a server
-# nothing will ever stop.
+# nothing will ever stop. A caller that already holds that lock on fd 8 (teardown) sets
+# WT_STATE_LOCK_HELD=1: taking it again here would reopen fd 8, which drops the caller's lock.
+# The record's mirror (below) follows every successful write.
 wt_serve_record_write() {  # $1 = worktree, $2 = pid ('' removes), $3 = pgid, $4 = identity, $5 = cmdcksum, $6 = url, $7 = stopby (default signal)
-  local wt=${1%/} rec='' held=0 when
+  local wt=${1%/} rec='' held=0 when old rc
   if [ -n "${2-}" ]; then
     when=$(date +%s 2>/dev/null) || when=0
     wt_state_join serve "$2" "${3-}" "${4-}" "${5-}" "${6-}" "$when" "${7:-signal}"
     rec=$WT_STATE_REC
   fi
-  wt_lock_acquire "$(wt_state_path "$wt").lock" 10 8 && held=1
+  if [ "${WT_STATE_LOCK_HELD:-0}" != 1 ]; then
+    wt_lock_acquire "$(wt_state_path "$wt").lock" 10 8 && held=1
+  fi
+  old=$(wt_serve_record_raw "$wt") || old=''
   wt_state_rewrite "$wt" serve '' "$rec"
-  local rc=$?
+  rc=$?
+  [ "$rc" -ne 0 ] || wt_serve_mirror_update "$wt" "$old" "${rec#serve"$WT_US"}"
   [ "$held" -eq 1 ] && wt_lock_release 8
   return "$rc"
+}
+
+# ---- The serve MIRROR: a copy of each serve record that outlives the worktree ----
+#
+# The state file dies with the worktree's admin dir, and Claude Code removes a native worktree
+# without running teardown (ADR-015), so a server /pitlane-serve started there would be left with
+# nothing recording it. Every serve record is therefore mirrored to
+# `<common>/worktree-servers/<admin id>.<pid>.<when>`, which /pitlane-tidy reads once the worktree
+# is gone. Not in the runtime ledger: that entry exists only for a worktree with an `rt` record, is
+# rebuilt whole by every rt write, and is forgotten when the allocation is released — none of which
+# matches a server's life.
+#
+# ONE FILE PER SERVER, named from its own record, so a re-entered worktree's new server never
+# overwrites the record of one its previous incarnation left running, and removing a file can only
+# ever remove the record it was named for. No lock is needed for that: no two writers share a name.
+#
+# THE SAME ENCODING AS THE STATE FILE: a `wtstate` header, a `worktree` record (path, admin id,
+# name, slug, port — what runtime.stop is expanded with once the state file is gone), and the
+# `serve` record byte for byte. ALWAYS ADVISORY, like the ledger: a failed write warns, never fails.
+
+WT_SERVE_MIRROR_DIRNAME='worktree-servers'
+WT_SERVE_MIRROR_TMP_PREFIX=.wtserve.
+
+# Set WT_SERVE_MIRROR_DIR and WT_SERVE_MIRROR_ID for worktree $1, read off its state path as
+# wt_ledger_write does; return 1 for anything that is not a linked worktree's admin dir.
+wt_serve_mirror_locate() {  # $1 = worktree
+  local wt=${1%/} state admin common
+  WT_SERVE_MIRROR_DIR='' WT_SERVE_MIRROR_ID=''
+  state=$(wt_state_path "$wt")
+  admin=${state%/*}
+  [ "$admin" != "$wt/.claude" ] && [ -f "$admin/gitdir" ] || return 1
+  common=${admin%/*}
+  [ "${common##*/}" = worktrees ] || return 1
+  wt_ledger_is_entry_name "${admin##*/}" || return 1
+  WT_SERVE_MIRROR_ID=${admin##*/}
+  WT_SERVE_MIRROR_DIR=${common%/*}/$WT_SERVE_MIRROR_DIRNAME
+}
+
+# The mirror file name for a serve record's fields ($2, US-joined) under admin id $1.
+wt_serve_mirror_name() {  # $1 = admin id, $2 = the record's fields
+  local pid when
+  IFS=$WT_US read -r pid _ _ _ _ when _ <<<"$2" || true
+  printf '%s.%s.%s' "$1" "$pid" "$when"
+}
+
+# Replace the mirror of record $2 (the fields the state file held, or empty) with one of record $3
+# (empty when the record was removed).
+wt_serve_mirror_update() {  # $1 = worktree, $2 = old record's fields or empty, $3 = new record's fields or empty
+  local wt=${1%/} old=${2-} new=${3-} oldname='' newname='' tmp slug port
+  wt_serve_mirror_locate "$wt" || return 0
+  [ -z "$old" ] || oldname=$(wt_serve_mirror_name "$WT_SERVE_MIRROR_ID" "$old")
+  [ -z "$new" ] || newname=$(wt_serve_mirror_name "$WT_SERVE_MIRROR_ID" "$new")
+  if [ -n "$newname" ]; then
+    slug=$(wt_runtime_state_get "$wt" slug) || slug=${WT_SLUG-}
+    port=$(wt_runtime_state_get "$wt" port) || port=''
+    wt_state_join worktree "$wt" "$WT_SERVE_MIRROR_ID" "${WT_NAME:-$(wt_name_from_path "$wt")}" "$slug" "$port"
+    if ! { [ -d "$WT_SERVE_MIRROR_DIR" ] || mkdir -p "$WT_SERVE_MIRROR_DIR" 2>/dev/null; } \
+      || ! tmp=$(mktemp "$WT_SERVE_MIRROR_DIR/${WT_SERVE_MIRROR_TMP_PREFIX}XXXXXX" 2>/dev/null); then
+      wt_log "could not write to $WT_SERVE_MIRROR_DIR — if this worktree is removed without its teardown, /pitlane-tidy will not find its server"
+    elif ! {
+      printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
+      printf '%s%s' "$WT_STATE_REC" "$WT_RS"
+      printf 'serve%s%s%s' "$WT_US" "$new" "$WT_RS"
+    } >"$tmp" 2>/dev/null || ! mv -f "$tmp" "$WT_SERVE_MIRROR_DIR/$newname" 2>/dev/null; then
+      rm -f "${tmp:?}"
+      wt_log "could not write $WT_SERVE_MIRROR_DIR/$newname — if this worktree is removed without its teardown, /pitlane-tidy will not find its server"
+    fi
+  fi
+  if [ -n "$oldname" ] && [ "$oldname" != "$newname" ]; then
+    rm -f "${WT_SERVE_MIRROR_DIR:?}/$oldname" 2>/dev/null
+  fi
+  return 0
+}
+
+# Parse mirror file $1 into WT_SERVE_* (wt_serve_record_parse) and WT_SERVE_MIRROR_PATH, _ADMIN,
+# _NAME, _SLUG and _PORT. Returns 1 for anything not wholly trustworthy, as the ledger's parser does.
+wt_serve_mirror_parse() {  # $1 = mirror file
+  local file=${1-} rec kind rest seen=0 have_wt=0 serve=''
+  WT_SERVE_MIRROR_PATH='' WT_SERVE_MIRROR_ADMIN='' WT_SERVE_MIRROR_NAME='' WT_SERVE_MIRROR_SLUG=''
+  WT_SERVE_MIRROR_PORT='' WT_SERVE_PID=''
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+  while IFS= read -r -d "$WT_RS" rec; do
+    kind=${rec%%"$WT_US"*}
+    rest=${rec#*"$WT_US"}
+    if [ "$kind" = wtstate ]; then
+      [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
+      seen=1
+      continue
+    fi
+    [ "$seen" = 1 ] || return 1
+    case $kind in
+      worktree)
+        # SC2034: _ADMIN is for the sweep, which matches a record to its live worktree by it.
+        # shellcheck disable=SC2034
+        IFS=$WT_US read -r WT_SERVE_MIRROR_PATH WT_SERVE_MIRROR_ADMIN WT_SERVE_MIRROR_NAME \
+          WT_SERVE_MIRROR_SLUG WT_SERVE_MIRROR_PORT <<<"$rest" || true
+        have_wt=1
+        ;;
+      serve) serve=$rest ;;
+    esac
+  done <"$file"
+  [ "$have_wt" = 1 ] && [ -n "$WT_SERVE_MIRROR_PATH" ] && [ -n "$serve" ] || return 1
+  wt_serve_record_parse "$serve"
+}
+
+# Remove mirror file $1. The second argument is ignored: it makes this a clear function for
+# wt_serve_stop_judged, called as `<clear> <key> ''` like wt_serve_record_write.
+wt_serve_mirror_forget() {  # $1 = mirror file
+  rm -f -- "${1:?}" 2>/dev/null && [ ! -e "$1" ]
+}
+
+# Stop the server mirror file $1 records, from directory $2 (where runtime.stop runs — the main
+# checkout, once the worktree is gone), with wt_serve_stop's codes; the mirror is forgotten whenever
+# the record would be cleared. The caller loads the profile and checks its approval for a `command`
+# record, as for wt_serve_stop.
+wt_serve_stop_mirrored() {  # $1 = mirror file, $2 = directory runtime.stop runs in
+  local rc
+  wt_serve_mirror_parse "$1" || return 1
+  wt_serve_judge
+  rc=$?
+  WT_SERVE_CTX_PORT=$WT_SERVE_MIRROR_PORT WT_SERVE_CTX_SLUG=$WT_SERVE_MIRROR_SLUG
+  WT_NAME=$WT_SERVE_MIRROR_NAME WT_PATH=$WT_SERVE_MIRROR_PATH WT_ROOT=$2
+  export WT_NAME WT_PATH WT_ROOT
+  wt_serve_stop_judged "$rc" "$2" wt_serve_mirror_forget "$1"
 }
 
 # Is the recorded server still the process this plugin started? Reads the record into WT_SERVE_*.
@@ -3090,6 +3236,11 @@ wt_serve_record_write() {  # $1 = worktree, $2 = pid ('' removes), $3 = pgid, $4
 #   4  it is recorded as stopped by command (stopby=command): there is no process to check
 wt_serve_check() {  # $1 = worktree
   wt_serve_record_read "$1" || return 1
+  wt_serve_judge
+}
+
+# wt_serve_check's answer, 0 or 2 to 4, for the record already loaded into WT_SERVE_*.
+wt_serve_judge() {
   [ "$WT_SERVE_STOPBY" != command ] || return 4
   wt_pid_alive "$WT_SERVE_PID" || return 2
   wt_serve_pid_ours || return 3
@@ -3155,25 +3306,38 @@ wt_serve_remains() {
 #   4  it would not stop (record kept)
 #   5  runtime.stop could not stop it — WT_SERVE_STOP_WHY says why (record kept)
 wt_serve_stop() {  # $1 = worktree
-  local wt=${1%/} grace=${PITLANE_SERVE_STOP_SECONDS:-10} i rc
-  wt_is_seconds "$grace" || grace=10
+  local wt=${1%/} rc
   wt_serve_check "$wt"
   rc=$?
+  if [ "$rc" -eq 4 ]; then
+    WT_SERVE_CTX_PORT=$(wt_runtime_state_get "$wt" port) || WT_SERVE_CTX_PORT=''
+    WT_SERVE_CTX_SLUG=$(wt_runtime_state_get "$wt" slug) || WT_SERVE_CTX_SLUG=${WT_SLUG-}
+  fi
+  wt_serve_stop_judged "$rc" "$wt" wt_serve_record_write "$wt"
+}
+
+# wt_serve_stop for a record already loaded into WT_SERVE_* and judged ($1, wt_serve_judge's code,
+# or 1 for none). runtime.stop runs in $2, expanded with WT_SERVE_CTX_PORT and _SLUG. The record is
+# cleared by running `$3 $4 ''` — wt_serve_record_write for a state record, wt_serve_mirror_forget
+# for a mirrored one. Same return codes as wt_serve_stop.
+wt_serve_stop_judged() {  # $1 = judged code, $2 = directory runtime.stop runs in, $3 = clear function, $4 = its first argument
+  local rc=$1 rundir=$2 clear=$3 key=$4 grace=${PITLANE_SERVE_STOP_SECONDS:-10} i
+  wt_is_seconds "$grace" || grace=10
   case $rc in
     0) ;;
     1) return 1 ;;
     2)
       if ! wt_serve_group_ours; then
-        wt_serve_record_write "$wt" ''
+        "$clear" "$key" ''
         return 2
       fi
       wt_log "the server's first process (pid $WT_SERVE_PID) has exited, but processes of its group are still running — stopping them"
       ;;
     4)
-      wt_serve_stop_by_command "$wt" "$grace"
+      wt_serve_stop_by_command "$rundir" "$grace" "$clear" "$key"
       return
       ;;
-    *) wt_serve_record_write "$wt" ''; return "$rc" ;;
+    *) "$clear" "$key" ''; return "$rc" ;;
   esac
   wt_serve_signal TERM
   i=0
@@ -3192,26 +3356,27 @@ wt_serve_stop() {  # $1 = worktree
     done
     wt_serve_remains && return 4
   fi
-  wt_serve_record_write "$wt" ''
+  "$clear" "$key" ''
   return 0
 }
 
-# Stop a server recorded as stopped by command: run runtime.stop, expanded, in the profile's shell,
-# bounded by PITLANE_SERVE_STOP_COMMAND_SECONDS (default 120), then wait up to $2 seconds for the
-# URL to stop answering. The caller loads the profile and checks its approval first: the command is
-# the profile's. Never refused for low memory — a stop frees memory. Returns 0 stopped (record
-# cleared) or 5 with WT_SERVE_STOP_WHY set (record kept, so a later stop can try again).
+# Stop a server recorded as stopped by command: run runtime.stop in $1, expanded with
+# WT_SERVE_CTX_PORT and _SLUG, in the profile's shell, bounded by PITLANE_SERVE_STOP_COMMAND_SECONDS
+# (default 120), then wait up to $2 seconds for the URL to stop answering. The caller loads the
+# profile and checks its approval first: the command is the profile's. Never refused for low memory
+# — a stop frees memory. Returns 0 stopped (record cleared by `$3 $4 ''`) or 5 with
+# WT_SERVE_STOP_WHY set (record kept, so a later stop can try again).
 # shellcheck disable=SC2034  # WT_SERVE_STOP_WHY is read by wt_serve_cli in bootstrap.sh.
-wt_serve_stop_by_command() {  # $1 = worktree, $2 = seconds to wait for the URL to go quiet
-  local wt=${1%/} grace=$2 secs=${PITLANE_SERVE_STOP_COMMAND_SECONDS:-120} cmd rc=0 i
+wt_serve_stop_by_command() {  # $1 = directory to run in, $2 = seconds to wait for the URL to go quiet, $3 = clear function, $4 = its first argument
+  local wt=${1%/} grace=$2 clear=$3 key=$4 secs=${PITLANE_SERVE_STOP_COMMAND_SECONDS:-120} cmd rc=0 i
   WT_SERVE_STOP_WHY=''
   wt_is_seconds "$secs" || secs=120
   if [ -z "${PROFILE_RT_STOP:-}" ]; then
     WT_SERVE_STOP_WHY='its serve command detached it, so only runtime.stop can stop it, and the profile names none'
     return 5
   fi
-  WT_PORT=$(wt_runtime_state_get "$wt" port) || WT_PORT=''
-  WT_SLUG=$(wt_runtime_state_get "$wt" slug) || WT_SLUG=${WT_SLUG-}
+  WT_PORT=${WT_SERVE_CTX_PORT-}
+  WT_SLUG=${WT_SERVE_CTX_SLUG:-${WT_SLUG-}}
   export WT_PORT WT_SLUG
   if ! cmd=$(wt_runtime_command "$PROFILE_RT_STOP"); then
     WT_SERVE_STOP_WHY="runtime.stop is refused: $cmd"
@@ -3234,7 +3399,7 @@ wt_serve_stop_by_command() {  # $1 = worktree, $2 = seconds to wait for the URL 
     WT_SERVE_STOP_WHY="runtime.stop ran, but $WT_SERVE_URL still answers ${grace}s later"
     return 5
   fi
-  wt_serve_record_write "$wt" ''
+  "$clear" "$key" ''
   return 0
 }
 

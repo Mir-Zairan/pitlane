@@ -1,6 +1,6 @@
 ---
 name: pitlane-tidy
-description: Find what this plugin's worktrees left behind — orphaned worktree directories, stale git registrations, runtime allocations (databases, containers) nothing uses any more, broken ledger entries — report it with the disk each item frees, and remove only the items the developer confirms. Use when disk is filling up with old worktrees, after worktrees were deleted by hand, or when a teardown did not finish.
+description: Find what this plugin's worktrees left behind — orphaned worktree directories, stale git registrations, runtime allocations (databases, containers) nothing uses any more, app servers /pitlane-serve started in worktrees since removed, broken ledger entries — report it with the disk each item frees, and remove only the items the developer confirms. Use when disk is filling up with old worktrees, after worktrees were deleted by hand, or when a teardown did not finish.
 argument-hint: "[--dry-run]"
 ---
 
@@ -23,7 +23,8 @@ You do not delete anything yourself, by any means. Specifically, you never run:
 - `git worktree remove`, `git worktree prune`, `git branch -D`, or any other git command that
   changes a repository;
 - `teardown.sh`, the profile's `runtime.teardown` script, or any seed/teardown script;
-- a database, `docker`, or container command.
+- a database, `docker`, or container command;
+- `kill`, `pkill`, the profile's `runtime.stop`, or anything else that stops a process.
 
 The only command that changes anything is `prune.sh --apply` with ids the developer selected. If it
 refuses an item, explain the reason and stop. Do not retry it, work around it, or offer to remove the
@@ -61,13 +62,15 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 |---|---|---|
 | `delete` | Remove the path. | Yes |
 | `teardown` | Run the repo's own teardown script with the recorded environment (it may drop a database or stop a container), then forget the ledger entry. | Yes — say what the script will release |
-| `forget` | Forget the ledger entry; nothing runs. The entry may be the only record of a database or containers that still exist — forgotten, nothing will ever tear them down. For a `runtime-leftover` whose reason says it is recorded only in a state file, it deletes that state file. | Yes — say both in the option's description |
+| `forget` | Forget the ledger entry; nothing runs. The entry may be the only record of a database or containers that still exist — forgotten, nothing will ever tear them down. For a `runtime-leftover` whose reason says it is recorded only in a state file, it deletes that state file. For a `server-leftover` it drops the record of a server that has already exited, or whose pid now belongs to another process — nothing is signalled. | Yes — say both in the option's description |
+| `stop` | Stop the app server `/pitlane-serve` started in a worktree that is gone: its process group, proved by the start identity it was recorded with, or the main checkout's approved `runtime.stop` for one that detached. Nothing else is stopped — never by port. | Yes — name the pid and URL from the reason |
 | `refuse` | Not safe now; the reason says why. | No |
 | `none` | Kept on purpose, listed so the developer sees why (a live worktree holding work). | No |
 
 Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `stale-admin` (git's
 registration of a worktree that is gone), `runtime-leftover` (a runtime allocation nothing uses),
-`ledger-junk` (a broken or abandoned ledger entry), `abandoned` (a subagent worktree — `agent-<hex>` — that is
+`server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
+as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry), `abandoned` (a subagent worktree — `agent-<hex>` — that is
 unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
 `WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live
 worktree with work in it).
@@ -98,7 +101,7 @@ here.** Do not ask the question in step 4.
 
 ## 4 — Ask which items to remove
 
-Ask with `AskUserQuestion`. Offer only items whose action is `delete`, `teardown` or `forget`.
+Ask with `AskUserQuestion`. Offer only items whose action is `delete`, `teardown`, `forget` or `stop`.
 
 `AskUserQuestion` takes 2–4 options per question; a question with one option is invalid. Label an
 item's option with the kind and the last path component; put the bytes and, for `teardown`, what
@@ -162,5 +165,11 @@ may offer to re-run the report once. That starts again at step 1, with a fresh q
 - **`abandoned` is not offered for a subagent worktree you expected.** It must be unlocked, hold no
   work, and have had nothing change in it for an hour. A running subagent keeps writing, so a recent
   one is left until it has been quiet that long.
+- **A `server-leftover` refuses.** One that detached from its serve command can only be stopped by
+  the main checkout's `runtime.stop`: it refuses while that profile is not approved (approve it with
+  `/pitlane-finish` in the main checkout), names no `runtime.stop`, or while a live worktree at the
+  same path could be the one answering. Say so; do not stop it yourself.
+- **The main checkout's own server, or one started by hand, is never listed.** Only servers
+  `/pitlane-serve` recorded are, so nothing else can be stopped from here.
 - **An item names a database you made by hand.** It cannot: prune only ever releases allocations the
   plugin's own ledger records, so a hand-cloned database is invisible to it and stays yours to drop.

@@ -14,19 +14,22 @@
 # runs from the main checkout.
 #
 # WHAT IS NEVER DONE, whatever the state says:
-#   * no process is killed. The state records a port, not a PID, so "the process on that port is
-#     still ours" cannot be proven — and a developer's machine reuses ports. The repo's
-#     runtime.teardown script is the only thing that may stop what its seed started.
+#   * no process is killed but the one server /pitlane-serve recorded starting here (ADR-021):
+#     its process group, signalled only while the recorded start identity still matches, or
+#     runtime.stop for one that daemonized, run only if approved. Never a process found by its port
+#     or its working directory — a developer's machine reuses ports, and the main checkout's own
+#     server shares the repository. The repo's runtime.teardown script is the only thing that may
+#     stop what its seed started.
 #   * the branch is never deleted. It is the user's, and a clean worktree can still be reopened.
 #   * shared state is never touched: the main checkout a dependency was hardlinked from, package
 #     caches, the dependency locks in <common>/worktree-locks/, other worktrees' ledger entries.
 #   * no `git worktree remove -f -f`. A locked worktree is someone saying "not this one", and the
 #     guard already counts it as work.
 #
-# THE EXIT STATUS SAYS WHETHER THE DIRECTORY IS GONE. A worktree this hook KEEPS — it
-# holds work, a bootstrap or a release is still running, the directory could not be deleted — exits
-# 1. Measured on Claude Code 2.1.286: with exit 0 and the directory still there, Claude Code told
-# the session "Exited and removed worktree", and the model reported the user's uncommitted file as
+# THE EXIT STATUS SAYS WHETHER THE DIRECTORY IS GONE. A worktree this hook KEEPS — it holds work,
+# a bootstrap, a /pitlane-serve or a release is still running, the directory could not be deleted —
+# exits 1. Measured on Claude Code 2.1.286: with exit 0 and the directory still there, Claude Code
+# told the session "Exited and removed worktree", and the model reported the user's uncommitted file as
 # deleted; with exit 1 it says "could not remove it — kept at <path>", and reopening that name
 # later works (it reopens the kept worktree). stderr reaches nobody, so the status is the only
 # honest channel. Everything else follows the fail-open rule: an internal failure warns on stderr and exits 0.
@@ -88,7 +91,12 @@ if [ "$present" = 1 ]; then
     wt_report_kept "$worktree" "$reasons"
     wt_exit_kept
   fi
-  # Held until exit.
+  # Both held until exit, in the order /pitlane-serve takes them. The serve lock first, so no server
+  # can be started here, unrecorded, while the worktree goes.
+  if ! wt_acquire_serve_lock "$worktree" 7; then
+    wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
+    wt_exit_kept
+  fi
   if ! wt_acquire_teardown_lock "$worktree" 8; then
     wt_report_kept "$worktree" "$WT_TD_KEEP_REASON"
     wt_exit_kept
@@ -123,10 +131,18 @@ else
   wt_load_profile "$root"
 fi
 
-# --- 3. runtime.teardown ---------------------------------------------------------------------
+# --- 3. the app /pitlane-serve started -------------------------------------------------------
+# Before anything is removed: the record of it lives in the admin dir that removal deletes. A server
+# that will not stop holds no work, so teardown carries on and its mirror is left for /pitlane-tidy.
+# fd 8 already holds the bootstrap lock the serve record is written under.
+# shellcheck disable=SC2034  # read by wt_serve_record_write, in bootstrap-lib.sh
+[ "$present" = 1 ] && WT_STATE_LOCK_HELD=1
+wt_stop_served_app "$worktree" "$root" "$present"
+
+# --- 4. runtime.teardown ---------------------------------------------------------------------
 wt_run_teardown_script "$rundir" "$worktree" "$root" "$deadline"
 
-# --- 4. the directory ------------------------------------------------------------------------
+# --- 5. the directory ------------------------------------------------------------------------
 if [ "$present" = 1 ]; then
   # The script ran IN the worktree and may have left something there — a dump, a log, a commit.
   if reasons=$(wt_worktree_holds_work "$worktree"); then
@@ -182,6 +198,6 @@ fi
 # A directory already gone keeps any admin dir git left behind: its checkout cannot be read, so the
 # guard cannot vouch for it, and `git worktree prune` or /pitlane-tidy owns that decision.
 
-# --- 5. the ledger ---------------------------------------------------------------------------
+# --- 6. the ledger ---------------------------------------------------------------------------
 wt_settle_ledger_entry "$root" "$entry" 1
 exit 0

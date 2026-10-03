@@ -30,7 +30,13 @@ TMP=$SCRATCH
 listener_pid=''
 # A test that makes a directory undeletable restores it itself; the chmod here is for one that
 # was interrupted before it could.
-trap '[ -n "$listener_pid" ] && kill "$listener_pid" 2>/dev/null; chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+# Every server a test starts is killed on the way out, by its group, whatever happened.
+SERVED=''
+kill_served() {
+  local g
+  for g in $SERVED; do kill -s KILL -- "-$g" "$g" 2>/dev/null; done
+}
+trap '[ -n "$listener_pid" ] && kill "$listener_pid" 2>/dev/null; kill_served; chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
@@ -47,6 +53,9 @@ unset XDG_CONFIG_HOME
 HOME=$SCRATCH/home
 mkdir -p "$HOME"
 export HOME
+
+# How many entries directory $1 holds; 0 when it does not exist.
+count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
 
 pass=0 fail=0 backends_run=0
 BACKEND=none
@@ -164,6 +173,36 @@ remove() {  # $1 = payload JSON (or any bytes), $2 = cwd to run from
 
 remove_payload() {  # $1 = worktree path, $2 = cwd
   printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s","reason":"session_exit","cwd":"%s"}' "$1" "$2"
+}
+
+# /pitlane-serve, run from worktree $1 with $2 (--serve or --serve-stop): its one line on stdout.
+serve() {  # $1 = worktree, $2 = mode
+  ( cd "$1" && bash "$CREATE_HOOK" "$2" 2>>"$TMP/serve-err" )
+}
+
+# Field $2 of worktree $1's `serve` record (1 pid, 5 url, 7 stopby), or nothing.
+served_field() {  # $1 = worktree, $2 = field number
+  python3 -c 'import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve" and len(f) > int(sys.argv[2]):
+        print(f[int(sys.argv[2])])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$2"
+}
+served_pid() { served_field "$1" 1; }
+
+alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
+
+# Every live process whose working directory is under $1, one `pid cwd` per line.
+running_under() {  # $1 = directory
+  local p cwd
+  for p in /proc/[0-9]*; do
+    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
+  done
 }
 
 # Every file under the main checkout and its git dir, less what a create/remove cycle keeps ON
@@ -675,6 +714,150 @@ log=$(cat "$LOGS/alice_fix_99.log" 2>/dev/null)
 eq 'nested name: exits 0' 0 "$(cat "$TMP/rc")"
 eq 'nested name: the teardown script dropped the database' no "$(exists "$DB/alice_fix_99")"
 contains 'nested name: teardown gets the WT_NAME the seed saw' "WT_NAME=$seed_name"$'\n' "$log"
+
+# ---------------------------------------------------------------------------
+# The app /pitlane-serve started is stopped, and nothing else (ADR-021)
+# ---------------------------------------------------------------------------
+
+if command -v setsid >/dev/null 2>&1 && [ -d /proc/self ]; then
+SVR=$TMP/repo-serves
+make_repo "$SVR"
+# serve stays in the foreground (stopped by signal); serve_daemon detaches and exits 0, so it is
+# stopped by runtime.stop, which records what it was run with outside the worktree.
+python3 - "$SVR/.claude/worktree-profile.json" "$TMP" <<'PY'
+import json, sys
+p, tmp = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["runtime"]["serve"] = "exec python3 -m http.server {port} --bind 127.0.0.1"
+d["runtime"]["url"] = "http://127.0.0.1:{port}/"
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SVR" commit -qam serve
+MIRRORS=$SVR/.git/worktree-servers
+
+# The main checkout's own server, started by hand: no recorded server of any worktree is it, so
+# every teardown below must leave it running.
+main_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+# Started straight from this shell: a $(...) subshell inherits the EXIT trap, so bash would not exec
+# the server, and the subshell would hold the substitution's pipe open for as long as it runs.
+( cd "$SVR" && exec setsid python3 -m http.server "$main_port" --bind 127.0.0.1 ) </dev/null >/dev/null 2>&1 &
+main_srv=$!
+SERVED="$SERVED $main_srv"
+
+# Foreground: stopped by its recorded group, before the worktree and its state go.
+WS=$(create "$SVR" served)
+out=$(serve "$WS" --serve)
+spid=$(served_pid "$WS")
+SERVED="$SERVED $spid"
+contains 'serve fixture: /pitlane-serve started the app' 'Pitlane: serving at' "$out"
+eq 'serve fixture: it is mirrored outside the admin dir' 1 "$(count_in "$MIRRORS")"
+out=$(remove "$(remove_payload "$WS" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'served: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'served: nothing on stdout' '' "$out"
+eq 'served: the worktree is removed' no "$(exists "$WS")"
+eq 'served: its server is stopped' no "$(alive "$spid")"
+eq '...and every process of its group' 0 "$(pgrep -g "$spid" 2>/dev/null | wc -l | tr -d ' ')"
+contains '...and stderr says so' "stopped the app /pitlane-serve started at" "$err"
+eq '...its mirror is forgotten' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
+eq 'served: the main checkout'"'"'s own server is still running' yes "$(alive "$main_srv")"
+
+# A recorded PID that now belongs to another process (simulated: an unrelated process with a start
+# identity that cannot match) is never signalled; the record is dropped and teardown completes.
+WR=$(create "$SVR" recycled)
+setsid sleep 300 </dev/null >/dev/null 2>&1 &
+other=$!
+SERVED="$SERVED $other"
+# shellcheck disable=SC1091  # the engine itself, sourced to write a record as /pitlane-serve does
+( . "$SCRIPTS/bootstrap-lib.sh"
+  wt_serve_record_write "$WR" "$other" "$other" 'stat:1' 'ck' 'http://127.0.0.1:1/' )
+eq 'recycled fixture: the record is mirrored' 1 "$(count_in "$MIRRORS")"
+out=$(remove "$(remove_payload "$WR" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'recycled: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'recycled: the worktree is removed' no "$(exists "$WR")"
+eq 'recycled: the process holding the PID is NOT signalled' yes "$(alive "$other")"
+contains '...stderr says it is not ours' 'now belongs to another process — not ours, left alone' "$err"
+eq '...and the record is dropped with its mirror' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
+kill "$other" 2>/dev/null
+
+# Daemonized: stopped by runtime.stop — only when approved, and a stop that fails does not stop the
+# teardown. The server's pid file and runtime.stop's log live outside the worktree. Each worktree
+# commits its own profile, kept on a second branch so the commit is not work the guard keeps.
+daemon_worktree() {  # $1 = name, $2 = runtime.stop; sets WC, then serves it and sets dpid
+  WC=$(create "$SVR" "$1")
+  python3 -c 'import json, sys
+p, tmp, stop = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p))
+d["runtime"]["serve"] = "setsid python3 -m http.server {port} --bind 127.0.0.1 </dev/null >/dev/null 2>&1 & echo $! > %s/daemon.pid" % tmp
+d["runtime"]["stop"] = stop
+json.dump(d, open(p, "w"), indent=2)' "$WC/.claude/worktree-profile.json" "$TMP" "$2"
+  git -C "$WC" commit -qam "$1"
+  git -C "$WC" branch "kept-$1"
+  rm -f "$TMP/daemon.pid"
+  serve "$WC" --serve >/dev/null
+  dpid=$(cat "$TMP/daemon.pid" 2>/dev/null)
+  SERVED="$SERVED $dpid"
+}
+STOP_CMD="echo stop {port} >> $TMP/stop.log; kill \$(cat $TMP/daemon.pid)"
+
+daemon_worktree daemon-held "$STOP_CMD"
+eq 'daemon fixture: recorded as stopped by runtime.stop' command "$(served_field "$WC" 7)"
+eq 'daemon fixture: the app answers' yes "$(alive "$dpid")"
+out=$(PITLANE_TRUST_PROFILES='' remove "$(remove_payload "$WC" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'unapproved stop: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'unapproved stop: the worktree is still removed' no "$(exists "$WC")"
+eq 'unapproved stop: runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...the server is left running' yes "$(alive "$dpid")"
+contains '...and stderr says why' 'runtime.stop is not approved' "$err"
+eq '...its mirror is kept for /pitlane-tidy' 1 "$(count_in "$MIRRORS")"
+kill "$dpid" 2>/dev/null
+rm -f "$MIRRORS"/*
+
+daemon_worktree daemon-stopped "$STOP_CMD"
+port_c=$(served_field "$WC" 5)
+port_c=${port_c##*:}
+out=$(remove "$(remove_payload "$WC" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'approved stop: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'approved stop: the worktree is removed' no "$(exists "$WC")"
+eq 'approved stop: runtime.stop ran, expanded' "stop ${port_c%/}" "$(cat "$TMP/stop.log" 2>/dev/null)"
+eq '...and the server is stopped' no "$(alive "$dpid")"
+eq '...its mirror is forgotten' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
+rm -f "$TMP/stop.log"
+
+# runtime.stop fails: a server holds no work, so the teardown completes and the mirror is kept.
+daemon_worktree daemon-unstoppable 'exit 3'
+out=$(remove "$(remove_payload "$WC" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'failed stop: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'failed stop: the worktree is still removed' no "$(exists "$WC")"
+contains '...stderr says the stop failed and teardown carried on' 'runtime.stop failed (exit 3); carrying on with the teardown' "$err"
+eq '...its mirror is kept for /pitlane-tidy' 1 "$(count_in "$MIRRORS")"
+kill "$dpid" 2>/dev/null
+rm -f "$MIRRORS"/*
+
+# Removed natively first (directory and admin dir gone, as Claude Code does): the hook that
+# fires after finds the server through its mirror.
+WN=$(create "$SVR" native)
+serve "$WN" --serve >/dev/null
+npid=$(served_pid "$WN")
+SERVED="$SERVED $npid"
+git -C "$SVR" worktree remove --force "$WN"
+out=$(remove "$(remove_payload "$WN" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'already gone: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'already gone: the server its mirror records is stopped' no "$(alive "$npid")"
+eq '...and the mirror forgotten' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
+
+eq 'serves: the main checkout'"'"'s own server survived every teardown' yes "$(alive "$main_srv")"
+kill "$main_srv" 2>/dev/null
+sleep 0.2
+eq 'serves: nothing started here is left running' '' "$(running_under "$TMP")"
+else
+  printf 'SKIP serve teardown: needs setsid and /proc\n' >&2
+fi
 
 # ---------------------------------------------------------------------------
 # The rm -rf fallback deletes only what was checked, and says when it could not

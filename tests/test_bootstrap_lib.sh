@@ -22,6 +22,9 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1091
 . "$BLIB"
 
+# How many entries directory $1 holds; 0 when it does not exist.
+count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
+
 pass=0 fail=0
 US_=$WT_US
 RS_=$WT_RS
@@ -4147,6 +4150,92 @@ time.sleep(5)' "$TMP/zombie.pid" &
   eq '...{port} from the rt record' yes "$([ -e "$SVW/stopped-4321" ] && echo yes || echo no)"
   wt_serve_record_read "$SVW"
   eq '...and clears the record' 1 $?
+
+  # The serve MIRROR: in a linked worktree every record write is copied to
+  # <common>/worktree-servers/<admin id>.<pid>.<when>, which outlives the worktree's admin dir.
+  MR=$TMP/mirror-repo
+  git init -q "$MR"
+  git -C "$MR" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+  MW=$MR/.claude/worktrees/mw
+  git -C "$MR" worktree add -q "$MW" -b worktree-mw 2>/dev/null
+  MW=$(cd -P "$MW" && pwd -P)
+  MDIR=$(cd -P "$MR/.git" && pwd -P)/worktree-servers
+  wt_runtime_state_set "$MW" mw-slug 4555 derived .env ours none '' 2>/dev/null
+  gp=$(sv_group "$TMP/m1.pid" 'sleep 300 & exec sleep 300')
+  gid=$(wt_proc_identity "$gp")
+  WT_NAME='' wt_serve_record_write "$MW" "$gp" "$gp" "$gid" 'ck 1' 'http://localhost:4555/'
+  wt_serve_record_read "$MW"
+  mfile=$MDIR/mw.$gp.$WT_SERVE_WHEN
+  eq 'mirror: a record written in a linked worktree is mirrored as <admin id>.<pid>.<when>' "$mfile" \
+    "$(ls -d "$MDIR"/* 2>/dev/null)"
+  wt_serve_mirror_parse "$mfile"
+  eq 'mirror: it carries the worktree, admin id, name, slug and port beside the record' \
+    "$MW|mw|mw|mw-slug|4555|$gp|$gp|$gid|http://localhost:4555/|signal" \
+    "$WT_SERVE_MIRROR_PATH|$WT_SERVE_MIRROR_ADMIN|$WT_SERVE_MIRROR_NAME|$WT_SERVE_MIRROR_SLUG|$WT_SERVE_MIRROR_PORT|$WT_SERVE_PID|$WT_SERVE_PGID|$WT_SERVE_IDENTITY|$WT_SERVE_URL|$WT_SERVE_STOPBY"
+  wt_serve_record_write "$MW" 99999999 '' '' 'ck 2' 'http://127.0.0.1:1/' command
+  wt_serve_record_read "$MW"
+  eq 'mirror: a rewritten record replaces its mirror' "$MDIR/mw.99999999.$WT_SERVE_WHEN" "$(ls -d "$MDIR"/* 2>/dev/null)"
+  wt_serve_record_write "$MW" ''
+  eq 'mirror: a removed record removes its mirror' '' "$(ls -A "$MDIR")"
+
+  # Teardown holds the bootstrap lock on fd 8 while it stops the server: the record write under it
+  # must not reopen fd 8, which would drop that lock.
+  MLOCK=$(wt_state_path "$MW").lock
+  wt_lock_acquire "$MLOCK" 1 8
+  WT_STATE_LOCK_HELD=1 wt_serve_record_write "$MW" ''
+  eq 'record: a write by a caller holding the lock leaves the lock held' held \
+    "$(flock -n "$MLOCK" true 2>/dev/null && echo free || echo held)"
+  wt_lock_release 8
+
+  # Removed as Claude Code removes a native worktree, directory and admin dir at once: the mirror is
+  # the record left. A re-entered worktree of the same name gets the same admin id, and its own
+  # server's records never touch the earlier one's.
+  wt_serve_record_write "$MW" "$gp" "$gp" "$gid" 'ck 1' 'http://localhost:4555/'
+  wt_serve_record_read "$MW"
+  mfile=$MDIR/mw.$gp.$WT_SERVE_WHEN
+  git -C "$MR" worktree remove --force "$MW"
+  eq 'mirror: it outlives the worktree and its admin dir' yes "$([ -f "$mfile" ] && echo yes || echo no)"
+  git -C "$MR" worktree add -q "$MW" -b worktree-mw-again 2>/dev/null
+  gp2=$(sv_group "$TMP/m2.pid" 'exec sleep 300')
+  wt_serve_record_write "$MW" "$gp2" "$gp2" "$(wt_proc_identity "$gp2")" 'ck 1' 'http://localhost:4555/'
+  eq 'mirror: a re-entered worktree mirrors its own server beside the earlier one' 2 "$(count_in "$MDIR")"
+  wt_serve_record_write "$MW" ''
+  eq '...and clearing its record removes only its own mirror' "$mfile" "$(ls -d "$MDIR"/* 2>/dev/null)"
+  kill -s KILL -- "-$gp2" 2>/dev/null
+
+  # Stopping from a mirror, as /pitlane-tidy and a teardown of a worktree already gone do.
+  mirror_file() {  # $1 = file, $2 = pid, $3 = identity, $4 = stopby, $5 = url
+    printf '%s' "wtstate$US$WT_STATE_VERSION${RS}worktree$US$MW${US}mw${US}mw${US}mw-slug${US}4555${RS}serve$US$2$US$2$US$3${US}ck$US$5${US}1$US$4$RS" >"$1"
+  }
+  mirror_file "$MDIR/mw.recycled" "$gp" 'stat:1' signal 'http://localhost:4555/'
+  wt_serve_stop_mirrored "$MDIR/mw.recycled" "$MR"
+  eq 'stop from mirror: a PID with another start identity is 3' 3 $?
+  eq '...and NOT signalled' yes "$(wt_pid_alive "$gp" && echo yes || echo no)"
+  eq '...nor its group' 2 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  eq '...and the mirror is forgotten' no "$([ -e "$MDIR/mw.recycled" ] && echo yes || echo no)"
+  printf 'wtstate%s99%s' "$US" "$RS" >"$MDIR/mw.foreign"
+  cat "$mfile" >>"$MDIR/mw.foreign"
+  wt_serve_stop_mirrored "$MDIR/mw.foreign" "$MR"
+  eq 'stop from mirror: a mirror of another version is not read' 1 $?
+  eq '...the process it names is not signalled' yes "$(wt_pid_alive "$gp" && echo yes || echo no)"
+  eq '...and the file is kept' yes "$([ -e "$MDIR/mw.foreign" ] && echo yes || echo no)"
+  rm -f "$MDIR/mw.foreign"
+  PITLANE_SERVE_STOP_SECONDS=5 wt_serve_stop_mirrored "$mfile" "$MR"
+  eq 'stop from mirror: its own server is stopped' 0 $?
+  sleep 0.2
+  eq '...every process of its group' 0 "$(pgrep -g "$gp" 2>/dev/null | wc -l | tr -d ' ')"
+  eq '...and the mirror is forgotten' '' "$(ls -A "$MDIR")"
+  mirror_file "$MDIR/mw.cmd" 4242 '' command 'http://127.0.0.1:1/'
+  WT_APPROVAL=no PROFILE_SHELL='' PROFILE_SHELLARGS='' PROFILE_RT_STOP='touch stopped-{port}-{slug}' WT_GUARD=off \
+    wt_serve_stop_mirrored "$MDIR/mw.cmd" "$MR" 2>/dev/null
+  eq 'stop from mirror: by command, unapproved, is not run' 5 $?
+  eq '...nothing ran' no "$([ -e "$MR/stopped-4555-mw-slug" ] && echo yes || echo no)"
+  eq '...and the mirror is kept' yes "$([ -e "$MDIR/mw.cmd" ] && echo yes || echo no)"
+  WT_APPROVAL=yes PROFILE_SHELL='' PROFILE_SHELLARGS='' PROFILE_RT_STOP='touch stopped-{port}-{slug}' WT_GUARD=off \
+    wt_serve_stop_mirrored "$MDIR/mw.cmd" "$MR" 2>/dev/null
+  eq 'stop from mirror: by command runs runtime.stop in the given directory' 0 $?
+  eq '...expanded with the port and slug the mirror recorded' yes "$([ -e "$MR/stopped-4555-mw-slug" ] && echo yes || echo no)"
+  eq '...and forgets the mirror' no "$([ -e "$MDIR/mw.cmd" ] && echo yes || echo no)"
 
   # The /dev/tcp fallback: a bracketed IPv6 host is unbracketed; one never closed is refused aloud.
   if python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.bind(("::1", 0))' 2>/dev/null; then

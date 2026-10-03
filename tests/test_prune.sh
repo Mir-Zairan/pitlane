@@ -26,7 +26,13 @@ PRUNE=$SCRIPTS/prune.sh
 SCRATCH=$(mktemp -d)
 SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
 TMP=$SCRATCH
-trap 'chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+# Every server a test starts is killed on the way out, by its group, whatever happened.
+SERVED=''
+kill_served() {
+  local g
+  for g in $SERVED; do kill -s KILL -- "-$g" "$g" 2>/dev/null; done
+}
+trap 'kill_served; chmod -R u+w "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 
 GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null
@@ -39,6 +45,9 @@ unset XDG_CONFIG_HOME
 HOME=$SCRATCH/home
 mkdir -p "$HOME"
 export HOME
+
+# How many entries directory $1 holds; 0 when it does not exist.
+count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
 
 pass=0 fail=0 backends_run=0
 BACKEND=none
@@ -139,6 +148,36 @@ prune() {  # $1 = directory to run from, $@ = arguments
 # A field of the report line for the item of kind $1 at path $2: 1 id, 4 bytes, 5 action, 6 reason.
 field() {  # $1 = kind, $2 = path, $3 = field number
   awk -F'\t' -v k="$1" -v p="$2" -v n="$3" '$2 == k && $3 == p { print $n; exit }' "$TMP/out"
+}
+
+# /pitlane-serve, run from worktree $1 with $2 (--serve or --serve-stop): its one line on stdout.
+serve() {  # $1 = worktree, $2 = mode
+  ( cd "$1" && bash "$CREATE_HOOK" "$2" 2>>"$TMP/serve-err" )
+}
+
+# Field $2 of worktree $1's `serve` record (1 pid, 5 url, 7 stopby), or nothing.
+served_field() {  # $1 = worktree, $2 = field number
+  python3 -c 'import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve" and len(f) > int(sys.argv[2]):
+        print(f[int(sys.argv[2])])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$2"
+}
+served_pid() { served_field "$1" 1; }
+
+alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
+
+# Every live process whose working directory is under $1, one `pid cwd` per line.
+running_under() {  # $1 = directory
+  local p cwd
+  for p in /proc/[0-9]*; do
+    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
+  done
 }
 
 # Every path under the given roots with each file's checksum: what "changed nothing" is compared by.
@@ -663,6 +702,131 @@ eq 'adoption: a dirty one is listed as held, with nothing to apply' 'none' \
   "$(field held "$RA/.claude/worktrees/handdirty" 5)"
 eq 'adoption: no runtime allocation is invented for them' 0 \
   "$(grep -c "$(printf '\t')runtime-leftover$(printf '\t')" "$TMP/out" | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+# Servers /pitlane-serve started in worktrees removed without their teardown (ADR-015)
+# ---------------------------------------------------------------------------
+
+if command -v setsid >/dev/null 2>&1 && [ -d /proc/self ]; then
+RV=$TMP/repo-serves
+make_repo "$RV"
+python3 -c 'import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["runtime"]["serve"] = "exec python3 -m http.server {port} --bind 127.0.0.1"
+d["runtime"]["url"] = "http://127.0.0.1:{port}/"
+json.dump(d, open(p, "w"), indent=2)' "$RV/.claude/worktree-profile.json"
+git -C "$RV" commit -qam serve
+RVM=$RV/.git/worktree-servers
+
+# The main checkout's own server, started by hand: nothing records it, so nothing may touch it.
+main_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+( cd "$RV" && exec setsid python3 -m http.server "$main_port" --bind 127.0.0.1 ) </dev/null >/dev/null 2>&1 &
+main_srv=$!
+SERVED="$SERVED $main_srv"
+
+# A live worktree serving: its server is /pitlane-serve's to stop, never an item.
+VL=$(create "$RV" servelive)
+serve "$VL" --serve >/dev/null
+lpid=$(served_pid "$VL")
+SERVED="$SERVED $lpid"
+# Removed natively while serving: directory, admin dir and state file gone; the mirror is left.
+VG=$(create "$RV" servegone)
+serve "$VG" --serve >/dev/null
+gpid=$(served_pid "$VG")
+SERVED="$SERVED $gpid"
+git -C "$RV" worktree remove --force "$VG"
+# Removed natively, its recorded PID since given to an unrelated process (simulated by a start
+# identity that cannot match): never signalled, only forgotten.
+VR=$(create "$RV" serverecycled)
+setsid sleep 300 </dev/null >/dev/null 2>&1 &
+other=$!
+SERVED="$SERVED $other"
+# shellcheck disable=SC1091  # the engine itself, sourced to write a record as /pitlane-serve does
+( . "$SCRIPTS/bootstrap-lib.sh"
+  wt_serve_record_write "$VR" "$other" "$other" 'stat:1' 'ck' 'http://127.0.0.1:1/' )
+git -C "$RV" worktree remove --force "$VR"
+eq 'serve fixture: the live, gone and recycled servers are each mirrored' 3 "$(count_in "$RVM")"
+eq 'serve fixture: the servers are running' 'yes yes yes yes' \
+  "$(alive "$main_srv") $(alive "$lpid") $(alive "$gpid") $(alive "$other")"
+
+before=$(snapshot "$RV")
+prune "$RV"
+eq 'serve report: exits 0' 0 "$(cat "$TMP/rc")"
+eq 'serve report: the gone worktree'"'"'s server is offered to stop' stop "$(field server-leftover "$VG" 5)"
+contains '...naming its pid' "pid $gpid" "$(field server-leftover "$VG" 6)"
+eq '...with no size' - "$(field server-leftover "$VG" 4)"
+eq 'serve report: the recycled PID is offered only to forget' forget "$(field server-leftover "$VR" 5)"
+contains '...saying it belongs to another process' 'belongs to another process' "$(field server-leftover "$VR" 6)"
+eq 'serve report: the live worktree'"'"'s server is not an item' '' "$(grep -F "$VL" "$TMP/out")"
+eq 'serve report: nor is the main checkout'"'"'s' '' "$(grep -F "$main_port" "$TMP/out")"
+eq 'serve report: changes nothing on disk' "$before" "$(snapshot "$RV")"
+eq 'serve report: and stops nothing' 'yes yes yes yes' \
+  "$(alive "$main_srv") $(alive "$lpid") $(alive "$gpid") $(alive "$other")"
+contains 'serve report: the stop is in the apply command' "$(field server-leftover "$VG" 1)" "$(grep '^# to apply' "$TMP/out")"
+
+# Only what is confirmed: applying the recycled item first leaves the other server running.
+id_g=$(field server-leftover "$VG" 1)
+id_r=$(field server-leftover "$VR" 1)
+prune "$RV" --apply "$id_r"
+eq 'serve apply: forgetting the recycled record exits 0' 0 "$(cat "$TMP/rc")"
+contains '...and says nothing was signalled' 'nothing was signalled or run' "$(grep "^applied" "$TMP/out")"
+eq '...the process holding the PID is NOT signalled' yes "$(alive "$other")"
+eq '...and the unconfirmed server still runs' yes "$(alive "$gpid")"
+eq '...one mirror fewer' 2 "$(count_in "$RVM")"
+prune "$RV" --apply "$id_g"
+eq 'serve apply: stopping the confirmed server exits 0' 0 "$(cat "$TMP/rc")"
+contains '...and says what it stopped' "stopped (pid $gpid" "$(grep "^applied" "$TMP/out")"
+eq '...it is stopped' no "$(alive "$gpid")"
+eq '...with every process of its group' 0 "$(pgrep -g "$gpid" 2>/dev/null | wc -l | tr -d ' ')"
+eq '...its mirror is forgotten, the live one kept' 1 "$(count_in "$RVM")"
+eq 'serve apply: the live worktree'"'"'s server still runs' yes "$(alive "$lpid")"
+eq 'serve apply: and the main checkout'"'"'s' yes "$(alive "$main_srv")"
+prune "$RV" --apply "$id_g"
+eq 'serve apply: the same id again is refused' 1 "$(cat "$TMP/rc")"
+kill "$other" 2>/dev/null
+
+# Daemonized (stopped by command): only the main checkout's APPROVED runtime.stop may stop it.
+# shellcheck disable=SC2016  # the $(...) belongs to runtime.stop, kept literal.
+python3 -c 'import json, sys
+p, tmp = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["runtime"]["stop"] = "echo stop {port} {slug} >> %s/stop.log; kill $(cat %s/daemon.pid)" % (tmp, tmp)
+json.dump(d, open(p, "w"), indent=2)' "$RV/.claude/worktree-profile.json" "$TMP"
+git -C "$RV" commit -qam stop
+dport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+( cd "$TMP" && exec setsid python3 -m http.server "$dport" --bind 127.0.0.1 ) </dev/null >/dev/null 2>&1 &
+dpid=$!
+SERVED="$SERVED $dpid"
+printf '%s\n' "$dpid" >"$TMP/daemon.pid"
+for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$dport") 2>/dev/null && break; sleep 0.1; done
+US=$'\x1f' RSEP=$'\x1e'
+printf '%s' "wtstate${US}1${RSEP}worktree$US$RV/.claude/worktrees/servedaemon${US}servedaemon${US}servedaemon${US}servedaemon${US}$dport${RSEP}serve${US}4242${US}${US}${US}ck${US}http://127.0.0.1:$dport/${US}1${US}command$RSEP" \
+  >"$RVM/servedaemon.4242.1"
+VD=$RV/.claude/worktrees/servedaemon
+PITLANE_TRUST_PROFILES='' prune "$RV"
+eq 'serve report: a daemonized server under an unapproved profile is refused' refuse "$(field server-leftover "$VD" 5)"
+contains '...saying to approve it first' 'not approved' "$(field server-leftover "$VD" 6)"
+id_d=$(field server-leftover "$VD" 1)
+PITLANE_TRUST_PROFILES='' prune "$RV" --apply "$id_d"
+eq 'serve apply: unapproved, it is refused' 1 "$(cat "$TMP/rc")"
+eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...and the server still runs' yes "$(alive "$dpid")"
+prune "$RV"
+eq 'serve report: approved, it is offered to stop' stop "$(field server-leftover "$VD" 5)"
+prune "$RV" --apply "$id_d"
+eq 'serve apply: approved, runtime.stop stops it' 0 "$(cat "$TMP/rc")"
+eq '...expanded with the port and slug the mirror recorded' "stop $dport servedaemon" "$(cat "$TMP/stop.log" 2>/dev/null)"
+eq '...the server is stopped' no "$(alive "$dpid")"
+eq '...and the mirror forgotten, the live one kept' 1 "$(count_in "$RVM")"
+
+eq 'serves: the main checkout'"'"'s own server survived the sweep' yes "$(alive "$main_srv")"
+kill "$main_srv" "$lpid" 2>/dev/null
+sleep 0.2
+eq 'serves: nothing started here is left running' '' "$(running_under "$TMP")"
+else
+  printf 'SKIP serve sweep: needs setsid and /proc\n' >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Usage

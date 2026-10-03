@@ -272,6 +272,34 @@ serve_stop() {  # $1 = worktree, $2 = its port, $3 = log
   contains "$name: and its port no longer answers" 'NO ANSWER' "$(fetch "http://localhost:$port/")"
 }
 
+alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
+
+# Every live process whose working directory is under $1, one `pid cwd` per line.
+running_under() {  # $1 = directory
+  local p cwd
+  for p in /proc/[0-9]*; do
+    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
+  done
+}
+
+# A server in the main checkout, started by hand on a port of its own, the way a developer runs one
+# beside their worktrees. No worktree recorded it, so no teardown may stop it. The host's own
+# python3 file server, not the stack's app: the stack's runtime may write into the main checkout's
+# dependency tree (a venv's bytecode), which main_snapshot would rightly count as a change. Sets
+# MAIN_SRV and MAIN_PORT. Started from this shell, not a $(...): a subshell inherits the EXIT trap,
+# so bash would not exec the server, and it would hold the substitution's pipe open.
+start_main_server() {  # $1 = repo, $2 = log
+  local i
+  MAIN_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  ( cd "$1" && exec setsid python3 -m http.server "$MAIN_PORT" --bind 127.0.0.1 ) </dev/null >"$2" 2>&1 &
+  MAIN_SRV=$!
+  SERVED_GROUPS="$SERVED_GROUPS $MAIN_SRV"
+  for i in $(seq 1 120); do
+    case $(fetch "http://localhost:$MAIN_PORT/") in 'NO ANSWER'*) sleep 0.5 ;; *) break ;; esac
+  done
+}
+
 # One worktree through start-up and --finish, with every per-worktree assertion. Sets WT_PORT_SEEN.
 exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 logs=$3 w out port expect
@@ -352,7 +380,7 @@ run_noprofile() {  # $1 = repo, $2 = logs
 }
 
 run_stack() {  # $1 = stack, $2 = index (for its port base)
-  local stack=$1 r logs before t0 fail0 p_alpha p_beta
+  local stack=$1 r logs before t0 fail0 p_alpha p_beta b_pid=
   STACK=$stack
   t0=$SECONDS fail0=$fail
   STACK_DEPDIRS='' STACK_LINKDIRS='' STACK_OWNFILES='' STACK_PROBE='' STACK_EXPECT='' STACK_ENVFILE=''
@@ -398,13 +426,25 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
       # Both apps at once, each on its own port: the case a hardcoded start command cannot serve.
       contains "alpha's app still answers beside beta's" "${STACK_SERVE_EXPECT//\{port\}/$p_alpha}" \
         "$(fetch "http://localhost:$p_alpha$STACK_SERVE_PATH")"
+      start_main_server "$r" "$logs/main.serve"
+      contains "a server in the main checkout answers beside them" '.gitignore' "$(fetch "http://localhost:$MAIN_PORT/")"
       serve_stop "$r/.claude/worktrees/alpha" "$p_alpha" "$logs/alpha.serve"
-      serve_stop "$r/.claude/worktrees/beta" "$p_beta" "$logs/beta.serve"
+      # beta's app is left running: its teardown must stop it.
+      b_pid=$(served_pid "$r/.claude/worktrees/beta")
     fi
     eq 'the main checkout is unchanged while worktrees are live' "$before" "$(main_snapshot "$r")"
     remove_worktree "$r" alpha "$logs"
     remove_worktree "$r" beta "$logs"
     eq 'teardown released each seeded database' '' "$(ls -A "$STACK_DB")"
+    if [ -n "$STACK_SERVE" ]; then
+      eq "beta's teardown stopped the app /pitlane-serve started there" no "$(alive "$b_pid")"
+      contains "...its port no longer answers" 'NO ANSWER' "$(fetch "http://localhost:$p_beta/")"
+      eq "the main checkout's server is still running after both teardowns" yes "$(alive "$MAIN_SRV")"
+      contains '...and still answers' '.gitignore' "$(fetch "http://localhost:$MAIN_PORT/")"
+      kill -s TERM -- "-$MAIN_SRV" 2>/dev/null
+      for _ in $(seq 1 50); do [ "$(alive "$MAIN_SRV")" = no ] && break; sleep 0.1; done
+    fi
+    eq 'nothing started in this stack is left running' '' "$(running_under "$dir")"
   fi
   eq 'the main checkout is unchanged after teardown' "$before" "$(main_snapshot "$r")"
 
