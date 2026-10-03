@@ -1851,7 +1851,7 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
 wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
   # No initialisers built from $1/$3 here: with fewer arguments than expected that is a fatal
   # unbound-variable error under `set -u`, which is precisely the crash this layer must not cause.
-  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} src dest
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} src dest err
 
   src=$root/$dir
   dest=$worktree/$dir
@@ -1884,14 +1884,29 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
     return 2
   fi
 
+  # A nested dir (vendor/bundle) has a parent the worktree may not have yet, and `cp -al` does not
+  # make one. Re-checked here because this is a write: the caller refused unsafe shapes and
+  # symlinked ancestors, so the parent can only land inside the worktree.
+  if [ "${dir%/*}" != "$dir" ]; then
+    if ! wt_is_safe_relpath "$dir" || wt_has_symlinked_parent "$worktree" "$dir"; then
+      wt_log "  $dir: not a plain path inside the worktree — installing instead"
+      return 1
+    fi
+    if ! err=$(mkdir -p -- "${dest%/*}" 2>&1); then
+      wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — installing instead"
+      return 1
+    fi
+  fi
+
   # `cp -al` fails on a cross-filesystem copy and on filesystems without hardlinks. Both are
   # ordinary situations, not errors: fall back rather than dying. Any partial tree is
-  # removed first, or the install that follows would run on top of debris.
-  if cp -al "$src" "$dest" 2>/dev/null; then
+  # removed first, or the install that follows would run on top of debris. cp's own first line is
+  # what gets logged: guessing a cause blamed the filesystem for what was a missing directory.
+  if err=$(cp -al "$src" "$dest" 2>&1); then
     return 0
   fi
   rm -rf "$dest" 2>/dev/null
-  wt_log "  $dir: could not hardlink (a different filesystem, or one without hardlinks) — installing instead"
+  wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — installing instead"
   return 1
 }
 

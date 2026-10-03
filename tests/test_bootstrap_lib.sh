@@ -1782,6 +1782,31 @@ eq 'hardlink: the file really is the same inode, not a copy' \
   "$(stat -c '%i' "$DREPO/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DREPO/vendor/pkg/file.txt")" \
   "$(stat -c '%i' "$DWT/vendor/pkg/file.txt" 2>/dev/null || stat -f '%i' "$DWT/vendor/pkg/file.txt")"
 
+# A nested dependency dir: its parent does not exist in a fresh worktree, and must be made for it.
+mkdir -p "$DREPO/vendor/bundle/gems"
+printf 'GEM\n' > "$DREPO/vendor/bundle/gems/g.rb"
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor/bundle composer.lock hardlink 'printf INSTALLED > /dev/null' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'hardlink: a nested dir is linked though its parent did not exist' 'GEM' \
+  "$(cat "$DWT/vendor/bundle/gems/g.rb" 2>/dev/null)"
+lacks '...without falling back to an install' 'could not hardlink' "$out"
+eq '...the same inode' \
+  "$(stat -c '%i' "$DREPO/vendor/bundle/gems/g.rb" 2>/dev/null || stat -f '%i' "$DREPO/vendor/bundle/gems/g.rb")" \
+  "$(stat -c '%i' "$DWT/vendor/bundle/gems/g.rb" 2>/dev/null || stat -f '%i' "$DWT/vendor/bundle/gems/g.rb")"
+# A copy that fails says why, in cp's words, rather than guessing at the filesystem.
+if [ "$(id -u)" != 0 ]; then
+  rm -rf "$DWT/vendor"; mkdir -p "$DWT/vendor"; chmod a-w "$DWT/vendor"
+  out=$(wt_hardlink_dep "$DREPO" "$DWT" vendor/bundle composer.lock 2>&1)
+  rc=$?
+  chmod u+w "$DWT/vendor"
+  eq 'hardlink: a copy that fails falls back to an install' 1 "$rc"
+  contains '...and the log says what cp said' 'Permission denied' "$out"
+  lacks '...not a guess at the filesystem' 'different filesystem' "$out"
+fi
+rm -rf "$DWT/vendor" "$DREPO/vendor/bundle"
+
 # --- hardlink falls back when the lockfiles differ -------------------------
 rm -rf "$DWT/vendor"
 printf 'LOCKV2-DIFFERENT\n' > "$DWT/composer.lock"
