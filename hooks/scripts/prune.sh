@@ -581,11 +581,36 @@ wt_find_stale_admin_dirs() {
 # WT_SERVE_MIRROR_* loaded. Returns 1 when the record is still its live worktree's own — the state
 # file there holds the same record — which is /pitlane-serve's to stop, not an item at all.
 #
+# The live worktree whose allocation now holds port $1 or slug $2 — by its ledger entry or its own
+# state file's `rt` record — on stdout, or return 1. Either can be handed out again once its
+# worktree is gone, and an app answering on a reused port is that worktree's.
+wt_prune_allocation_holder() {  # $1 = port, $2 = slug
+  local port=${1-} slug=${2-} path held_slug held_port live state
+  [ -n "$port" ] || [ -n "$slug" ] || return 1
+  while IFS=$WT_US read -r -d "$WT_RS" _ path _ _ held_slug held_port _; do
+    wt_prune_is_live "$(wt_physical_path "$path")" || continue
+    if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
+      printf '%s' "$path"
+      return 0
+    fi
+  done < <(wt_ledger_entries "$WT_PRUNE_ROOT" 2>/dev/null)
+  for live in ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
+    state=$(wt_state_path "$live") || continue
+    held_port=$(wt_runtime_state_read "$state" port 2>/dev/null) || held_port=''
+    held_slug=$(wt_runtime_state_read "$state" slug 2>/dev/null) || held_slug=''
+    if { [ -n "$port" ] && [ "$held_port" = "$port" ]; } || { [ -n "$slug" ] && [ "$held_slug" = "$slug" ]; }; then
+      printf '%s' "$live"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # A `command` record names no process, so nothing proves what answers at its URL is that server:
-# for one whose path is a live worktree again, runtime.stop would stop that worktree's app, and it
-# is refused.
+# for one whose path is a live worktree again, or whose port or slug a live worktree now holds,
+# runtime.stop would stop that worktree's app, and it is refused.
 wt_prune_judge_server() {  # $1 = mirror file
-  local file=$1 wt raw where rc reentered=0
+  local file=$1 wt raw where rc holder reentered=0
   WT_PRUNE_VERDICT=refuse WT_PRUNE_WHY=''
   if ! wt_serve_mirror_parse "$file"; then
     WT_PRUNE_VERDICT=none
@@ -609,6 +634,8 @@ wt_prune_judge_server() {  # $1 = mirror file
     elif ! wt_serve_answers "$WT_SERVE_URL"; then
       WT_PRUNE_VERDICT=forget
       WT_PRUNE_WHY="$where; nothing answers at $WT_SERVE_URL any more — forget drops the record without running anything"
+    elif holder=$(wt_prune_allocation_holder "$WT_SERVE_MIRROR_PORT" "$WT_SERVE_MIRROR_SLUG"); then
+      WT_PRUNE_WHY="$where; only runtime.stop can stop it, and its port or slug is now $holder's, so what answers may be that worktree's app — stop it by hand"
     elif [ "${PROFILE_PRESENT:-0}" != 1 ] || [ -z "${PROFILE_RT_STOP:-}" ]; then
       WT_PRUNE_WHY="$where; it detached from its serve command, so only runtime.stop can stop it, and the main checkout's profile names none — stop it by hand"
     elif wt_approval_check "$WT_PRUNE_ROOT"; [ "$WT_APPROVAL" != yes ]; then
@@ -679,7 +706,15 @@ wt_find_runtime_leftovers() {
 }
 
 wt_find_ledger_junk() {
-  local ledger=$WT_PRUNE_COMMON/$WT_LEDGER_DIRNAME file
+  local ledger=$WT_PRUNE_COMMON/$WT_LEDGER_DIRNAME servers=$WT_PRUNE_COMMON/$WT_SERVE_MIRROR_DIRNAME file
+  if [ -d "$servers" ] && [ ! -L "$servers" ]; then
+    while IFS= read -r file; do
+      [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || continue
+      wt_prune_add ledger-junk "$file" "$file" "$(wt_prune_bytes "$file")" delete \
+        "a serve record abandoned half-written over $WT_PRUNE_TEMP_MINUTES minutes ago" "$file"
+    done < <(find "$servers" -maxdepth 1 -type f -name "${WT_SERVE_MIRROR_TMP_PREFIX}*" \
+      -mmin +"$WT_PRUNE_TEMP_MINUTES" 2>/dev/null)
+  fi
   [ -d "$ledger" ] && [ ! -L "$ledger" ] || return 0
   while IFS= read -r file; do
     [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || continue
@@ -954,7 +989,7 @@ wt_prune_release_allocation() {  # $1 = item index
 # Stop, or forget, the server a serve mirror records, as judged by the discovery made just before.
 # Stopping re-proves the process against its recorded identity right before each signal.
 wt_apply_server_leftover() {  # $1 = item index
-  local name=${PRUNE_KEY[$1]#server:} file pid
+  local name=${PRUNE_KEY[$1]#server:} file pid holder
   file=$WT_PRUNE_COMMON/$WT_SERVE_MIRROR_DIRNAME/$name
   if ! wt_ledger_is_entry_name "$name" || [ -L "$file" ] || [ ! -f "$file" ]; then
     WT_PRUNE_DETAIL="$file is no longer a serve record"
@@ -969,6 +1004,11 @@ wt_apply_server_leftover() {  # $1 = item index
     return 0
   fi
   if wt_serve_mirror_parse "$file" && [ "$WT_SERVE_STOPBY" = command ]; then
+    # Discovery judged this a moment ago; a worktree created since may hold the port already.
+    if holder=$(wt_prune_allocation_holder "$WT_SERVE_MIRROR_PORT" "$WT_SERVE_MIRROR_SLUG"); then
+      WT_PRUNE_DETAIL="its port or slug is now $holder's, so runtime.stop could stop that worktree's app — nothing run; stop it by hand"
+      return 1
+    fi
     wt_approval_check "$WT_PRUNE_ROOT"
     if [ "$WT_APPROVAL" = no ]; then
       WT_PRUNE_DETAIL="runtime.stop is not approved in $WT_PRUNE_ROOT — nothing run; the record is kept"
@@ -995,13 +1035,14 @@ wt_apply_server_leftover() {  # $1 = item index
 }
 
 wt_apply_ledger_junk() {  # $1 = item index
-  local file=${PRUNE_KEY[$1]}
+  local file=${PRUNE_KEY[$1]} dir
   case ${file##*/} in
-    "$WT_LEDGER_TMP_PREFIX"*) ;;
+    "$WT_LEDGER_TMP_PREFIX"*) dir=$WT_PRUNE_COMMON/$WT_LEDGER_DIRNAME ;;
+    "$WT_SERVE_MIRROR_TMP_PREFIX"*) dir=$WT_PRUNE_COMMON/$WT_SERVE_MIRROR_DIRNAME ;;
     *) WT_PRUNE_DETAIL="$file is not a half-written entry"; return 1 ;;
   esac
-  if [ "${file%/*}" != "$WT_PRUNE_COMMON/$WT_LEDGER_DIRNAME" ] || [ -L "$file" ] || [ ! -f "$file" ]; then
-    WT_PRUNE_DETAIL="$file is no longer a plain file in the ledger"
+  if [ "${file%/*}" != "$dir" ] || [ -L "$dir" ] || [ -L "$file" ] || [ ! -f "$file" ]; then
+    WT_PRUNE_DETAIL="$file is no longer a plain file in $dir"
     return 1
   fi
   if ! rm -f -- "${file:?}" 2>/dev/null || [ -e "$file" ]; then

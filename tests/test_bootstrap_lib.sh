@@ -22,8 +22,9 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1091
 . "$BLIB"
 
-# How many entries directory $1 holds; 0 when it does not exist.
-count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
+# shellcheck source=serve_helpers.sh
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/serve_helpers.sh"
 
 pass=0 fail=0
 US_=$WT_US

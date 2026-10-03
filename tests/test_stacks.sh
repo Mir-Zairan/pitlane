@@ -30,6 +30,9 @@ REMOVE_HOOK=$SCRIPTS/teardown.sh
 # shellcheck source=stack_fixtures.sh
 # shellcheck disable=SC1091
 . "$TESTS/stack_fixtures.sh"
+# shellcheck source=serve_helpers.sh
+# shellcheck disable=SC1091
+. "$TESTS/serve_helpers.sh"
 
 STACK_ALL=(pnpm npm bun uv composer bundler cargo go monorepo noprofile compose)
 
@@ -238,19 +241,6 @@ except Exception as e:
     print("NO ANSWER: %s" % e)' "$1"
 }
 
-# The PID of the server recorded in worktree $1's state, or nothing.
-served_pid() {  # $1 = worktree
-  python3 -c 'import sys
-try:
-    data = open(sys.argv[1], encoding="latin-1").read()
-except OSError:
-    sys.exit(0)
-for rec in data.split("\x1e"):
-    f = rec.split("\x1f")
-    if f[0] == "serve":
-        print(f[1])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state"
-}
-
 # /pitlane-serve in worktree $1 on port $2: the stack's own app, through the profile's shell, answers
 # on the worktree's port from the worktree's checkout. It is left running; serve_stop stops it.
 serve_check() {  # $1 = worktree, $2 = its port, $3 = log
@@ -270,17 +260,6 @@ serve_stop() {  # $1 = worktree, $2 = its port, $3 = log
   out=$(cd "$w" && bash "$HOOK" --serve-stop 2>>"$3")
   contains "$name: --serve-stop stops it" "Pitlane: stopped the server at http://localhost:$port/" "$out"
   contains "$name: and its port no longer answers" 'NO ANSWER' "$(fetch "http://localhost:$port/")"
-}
-
-alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
-
-# Every live process whose working directory is under $1, one `pid cwd` per line.
-running_under() {  # $1 = directory
-  local p cwd
-  for p in /proc/[0-9]*; do
-    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
-  done
 }
 
 # A server in the main checkout, started by hand on a port of its own, the way a developer runs one
@@ -431,6 +410,8 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
       serve_stop "$r/.claude/worktrees/alpha" "$p_alpha" "$logs/alpha.serve"
       # beta's app is left running: its teardown must stop it.
       b_pid=$(served_pid "$r/.claude/worktrees/beta")
+      ne "beta's app is recorded before its teardown" '' "$b_pid"
+      eq "...and running" yes "$(alive "$b_pid")"
     fi
     eq 'the main checkout is unchanged while worktrees are live' "$before" "$(main_snapshot "$r")"
     remove_worktree "$r" alpha "$logs"

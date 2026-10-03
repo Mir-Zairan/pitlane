@@ -955,7 +955,9 @@ wt_acquire_serve_lock() {  # $1 = worktree, $2 = fd number
 # process group, proved by its start identity, or by runtime.stop for one that daemonized (ADR-021).
 # Never by port or cwd. Present ($3 = 1), the record is in its state file and runtime.stop runs in
 # it with its own profile; gone, the serve mirror is the only record left and runtime.stop runs in
-# the main checkout ($2) — the profile the caller loaded either way.
+# the main checkout ($2) — the profile the caller loaded either way. teardown.sh reaches the gone
+# case only for a worktree with a ledger entry (the resolver exits on any other), so a server
+# mirrored for one without is /pitlane-tidy's to find, as is one a native removal left running.
 #
 # ALWAYS RETURNS 0. A server holds no work, so one that will not stop, or whose runtime.stop is not
 # approved, is warned about and teardown carries on (ADR-003): its record stays, and once the admin
@@ -980,6 +982,13 @@ wt_stop_served_app() {  # $1 = worktree, $2 = main checkout, $3 = 1 if the workt
 wt_stop_one_server() {  # $1 = state|mirror, $2 = worktree or mirror file, $3 = directory runtime.stop runs in
   local source=$1 key=$2 rundir=$3 url=$WT_SERVE_URL pid=$WT_SERVE_PID
   if [ "$WT_SERVE_STOPBY" = command ]; then
+    # Nothing answering is nothing left to stop, and a gone worktree's port may be another's by
+    # now: runtime.stop, expanded with it, could only reach that worktree's app.
+    if [ "$source" = mirror ] && ! wt_serve_answers "$url"; then
+      wt_serve_mirror_forget "$key"
+      wt_log "nothing answers at $url, where /pitlane-serve started the app — record dropped, runtime.stop not run"
+      return 0
+    fi
     if [ "${PROFILE_PRESENT:-0}" != 1 ]; then
       wt_log "not stopping the app at $url: only runtime.stop can stop it, and no usable profile is loaded — /pitlane-tidy lists it"
       return 0

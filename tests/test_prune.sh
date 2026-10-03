@@ -46,8 +46,9 @@ HOME=$SCRATCH/home
 mkdir -p "$HOME"
 export HOME
 
-# How many entries directory $1 holds; 0 when it does not exist.
-count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
+# shellcheck source=serve_helpers.sh
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/serve_helpers.sh"
 
 pass=0 fail=0 backends_run=0
 BACKEND=none
@@ -148,36 +149,6 @@ prune() {  # $1 = directory to run from, $@ = arguments
 # A field of the report line for the item of kind $1 at path $2: 1 id, 4 bytes, 5 action, 6 reason.
 field() {  # $1 = kind, $2 = path, $3 = field number
   awk -F'\t' -v k="$1" -v p="$2" -v n="$3" '$2 == k && $3 == p { print $n; exit }' "$TMP/out"
-}
-
-# /pitlane-serve, run from worktree $1 with $2 (--serve or --serve-stop): its one line on stdout.
-serve() {  # $1 = worktree, $2 = mode
-  ( cd "$1" && bash "$CREATE_HOOK" "$2" 2>>"$TMP/serve-err" )
-}
-
-# Field $2 of worktree $1's `serve` record (1 pid, 5 url, 7 stopby), or nothing.
-served_field() {  # $1 = worktree, $2 = field number
-  python3 -c 'import sys
-try:
-    data = open(sys.argv[1], encoding="latin-1").read()
-except OSError:
-    sys.exit(0)
-for rec in data.split("\x1e"):
-    f = rec.split("\x1f")
-    if f[0] == "serve" and len(f) > int(sys.argv[2]):
-        print(f[int(sys.argv[2])])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$2"
-}
-served_pid() { served_field "$1" 1; }
-
-alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
-
-# Every live process whose working directory is under $1, one `pid cwd` per line.
-running_under() {  # $1 = directory
-  local p cwd
-  for p in /proc/[0-9]*; do
-    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
-  done
 }
 
 # Every path under the given roots with each file's checksum: what "changed nothing" is compared by.
@@ -786,6 +757,22 @@ prune "$RV" --apply "$id_g"
 eq 'serve apply: the same id again is refused' 1 "$(cat "$TMP/rc")"
 kill "$other" 2>/dev/null
 
+US=$'\x1f' RSEP=$'\x1e'
+# Write serve mirror $1 as /pitlane-serve would: for worktree path $2 with slug $3 and port $4, a
+# server of pid $5 at URL $6 stopped by $7; $8 is the wtstate version (default 1).
+mirror_put() {  # $1 = file name, $2 = path, $3 = slug, $4 = port, $5 = pid, $6 = url, $7 = stopby, $8 = version
+  printf '%s' "wtstate${US}${8:-1}${RSEP}worktree$US$2$US${2##*/}$US${2##*/}$US$3$US$4${RSEP}serve$US$5$US$US${US}ck$US$6${US}1$US$7$RSEP" \
+    >"$RVM/$1"
+}
+
+# A daemonized server whose profile names no runtime.stop: nothing can stop it but the developer.
+VN=$RV/.claude/worktrees/servenostop
+mirror_put servenostop.4250.1 "$VN" servenostop "$main_port" 4250 "http://127.0.0.1:$main_port/" command
+prune "$RV"
+eq 'serve report: no runtime.stop in the main profile refuses a daemonized server' refuse "$(field server-leftover "$VN" 5)"
+contains '...saying to stop it by hand' 'profile names none — stop it by hand' "$(field server-leftover "$VN" 6)"
+rm -f "$RVM/servenostop.4250.1"
+
 # Daemonized (stopped by command): only the main checkout's APPROVED runtime.stop may stop it.
 # shellcheck disable=SC2016  # the $(...) belongs to runtime.stop, kept literal.
 python3 -c 'import json, sys
@@ -800,7 +787,6 @@ dpid=$!
 SERVED="$SERVED $dpid"
 printf '%s\n' "$dpid" >"$TMP/daemon.pid"
 for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$dport") 2>/dev/null && break; sleep 0.1; done
-US=$'\x1f' RSEP=$'\x1e'
 printf '%s' "wtstate${US}1${RSEP}worktree$US$RV/.claude/worktrees/servedaemon${US}servedaemon${US}servedaemon${US}servedaemon${US}$dport${RSEP}serve${US}4242${US}${US}${US}ck${US}http://127.0.0.1:$dport/${US}1${US}command$RSEP" \
   >"$RVM/servedaemon.4242.1"
 VD=$RV/.claude/worktrees/servedaemon
@@ -819,6 +805,103 @@ eq 'serve apply: approved, runtime.stop stops it' 0 "$(cat "$TMP/rc")"
 eq '...expanded with the port and slug the mirror recorded' "stop $dport servedaemon" "$(cat "$TMP/stop.log" 2>/dev/null)"
 eq '...the server is stopped' no "$(alive "$dpid")"
 eq '...and the mirror forgotten, the live one kept' 1 "$(count_in "$RVM")"
+
+# A daemonized server's port or slug handed to a live worktree since: what answers at the URL is
+# that worktree's app, which runtime.stop would stop. Refused in the report and at apply.
+rm -f "$TMP/stop.log"
+lurl=$(served_field "$VL" 5)
+lport=${lurl##*:}
+lport=${lport%/}
+eq 'reallocated fixture: the live worktree holds slug servelive' yes "$(exists "$DB/servelive")"
+VP=$RV/.claude/worktrees/serveport
+mirror_put serveport.4251.1 "$VP" serveport "$lport" 4251 "$lurl" command
+VS=$RV/.claude/worktrees/serveslug
+mirror_put serveslug.4252.1 "$VS" servelive '' 4252 "$lurl" command
+prune "$RV"
+eq 'serve report: a port now held by a live worktree is refused' refuse "$(field server-leftover "$VP" 5)"
+contains '...naming the worktree that holds it' "is now $VL's" "$(field server-leftover "$VP" 6)"
+eq 'serve report: so is a slug now held by one' refuse "$(field server-leftover "$VS" 5)"
+id_p=$(field server-leftover "$VP" 1)
+id_s=$(field server-leftover "$VS" 1)
+prune "$RV" --apply "$id_p" "$id_s"
+eq 'serve apply: both are refused' 1 "$(cat "$TMP/rc")"
+eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...the live worktree'"'"'s app still runs' yes "$(alive "$lpid")"
+eq '...and both mirrors are kept' 'yes yes' "$(exists "$RVM/serveport.4251.1") $(exists "$RVM/serveslug.4252.1")" 
+rm -f "$RVM/serveport.4251.1" "$RVM/serveslug.4252.1"
+
+# A daemonized server whose URL no longer answers: nothing to stop, so the record is only forgotten.
+qport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+VQ=$RV/.claude/worktrees/servequiet
+mirror_put servequiet.4253.1 "$VQ" servequiet "$qport" 4253 "http://127.0.0.1:$qport/" command
+prune "$RV"
+eq 'serve report: a daemonized server that no longer answers is only forgotten' forget "$(field server-leftover "$VQ" 5)"
+prune "$RV" --apply "$(field server-leftover "$VQ" 1)"
+eq 'serve apply: forgetting it exits 0' 0 "$(cat "$TMP/rc")"
+eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...and the mirror is gone' no "$(exists "$RVM/servequiet.4253.1")"
+
+# A mirror swapped for a symlink between the report and the apply is refused, and what it points
+# at is left as it was.
+mirror_put servesym.4254.1 "$RV/.claude/worktrees/servesym" servesym "$qport" 4254 "http://127.0.0.1:$qport/" command
+prune "$RV"
+id_y=$(field server-leftover "$RV/.claude/worktrees/servesym" 1)
+eq 'symlinked mirror fixture: offered to forget' forget "$(field server-leftover "$RV/.claude/worktrees/servesym" 5)"
+mv "$RVM/servesym.4254.1" "$TMP/precious"
+ln -s "$TMP/precious" "$RVM/servesym.4254.1"
+before=$(cksum <"$TMP/precious")
+prune "$RV" --apply "$id_y"
+eq 'symlinked mirror: apply exits 1' 1 "$(cat "$TMP/rc")"
+contains '...refusing it' 'refused' "$(cat "$TMP/out")"
+eq '...the symlink is kept' yes "$([ -L "$RVM/servesym.4254.1" ] && echo yes || echo no)"
+eq '...and its target is untouched' "$before" "$(cksum <"$TMP/precious" 2>/dev/null)"
+rm -f "$RVM/servesym.4254.1"
+
+# A mirror of another format version: listed, never acted on, never deleted.
+mirror_put serveformat.4255.1 "$RV/.claude/worktrees/serveformat" serveformat '' 4255 "http://127.0.0.1:$qport/" signal 99
+prune "$RV"
+eq 'serve report: a mirror of another version is listed only' none "$(field server-leftover "$RVM/serveformat.4255.1" 5)"
+prune "$RV" --apply "$(field server-leftover "$RVM/serveformat.4255.1" 1)"
+eq 'serve apply: it is refused' 1 "$(cat "$TMP/rc")"
+eq '...and the file is still there' yes "$(exists "$RVM/serveformat.4255.1")"
+rm -f "$RVM/serveformat.4255.1"
+
+# Re-entered: a live worktree at the path of an earlier, gone one. Its own record is
+# /pitlane-serve's and not an item; an earlier server's mirror for that path is listed — and one
+# stopped by command is refused, since runtime.stop cannot tell it from the new worktree's app.
+VE=$(create "$RV" servereenter)
+setsid sleep 300 </dev/null >/dev/null 2>&1 &
+eother=$!
+SERVED="$SERVED $eother"
+# shellcheck disable=SC1091  # the engine itself, sourced to write a record as /pitlane-serve does
+( . "$SCRIPTS/bootstrap-lib.sh"
+  wt_serve_record_write "$VE" "$eother" "$eother" 'stat:1' 'ck' 'http://127.0.0.1:1/' )
+mirror_put servereenter.4256.1 "$VE" servereenter '' 4256 'http://127.0.0.1:1/' signal
+mirror_put servereenter.4257.1 "$VE" servereenter '' 4257 "$lurl" command
+prune "$RV"
+eq 're-entered: its own server is not an item' '' "$(grep -F "pid $eother," "$TMP/out")"
+contains 're-entered: the earlier server'"'"'s mirror is listed' 'an earlier worktree at' \
+  "$(grep -F 'pid 4256,' "$TMP/out" | cut -f6)"
+eq 're-entered, stopped by command: refused' refuse "$(grep -F 'pid 4257,' "$TMP/out" | cut -f5)"
+contains '...saying to stop it by hand' 'cannot tell it from the app of the worktree now at that path — stop it by hand' \
+  "$(grep -F 'pid 4257,' "$TMP/out" | cut -f6)"
+eq '...and the live app is left running' yes "$(alive "$lpid")"
+rm -f "$RVM/servereenter.4256.1" "$RVM/servereenter.4257.1"
+kill "$eother" 2>/dev/null
+
+# A serve record abandoned half-written is swept with the ledger's junk; a fresh one is a write in
+# progress and is left alone.
+printf 'half' >"$RVM/.wtserve.old"
+touch -t 202001010000 "$RVM/.wtserve.old"
+printf 'half' >"$RVM/.wtserve.new"
+prune "$RV"
+eq 'serve temp: an abandoned one is offered for deletion' delete "$(field ledger-junk "$RVM/.wtserve.old" 5)"
+eq 'serve temp: a fresh one is not listed' '' "$(grep -F '.wtserve.new' "$TMP/out")"
+eq 'serve temp: neither is read as a server' '' "$(grep -F '.wtserve.' "$TMP/out" | grep -F server-leftover)"
+prune "$RV" --apply "$(field ledger-junk "$RVM/.wtserve.old" 1)"
+eq 'serve temp: apply exits 0' 0 "$(cat "$TMP/rc")"
+eq '...the abandoned one is gone, the fresh one kept' 'no yes' "$(exists "$RVM/.wtserve.old") $(exists "$RVM/.wtserve.new")"
+rm -f "$RVM/.wtserve.new"
 
 eq 'serves: the main checkout'"'"'s own server survived the sweep' yes "$(alive "$main_srv")"
 kill "$main_srv" "$lpid" 2>/dev/null

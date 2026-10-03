@@ -70,7 +70,7 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `stale-admin` (git's
 registration of a worktree that is gone), `runtime-leftover` (a runtime allocation nothing uses),
 `server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
-as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry), `abandoned` (a subagent worktree — `agent-<hex>` — that is
+as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record), `abandoned` (a subagent worktree — `agent-<hex>` — that is
 unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
 `WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live
 worktree with work in it).
@@ -167,8 +167,9 @@ may offer to re-run the report once. That starts again at step 1, with a fresh q
   one is left until it has been quiet that long.
 - **A `server-leftover` refuses.** One that detached from its serve command can only be stopped by
   the main checkout's `runtime.stop`: it refuses while that profile is not approved (approve it with
-  `/pitlane-finish` in the main checkout), names no `runtime.stop`, or while a live worktree at the
-  same path could be the one answering. Say so; do not stop it yourself.
+  `/pitlane-finish` in the main checkout), names no `runtime.stop`, or while a live worktree — at the
+  same path, or now holding its port or slug — could be the one answering. Say so; do not stop it
+  yourself.
 - **The main checkout's own server, or one started by hand, is never listed.** Only servers
   `/pitlane-serve` recorded are, so nothing else can be stopped from here.
 - **An item names a database you made by hand.** It cannot: prune only ever releases allocations the

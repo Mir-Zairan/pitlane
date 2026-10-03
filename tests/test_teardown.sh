@@ -54,8 +54,9 @@ HOME=$SCRATCH/home
 mkdir -p "$HOME"
 export HOME
 
-# How many entries directory $1 holds; 0 when it does not exist.
-count_in() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
+# shellcheck source=serve_helpers.sh
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/serve_helpers.sh"
 
 pass=0 fail=0 backends_run=0
 BACKEND=none
@@ -173,36 +174,6 @@ remove() {  # $1 = payload JSON (or any bytes), $2 = cwd to run from
 
 remove_payload() {  # $1 = worktree path, $2 = cwd
   printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s","reason":"session_exit","cwd":"%s"}' "$1" "$2"
-}
-
-# /pitlane-serve, run from worktree $1 with $2 (--serve or --serve-stop): its one line on stdout.
-serve() {  # $1 = worktree, $2 = mode
-  ( cd "$1" && bash "$CREATE_HOOK" "$2" 2>>"$TMP/serve-err" )
-}
-
-# Field $2 of worktree $1's `serve` record (1 pid, 5 url, 7 stopby), or nothing.
-served_field() {  # $1 = worktree, $2 = field number
-  python3 -c 'import sys
-try:
-    data = open(sys.argv[1], encoding="latin-1").read()
-except OSError:
-    sys.exit(0)
-for rec in data.split("\x1e"):
-    f = rec.split("\x1f")
-    if f[0] == "serve" and len(f) > int(sys.argv[2]):
-        print(f[int(sys.argv[2])])' "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" "$2"
-}
-served_pid() { served_field "$1" 1; }
-
-alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
-
-# Every live process whose working directory is under $1, one `pid cwd` per line.
-running_under() {  # $1 = directory
-  local p cwd
-  for p in /proc/[0-9]*; do
-    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
-    case $cwd/ in "$1"/*) printf '%s %s\n' "${p#/proc/}" "$cwd" ;; esac
-  done
 }
 
 # Every file under the main checkout and its git dir, less what a create/remove cycle keeps ON
@@ -552,6 +523,36 @@ if command -v flock >/dev/null 2>&1; then
   eq 'unusable lock: the teardown script did NOT run' yes "$(exists "$DB/busy")"
   eq 'unusable lock: the symlink target was not created' no "$(exists "$TMP/lock-target")"
   contains 'unusable lock: stderr says why' 'could not check for a running bootstrap' "$err"
+
+  # A /pitlane-serve holding the serve lock may be starting a server it has not recorded yet. The
+  # holder is a background process of its own, as /pitlane-serve is; exec makes $! the holder.
+  WSL=$(create "$RB" serving)
+  serve_lock=$RB/.git/worktrees/serving/worktree-serve.lock
+  rm -f "$TMP/serve-held"
+  ( flock -n 9 || exit 1; touch "$TMP/serve-held"; exec sleep 60 ) 9>"$serve_lock" &
+  holder=$!
+  SERVED="$SERVED $holder"
+  for _ in $(seq 1 50); do [ -e "$TMP/serve-held" ] && break; sleep 0.1; done
+  out=$(remove "$(remove_payload "$WSL" "$RB")" "$RB")
+  err=$(cat "$TMP/err")
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+  eq 'serve lock held: exits 1, so Claude Code reports the worktree kept rather than removed' 1 "$(cat "$TMP/rc")"
+  eq 'serve lock held: nothing on stdout' '' "$out"
+  eq 'serve lock held: the worktree is kept' yes "$(exists "$WSL/.env.worktree.local")"
+  eq 'serve lock held: the teardown script did NOT run' yes "$(exists "$DB/serving")"
+  contains 'serve lock held: stderr says why' 'a /pitlane-serve is starting the app in it' "$err"
+
+  rm -f "$serve_lock"
+  ln -s "$TMP/serve-lock-target" "$serve_lock"
+  out=$(remove "$(remove_payload "$WSL" "$RB")" "$RB")
+  err=$(cat "$TMP/err")
+  rm -f "$serve_lock"
+  eq 'unusable serve lock: exits 1' 1 "$(cat "$TMP/rc")"
+  eq 'unusable serve lock: the worktree is kept' yes "$(exists "$WSL/.env.worktree.local")"
+  eq 'unusable serve lock: the teardown script did NOT run' yes "$(exists "$DB/serving")"
+  eq 'unusable serve lock: the symlink target was not created' no "$(exists "$TMP/serve-lock-target")"
+  contains 'unusable serve lock: stderr says why' 'could not check for a running /pitlane-serve' "$err"
 else
   printf 'SKIP no flock to hold the bootstrap lock with\n' >&2
 fi
@@ -837,6 +838,19 @@ contains '...stderr says the stop failed and teardown carried on' 'runtime.stop 
 eq '...its mirror is kept for /pitlane-tidy' 1 "$(count_in "$MIRRORS")"
 kill "$dpid" 2>/dev/null
 rm -f "$MIRRORS"/*
+
+# Removed natively after its daemon had already gone: nothing answers at the URL, so the mirror is
+# dropped and runtime.stop — which could only reach whatever holds that port now — is not run.
+daemon_worktree daemon-quiet "$STOP_CMD"
+kill "$dpid" 2>/dev/null
+for _ in $(seq 1 50); do [ "$(alive "$dpid")" = no ] && break; sleep 0.1; done
+git -C "$SVR" worktree remove --force "$WC"
+out=$(remove "$(remove_payload "$WC" "$SVR")" "$SVR")
+err=$(cat "$TMP/err")
+eq 'gone, quiet daemon: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq '...runtime.stop did not run' no "$(exists "$TMP/stop.log")"
+eq '...the mirror is forgotten' '' "$(ls -A "$MIRRORS" 2>/dev/null)"
+contains '...and stderr says why' 'record dropped, runtime.stop not run' "$err"
 
 # Removed natively first (directory and admin dir gone, as Claude Code does): the hook that
 # fires after finds the server through its mirror.
