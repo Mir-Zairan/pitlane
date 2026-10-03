@@ -984,7 +984,7 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
   printf '%s/%s.lock' "$WT_LOCKDIR_IS" "$slug"
 }
 
-# Acquire the lock at $1 on file descriptor $3, waiting at most $2 seconds.
+# Acquire the lock at $1 on file descriptor $3, waiting at most $2 seconds (0: not at all).
 #   0 = held, 1 = not held (caller proceeds unlocked), 2 = could not even try.
 #
 # The fd is a parameter and applied with `eval` because bash 3.2 — the portability floor — has no
@@ -995,7 +995,7 @@ wt_lock_acquire() {  # $1 = lock path, $2 = wait seconds, $3 = fd number
   # redirect the hook's STDOUT — the channel carrying the worktree path — into the lock file.
   case $fd in '' | *[!0-9]* | 0 | 1 | 2) return 2 ;; esac
   [ -n "$lock" ] || return 2
-  wt_is_seconds "$secs" || secs=$WT_LOCK_WAIT
+  [ "$secs" = 0 ] || wt_is_seconds "$secs" || secs=$WT_LOCK_WAIT
 
   if ! command -v flock >/dev/null 2>&1; then
     # Stock macOS has no flock(1). Say so ONCE per run and carry on: an unserialised install is a
@@ -1027,7 +1027,9 @@ wt_lock_acquire() {  # $1 = lock path, $2 = wait seconds, $3 = fd number
   fi
   [ "$dir" = "$lock" ] || [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 2
   eval "exec $fd>\"\$lock\"" 2>/dev/null || return 2
-  if flock -w "$secs" "$fd" 2>/dev/null; then
+  if [ "$secs" = 0 ]; then
+    flock -n "$fd" 2>/dev/null && return 0
+  elif flock -w "$secs" "$fd" 2>/dev/null; then
     return 0
   fi
   wt_lock_release "$fd"
@@ -1173,7 +1175,7 @@ wt_state_join() {  # $@ = field values; sets WT_STATE_REC
 #     arm is why layer 2 and layer 3 can share one file at all.
 #
 # Atomic: temp file in the SAME directory (so `mv` is a rename and not a copy), then `mv -f`.
-wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first field or empty, $4 = the replacement record
+wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first field or empty, $4 = the replacement record, empty to remove it
   local wt=${1%/} kind=${2-} key=${3-} newrec=${4-}
   local file tmp rec rkind rest kept='' hdrok=0 parent
 
@@ -1206,7 +1208,7 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
   {
     printf 'wtstate%s%s%s' "$WT_US" "$WT_STATE_VERSION" "$WT_RS"
     printf '%s' "$kept"
-    printf '%s%s' "$newrec" "$WT_RS"
+    [ -z "$newrec" ] || printf '%s%s' "$newrec" "$WT_RS"
   } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
   return 0
@@ -2135,8 +2137,12 @@ wt_install_note_changes() {  # $1 = worktree, $2 = dir, $3 = tracked changes bef
       *) paths+=("$path") ;;
     esac
   done <<<"$kept$WT_NL$(wt_lines_not_in "$kept" "$changed")"
-  wt_state_join changed "$dir" ${paths[@]+"${paths[@]}"}
-  rec=$WT_STATE_REC
+  # No paths left: the record goes, so a clean worktree has none for the status line to look into.
+  rec=''
+  if [ "${#paths[@]}" -gt 0 ]; then
+    wt_state_join changed "$dir" "${paths[@]}"
+    rec=$WT_STATE_REC
+  fi
   wt_state_join "$dir"
   wt_state_rewrite "$worktree" changed "$WT_STATE_REC" "$rec" || true
   [ -n "$changed" ] || return 0
@@ -2144,18 +2150,93 @@ wt_install_note_changes() {  # $1 = worktree, $2 = dir, $3 = tracked changes bef
   [ -z "$unheld" ] || wt_log "  $dir: $(wt_paths_display "$unheld") cannot be recorded by name, so /pitlane-finish will not offer it — look at it with git status"
 }
 
-# Every tracked path an install changed that is still changed now, one per line, each once, raw:
-# wt_paths_display before printing one. A path the developer restored, or committed, drops out. If
-# git cannot say, the record is printed as is.
-wt_install_changed_paths() {  # $1 = worktree
-  local recorded
-  recorded=$(wt_install_changed_recorded "$1" | LC_ALL=C awk '$0 != "" && !seen[$0]++')
-  [ -n "$recorded" ] || return 0
-  if wt_tracked_changes "$1"; then
-    wt_lines_in "$WT_TRACKED_CHANGES" "$recorded"
+# Every tracked path an install changed that is still changed now, one per line, each once, raw, in
+# WT_INSTALL_CHANGED: wt_paths_display before printing one. If git cannot say, or $2's budget is
+# spent, it is the record as is. A path the developer restored, or committed, drops out — of the
+# record too, so a worktree whose changes are all gone stops paying for the git status that found it.
+#
+# FREE WHEN THERE IS NO RECORD, which is every clean worktree on every session start: the state file
+# is read with bash's own `read`, and nothing forks until a `changed` record holding a path is found.
+wt_install_changed_collect() {  # $1 = worktree, $2 = deadline (epoch seconds; empty = WT_STATUS_SECONDS)
+  local worktree=${1%/} file rec records='' recorded left deadline=${2-} seen=0
+  WT_INSTALL_CHANGED=''
+  # The memo read directly: wt_state_path answers through a command substitution, i.e. a fork.
+  if [ "${WT_STATE_PATH_FOR:-}" = "$worktree" ] && [ -n "${WT_STATE_PATH_IS:-}" ]; then
+    file=$WT_STATE_PATH_IS
   else
-    printf '%s\n' "$recorded"
+    file=$(wt_state_path "$worktree")
   fi
+  [ -r "$file" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      "wtstate$WT_US"*)
+        [ "${rec#wtstate"$WT_US"}" = "$WT_STATE_VERSION" ] || return 0
+        seen=1
+        ;;
+      "changed$WT_US"*"$WT_US"*)
+        [ "$seen" = 1 ] || return 0
+        records+=${rec#changed"$WT_US"}$WT_NL
+        ;;
+    esac
+  done <"$file"
+  [ -n "$records" ] || return 0
+  recorded=$(printf '%s' "$records" | cut -d "$WT_US" -f 2- | tr "$WT_US" '\n' | LC_ALL=C awk '$0 != "" && !seen[$0]++')
+  # Capped at WT_STATUS_SECONDS: this is a status read, and a profile's budget can run to minutes.
+  if [ -n "$deadline" ]; then
+    left=$(wt_budget_left "$deadline")
+    if [ "$left" -le 0 ]; then
+      WT_INSTALL_CHANGED=$recorded
+      return 0
+    fi
+    [ "$left" -lt "$WT_STATUS_SECONDS" ] || deadline=''
+  fi
+  if ! wt_tracked_changes "$worktree" "$deadline"; then
+    WT_INSTALL_CHANGED=$recorded
+    return 0
+  fi
+  WT_INSTALL_CHANGED=$(wt_lines_in "$WT_TRACKED_CHANGES" "$recorded")
+  [ "$WT_INSTALL_CHANGED" = "$recorded" ] || wt_install_changed_prune "$worktree" "$records" "$WT_TRACKED_CHANGES"
+  return 0
+}
+
+# Drop from each `changed` record ($2: `dir US path…` per line, as read) the paths no longer changed
+# ($3: wt_tracked_changes), and a record left with none. Only under the worktree's lock, re-reading
+# each record there: a run holding it may be writing the state, and a rewrite from what was read
+# before would put back what that run just changed. Busy, it is skipped; the next read tries again.
+# With no flock at all nothing is serialised anyway (wt_lock_acquire), so it goes ahead unlocked.
+wt_install_changed_prune() {  # $1 = worktree, $2 = records, $3 = tracked changes now
+  local worktree=${1%/} line dir paths kept rec held=0 path
+  local -a keep
+  if command -v flock >/dev/null 2>&1; then
+    wt_lock_acquire "$(wt_state_path "$worktree").lock" 0 8 || return 0
+    held=1
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    dir=${line%%"$WT_US"*}
+    paths=$(wt_install_changed_recorded "$worktree" "$dir")
+    kept=$(wt_lines_in "${3-}" "$paths")
+    [ "$kept" != "$paths" ] || continue
+    keep=()
+    while IFS= read -r path; do
+      [ -z "$path" ] || keep+=("$path")
+    done <<<"$kept"
+    rec=''
+    if [ "${#keep[@]}" -gt 0 ]; then
+      wt_state_join changed "$dir" "${keep[@]}"
+      rec=$WT_STATE_REC
+    fi
+    wt_state_join "$dir"
+    wt_state_rewrite "$worktree" changed "$WT_STATE_REC" "$rec" || true
+  done <<<"${2-}"
+  [ "$held" -eq 0 ] || wt_lock_release 8
+  return 0
+}
+
+# wt_install_changed_collect's list, printed: one path per line.
+wt_install_changed_paths() {  # $1 = worktree, $2 = deadline (optional)
+  wt_install_changed_collect "$1" "${2-}"
+  [ -z "$WT_INSTALL_CHANGED" ] || printf '%s\n' "$WT_INSTALL_CHANGED"
 }
 
 # Put one path an install changed back to its committed content, index and working tree, printing
@@ -2511,6 +2592,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
     fi
 
+    # AN INSTALL MAY REWRITE ITS OWN LOCKFILE (npm updating package-lock.json, a tool normalising
+    # one). The checksum taken before it would then never match again: pending forever, reinstalled
+    # every run. So a finished install records the lockfile as it left it. A tracked one it rewrote
+    # is in the `changed` record (wt_install_note_changes), so the user is still told.
+    if [ "$effective" = install ]; then
+      case $outcome in "done" | warn) lckhash=$(wt_cksum_file "$worktree/$lock") ;; esac
+    fi
     case $outcome in
       warn | failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
       *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" || true ;;
@@ -2534,7 +2622,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # seed's status) or `warn` (present, installed with warnings; detail its reason). Globals, not
 # output, so one walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
-  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed current
   WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -2550,16 +2638,28 @@ wt_bootstrap_pending() {  # $1 = worktree
     install=$(wt_expand "$install")
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
-    if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
-      if wt_state_dep_read "$worktree" "$dir" && [ "$WT_DEP_STATUS" = warn ]; then
-        WT_STATUS_ITEMS+=warn$WT_US$dir$WT_US$(wt_dep_recorded_reason)$WT_NL
-      fi
-      continue
+    # ONE read of the record decides done, warn and a failure that stands, by the rules of
+    # wt_state_is_done and wt_state_failure_stands: the record is for this lockfile, command and
+    # strategy (never empty here), and then its status says which.
+    current=0
+    if wt_state_dep_read "$worktree" "$dir" && [ "$WT_DEP_LCK" = "$lckhash" ] \
+      && [ "$WT_DEP_ICK" = "$ickhash" ] && [ "$WT_DEP_STRATEGY" = "$strategy" ]; then
+      current=1
+    fi
+    if [ "$current" = 1 ]; then
+      case $WT_DEP_STATUS in
+        "done") continue ;;
+        warn)
+          wt_dep_recorded_reason
+          WT_STATUS_ITEMS+=warn$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
+          continue
+          ;;
+      esac
     fi
     WT_PENDING+=${WT_PENDING:+$'\n'}$dir
-    # wt_state_failure_stands reads the record either way, so WT_DEP_STATUS is this dir's below.
-    if wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
-      WT_STATUS_ITEMS+=standing$WT_US$dir$WT_US$(wt_dep_recorded_reason)$WT_NL
+    if [ "$current" = 1 ] && [ "$WT_DEP_STATUS" = failed ]; then
+      wt_dep_recorded_reason
+      WT_STATUS_ITEMS+=standing$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
       continue
     fi
     WT_STATUS_ITEMS+=missing$WT_US$dir$WT_US$WT_DEP_STATUS$WT_NL
@@ -2578,12 +2678,12 @@ wt_bootstrap_pending() {  # $1 = worktree
   return 0
 }
 
-# The reason recorded for the dependency wt_state_dep_read last read: its error line, else its exit
-# code. Capped well below the record's 160: it shares one status line with everything else.
+# The reason recorded for the dependency wt_state_dep_read last read, in WT_DEP_SHOWN_REASON: its
+# error line, else its exit code. Capped well below the record's 160: it shares one status line with
+# everything else.
 wt_dep_recorded_reason() {
-  local why=${WT_DEP_REASON:-exit ${WT_DEP_RC:-?}}
-  [ "${#why}" -le 80 ] || why="${why:0:77}..."
-  printf '%s' "$why"
+  WT_DEP_SHOWN_REASON=${WT_DEP_REASON:-exit ${WT_DEP_RC:-?}}
+  [ "${#WT_DEP_SHOWN_REASON}" -le 80 ] || WT_DEP_SHOWN_REASON="${WT_DEP_SHOWN_REASON:0:77}..."
 }
 
 # How many imperfect items the status line names before it says "and N more".
@@ -2597,8 +2697,8 @@ WT_STATUS_SHOWN=3
 # at start-up a complete worktree with nothing to report prints NOTHING: stdout there is model
 # context. A worktree whose only gaps are failures that stand is not sent to /pitlane-finish as if
 # that would fix them: it would not retry them, and retrying is the user's call.
-wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = background | approval | empty
-  local worktree=${1%/} when=${2-} how=${3-} kind name detail why path n=0 nchanged=0 standing=0
+wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = background | approval | empty, $4 = deadline for asking git which changed files remain (empty = WT_STATUS_SECONDS)
+  local worktree=${1%/} when=${2-} how=${3-} deadline=${4-} kind name detail why path n=0 nchanged=0 standing=0
   local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary
   local -a absent_items=() warned_items=()
   while IFS=$WT_US read -r kind name detail; do
@@ -2633,9 +2733,12 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
   done
   [ "$n" -le "$WT_STATUS_SHOWN" ] || list+=" and $((n - WT_STATUS_SHOWN)) more"
   list=$(wt_visible "$list")
-  while IFS= read -r path; do
-    [ -z "$path" ] || nchanged=$((nchanged + 1))
-  done <<<"$(wt_install_changed_paths "$worktree")"
+  wt_install_changed_collect "$worktree" "$deadline"
+  if [ -n "$WT_INSTALL_CHANGED" ]; then
+    while IFS= read -r path; do
+      [ -z "$path" ] || nchanged=$((nchanged + 1))
+    done <<<"$WT_INSTALL_CHANGED"
+  fi
   if [ "$nchanged" -gt 0 ]; then
     changed="an install changed $nchanged tracked file$([ "$nchanged" -eq 1 ] || echo s)"
     if [ "$when" = finish ]; then
@@ -2675,7 +2778,7 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
   elif [ "$how" = background ]; then
     printf 'Pitlane: this worktree is still being set up in the background — %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.\n' "$summary"
   elif [ -z "${WT_PENDING_ATTEMPTABLE:-}" ]; then
-    printf 'Pitlane: this worktree is not fully set up — %s. That failure stands: it is not retried while the lockfile and install command are unchanged, so running /pitlane-finish will not fix it. Tell the user the reason; if they say the cause is fixed, /pitlane-finish can retry it on their word. Do not install dependencies by hand.\n' "$summary"
+    printf 'Pitlane: this worktree is not fully set up — %s. An install that failed is not retried while its lockfile and install command are unchanged, so running /pitlane-finish will not fix this. Tell the user why it failed; if they say the cause is fixed, /pitlane-finish can retry on their word. Do not install dependencies by hand.\n' "$summary"
   else
     printf 'Pitlane: this worktree is not fully set up yet — %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.\n' "$summary"
   fi

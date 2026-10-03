@@ -1573,7 +1573,9 @@ eq 'status, --finish with nothing standing: no retry advice' 'Pitlane: still not
 out=$(status_line 'standing|a|error: registry unreachable' a '' start)
 contains 'status, only standing failures: named with the reason' 'a missing (install failed: error: registry unreachable).' "$out"
 lacks '...not sent to /pitlane-finish as if it would complete it' 'Run /pitlane-finish to complete it' "$out"
-contains '...told /pitlane-finish retries only on the user'"'"'s word' '/pitlane-finish can retry it on their word' "$out"
+contains '...told /pitlane-finish retries only on the user'"'"'s word' '/pitlane-finish can retry on their word' "$out"
+contains '...in words that fit one failure or several' 'An install that failed is not retried while its lockfile' "$out"
+lacks '...never "that failure", which is wrong for two' 'That failure' "$out"
 eq 'status, complete with a warning: not a bare "fully set up"' \
   'Pitlane: this worktree is set up, with warnings — c ready with warnings (peer warning).' \
   "$(status_line 'warn|c|peer warning' '' '' finish)"
@@ -1584,6 +1586,43 @@ eq '...and "fully set up" from --finish' 'Pitlane: this worktree is fully set up
 contains 'status: a name the branch wrote is shown printable' 'x?[31m missing' \
   "$(status_line "missing|x"$'\033'"[31m|dirty" x x start)"
 WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE=''
+
+# The walk reads each record once and decides from it: a record is current only for this lockfile,
+# install command AND strategy, and only then is it done, a warning, or a failure that stands.
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+SWCMD='true # status walk'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$SWCMD" '')
+SWL=$(wt_cksum_file "$DWT/composer.lock"); SWI=$(wt_cksum_string "$SWCMD")
+wt_state_set "$DWT" vendor hardlink "$SWL" "$SWI" "done"
+eq 'walk: done, but for another strategy, is pending' vendor "$(pending_all "$DWT")"
+eq '...as missing, with its recorded status' 'missing|vendor|done' "$(status_items "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" other-ick "done"
+eq 'walk: done, but for another install command, is pending' 'missing|vendor|done' "$(status_items "$DWT")"
+wt_state_set "$DWT" vendor install other-lck "$SWI" warn 1 why
+eq 'walk: a warning for another lockfile is pending' 'missing|vendor|warn' "$(status_items "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done"
+eq 'walk: done for this lockfile, command and strategy is no item' '' "$(status_items "$DWT")"
+eq '...and not pending' '' "$(pending_all "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" failed 1 boom
+eq 'walk: a failure for this lockfile, command and strategy stands' 'standing|vendor|boom' "$(status_items "$DWT")"
+eq '...pending' vendor "$(pending_all "$DWT")"
+eq '...but not attempted' '' "$(pending_attemptable "$DWT")"
+wt_state_set "$DWT" vendor hardlink "$SWL" "$SWI" failed 1 boom
+eq 'walk: a failure recorded for another strategy does not stand' 'missing|vendor|failed' "$(status_items "$DWT")"
+eq '...so it is attempted' vendor "$(pending_attemptable "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" other-ick failed 1 boom
+eq 'walk: nor one for another install command' vendor "$(pending_attemptable "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" failed 2 ''
+eq 'walk: a failure with no error line is shown by its exit code' 'standing|vendor|exit 2' "$(status_items "$DWT")"
+EIGHTY=$(printf '%080d' 0)
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 "$EIGHTY"
+eq 'walk: a reason of exactly 80 characters is shown whole' "warn|vendor|$EIGHTY" "$(status_items "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 "${EIGHTY}1"
+item=$(status_items "$DWT"); detail=${item##*|}
+eq 'walk: one character longer is cut to exactly 80' 80 "${#detail}"
+eq '...its last three an ellipsis' "${EIGHTY:0:77}..." "$detail"
+rm -f "$(wt_state_path "$DWT")"
 
 # The reason is one bounded line of printable ASCII: nothing that could break the record.
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
@@ -1761,16 +1800,76 @@ lacks '...without claiming it changed it again, or taking the session'"'"'s edit
 # Restored by the user: it drops out of what is reported.
 git -C "$DWT" checkout -q -- 'conf/work space.yaml' notes.txt
 eq '...and a path the user restored is no longer reported' '' "$(wt_install_changed_paths "$DWT")"
-# ...and out of the record, at the next install of that dir that leaves it alone.
+eq '...and the read that found it restored drops the record, so git is not asked again' '' "$(changed_recs)"
+# An install that finds a recorded path restored drops it too, and writes no empty record.
+printf 'placeholder: 1\n' >> "$DWT/conf/work space.yaml"
+wt_install_note_changes "$DWT" vendor '' 2>/dev/null
+eq '...(a record to drop)' 'changed|vendor|conf/work space.yaml' "$(changed_recs)"
+git -C "$DWT" checkout -q -- 'conf/work space.yaml'
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && touch vendor/autoload.php # v3' 'test -r vendor/autoload.php')
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
-eq '...a re-install after the restore drops it from the record' 'changed|vendor' "$(changed_recs)"
+eq '...a re-install after the restore drops the record whole' '' "$(changed_recs)"
 # A path in two dependencies' records is reported once.
 printf 'placeholder: 2\n' >> "$DWT/conf/work space.yaml"
 wt_install_note_changes "$DWT" other '' 2>/dev/null
 eq '...a path two installs changed is reported once' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
 git -C "$DWT" checkout -q -- . ; rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+
+# Pruning takes out only what git shows gone: a path still changed keeps its record, a record left
+# with none goes, and every other record is carried through.
+write_changed() {  # $@ = records, each `dir|path|path...`; a dep record is kept beside them
+  local r out
+  out=$(printf 'wtstate%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_")
+  for r in "$@"; do out+=changed$US_${r//|/$US_}$RS_; done
+  printf '%s' "$out" > "$(wt_state_path "$DWT")"
+  wt_state_set "$DWT" vendor install L I "done"
+}
+printf 'placeholder: 3\n' >> "$DWT/conf/work space.yaml"
+write_changed 'vendor|conf/work space.yaml|notes.txt' 'other|notes.txt'
+eq 'prune: what is still changed is reported' 'conf/work space.yaml' "$(wt_install_changed_paths "$DWT")"
+eq '...the restored path leaves its record, and a record left empty goes' \
+  'changed|vendor|conf/work space.yaml' "$(changed_recs)"
+contains '...the dependency record is untouched' '|install|L|I|done|' "$(dep_line vendor)"
+eq '...and a second read finds nothing to prune' 'changed|vendor|conf/work space.yaml' \
+  "$(wt_install_changed_paths "$DWT" >/dev/null; changed_recs)"
+if command -v flock >/dev/null 2>&1; then
+  write_changed 'vendor|notes.txt'
+  exec 7>"$(wt_state_path "$DWT").lock"; flock 7
+  eq 'prune: while a run holds the worktree lock, the record is not rewritten' 'changed|vendor|notes.txt' \
+    "$(wt_install_changed_paths "$DWT" >/dev/null; changed_recs)"
+  exec 7>&-
+  eq '...and once it is free, it is' '' "$(wt_install_changed_paths "$DWT" >/dev/null; changed_recs)"
+fi
+# A clean worktree pays nothing: with no `changed` record, not one process outside bash is started.
+mkdir -p "$TMP/no-path"
+collect_with_no_path() {  # run in a subshell: any process the read starts is "not found"
+  # shellcheck disable=SC2123  # emptying the search path is the point
+  PATH=$TMP/no-path
+  wt_install_changed_collect "$DWT" ''
+  printf 'rc=%s[%s]' "$?" "$WT_INSTALL_CHANGED"
+}
+write_changed
+wt_state_path "$DWT" >/dev/null
+eq 'no record: answered without starting a process' 'rc=0[]' "$(collect_with_no_path 2>&1)"
+write_changed 'vendor'
+eq '...nor for a record that names no path' 'rc=0[]' "$(collect_with_no_path 2>&1)"
+write_changed 'vendor|notes.txt'
+contains '...while one that names a path does start them (so the check above is not vacuous)' 'not found' \
+  "$(collect_with_no_path 2>&1)"
+# The status line asks git within the budget it is given; with none left it reports the record as
+# stored, without asking, and prunes nothing.
+SPENT=$(( $(date +%s) - 5 ))
+write_changed 'vendor|notes.txt'
+out=$( { WT_TRACKING_SKIP_LOGGED=''; wt_install_changed_paths "$DWT" "$SPENT"; } 2>&1 )
+eq 'deadline spent: the record as stored, git not asked' notes.txt "$out"
+eq '...nothing pruned' 'changed|vendor|notes.txt' "$(changed_recs)"
+out=$(WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE='' wt_bootstrap_status_line "$DWT" start '' "$SPENT" 2>&1)
+contains 'status line: the start-up deadline reaches the changed-files read' 'an install changed 1 tracked file' "$out"
+eq '...and with time to ask, git says it was restored, so a clean worktree starts silent' '' \
+  "$(WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE='' wt_bootstrap_status_line "$DWT" start '' "$FAR" 2>&1)"
+eq '...and its record is gone' '' "$(changed_recs)"
+git -C "$DWT" checkout -q -- . ; rm -f "$(wt_state_path "$DWT")"
 
 # Already changed before the install: the change is the session's, never offered for a restore.
 printf 'mine\n' >> "$DWT/conf/work space.yaml"
@@ -1880,6 +1979,22 @@ if command -v timeout >/dev/null 2>&1; then
   contains '...said' 'the budget ran out before the install could start' "$out"
   eq '...and left to retry' dirty "$(wt_state_status "$DWT" vendor)"
   rm -f "$CNT" "$(wt_state_path "$DWT")"
+  # The changed-files read is bounded by the deadline it is given, and never past WT_STATUS_SECONDS
+  # however far off that deadline is: a git that hangs costs a second here, not the hang.
+  write_changed 'vendor|notes.txt'
+  start=$(date +%s)
+  # shellcheck disable=SC2034  # read by the sourced engine
+  out=$( { WT_TRACKING_SKIP_LOGGED='' WT_GIT_CMD=("$FAKEGIT/slow")
+    wt_install_changed_paths "$DWT" $(( $(date +%s) + 1 )); } 2>/dev/null )
+  eq 'changed read: a git that outruns the deadline leaves the record as stored' notes.txt "$out"
+  eq '...within the deadline' yes "$([ $(( $(date +%s) - start )) -lt 4 ] && echo yes)"
+  start=$(date +%s)
+  # shellcheck disable=SC2034  # read by the sourced engine
+  out=$( { WT_TRACKING_SKIP_LOGGED='' WT_STATUS_SECONDS=1 WT_GIT_CMD=("$FAKEGIT/slow")
+    wt_install_changed_paths "$DWT" "$FAR"; } 2>/dev/null )
+  eq 'changed read: a far deadline is capped at WT_STATUS_SECONDS' notes.txt "$out"
+  eq '...so it returns within it' yes "$([ $(( $(date +%s) - start )) -lt 4 ] && echo yes)"
+  rm -f "$(wt_state_path "$DWT")"
 fi
 
 # Untracked and ignored files are what an install is for.
@@ -1889,6 +2004,32 @@ out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks 'tracked: an install writing only untracked and ignored files reports nothing' 'changed tracked files' "$out"
 eq '...and writes no record' '' "$(changed_recs)"
 rm -rf "$DWT/vendor" "$DWT/new.txt" "$DWT/ignored.log"; rm -f "$(wt_state_path "$DWT")"
+
+# An install that rewrites its own lockfile (npm updating package-lock.json): recorded against the
+# lockfile as the install left it, so it is done after one run and not re-run on the next. The
+# lockfile is tracked, so the rewrite is an install-changed file the user is told about.
+rm -f "$CNT"
+RWCMD="printf x >> '$CNT'; mkdir -p vendor && touch vendor/autoload.php && printf 'LOCKV1 normalised\\n' > composer.lock"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$RWCMD" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'lockfile rewritten by its install: the rewrite happened' 'LOCKV1 normalised' "$(cat "$DWT/composer.lock")"
+eq '...done after one run' "done" "$(wt_state_status "$DWT" vendor)"
+eq '...recorded against the lockfile as the install left it' "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(dep_line vendor | cut -d'|' -f4)"
+eq '...so it is not pending' '' "$(pending_all "$DWT")"
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...and not re-run' x "$(cat "$CNT")"
+eq '...the lockfile listed as a tracked file the install changed' composer.lock "$(wt_install_changed_paths "$DWT")"
+# Installed with warnings: the same.
+git -C "$DWT" checkout -q -- composer.lock; rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "$RWCMD; exit 1" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'lockfile rewritten by an install with warnings: warn' warn "$(wt_state_status "$DWT" vendor)"
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...and not re-run either' x "$(cat "$CNT")"
+git -C "$DWT" checkout -q -- composer.lock; rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
 
 # Where git cannot say, nothing is recorded, and nothing is captured into the working tree.
 NOGIT=$TMP/nogit-wt
@@ -2467,6 +2608,12 @@ eq 'a hardlinked vendor is not' '' "$(venv_warning vendor:hardlink)"
 eq 'nor an installed .venv' '' "$(venv_warning .venv:install)"
 eq 'nor a dir merely ending in venv' '' "$(venv_warning my.venv:hardlink)"
 contains 'several are named in one line' '.venv, env: hardlinked' "$(venv_warning .venv:hardlink vendor:hardlink env:hardlink)"
+# A dir outside the checkout is never probed for a pyvenv.cfg, even where one exists — both at the
+# path it names and at that path under the checkout, so the guard alone is what keeps it quiet.
+mkdir -p "$TMP/outside-venv" "$VNR$TMP/abs-venv" "$TMP/abs-venv"
+: > "$TMP/outside-venv/pyvenv.cfg"; : > "$VNR$TMP/abs-venv/pyvenv.cfg"; : > "$TMP/abs-venv/pyvenv.cfg"
+eq 'a ../ dir holding a pyvenv.cfg is not probed' '' "$(venv_warning ../outside-venv:hardlink)"
+eq 'nor an absolute one' '' "$(venv_warning "$TMP/abs-venv:hardlink")"
 # shellcheck disable=SC2034
 PROFILE_RAW=$(printf '0%s%s1%s.venv%scomposer.lock%shardlink%sx%s%s%s' "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
 # shellcheck disable=SC2034  # read by wt_warn_hardlinked_venvs

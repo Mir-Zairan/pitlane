@@ -188,7 +188,7 @@ W2=$R2/.claude/worktrees/f2
 git -C "$R2" worktree add -q "$W2" -b worktree-f2 2>/dev/null
 inject 'an install that fails' "$R2" "$W2"
 contains 'a failed install is named in the SessionStart notice, with its reason' 'vendor missing (install failed: exit 1)' "$INJECT_OUT"
-contains '...which says /pitlane-finish can retry it only on the user'"'"'s word' 'retry it on their word' "$INJECT_OUT"
+contains '...which says /pitlane-finish can retry it only on the user'"'"'s word' 'retry on their word' "$INJECT_OUT"
 contains 'an install that fails: says so' 'install command failed' "$(cat "$TMP/err")"
 
 R3=$TMP/r3
@@ -1368,7 +1368,7 @@ contains 'failed: the session is told the dependency is missing, and why' \
 # Only a standing failure is left, which /pitlane-finish would not retry: the session must not be
 # sent there as if it would fix it.
 lacks '...and is not told /pitlane-finish will complete it' 'Run /pitlane-finish to complete it' "$outW"
-contains '...but that it can retry it on the user'"'"'s word' '/pitlane-finish can retry it on their word' "$outW"
+contains '...but that it can retry it on the user'"'"'s word' '/pitlane-finish can retry on their word' "$outW"
 eq '...in one line' 1 "$(printf '%s\n' "$outW" | wc -l | tr -d ' ')"
 outF=$( cd "$WFL" && bash "$HOOK" --finish 2>"$TMP/err" ); errF=$(cat "$TMP/err")
 contains 'failed: /pitlane-finish still reports it missing, with the recorded reason' \
@@ -1442,6 +1442,8 @@ git -C "$WTC" checkout -q -- .gitignore
 contains '...and counts only what is still changed' 'an install changed 1 tracked file (' "$(start_hook "$WTC")"
 git -C "$WTC" checkout -q -- .worktreeinclude
 eq '...and once restored, a clean complete worktree starts silent' '' "$(start_hook "$WTC")"
+eq '...and its changed record is gone, so the next start asks git nothing' 0 \
+  "$(tr '\036' '\n' <"$(git -C "$WTC" rev-parse --absolute-git-dir)/worktree-bootstrap-state" | grep -c '^changed' || true)"
 eq '...and --finish says fully set up' 'Pitlane: this worktree is fully set up.' \
   "$( cd "$WTC" && bash "$HOOK" --finish 2>/dev/null )"
 

@@ -257,6 +257,8 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
     deadline=$((started + budget))
     [ "$deadline" -le $((hook_deadline - reserve)) ] || deadline=$((hook_deadline - reserve))
   fi
+  # Published for the start-up status line, whose git status must fit the same budget.
+  WT_BOOTSTRAP_DEADLINE=$deadline
 
   # A second lock, scoped to THIS worktree, so two sessions entering the same worktree at once do
   # not both walk the whole sequence. The per-dependency locks are for contention BETWEEN
@@ -528,7 +530,7 @@ case $event in
         wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
       fi
     fi
-    wt_bootstrap_status_line "$worktree" start "$how"
+    wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
     exit 0
     ;;
 
