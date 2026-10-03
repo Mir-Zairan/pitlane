@@ -18,16 +18,18 @@
 </p>
 
 When Claude Code starts a session in a separate copy of your project (a git worktree, which is what
-`claude -w` makes), that copy is empty-handed: it has no settings, no installed packages, and it shares
-the same database and web address as every other copy.
-So one session can break another's work without anyone noticing. Pitlane fixes that: like a pit lane readies a car before it goes back out, it readies each copy before a session starts. Every new copy
+`claude -w` makes), that copy has its own files, and even your `.env` if you list it in
+`.worktreeinclude`. But it has no installed packages, and because every copy has the same `.env`, they
+all share one database and one web address.
+So one session can break another's work without anyone noticing, and a browser pointed at your app
+shows whichever session started its server first. Pitlane fixes that: like a pit lane readies a car before it goes back out, it readies each copy before a session starts. Every new copy
 comes ready to use and gets its own database and its own address, so each session works on its own.
 
 ## What it does
 
 | Feature | What you get |
 |---|---|
-| **Settings** | Copies `.env` and other ignored config into each copy |
+| **Settings** | Copies `.env` and other ignored config into each copy, then points it at that copy's own database and port |
 | **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk |
 | **Database & port** | Each copy gets its own, so sessions never clash |
 | **Pull requests** | `claude -w "#1234"` opens a PR in its own copy. You approve its setup before anything runs, and again after each new push |
