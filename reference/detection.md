@@ -27,25 +27,52 @@ First column is the marker file at the repo root. The strategy rationale: `insta
 where the tool has its own content-addressable store, `hardlink` where it materialises real bytes per
 project, `skip` where the artefacts are build output that a shared cache already handles.
 
-| Marker | `dir` | Strategy | Install command |
-|---|---|---|---|
-| `composer.lock` | `vendor` | hardlink | `composer install --no-interaction --no-progress` |
-| `pnpm-lock.yaml` | `node_modules` | install | `pnpm install --frozen-lockfile` |
-| `package-lock.json` | `node_modules` | hardlink | `npm ci` |
-| `yarn.lock` + `.yarnrc.yml` | `.yarn/cache` | install | `yarn install --immutable` |
-| `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` |
-| `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` |
-| `uv.lock` | `.venv` | install | `uv sync --frozen` |
-| `poetry.lock` | `.venv` | hardlink¹ | `poetry install` |
-| `Pipfile.lock` | `.venv` | hardlink¹ | `pipenv sync` |
-| `Gemfile.lock` | `vendor/bundle` | hardlink¹ | `bundle install` |
-| `mix.lock` | `deps` | hardlink | `mix deps.get` |
-| `Cargo.lock` | — | skip | `cargo fetch` |
-| `go.sum` | — | skip | `go mod download` |
+| Marker | `dir` | Strategy | Install command | Default `verify` |
+|---|---|---|---|---|
+| `composer.lock` | `vendor` | hardlink | `composer install --no-interaction --no-progress` | `test -r vendor/autoload.php` |
+| `pnpm-lock.yaml` | `node_modules` | install | `pnpm install --frozen-lockfile` | `test -f node_modules/.modules.yaml` |
+| `package-lock.json` | `node_modules` | hardlink | `npm ci` | `test -f node_modules/.package-lock.json` |
+| `yarn.lock` + `.yarnrc.yml` | `.yarn/cache` | install | `yarn install --immutable` | `test -f .yarn/install-state.gz` |
+| `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` | `test -f node_modules/.yarn-integrity` |
+| `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` | `test -d node_modules` |
+| `uv.lock` | `.venv` | install | `uv sync --frozen` | `test -x .venv/bin/python` |
+| `poetry.lock` | `.venv` | install | `poetry install` | `test -x .venv/bin/python`¹ |
+| `Pipfile.lock` | `.venv` | install | `pipenv sync` | `test -x .venv/bin/python`¹ |
+| `Gemfile.lock` | `vendor/bundle` | hardlink¹ | `bundle install` | `test -d vendor/bundle/ruby`¹ |
+| `mix.lock` | `deps` | hardlink | `mix deps.get` | `test -d deps` |
+| `Cargo.lock` | — | skip | `cargo fetch` | — |
+| `go.sum` | — | skip | `go mod download` | — |
 
-¹ `requiresDir: true` — these three only get `hardlink` if the directory actually exists in the main
-checkout, because for all three it is **opt-in, not the default**. Otherwise they fall back to
-`install`. See the caveats.
+¹ `requiresDir: true` — for these three the in-project directory is **opt-in, not the default**. When
+it does not exist in the main checkout, detection withholds the default `verify` (it would fail in
+every worktree) and says so in a `depNote`, and bundler's `hardlink` falls back to `install`. See the
+caveats.
+
+### `verify`: what it is for, and why each default is what it is
+
+bootstrap believes `verify` over the install's exit code: an install that exits non-zero but leaves a
+tree that passes is `warn`, not `failed`. So every rule that manages a directory carries one, and
+`/pitlane-setup` asks the developer when detection has none. It runs **from the worktree root in the
+host shell** — the toolchain wrapper can cost tens of seconds — so each default is a plain file test,
+side-effect free, naming a file the tool's own install writes. Each was checked against a real install:
+
+- **pnpm** writes `node_modules/.modules.yaml` on every install with at least one package. A lockfile
+  with no dependencies at all writes none, so the check fails there; such a repo needs no entry.
+- **npm** writes the hidden lockfile `node_modules/.package-lock.json`. It travels with a hardlinked
+  tree, which is correct: the tree it describes came with it.
+- **Yarn Berry** writes `.yarn/install-state.gz` under both Plug'n'Play and the `node-modules` linker —
+  and Berry 4's global cache means `.yarn/cache` itself may never exist, so the check is not on `dir`.
+- **classic yarn** writes `node_modules/.yarn-integrity`.
+- **bun** (1.3, hoisted linker) writes no marker file into `node_modules`, so the check is the
+  directory alone. That is the weakest default in the table; a repo that can name a package it always
+  installs should check for it instead.
+- **uv, poetry, pipenv** — `test -x .venv/bin/python`. `-x` follows the symlink, so a venv whose
+  interpreter has gone away fails it.
+- **bundler** with a configured `path` creates `vendor/bundle/ruby/<ruby version>/`; the version
+  directory is not named because it changes with the interpreter.
+- **mix** fetches into `deps/<package>/`; `deps` itself is all that holds for every repo.
+- **cargo and go** keep dependencies in a machine-wide cache (`CARGO_HOME`, `GOMODCACHE`); there is no
+  per-project directory to check, and their entries are `skip`.
 
 A repo can match several of these at once and each is independent — **except that at most one entry
 may claim a given `dir`**. A repo mid-migration with both `pnpm-lock.yaml` and `package-lock.json`
@@ -67,20 +94,21 @@ into an array. Ordering plus a guard expresses the same thing with no nesting.
   `.yarnrc.yml` means Yarn 2+, which keeps a zip cache and — under Plug'n'Play — has no
   `node_modules` to share at all. `--frozen-lockfile` is the deprecated spelling of `--immutable`.
   Detecting only on `yarn.lock` would propose hardlinking a directory that does not exist.
+- **A venv is never hardlinked.** Measured: a hardlinked `.venv`'s shebangs, `activate` scripts and
+  editable-install mappings name the *main checkout*, so `pip install` in the worktree installs into
+  main's venv and imports load main's source. Before detection version 3, poetry and pipenv proposed
+  `hardlink` for an in-project `.venv`; every venv rule is now `install`, and the suite fails if a rule
+  proposes `hardlink` for one.
 - **`Pipfile.lock`'s `.venv` is the exception, not the rule.** pipenv's *default* is a venv **outside**
   the project, under `~/.local/share/virtualenvs/<project>-<hash>`. `.venv` is used only when
-  `PIPENV_VENV_IN_PROJECT` is set or a `.venv` already exists — so proposing `hardlink` unconditionally
-  would name a directory that isn't there.
+  `PIPENV_VENV_IN_PROJECT` is set or a `.venv` already exists — so without one, a `.venv` check would
+  fail in every worktree, and the default `verify` is withheld.
 - **`poetry.lock` assumes an in-project venv too.** `poetry install` only creates `.venv` in the
   project when `virtualenvs.in-project` is set. Also note `poetry install --sync` is deprecated in
   Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both, which is why the
   table uses it.
 - **`Gemfile.lock` assumes a vendored bundle.** `vendor/bundle` only exists if bundler is configured
   with `path` — check `.bundle/config`. Otherwise gems live in the system/rbenv gem home.
-- **A venv is not fully relocatable.** Scripts in `.venv/bin` hard-code an absolute interpreter path
-  in their shebang, so a hardlinked venv still points at the main checkout's path. It usually works
-  because the interpreter is outside the repo, but it is the reason `uv` is `install` rather than
-  `hardlink` even beyond its global cache.
 - **`Cargo.lock` gets `dir: null`, not `dir: target`.** `install` is documented as the command that
   populates `dir`, and `cargo fetch` populates `CARGO_HOME`, not `target/`. Naming a directory the
   entry then skips would be a claim it doesn't honour. Nothing per-project is managed for Rust.

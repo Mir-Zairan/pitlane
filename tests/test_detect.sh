@@ -120,18 +120,74 @@ run_suite() {
   eq 'uv: install, because uv has its own cache' 'install' "$(field "$out" dep 5)"
   eq 'uv: uv sync --frozen' 'uv sync --frozen' "$(field "$out" dep 6)"
 
-  # --- poetry, whose in-project venv is opt-in ---------------------------------
-  # hardlink is only meaningful if the directory is really there; poetry only creates it
-  # in-project when configured to, so the strategy must degrade rather than name a directory
-  # that does not exist.
-  r=$(mkrepo poetrynovenv pyproject.toml poetry.lock)
-  out=$(det "$r")
-  eq 'poetry: no .venv present -> downgraded to install' 'install' "$(field "$out" dep 5)"
-  has 'poetry: and the downgrade is announced with a reason' 'depDowngrade|0|hardlink|install' "$out"
+  # --- a virtualenv is never hardlinked -----------------------------------------
+  # Measured: a hardlinked venv's shebangs, activate scripts and editable-install mappings name the
+  # MAIN checkout, so pip installs into main's venv and imports load main's source. Even an
+  # in-project .venv that exists must be installed.
   r=$(mkrepo poetryvenv pyproject.toml poetry.lock .venv/pyvenv.cfg)
   out=$(det "$r")
-  eq 'poetry: an existing in-project .venv keeps hardlink' 'hardlink' "$(field "$out" dep 5)"
+  eq 'poetry: an existing in-project .venv is installed, not hardlinked' 'install' "$(field "$out" dep 5)"
+  eq 'poetry: and it is verified through the venv interpreter' 'test -x .venv/bin/python' "$(field "$out" dep 7)"
   hasnt 'poetry: and nothing is downgraded' 'depDowngrade' "$out"
+  r=$(mkrepo pipenvvenv Pipfile Pipfile.lock .venv/pyvenv.cfg)
+  out=$(det "$r")
+  eq 'pipenv: an existing in-project .venv is installed, not hardlinked' 'install' "$(field "$out" dep 5)"
+  eq 'pipenv: and verified through the venv interpreter' 'test -x .venv/bin/python' "$(field "$out" dep 7)"
+  # No in-project venv: poetry puts it under its own cache, so a .venv check would fail in every
+  # worktree. The default is withheld and the developer is told why, rather than handed a check
+  # that cannot pass.
+  r=$(mkrepo poetrynovenv pyproject.toml poetry.lock)
+  out=$(det "$r")
+  eq 'poetry: no .venv present -> still install' 'install' "$(field "$out" dep 5)"
+  hasnt 'poetry: and install is not announced as a downgrade' 'depDowngrade' "$out"
+  eq 'poetry: no .venv present -> no default verify' '' "$(field "$out" dep 7)"
+  has 'poetry: and says the verify must come from the developer' 'depNote|0|no default verify' "$out"
+  # Every venv rule in the table, not just the ones with a fixture above: a rule added later that
+  # proposes hardlink for a venv fails here.
+  eq 'table: no rule proposes hardlink for a .venv' '' "$(
+    # shellcheck disable=SC1091
+    . "$HERE/../hooks/scripts/lib.sh"
+    wt_json_records deps dir strategy <"$TABLE" |
+      tr "$WT_RS" '\n' | tr "$WT_US" '|' | grep -E '(^|/)\.?venv\|hardlink$'
+  )"
+
+  # --- a default verify for every dependency directory -------------------------
+  # Exact values, run from the worktree root in the host shell. Each names a file the tool's own
+  # install writes (checked against real installs): a check that passes on an empty directory, or
+  # with no directory at all, cannot tell bootstrap anything.
+  vfy() {  # $1 = repo name, $2 = expected dir, $3 = expected verify, rest = files
+    local name=$1 dir=$2 want=$3 d o
+    shift 3
+    d=$(mkrepo "$name" "$@")
+    o=$(det "$d")
+    eq "verify: $name targets $dir" "$dir" "$(field "$o" dep 3)"
+    eq "verify: $name" "$want" "$(field "$o" dep 7)"
+  }
+  vfy v_composer vendor        'test -r vendor/autoload.php'            composer.lock
+  vfy v_pnpm     node_modules  'test -f node_modules/.modules.yaml'     package.json pnpm-lock.yaml
+  vfy v_npm      node_modules  'test -f node_modules/.package-lock.json' package.json package-lock.json
+  vfy v_berry    .yarn/cache   'test -f .yarn/install-state.gz'         package.json yarn.lock .yarnrc.yml
+  vfy v_yarn1    node_modules  'test -f node_modules/.yarn-integrity'   package.json yarn.lock
+  vfy v_bun      node_modules  'test -d node_modules'                   package.json bun.lock
+  vfy v_bunb     node_modules  'test -d node_modules'                   package.json bun.lockb
+  vfy v_uv       .venv         'test -x .venv/bin/python'               pyproject.toml uv.lock
+  vfy v_bundle   vendor/bundle 'test -d vendor/bundle/ruby'             Gemfile Gemfile.lock vendor/bundle/ruby/3.4.0/x
+  vfy v_mix      deps          'test -d deps'                           mix.exs mix.lock
+  # cargo and go keep their dependencies in a machine-wide cache; there is no directory to check.
+  vfy v_cargo    ''            ''                                       Cargo.toml Cargo.lock
+  vfy v_go       ''            ''                                       go.mod go.sum
+  # Bundler's vendor/bundle is opt-in like poetry's .venv: absent, the check is withheld, and the
+  # hardlink still degrades to install as before.
+  r=$(mkrepo v_nobundle Gemfile Gemfile.lock)
+  out=$(det "$r")
+  eq 'verify: bundler without vendor/bundle gets no default verify' '' "$(field "$out" dep 7)"
+  has 'verify: and the hardlink still degrades' 'depDowngrade|0|hardlink|install' "$out"
+  eq 'table: every rule that manages a directory carries a default verify' '' "$(
+    # shellcheck disable=SC1091
+    . "$HERE/../hooks/scripts/lib.sh"
+    wt_json_records deps dir strategy verify <"$TABLE" |
+      tr "$WT_RS" '\n' | tr "$WT_US" '|' | grep -E '^[^|]+\|[^|]+\|$'
+  )"
 
   # --- Yarn Berry is a different package manager wearing the same lockfile name --
   r=$(mkrepo berry package.json yarn.lock .yarnrc.yml)
@@ -143,6 +199,8 @@ run_suite() {
   out=$(det "$r")
   eq 'yarn classic: falls through to the unguarded rule' 'node_modules' "$(field "$out" dep 3)"
   eq 'yarn classic: hardlink' 'hardlink' "$(field "$out" dep 5)"
+  eq 'yarn classic: a verify that reads the installed tree' \
+    'test -f node_modules/.yarn-integrity' "$(field "$out" dep 7)"
 
   # --- two live lockfiles for one directory ------------------------------------
   # Two entries for one directory would make bootstrap hardlink a tree and then reinstall

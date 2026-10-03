@@ -36,6 +36,8 @@
 #   shellWarn        <warning>                  (only when the matched rule carries one)
 #   probe            <tool>  ok|fail|timeout  <version line, or why it did not run>
 #   dep              <n> <dir> <lock> <strategy> <install> <verify>
+#                    (<verify> is empty for a rule with no dir, or when a depNote says why the
+#                    table's default was withheld — setup then asks the developer for one)
 #                    (a NESTED project's dir and lock carry its directory, and its commands
 #                    start with `cd '<dir>' &&` — they run from the worktree root like the rest)
 #   depReason        <n> <why this strategy>
@@ -534,14 +536,22 @@ detect_deps_in() {  # $1 = directory prefix
     fi
   
     strategy=$d_strategy
-    # `hardlink` only means anything when the directory really exists here. For poetry, pipenv
-    # and bundler an in-project directory is OPT-IN rather than the default, so proposing
-    # hardlink unconditionally would name a directory that is not there.
+    verify=$d_verify
+    # For poetry, pipenv and bundler an in-project directory is OPT-IN rather than the default.
+    # Absent here, a hardlink would name a directory that is not there, and the default verify
+    # would test a path the tool never writes — failing in every worktree, which bootstrap now
+    # believes over the install's exit code. So the verify is withheld and setup asks for one.
     if [ "$d_requires" = true ] && [ -n "$d_dir" ] && [ ! -d "$ROOT/$pre$d_dir" ]; then
-      fallback=${d_fallback:-install}
-      emit depDowngrade "$N" "$d_strategy" "$fallback" \
-        "$d_dir does not exist in this checkout, so there is nothing to hardlink — this tool only creates it in-project when explicitly configured to"
-      strategy=$fallback
+      if [ "$d_strategy" = hardlink ]; then
+        fallback=${d_fallback:-install}
+        emit depDowngrade "$N" "$d_strategy" "$fallback" \
+          "$d_dir does not exist in this checkout, so there is nothing to hardlink — this tool only creates it in-project when explicitly configured to"
+        strategy=$fallback
+      fi
+      if [ -n "$verify" ]; then
+        emit depNote "$N" "no default verify: \`$verify\` only holds when $d_dir is created in-project, and it is not here — ask the developer for a check that reads wherever this tool installs"
+        verify=''
+      fi
     fi
   
     CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
@@ -609,7 +619,6 @@ detect_deps_in() {  # $1 = directory prefix
     # A nested entry's commands run from the worktree ROOT, like every other entry's, so they are
     # prefixed with a `cd` into their own directory. The prefix passed a conservative character set
     # before it got here, so single-quoting it is exact.
-    verify=$d_verify
     if [ -n "$pre" ]; then
       install="cd '${pre%/}' && $install"
       [ -n "$verify" ] && verify="cd '${pre%/}' && $verify"

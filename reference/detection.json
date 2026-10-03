@@ -37,9 +37,19 @@
     "reasons would differ run to run; these do not.",
     "",
     "NO TAB CHARACTERS ANYWHERE IN THIS FILE'S VALUES. detect.sh emits tab-separated records, and it",
-    "strips tabs defensively, but a tab here would be a silent field split at the source."
+    "strips tabs defensively, but a tab here would be a silent field split at the source.",
+    "",
+    "EVERY RULE THAT MANAGES A DIRECTORY CARRIES A `verify`. It runs from the worktree root in the HOST",
+    "shell, so it is a plain file test, never a tool call, and it names a file the tool's own install",
+    "writes -- checked against a real install of each tool. bootstrap trusts it over the install's exit",
+    "code, so a check that passes on an empty or absent tree is worse than none. A rule with",
+    "`requiresDir` names a directory the tool creates in-project only when configured to; when it is",
+    "absent, detect.sh withholds the default (it would fail in every worktree) and setup asks instead.",
+    "Rules with no `dir` (cargo, go) keep their dependencies in a machine-wide cache and need none.",
+    "",
+    "VERSION 3: per-rule verify defaults, and no rule hardlinks a Python venv any more."
   ],
-  "detectionVersion": 2,
+  "detectionVersion": 3,
   "_comment_sameDirPolicy": [
     "Several markers can resolve to the same `dir` — a repo mid-migration with both pnpm-lock.yaml and",
     "package-lock.json, or both bun.lock and bun.lockb, all claim node_modules. Two profile entries for",
@@ -75,6 +85,7 @@
       "dir": "node_modules",
       "strategy": "install",
       "install": "pnpm install --frozen-lockfile",
+      "verify": "test -f node_modules/.modules.yaml",
       "reason": "pnpm already content-addresses packages in a global store and hardlinks them in, so the tree is mostly not real disk and sharing it is unsafe — node_modules/.modules.yaml records the project it was installed for",
       "hazards": [
         "npm-postinstall"
@@ -87,6 +98,7 @@
       "dir": "node_modules",
       "strategy": "hardlink",
       "install": "npm ci",
+      "verify": "test -f node_modules/.package-lock.json",
       "reason": "npm materialises real bytes per project, so hardlinking beats reinstalling",
       "hazards": [
         "npm-postinstall"
@@ -99,6 +111,7 @@
       "dir": ".yarn/cache",
       "strategy": "install",
       "install": "yarn install --immutable",
+      "verify": "test -f .yarn/install-state.gz",
       "reason": "Yarn Berry keeps its own zip cache and, under Plug'n'Play, has no node_modules to share at all — so install rather than hardlink, and --frozen-lockfile is the deprecated spelling of --immutable",
       "when": {
         "exists": ".yarnrc.yml"
@@ -111,6 +124,7 @@
       "dir": "node_modules",
       "strategy": "hardlink",
       "install": "yarn install --frozen-lockfile",
+      "verify": "test -f node_modules/.yarn-integrity",
       "reason": "classic yarn materialises real bytes per project, so hardlinking beats reinstalling",
       "hazards": [
         "npm-postinstall"
@@ -124,6 +138,7 @@
       "dir": "node_modules",
       "strategy": "install",
       "install": "bun install --frozen-lockfile",
+      "verify": "test -d node_modules",
       "reason": "bun installs from its own global cache, so a fresh install is cheap and sharing the tree buys nothing. bun.lockb is the pre-1.2 binary lockfile; newer repos use the text bun.lock — one entry covers both, since a repo mid-migration must not get two",
       "hazards": [
         "npm-postinstall"
@@ -136,31 +151,32 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "uv sync --frozen",
-      "reason": "uv hardlinks from its own global cache and a sync is seconds, so installing is cheaper and safer than sharing a venv whose scripts hard-code their own absolute paths"
+      "verify": "test -x .venv/bin/python",
+      "reason": "uv hardlinks from its own global cache and a sync is seconds — and a venv is never hardlinked anyway: its scripts and editable-install mappings hard-code the main checkout's path"
     },
     {
       "markers": [
         "poetry.lock"
       ],
       "dir": ".venv",
-      "strategy": "hardlink",
+      "strategy": "install",
       "install": "poetry install",
-      "reason": "poetry materialises real bytes into the project venv, so hardlinking beats reinstalling — but ONLY when the venv is in-project; see requiresDir",
+      "verify": "test -x .venv/bin/python",
+      "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
       "requiresDir": true,
-      "fallbackStrategy": "install",
-      "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and there is nothing in the repo to hardlink. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
+      "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and a .venv check would fail in every worktree. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
     },
     {
       "markers": [
         "Pipfile.lock"
       ],
       "dir": ".venv",
-      "strategy": "hardlink",
+      "strategy": "install",
       "install": "pipenv sync",
-      "reason": "pipenv materialises real bytes into the project venv, so hardlinking beats reinstalling — but ONLY when the venv is in-project; see requiresDir",
+      "verify": "test -x .venv/bin/python",
+      "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
       "requiresDir": true,
-      "fallbackStrategy": "install",
-      "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so proposing hardlink unconditionally would name a directory that is not there."
+      "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so a .venv check would fail in every worktree of a repo that uses the default."
     },
     {
       "markers": [
@@ -169,10 +185,11 @@
       "dir": "vendor/bundle",
       "strategy": "hardlink",
       "install": "bundle install",
+      "verify": "test -d vendor/bundle/ruby",
       "reason": "a vendored bundle is real bytes per project, so hardlinking beats reinstalling — but ONLY when bundler is configured to vendor; see requiresDir",
       "requiresDir": true,
       "fallbackStrategy": "install",
-      "notes": "vendor/bundle exists only when bundler is configured with a `path` (check .bundle/config). Otherwise gems are installed into the system/rbenv gem home and there is nothing per-project to copy.",
+      "notes": "vendor/bundle exists only when bundler is configured with a `path` (check .bundle/config). Otherwise gems are installed into the system/rbenv gem home and there is nothing per-project to copy. The verify reads vendor/bundle/ruby, which bundler creates under a configured path; the ruby version directory below it changes with the interpreter, so it is not named.",
       "hazards": [
         "ruby-postinstall"
       ]
@@ -184,6 +201,7 @@
       "dir": "deps",
       "strategy": "hardlink",
       "install": "mix deps.get",
+      "verify": "test -d deps",
       "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching"
     },
     {

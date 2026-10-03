@@ -90,13 +90,26 @@ Read the existing profile first if there is one.
 ## 3 — Present layers 1 and 2, with the reasons
 
 For each `dep`, show: the directory, the lockfile, the strategy, the install command, the `verify`
-command if there is one, and the one-line reason. The reason exists so the developer can **disagree** — make that easy, not
+command, and the one-line reason. The reason exists so the developer can **disagree** — make that easy, not
 rhetorical.
+
+**Every dependency gets a `verify`** — every one whose strategy is not `skip`. bootstrap believes it
+over the install's exit code, so without one a failed install and a usable tree look the same. Use the
+one detection proposed. When its `verify` field is empty (a `depNote` says why — usually a tool whose
+in-project directory is opt-in and absent), **ask the developer** for a check rather than writing none:
+a plain file test, run from the worktree root in the host shell, that names a file the install writes
+and that cannot pass on an empty or missing tree (`test -f <dir>/<file the tool writes>`). Do not use a
+tool command (`composer validate`, `npm ls`) — `verify` runs outside the toolchain shell, and a check
+on the lockfile alone passes with no tree at all. A profile written before `verify` was required still
+works unchanged; offer to add one on recalibration, under the keep-theirs rule above.
 
 Say the strategy rationale plainly when it comes up, because it is the part people push back on:
 `install` is for a package manager with its own content-addressable store (pnpm, bun, uv, Yarn
 Berry) where the tree is mostly not real disk and sharing it is unsafe; `hardlink` is for one that
-writes real bytes per project; `skip` is for build output a shared cache already handles.
+writes real bytes per project; `skip` is for build output a shared cache already handles. A Python
+venv is always `install`, even an in-project one: a hardlinked venv's scripts and editable installs
+point at the main checkout, so the worktree would install into and import from main. If the developer
+asks for `hardlink` on a `.venv`, say that before writing it.
 
 **Hazards are not a footnote.** When you see `escalate`, stop and ask — quote the `hazardChain` so
 the developer can see what the install actually reaches.
