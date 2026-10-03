@@ -39,13 +39,16 @@
     "NO TAB CHARACTERS ANYWHERE IN THIS FILE'S VALUES. detect.sh emits tab-separated records, and it",
     "strips tabs defensively, but a tab here would be a silent field split at the source.",
     "",
-    "EVERY RULE THAT MANAGES A DIRECTORY CARRIES A `verify`. It runs from the worktree root in the HOST",
-    "shell, so it is a plain file test, never a tool call, and it names a file the tool's own install",
-    "writes -- checked against a real install of each tool. bootstrap trusts it over the install's exit",
-    "code, so a check that passes on an empty or absent tree is worse than none. A rule with",
-    "`requiresDir` names a directory the tool creates in-project only when configured to; when it is",
-    "absent, detect.sh withholds the default (it would fail in every worktree) and setup asks instead.",
-    "Rules with no `dir` (cargo, go) keep their dependencies in a machine-wide cache and need none.",
+    "EVERY RULE THAT MANAGES A DIRECTORY CARRIES EITHER A `verify` OR A `noVerify`. A verify runs from the",
+    "worktree root in the HOST shell, so it is a plain file test, never a tool call, and it names a file",
+    "only a FINISHED install writes -- checked against a real install of each tool, and against a failed",
+    "one. bootstrap trusts it over the install's exit code, so a check that also passes on the tree a",
+    "failed install leaves behind is worse than none: it turns `failed` into `warn`. Where no such file",
+    "exists (bun, mix, poetry, pipenv), the rule says why in `noVerify` instead, detect.sh passes that on",
+    "in a depNote, and setup asks the developer for a check. A rule with `requiresDir` names a directory",
+    "the tool creates in-project only when configured to; when it is absent, detect.sh withholds the",
+    "default (it would fail in every worktree) and setup asks instead. Rules with no `dir` (cargo, go)",
+    "keep their dependencies in a machine-wide cache and need neither.",
     "",
     "VERSION 3: per-rule verify defaults, and no rule hardlinks a Python venv any more."
   ],
@@ -138,7 +141,7 @@
       "dir": "node_modules",
       "strategy": "install",
       "install": "bun install --frozen-lockfile",
-      "verify": "test -d node_modules",
+      "noVerify": "bun (1.3) writes no marker file into node_modules, and a failed install keeps the tree it extracted -- a postinstall that exits non-zero leaves every package in place -- so no file test separates a finished install from a broken one; ask for a package this repo always installs, e.g. test -f node_modules/<package>/package.json",
       "reason": "bun installs from its own global cache, so a fresh install is cheap and sharing the tree buys nothing. bun.lockb is the pre-1.2 binary lockfile; newer repos use the text bun.lock — one entry covers both, since a repo mid-migration must not get two",
       "hazards": [
         "npm-postinstall"
@@ -151,8 +154,9 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "uv sync --frozen",
-      "verify": "test -x .venv/bin/python",
-      "reason": "uv hardlinks from its own global cache and a sync is seconds — and a venv is never hardlinked anyway: its scripts and editable-install mappings hard-code the main checkout's path"
+      "verify": "set -- .venv/lib/python*/site-packages/*.dist-info; test -d \"$1\"",
+      "reason": "uv hardlinks from its own global cache and a sync is seconds — and a venv is never hardlinked anyway: its scripts and editable-install mappings hard-code the main checkout's path",
+      "notes": "the verify holds because uv creates the venv unseeded (no pip) and links packages only once every one is resolved and downloaded, so a .dist-info appears only when installing began; .venv/bin/python and .venv/.lock exist before resolution, so a failed sync passes a check on them. A virtual project with no dependencies at all writes no .dist-info, and needs a different check."
     },
     {
       "markers": [
@@ -161,9 +165,8 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "poetry install",
-      "verify": "test -x .venv/bin/python",
+      "noVerify": "poetry creates the venv -- its interpreter and a seeded pip with its own .dist-info -- before resolving, so every generic file test on the venv also passes after a failed install; ask for a package this repo always installs, e.g. a glob for its .dist-info under the venv's site-packages",
       "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
-      "requiresDir": true,
       "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and a .venv check would fail in every worktree. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
     },
     {
@@ -173,9 +176,8 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "pipenv sync",
-      "verify": "test -x .venv/bin/python",
+      "noVerify": "pipenv creates the venv -- its interpreter and a seeded pip with its own .dist-info -- before installing, so every generic file test on the venv also passes after a failed install; ask for a package this repo always installs, e.g. a glob for its .dist-info under the venv's site-packages",
       "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
-      "requiresDir": true,
       "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so a .venv check would fail in every worktree of a repo that uses the default."
     },
     {
@@ -201,7 +203,7 @@
       "dir": "deps",
       "strategy": "hardlink",
       "install": "mix deps.get",
-      "verify": "test -d deps",
+      "noVerify": "mix deps.get writes one deps/<package>/ per dependency and no marker for the whole fetch, so a fetch that fails part-way leaves a deps/ every generic file test passes; `mix deps.loadpaths --no-compile` does tell (it fails on any missing or out-of-date dependency) but needs elixir, and a verify runs in the host shell -- use it only where elixir is on the host's PATH, else test for a package this repo always fetches",
       "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching"
     },
     {

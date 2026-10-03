@@ -127,12 +127,16 @@ run_suite() {
   r=$(mkrepo poetryvenv pyproject.toml poetry.lock .venv/pyvenv.cfg)
   out=$(det "$r")
   eq 'poetry: an existing in-project .venv is installed, not hardlinked' 'install' "$(field "$out" dep 5)"
-  eq 'poetry: and it is verified through the venv interpreter' 'test -x .venv/bin/python' "$(field "$out" dep 7)"
+  # poetry seeds the venv (interpreter, pip and pip's .dist-info) before resolving, so no generic file
+  # test fails on what a failed install leaves; the rule says so instead of proposing one.
+  eq 'poetry: no default verify, even with an in-project .venv' '' "$(field "$out" dep 7)"
+  has 'poetry: and the developer is told why' 'depNote|0|no default verify: poetry creates the venv' "$out"
   hasnt 'poetry: and nothing is downgraded' 'depDowngrade' "$out"
   r=$(mkrepo pipenvvenv Pipfile Pipfile.lock .venv/pyvenv.cfg)
   out=$(det "$r")
   eq 'pipenv: an existing in-project .venv is installed, not hardlinked' 'install' "$(field "$out" dep 5)"
-  eq 'pipenv: and verified through the venv interpreter' 'test -x .venv/bin/python' "$(field "$out" dep 7)"
+  eq 'pipenv: no default verify, for the same reason' '' "$(field "$out" dep 7)"
+  has 'pipenv: and the developer is told why' 'depNote|0|no default verify: pipenv creates the venv' "$out"
   # No in-project venv: poetry puts it under its own cache, so a .venv check would fail in every
   # worktree. The default is withheld and the developer is told why, rather than handed a check
   # that cannot pass.
@@ -142,14 +146,28 @@ run_suite() {
   hasnt 'poetry: and install is not announced as a downgrade' 'depDowngrade' "$out"
   eq 'poetry: no .venv present -> no default verify' '' "$(field "$out" dep 7)"
   has 'poetry: and says the verify must come from the developer' 'depNote|0|no default verify' "$out"
-  # Every venv rule in the table, not just the ones with a fixture above: a rule added later that
-  # proposes hardlink for a venv fails here.
-  eq 'table: no rule proposes hardlink for a .venv' '' "$(
+  # A nested poetry project with an installed, gitignored .venv is proposed — still with no verify.
+  r=$(mkrepo nestedpoetry composer.lock tools/py/pyproject.toml tools/py/poetry.lock)
+  mkdir -p "$r/tools/py/.venv/bin"
+  out=$(det "$r")
+  has 'nested poetry: proposed as its own entry' 'dep|1|tools/py/.venv|tools/py/poetry.lock|install|' "$out"
+  eq 'nested poetry: with an empty verify field' '' "$(field "$out" dep 7 2)"
+  has 'nested poetry: and the reason there is none' 'depNote|1|no default verify: poetry creates the venv' "$out"
+  has 'nested poetry: and the nested note beside it' 'depNote|1|nested: tools/py' "$out"
+
+  # The whole table, one row per rule as dir|strategy|verify|noVerify. The row count is asserted
+  # first: an empty read would pass every "no row matches" check below.
+  local rules
+  rules=$(
     # shellcheck disable=SC1091
     . "$HERE/../hooks/scripts/lib.sh"
-    wt_json_records deps dir strategy <"$TABLE" |
-      tr "$WT_RS" '\n' | tr "$WT_US" '|' | grep -E '(^|/)\.?venv\|hardlink$'
-  )"
+    wt_json_records deps dir strategy verify noVerify <"$TABLE" | tr "$WT_RS" '\n' | tr "$WT_US" '|'
+  )
+  eq 'table: every rule is read' "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["deps"]))' "$TABLE")" \
+    "$(printf '%s\n' "$rules" | grep -c '|')"
+  # A rule added later that proposes hardlink for a venv fails here.
+  eq 'table: no rule proposes hardlink for a .venv' '' \
+    "$(printf '%s\n' "$rules" | grep -E '^([^|]*/)?\.?venv\|hardlink\|' || true)"
 
   # --- a default verify for every dependency directory -------------------------
   # Exact values, run from the worktree root in the host shell. Each names a file the tool's own
@@ -168,11 +186,18 @@ run_suite() {
   vfy v_npm      node_modules  'test -f node_modules/.package-lock.json' package.json package-lock.json
   vfy v_berry    .yarn/cache   'test -f .yarn/install-state.gz'         package.json yarn.lock .yarnrc.yml
   vfy v_yarn1    node_modules  'test -f node_modules/.yarn-integrity'   package.json yarn.lock
-  vfy v_bun      node_modules  'test -d node_modules'                   package.json bun.lock
-  vfy v_bunb     node_modules  'test -d node_modules'                   package.json bun.lockb
-  vfy v_uv       .venv         'test -x .venv/bin/python'               pyproject.toml uv.lock
+  vfy v_bun      node_modules  ''                                       package.json bun.lock
+  vfy v_bunb     node_modules  ''                                       package.json bun.lockb
+  # shellcheck disable=SC2016  # the $1 belongs to the verify command under test
+  vfy v_uv       .venv         'set -- .venv/lib/python*/site-packages/*.dist-info; test -d "$1"' \
+                                                                        pyproject.toml uv.lock
   vfy v_bundle   vendor/bundle 'test -d vendor/bundle/ruby'             Gemfile Gemfile.lock vendor/bundle/ruby/3.4.0/x
-  vfy v_mix      deps          'test -d deps'                           mix.exs mix.lock
+  vfy v_mix      deps          ''                                       mix.exs mix.lock
+  # Where the table has no verify, the developer is told why rather than handed a check that passes
+  # on the tree a failed install leaves.
+  has 'verify: bun says why it has none' 'depNote|0|no default verify: bun' "$(det "$TMP/$BACKEND/v_bun")"
+  has 'verify: mix says why it has none' 'depNote|0|no default verify: mix deps.get' "$(det "$TMP/$BACKEND/v_mix")"
+  hasnt 'verify: a rule with a default does not say it has none' 'no default verify' "$(det "$TMP/$BACKEND/v_uv")"
   # cargo and go keep their dependencies in a machine-wide cache; there is no directory to check.
   vfy v_cargo    ''            ''                                       Cargo.toml Cargo.lock
   vfy v_go       ''            ''                                       go.mod go.sum
@@ -182,12 +207,15 @@ run_suite() {
   out=$(det "$r")
   eq 'verify: bundler without vendor/bundle gets no default verify' '' "$(field "$out" dep 7)"
   has 'verify: and the hardlink still degrades' 'depDowngrade|0|hardlink|install' "$out"
-  eq 'table: every rule that manages a directory carries a default verify' '' "$(
-    # shellcheck disable=SC1091
-    . "$HERE/../hooks/scripts/lib.sh"
-    wt_json_records deps dir strategy verify <"$TABLE" |
-      tr "$WT_RS" '\n' | tr "$WT_US" '|' | grep -E '^[^|]+\|[^|]+\|$'
-  )"
+  # With vendor/bundle present nothing is withheld: hardlink stays, and the verify is proposed.
+  r=$(mkrepo v_bundlekept Gemfile Gemfile.lock vendor/bundle/ruby/3.4.0/x)
+  out=$(det "$r")
+  eq 'verify: bundler with vendor/bundle keeps hardlink' 'hardlink' "$(field "$out" dep 5)"
+  hasnt 'verify: and nothing is downgraded' 'depDowngrade' "$out"
+  hasnt 'verify: nor its verify withheld' 'no default verify' "$out"
+  eq 'table: every rule that manages a directory carries a verify or says why it has none' '' \
+    "$(printf '%s\n' "$rules" | grep -E '^[^|]+\|[^|]+\|\|$' || true)"
+  eq 'table: and never both' '' "$(printf '%s\n' "$rules" | grep -E '^[^|]*\|[^|]*\|[^|]+\|[^|]+$' || true)"
 
   # --- Yarn Berry is a different package manager wearing the same lockfile name --
   r=$(mkrepo berry package.json yarn.lock .yarnrc.yml)

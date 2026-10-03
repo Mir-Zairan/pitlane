@@ -76,11 +76,18 @@ Read the existing profile first if there is one.
 - **A hand-edited value must never be silently discarded, `--force` or not.** If the existing profile
   disagrees with what detection proposes, that is a *question*, not a merge conflict to resolve on
   your own, and the default answer is **keep theirs**. Show both and ask for every differing
-  `install`, `verify`, `shell`, `shellArgs` or `runtime` value.
+  `strategy`, `install`, `verify`, `shell`, `shellArgs` or `runtime` value.
   This matters most for exactly the value most likely to have been hand-edited: an `install` command a
   developer narrowed after one of the hazard conversations below. Detection *keeps* a `note` hazard's
   lifecycle script, so regenerating that command silently re-arms it — and the next unattended session
   start runs it again. Consent given once must not be erased by a flag.
+- **A profile whose `evidence.detectionVersion` is below 3 and that hardlinks a `.venv`** (any entry
+  whose `dir` is or ends in `.venv` with `strategy: "hardlink"`): raise it as an explicit change to
+  `install`, not one more differing value. Say why before asking: a hardlinked venv's scripts,
+  `activate` files and editable-install mappings name the main checkout, so every worktree installs
+  into main's venv and imports main's source. Propose the `install` command detection gives now, and
+  a `verify` as step 3 says. Keep-theirs still applies — but if they keep `hardlink`, say in the agent
+  note that they chose it knowing this.
 - **An older `schemaVersion`:** migrate it, and say exactly what changed and why. Never drop a key
   you do not recognise without saying so.
 - **A second run on an unchanged repo must change nothing** and must say so plainly. If you find
@@ -95,12 +102,14 @@ rhetorical.
 
 **Every dependency gets a `verify`** — every one whose strategy is not `skip`. bootstrap believes it
 over the install's exit code, so without one a failed install and a usable tree look the same. Use the
-one detection proposed. When its `verify` field is empty (a `depNote` says why — usually a tool whose
-in-project directory is opt-in and absent), **ask the developer** for a check rather than writing none:
-a plain file test, run from the worktree root in the host shell, that names a file the install writes
-and that cannot pass on an empty or missing tree (`test -f <dir>/<file the tool writes>`). Do not use a
-tool command (`composer validate`, `npm ls`) — `verify` runs outside the toolchain shell, and a check
-on the lockfile alone passes with no tree at all. A profile written before `verify` was required still
+one detection proposed. When its `verify` field is empty (a `no default verify:` `depNote` says why —
+a tool that writes no file only a finished install writes, or whose in-project directory is opt-in and
+absent), **ask the developer** for a check rather than writing none: a plain file test, run from the
+worktree root in the host shell, that names a file the install writes and that cannot pass on an
+empty or missing tree, nor on what a failed install leaves — usually a package this repo always
+installs (`test -f node_modules/<package>/package.json`). Do not use a tool command (`composer
+validate`, `npm ls`) unless the developer confirms the tool is on the host shell's PATH — `verify` runs
+outside the toolchain shell — and a check on the lockfile alone passes with no tree at all. A profile written before `verify` was required still
 works unchanged; offer to add one on recalibration, under the keep-theirs rule above.
 
 Say the strategy rationale plainly when it comes up, because it is the part people push back on:

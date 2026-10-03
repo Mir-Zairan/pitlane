@@ -36,8 +36,8 @@
 #   shellWarn        <warning>                  (only when the matched rule carries one)
 #   probe            <tool>  ok|fail|timeout  <version line, or why it did not run>
 #   dep              <n> <dir> <lock> <strategy> <install> <verify>
-#                    (<verify> is empty for a rule with no dir, or when a depNote says why the
-#                    table's default was withheld — setup then asks the developer for one)
+#                    (<verify> is empty for a rule with no dir, or when a `no default verify:`
+#                    depNote says why there is none — setup then asks the developer for one)
 #                    (a NESTED project's dir and lock carry its directory, and its commands
 #                    start with `cd '<dir>' &&` — they run from the worktree root like the rest)
 #   depReason        <n> <why this strategy>
@@ -467,11 +467,11 @@ claimed() {  # $1 = list, $2 = needle
 # is: same strategy, same hazards, same escalations.
 detect_deps_in() {  # $1 = directory prefix
   local pre=${1-} d_markers d_dir d_strategy d_install d_verify d_reason d_hazards d_when d_requires
-  local d_fallback d_notes marker m strategy fallback install verify hid h_manifest h_probes h_action
+  local d_fallback d_notes d_noverify marker m strategy fallback install verify hid h_manifest h_probes h_action
   local h_flag h_why x_id x_manifest x_probes x_action x_flag x_why hit probed pkey
   while IFS=$WT_US read -r -d "$WT_RS" \
         d_markers d_dir d_strategy d_install d_verify d_reason d_hazards \
-        d_when d_requires d_fallback d_notes; do
+        d_when d_requires d_fallback d_notes d_noverify; do
   
     marker=''
     while IFS= read -r m; do
@@ -537,10 +537,11 @@ detect_deps_in() {  # $1 = directory prefix
   
     strategy=$d_strategy
     verify=$d_verify
-    # For poetry, pipenv and bundler an in-project directory is OPT-IN rather than the default.
-    # Absent here, a hardlink would name a directory that is not there, and the default verify
-    # would test a path the tool never writes — failing in every worktree, which bootstrap now
-    # believes over the install's exit code. So the verify is withheld and setup asks for one.
+    # For bundler an in-project directory is OPT-IN rather than the default (poetry and pipenv
+    # too, but their rules carry no verify to withhold). Absent here, a hardlink would name a
+    # directory that is not there, and the default verify would test a path the tool never writes —
+    # failing in every worktree, which bootstrap believes over the install's exit code. So the
+    # verify is withheld and setup asks for one.
     if [ "$d_requires" = true ] && [ -n "$d_dir" ] && [ ! -d "$ROOT/$pre$d_dir" ]; then
       if [ "$d_strategy" = hardlink ]; then
         fallback=${d_fallback:-install}
@@ -625,6 +626,7 @@ detect_deps_in() {  # $1 = directory prefix
     fi
     emit dep "$N" "$pre$d_dir" "$pre$marker" "$strategy" "$install" "$verify"
     emit depReason "$N" "$d_reason"
+    [ -n "$d_noverify" ] && emit depNote "$N" "no default verify: $d_noverify"
     [ -n "$d_notes" ] && emit depNote "$N" "$d_notes"
     if [ -n "$pre" ]; then
       emit depNote "$N" "nested: ${pre%/} has its own lockfile and an installed, gitignored $d_dir, so a root install does not provide it"
@@ -636,7 +638,7 @@ detect_deps_in() {  # $1 = directory prefix
   
     N=$((N + 1))
   done < <(wt_json_records deps markers dir strategy install verify reason hazards \
-           when.exists requiresDir fallbackStrategy notes <"$WT_DETECTION_JSON")
+           when.exists requiresDir fallbackStrategy notes noVerify <"$WT_DETECTION_JSON")
 }
 
 detect_deps_in ''
