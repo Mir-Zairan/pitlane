@@ -1340,6 +1340,43 @@ eq "...leaving the main checkout's copy alone" MAIN "$(cat "$BG/vendor/autoload.
 git -C "$WBG" checkout -q composer.lock
 
 # ---------------------------------------------------------------------------
+# Verify decides, not the install's exit code; a failure that would repeat is not retried
+# ---------------------------------------------------------------------------
+
+# A package manager that installs everything, then exits 1 on a policy check.
+WRN=$TMP/wrn
+make_repo "$WRN" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"printf x >> $TMP/wrn-count; mkdir -p vendor && printf ok > vendor/autoload.php; echo ERR_FAKE_IGNORED_BUILDS >&2; exit 1\",\"verify\":\"test -r vendor/autoload.php\"}"
+WWR=$WRN/.claude/worktrees/wrn
+git -C "$WRN" worktree add -q "$WWR" -b worktree-wrn 2>/dev/null
+outW=$(start_hook "$WWR"); errW=$(cat "$TMP/err")
+eq 'warn: an install that exits 1 with a passing verify leaves a session told nothing is missing' '' "$outW"
+contains '...and stderr says it installed with warnings' 'installed with warnings' "$errW"
+outF=$( cd "$WWR" && bash "$HOOK" --finish 2>"$TMP/err" )
+eq 'warn: /pitlane-finish reports the worktree complete' 'Pitlane: this worktree is fully set up.' "$outF"
+eq '...without re-running the install' x "$(cat "$TMP/wrn-count")"
+
+# One that exits 1 having installed nothing: failed, and /pitlane-finish does not pay for it again.
+FLD=$TMP/fld
+make_repo "$FLD" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"install\",\"install\":\"printf x >> $TMP/fld-count; echo 'error: registry unreachable' >&2; exit 1\",\"verify\":\"test -r vendor/autoload.php\"}"
+WFL=$FLD/.claude/worktrees/fld
+git -C "$FLD" worktree add -q "$WFL" -b worktree-fld 2>/dev/null
+outW=$(start_hook "$WFL")
+contains 'failed: the session is told the dependency is missing' 'still missing: vendor' "$outW"
+outF=$( cd "$WFL" && bash "$HOOK" --finish 2>"$TMP/err" ); errF=$(cat "$TMP/err")
+eq 'failed: /pitlane-finish still reports it missing' 'Pitlane: still not complete — missing: vendor' "$outF"
+eq '...without re-running an install that would fail the same way' x "$(cat "$TMP/fld-count")"
+contains '...saying why, and what would make a retry worth it' 'error: registry unreachable) — not retrying' "$errF"
+# With the hand-off on, a standing failure starts no background run that would only repeat that.
+outB=$(PITLANE_BACKGROUND=on start_hook "$WFL")
+GDFL=$(git -C "$WFL" rev-parse --absolute-git-dir)
+eq 'failed: a standing failure starts no background run' no "$([ -e "$GDFL/worktree-bootstrap.pid" ] && echo yes || echo no)"
+lacks '...and the session is not told one is in progress' 'in the background' "$outB"
+# A changed lockfile is worth a retry.
+printf 'LOCK2\n' > "$WFL/composer.lock"
+( cd "$WFL" && bash "$HOOK" --finish >/dev/null 2>&1 )
+eq 'failed: a changed lockfile retries the install' xx "$(cat "$TMP/fld-count")"
+
+# ---------------------------------------------------------------------------
 # The approval gate: nothing a profile names runs until that content is approved
 # ---------------------------------------------------------------------------
 #

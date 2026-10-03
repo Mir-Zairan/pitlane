@@ -497,7 +497,9 @@ case $event in
         # Nothing a background run could do: everything left needs the commands that are held back.
         wt_log "not run, pending approval: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
         wt_bootstrap_notice "$pending" approval
-      elif [ "$WT_DEFER" = 1 ] && wt_background_start "$worktree"; then
+      # A run is started only for work it would attempt: an install whose failure stands is not.
+      elif [ "$WT_DEFER" = 1 ] && [ -n "$(wt_bootstrap_pending "$worktree" attemptable)" ] \
+        && wt_background_start "$worktree"; then
         wt_log "finishing in the background: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
         wt_bootstrap_notice "$pending" background
       else

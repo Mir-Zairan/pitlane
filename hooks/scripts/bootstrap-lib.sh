@@ -595,13 +595,29 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   # `|| rc=$?` rather than a bare call followed by `rc=$?`: the latter reads the status fine here,
   # but would abort the caller outright under `set -e`, which would make this file's promise that
   # nothing escapes as a shell error true only by accident of the current entrypoint's options.
+  #
+  # WT_RUN_CAPTURE names a file to take the command's output instead, replayed to stderr once it
+  # ends, so the caller can read the error line back. A file rather than a `tee` pipe: a daemon the
+  # install leaves behind would hold a pipe open and hang the hook past its budget; it cannot hold
+  # up a file.
   if command -v timeout >/dev/null 2>&1; then
-    ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+    if [ -n "${WT_RUN_CAPTURE:-}" ]; then
+      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >"$WT_RUN_CAPTURE" 2>&1 || rc=$?
+    else
+      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+    fi
   else
     # No coreutils `timeout` (a stock macOS host). Run unbounded rather than not at all, and say
     # so once: an unbounded install is a risk, but refusing to install is a certainty.
     wt_log "coreutils timeout is not on PATH — running \"$cmd\" without a time limit"
-    ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+    if [ -n "${WT_RUN_CAPTURE:-}" ]; then
+      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >"$WT_RUN_CAPTURE" 2>&1 || rc=$?
+    else
+      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+    fi
+  fi
+  if [ -n "${WT_RUN_CAPTURE:-}" ]; then
+    cat "$WT_RUN_CAPTURE" >&2 2>/dev/null || true
   fi
   # A step the cap stopped dies of SIGKILL: 137 through `timeout`. Say what happened, because "exit
   # 137" reads like a crash in the tool rather than the guard doing its job.
@@ -1017,6 +1033,15 @@ wt_lock_release() {  # $1 = fd number
 # "installed" from "killed halfway by the timeout", which a populated directory cannot tell you —
 # and the design requires a hung install to leave a usable session.
 #
+# THE STATUSES of a `dep` record: `doing` (started, not finished), `done`, `warn` (the install
+# exited non-zero but its verify passed: a package manager that installs everything and then fails
+# on a policy check has produced a usable tree, so it counts as present), `failed` (exited non-zero
+# and nothing said otherwise), `dirty` (not done, for any other reason: out of time, out of memory,
+# not approved, a verify that failed after a clean exit). A `failed` install is NOT retried with
+# the same lockfile and command (wt_state_failure_stands): it would fail the same way, and each
+# attempt can cost minutes. Fields 7 and 8, after `when`, carry a `warn` or `failed` install's
+# exit code and its error line.
+#
 # NO PARTIAL TRUST, the same rule the profile has: unreadable, wrong version, unparseable, or an
 # entry left at `doing` all mean THE SAME THING — not done, do it again. Redoing safe work is
 # cheap; skipping real work leaves a worktree that looks finished and is not.
@@ -1152,8 +1177,8 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
 
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
 # entries, and a partial write is the one thing a reader must never see.
-wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status
-  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} when rec
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} when rec
 
   # Recorded but never compared: it answers "when did this last happen" for a developer looking at
   # a worktree that seems stale, and gives prune something to age entries by. It is deliberately
@@ -1161,7 +1186,7 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
 
-  wt_state_join dep "$dir" "$strategy" "$lck" "$ick" "$status" "$when"
+  wt_state_join dep "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
   rec=$WT_STATE_REC
   # The KEY is cleaned the same way the field was, or a `dir` carrying a stripped byte would never
   # match the record it just wrote and would append a duplicate on every session.
@@ -1198,8 +1223,8 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
         # shellcheck disable=SC2034
         IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen <<<"$rest" || true
         [ "$rdir" = "$dir" ] || continue
-        # Quoted: bare `done` is the loop keyword to the parser.
-        [ "$rstatus" = "done" ] || return 1   # `doing` means killed mid-write: redo it
+        # Quoted: bare `done` is the loop keyword to the parser. `doing` means killed mid-write.
+        case $rstatus in "done" | warn) ;; *) return 1 ;; esac
         [ "$rlck" = "$lck" ] || return 1
         [ "$rick" = "$ick" ] || return 1
         # The recorded STRATEGY is compared too, not merely stored. Flipping a dependency from
@@ -1614,37 +1639,67 @@ wt_cksum_file() {  # $1 = path
   printf '%s' "$out"
 }
 
-# Read back the recorded status for one dependency: `done`, `doing`, `dirty`, or empty when there
-# is no usable record. Needed as well as wt_state_is_done because "we were interrupted" and "we
-# have never run" call for different handling — only the first justifies deleting anything.
-wt_state_status() {  # $1 = worktree, $2 = dir
-  local wt=${1%/} dir=${2-} file rec kind rest ver rdir rstrategy rlck rick rstatus rwhen seen=0
+# Read one dependency's record into WT_DEP_STRATEGY, WT_DEP_LCK, WT_DEP_ICK, WT_DEP_STATUS,
+# WT_DEP_RC and WT_DEP_REASON. Returns 1, with them all empty, when there is no usable record.
+# Globals rather than output so a caller in its own shell gets every field from one read.
+wt_state_dep_read() {  # $1 = worktree, $2 = dir
+  local wt=${1%/} dir=${2-} file rec kind rest rdir rwhen seen=0
+  WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_RC='' WT_DEP_REASON=''
   file=$(wt_state_path "$wt")
-  [ -r "$file" ] || { printf ''; return 0; }
+  [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
     rest=${rec#*"$WT_US"}
     case $kind in
       wtstate)
-        ver=${rest%%"$WT_US"*}
-        [ "$ver" = "$WT_STATE_VERSION" ] || { printf ''; return 0; }
+        [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
         seen=1
         ;;
       dep)
-        [ "$seen" = 1 ] || { printf ''; return 0; }
-        rdir=${rest%%"$WT_US"*}
-        [ "$rdir" = "$dir" ] || continue
-        # Read POSITIONALLY, not as "the last field": a trailing timestamp now follows the status,
-        # and `${rest##*US}` would return that instead.
+        [ "$seen" = 1 ] || return 1
+        [ "${rest%%"$WT_US"*}" = "$dir" ] || continue
+        # SC2034: rdir and rwhen are read POSITIONALLY to consume their fields.
         # shellcheck disable=SC2034
-        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen <<<"$rest" || true
-        printf '%s' "$rstatus"
+        IFS=$WT_US read -r rdir WT_DEP_STRATEGY WT_DEP_LCK WT_DEP_ICK WT_DEP_STATUS rwhen \
+          WT_DEP_RC WT_DEP_REASON <<<"$rest" || true
         return 0
         ;;
     esac
   done <"$file"
-  printf ''
-  return 0
+  return 1
+}
+
+# Read back the recorded status for one dependency: `done`, `warn`, `failed`, `doing`, `dirty`, or
+# empty when there is no usable record. Needed as well as wt_state_is_done because "we were
+# interrupted" and "we have never run" call for different handling — only the first justifies
+# deleting anything.
+wt_state_status() {  # $1 = worktree, $2 = dir
+  wt_state_dep_read "$1" "${2-}" || true
+  printf '%s' "$WT_DEP_STATUS"
+}
+
+# True when this dependency's install FAILED with the same lockfile, install command and strategy as
+# now: running it again would fail the same way. Leaves the recorded exit code and error line in
+# WT_DEP_RC and WT_DEP_REASON for the caller's message.
+wt_state_failure_stands() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy
+  wt_state_dep_read "$1" "${2-}" || return 1
+  [ "$WT_DEP_STATUS" = failed ] && [ "$WT_DEP_LCK" = "${3-}" ] && [ "$WT_DEP_ICK" = "${4-}" ] \
+    && [ "$WT_DEP_STRATEGY" = "${5-}" ]
+}
+
+# The line an install's output ends on that best says why it failed: the last one that looks like an
+# error, else the last non-empty one. Made safe to record and to show: escape sequences removed,
+# then everything outside printable ASCII (the record's separators included), capped at 160.
+wt_install_error_line() {  # $1 = file holding the install's output
+  local esc
+  esc=$(printf '\033')
+  [ -r "${1-}" ] || return 0
+  tail -n 400 "$1" 2>/dev/null | tr '\r' '\n' | LC_ALL=C sed "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
+    | LC_ALL=C tr -cd '\n -~' \
+    | awk '{ sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+           $0 != "" { last = $0; if (tolower($0) ~ /err|fail|fatal/) hit = $0 }
+           END { print (hit != "" ? hit : last) }' \
+    | cut -c1-160
 }
 
 # True if $1 contains a character that lets it stop being a value and start being syntax.
@@ -1849,6 +1904,11 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
   esac
 }
 
+wt_dep_log_failure_stands() {  # $1 = dir, $2 = lock, $3 = recorded exit code, $4 = recorded error line
+  local why="exit ${3:-?}${4:+: $4}"
+  wt_log "  $1: the recorded failure stands ($why) — not retrying an install that would fail the same way; it is retried once ${2:-its lockfile} or the install command changes"
+}
+
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
 #
 # TWO PASSES, cheapest first: hardlinked entries (a second or so each, and no toolchain needed), then
@@ -1858,6 +1918,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local rec body dir lock strategy install verify _cksum n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
+  local stands stood_rc stood_reason capture reason outcome vrc
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
 
@@ -1943,6 +2004,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_log "  $dir: already up to date"
       continue
     fi
+    # Settled before the lock and the deferral, so a standing failure neither waits for a lock nor
+    # starts a background run that would only say this again. A hardlink is still tried below: its
+    # failure was the fallback install's, and the link may work now.
+    if [ "$strategy" = install ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      wt_dep_log_failure_stands "$dir" "$lock" "$WT_DEP_RC" "$WT_DEP_REASON"
+      continue
+    fi
 
     # Not approved: an install is left undone, before any lock is taken or anything cleared. Not
     # recorded either — the state still says "not done", which is what the session is told.
@@ -1981,6 +2049,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_log "  $dir: another session finished it while we waited"
       wt_lock_release 9
       continue
+    fi
+
+    # Read before `doing` overwrites it: a hardlink only learns below whether it needs the install.
+    stands=0 stood_rc='' stood_reason=''
+    if [ "$strategy" = hardlink ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      stands=1 stood_rc=$WT_DEP_RC stood_reason=$WT_DEP_REASON
     fi
 
     # Only a dependency we KNOW was interrupted is cleared. A directory with no record at all may
@@ -2026,6 +2100,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         2) effective=present ;;
         *) effective=install ;;
       esac
+      if [ "$effective" = install ] && [ "$stands" -eq 1 ]; then
+        wt_dep_log_failure_stands "$dir" "$lock" "$stood_rc" "$stood_reason"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" failed "$stood_rc" "$stood_reason" || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
       # A hardlink that has to fall back to an install is as slow as any install, so it is deferred
       # too. `dirty`, not `doing`: nothing was started that a later run should clear away.
       if [ "$effective" = install ] && [ "${WT_DEFER:-0}" = 1 ]; then
@@ -2036,7 +2116,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
     fi
 
-    rc=0
+    rc=0 reason=''
     # A hardlink that fell back to an install runs the install command like any other.
     if [ "$effective" = install ] && [ "${WT_APPROVAL:-}" = no ]; then
       wt_log "  $dir: not installed — the profile's commands are not approved"
@@ -2071,8 +2151,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       left=$(wt_budget_left "$deadline")
       wt_log "  $dir: installing (${left}s of the budget left)"
       started=$(date +%s 2>/dev/null) || started=''
-      wt_run_in_shell "$install" "$worktree" "$left"
+      capture=$(mktemp "${TMPDIR:-/tmp}/pitlane-install.XXXXXX" 2>/dev/null) || capture=''
+      WT_RUN_CAPTURE=$capture wt_run_in_shell "$install" "$worktree" "$left"
       rc=$?
+      reason=''
+      [ "$rc" -eq 0 ] || reason=$(wt_install_error_line "$capture")
+      [ -z "$capture" ] || rm -f "$capture"
       elapsed=''
       [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
       case $rc in
@@ -2085,7 +2169,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_log "  $dir: hardlinked from the main checkout"
     fi
 
-    # The optional cheap sanity check. It decides `done` versus `dirty`, and `dirty` is what makes
+    # The optional cheap sanity check. It decides the recorded outcome, and `dirty` is what makes
     # the next entry try again rather than trust this one.
     #
     # IT RUNS IN THE HOST SHELL, NOT THE TOOLCHAIN WRAPPER. A verify is a cheap check by contract —
@@ -2093,26 +2177,45 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # measured on a real repository, one `nix develop --command true` costs 14s warm in the main
     # checkout and 25–38s in a fresh worktree, and a repo with nine dependency entries paid that nine
     # times on its first bootstrap, for nine `test -r` calls. The time bound is unchanged.
-    if [ "$rc" -eq 0 ] && [ -n "$verify" ]; then
+    #
+    # IT RUNS AFTER A NON-ZERO INSTALL TOO, because the exit code is not the last word: a package
+    # manager can install every package and then exit 1 on a policy check (pnpm's ignored build
+    # scripts). A pass then records `warn`; a fail, or no verify to ask, records `failed`. An install
+    # that was STOPPED (budget, memory cap, guard) stays `dirty` whatever verify says: it did not
+    # finish, and a verify that tests one file can pass on a half-written tree.
+    outcome=dirty
+    case $rc in
+      0) outcome="done" ;;
+      124 | 137 | "$WT_GUARD_REFUSED") ;;
+      *) outcome=failed ;;
+    esac
+    if [ -n "$verify" ]; then
       left=$(wt_budget_left "$deadline")
       if [ "${WT_APPROVAL:-}" = no ]; then
         wt_log "  $dir: its verify command is not approved, so it was not run — recording it as needing another look"
-        rc=1
+        outcome=dirty
       elif [ "$left" -le 0 ]; then
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
-        rc=1
+        outcome=dirty
       else
         WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
-        rc=$?
-        [ "$rc" -eq 0 ] || wt_log "  $dir: the verify command failed (exit $rc) — it will be retried next session"
+        vrc=$?
+        if [ "$vrc" -eq 0 ] && [ "$outcome" = failed ]; then
+          outcome=warn
+          wt_log "  $dir: installed with warnings — the install exited $rc${reason:+ (\"$reason\")}, but its verify passed, so it counts as installed"
+        elif [ "$vrc" -ne 0 ] && [ "$outcome" = "done" ]; then
+          outcome=dirty
+          wt_log "  $dir: the verify command failed (exit $vrc) — it will be retried next session"
+        elif [ "$vrc" -ne 0 ]; then
+          wt_log "  $dir: the verify command failed (exit $vrc) as well"
+        fi
       fi
     fi
 
-    if [ "$rc" -eq 0 ]; then
-      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "done" || true
-    else
-      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
-    fi
+    case $outcome in
+      warn | failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
+      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" || true ;;
+    esac
 
     [ "$held" -eq 1 ] && wt_lock_release 9
   done < <(printf '%s' "$PROFILE_RAW")
@@ -2121,11 +2224,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 }
 
 # What this worktree's bootstrap has NOT finished, one item per line: each dependency directory not
-# recorded done for its current lockfile and install command, then `databases (seed: <status>)` when
-# the profile has a seed that has not run to done. Empty output means the worktree is complete.
-# It is what the session is told, so it reads the state the steps recorded rather than guessing.
-wt_bootstrap_pending() {  # $1 = worktree
-  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed
+# recorded done (or warn) for its current lockfile and install command, then
+# `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty output
+# means the worktree is complete. It is what the session is told, so it reads the state the steps
+# recorded rather than guessing. With $2 = attemptable, a dependency whose failure stands is left
+# out: what remains is what a run would actually try, which decides whether one is worth starting.
+wt_bootstrap_pending() {  # $1 = worktree, $2 = attemptable (optional)
+  local worktree=${1%/} mode=${2-} rec body dir lock strategy install verify _cksum lckhash ickhash seed
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
@@ -2140,7 +2245,11 @@ wt_bootstrap_pending() {  # $1 = worktree
     install=$(wt_expand "$install")
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
-    wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" || printf '%s\n' "$dir"
+    wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" && continue
+    if [ "$mode" = attemptable ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+      continue
+    fi
+    printf '%s\n' "$dir"
   done < <(printf '%s' "${PROFILE_RAW:-}")
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ] \
     && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
