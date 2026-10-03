@@ -61,6 +61,7 @@ human-readable companion to the table the script used.
 | `hint` | Layer-3 candidates. **Hints beside a question, never defaults.** |
 | `compose` | What names each compose project, and how many host ports it publishes. Raise it in step 5. |
 | `assign` | A `NAME=value` for a hinted variable in the repo's own docs or scripts — *possibly* an inline pin. Read the line: a command prefix, an `export`, or a `-e NAME=…` passed to a container sets the process environment and beats every env file; a code block showing `.env` contents does not. Raise the real ones in step 5 and in the agent note. |
+| `start` | A start command the repo writes down (a manifest script, a `Procfile` process, a documented server invocation) and the first port literal or flag in it. Evidence for how the server takes its port — see *How the app starts* in step 5. A port in that field is usually hardcoded. |
 | `ignore` | Whether a path the plugin creates in a checkout is gitignored. `missing` — offer the `.gitignore` line in step 4. |
 | `warn` | Show it. |
 
@@ -184,10 +185,9 @@ as **options to choose from, never as pre-filled defaults**. Ask about:
   *and* changes who the app thinks it is. If there is a narrower knob that moves only the storage (a
   database-name variable the app honours), prefer it. If there is none, say so plainly: the repo may
   need a small change of its own to honour one, and that change is the developer's, not yours;
-- **the port variable, and how the dev server actually takes its port** — a variable the app reads,
-  a command-line flag, or a compose port mapping. A variable nothing reads isolates nothing. When it
-  is a flag, the variable only helps if the start command uses it, so record that command for the
-  agent note below. Then a sensible base to derive from, and how wide a span to spread across;
+- **the port, and how the dev server actually takes it** — established before `runtime.port` is
+  written, by the gate in *How the app starts* below. Then a sensible base to derive from, and how
+  wide a span to spread across;
 - **which env files the app actually loads, per environment** — these become `runtime.env.file`, a
   path or a list of paths, and nothing else can
   supply them: the engine has nowhere to write the overrides without them. Find out from the app's
@@ -229,6 +229,41 @@ need their own state. Every confirmed environment needs its env file in `runtime
 seed must create every store the app derives from the selector in that environment — a test env that
 appends `_test` to a database name needs that database cloned too. "Only development" is a fine
 answer — but it has to be an answer, not an omission you made for them.
+
+### How the app starts — a port nothing reads is a setup error
+
+A `runtime.port` the server never reads isolates nothing: the env files carry a fresh port, the app
+binds its usual one, and the main checkout's server already holds it. Profiles have shipped exactly
+that. So before writing `runtime.port`, **establish how the dev server takes its port**, from the
+repo itself and not from convention alone: the `start` records, the manifest scripts, `Procfile`,
+`Makefile`/`justfile` targets, composer scripts, the README and agent guides, and the framework's own
+rule for where it reads a port (some dev servers read a `PORT` variable, some only a flag or their
+config file, some an address argument). Show the developer the line that decides it. It is one of
+three things:
+
+- **A variable the app reads** — then it is `runtime.port.var`. Name the code or config that reads
+  it; a variable that only *appears* in an env file proves nothing.
+- **A flag or argument, or a port hardcoded in the start command** — then write `runtime.serve`:
+  the start command with `{port}` substituted where the port goes (`pnpm run dev --port={port}`,
+  `php -S localhost:{port} -t public`, `manage.py runserver 127.0.0.1:{port}`). Write `runtime.url`
+  with it (`http://localhost:{port}`, or the host the app needs). If the command daemonizes (a `-d`,
+  `--daemon`, `up -d`), prefer its foreground form; when it has none, write `runtime.stop` with the
+  command that stops **this worktree's** server and nothing else — never one that stops a stack the
+  main checkout shares. `/pitlane-serve` can only stop a daemonized server through `stop`.
+- **A compose port mapping** — the variable the `ports:` entry interpolates is the port variable,
+  and only if compose reads it from a file the plugin can write (see the compose question above).
+
+**Do not finish with a `runtime.port` that has neither a variable the app reads nor a `serve` that
+passes `{port}`.** When none can be established — the port is fixed in source, say — tell the
+developer plainly that the plugin cannot move it without a change to the repo, which is theirs to
+make, and leave the port out rather than write one that isolates nothing.
+
+**Every additional server, the same way**: an asset dev server, a second app, a queue dashboard. Only
+one port is isolated today (`runtime.port` is a single port), so say which servers stay on their fixed
+ports and will collide with the main checkout's while both run, and put that in the agent note.
+
+Confirm it concretely: "a worktree named `alice/fix-99` would start the app with
+`pnpm run dev --port=4213` and answer at `http://localhost:4213`".
 
 ### Rules for this step, and they are not negotiable
 
@@ -272,7 +307,10 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
 - `runtime.port` — `var`, `base` and `span`; the port is derived as `base + (cksum(slug) % span)`
   using POSIX `cksum` (not zlib CRC-32 — they disagree); `base` must be at least 1024 and
   `base + span - 1` no more than 65535, so
-  `span` decides how much room there is before two worktrees collide.
+  `span` decides how much room there is before two worktrees collide. Written only once *How the app
+  starts* has established a reader for it: a `var` the app reads, or a `serve` that passes `{port}`.
+- `runtime.serve`, `runtime.url`, `runtime.stop` — commands and a template from that same step.
+  `serve` runs inside `shell`, from the worktree root; `url` may use only `{port}` and `{slug}`.
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
   guard fires.
@@ -306,8 +344,8 @@ bootstrap will take, and what — if anything — will be isolated. Then ask **w
 
 ### Approve what you wrote
 
-The hooks run none of the profile's commands — installs, verify checks, the seed and teardown
-scripts — until the developer approves that exact content, so a profile nobody approves sets up config
+The hooks run none of the profile's commands — installs, verify checks, the `serve` and `stop`
+commands, the seed and teardown scripts — until the developer approves that exact content, so a profile nobody approves sets up config
 and ports and nothing else. Once the profile **and the scripts it names** are written, run from the main
 checkout:
 
@@ -335,6 +373,8 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
   port — and, from every `assign` record, which documented commands pin a variable inline and must
   be run **without** that prefix inside a worktree;
 - how to start the dev server on the worktree's port, when the port is taken by a flag;
+- which additional servers stay on their fixed ports, and so collide with the main checkout's while
+  both run;
 - when the profile has `runtime.serve`: start the app with `/pitlane-serve`, never the repo's own
   start command (which does not know this worktree's port), and find it at `$WORKTREE_URL` — set in
   the session's environment and in the env files named above — rather than at the main checkout's

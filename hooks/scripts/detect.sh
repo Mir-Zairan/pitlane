@@ -55,7 +55,9 @@
 #                    (`directory`: each worktree gets its own stack, and its host ports collide)
 #   assign           <name> <file> <count> <first line:text>   (an inline NAME=value for a hinted
 #                    variable: it beats every env file, so it bypasses the overrides)
-#   ignore           <path> ok|missing           (a path the plugin creates in a checkout)
+#   start            <file> scripts.<name>|<process>|line <n> <port literal or flag, or ""> <command>
+#                    (a documented start command: how the app may take its port, never a decision)
+#   ignore          <path> ok|missing           (a path the plugin creates in a checkout)
 #   warn             <message>
 #
 # WT_SKIP_PROBES=1 skips the toolchain version probes. They are the only part of detection
@@ -890,6 +892,54 @@ while IFS= read -r f; do
     emit assign "$name" "$f" "$count" "$first"
   done
 done < <(json_array_items "$(wt_json_get runtimeHints.assignSources <"$WT_DETECTION_JSON")")
+
+# ---------------------------------------------------------------------------
+# How the app starts
+# ---------------------------------------------------------------------------
+# A port nothing reads isolates nothing, and the usual reason nothing reads it is a start command
+# that hardcodes its own. These records show setup the repo's start commands with any port literal or
+# flag pulled out beside them. Which one is the dev server, and how it takes a port, is setup's call.
+START_PORT_PAT=$(wt_json_get runtimeHints.startPortPattern <"$WT_DETECTION_JSON") || START_PORT_PAT=''
+START_PAT=$(wt_json_get runtimeHints.startCommandPattern <"$WT_DETECTION_JSON") || START_PAT=''
+START_LINES=$(wt_json_get runtimeHints.startLinesPerFile <"$WT_DETECTION_JSON") || START_LINES=''
+wt_is_posint "$START_LINES" || START_LINES=10
+
+emit_start() {  # $1 = file, $2 = where in it, $3 = the command
+  local port=''
+  [ -n "$START_PORT_PAT" ] && port=$(printf '%s\n' "$3" | grep -oE -- "$START_PORT_PAT" 2>/dev/null | head -1)
+  emit start "$1" "$2" "$port" "$(printf '%s' "$3" | cut -c1-160)"
+}
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$ROOT/$f" ] || continue
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    cmd=$(manifest_value "$ROOT/$f" "scripts.$name")
+    [ -n "$cmd" ] && emit_start "$f" "scripts.$name" "$cmd"
+  done < <(json_array_items "$(wt_json_get runtimeHints.startScriptNames <"$WT_DETECTION_JSON")")
+done < <(json_array_items "$(wt_json_get runtimeHints.startManifests <"$WT_DETECTION_JSON")")
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$ROOT/$f" ] || continue
+  while IFS=: read -r proc cmd || [ -n "$proc" ]; do
+    case $proc in '' | '#'* | *[!A-Za-z0-9_-]*) continue ;; esac
+    cmd=${cmd#"${cmd%%[![:space:]]*}"}
+    [ -n "$cmd" ] && emit_start "$f" "$proc" "$cmd"
+  done <"$ROOT/$f"
+done < <(json_array_items "$(wt_json_get runtimeHints.startProcfiles <"$WT_DETECTION_JSON")")
+
+if [ -n "$START_PAT" ]; then
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$ROOT/$f" ] || continue
+    while IFS=: read -r lineno text; do
+      [ -n "$lineno" ] || continue
+      emit_start "$f" "line $lineno" "${text#"${text%%[![:space:]]*}"}"
+    done < <(grep -nE -- "$START_PAT" "$ROOT/$f" 2>/dev/null | head -n "$START_LINES")
+  done < <(json_array_items "$(wt_json_get runtimeHints.startSources <"$WT_DETECTION_JSON")")
+fi
 
 # ---------------------------------------------------------------------------
 # The plugin's own paths inside a checkout

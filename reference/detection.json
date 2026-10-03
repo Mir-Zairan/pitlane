@@ -603,6 +603,45 @@
       "package.json",
       "composer.json"
     ],
+    "_comment_start": [
+      "WHERE THE REPO WRITES DOWN HOW ITS APP STARTS, for `start` records. A port nothing reads isolates",
+      "nothing, so setup must find out how the dev server takes its port before it writes runtime.port:",
+      "a variable the app reads, a flag, or a compose mapping. These records save it the reading; they",
+      "decide nothing. startScriptNames are read from each startManifest's `scripts`; every `name: command`",
+      "line of a startProcfile is a process; a line of a startSource is reported when it matches",
+      "startCommandPattern (capped at startLinesPerFile per file). startPortPattern pulls the first port",
+      "literal or port flag out of each command, so a hardcoded port is visible at a glance. Generic",
+      "server invocations per ecosystem, never one project's command."
+    ],
+    "startManifests": [
+      "package.json",
+      "composer.json"
+    ],
+    "startScriptNames": [
+      "dev",
+      "start",
+      "serve",
+      "server",
+      "preview"
+    ],
+    "startProcfiles": [
+      "Procfile",
+      "Procfile.dev"
+    ],
+    "startSources": [
+      "AGENTS.md",
+      "CLAUDE.md",
+      "README.md",
+      "CONTRIBUTING.md",
+      "docs/README.md",
+      "Makefile",
+      "justfile",
+      "Taskfile.yml",
+      "bin/dev"
+    ],
+    "startLinesPerFile": 10,
+    "startCommandPattern": "(symfony (serve|server:start|local:server:start)|console server:(run|start)|rails (s|server)([[:space:]]|$)|manage\\.py runserver|php -S |artisan serve|uvicorn |gunicorn |flask run|hypercorn |vite([[:space:]]+(dev|serve|preview|--)|[[:space:]]*$)|next (dev|start)|nuxt dev|astro dev|webpack serve|webpack-dev-server|ng serve|hugo server|phx\\.server|puma |(npm|pnpm|yarn|bun) (run )?(dev|start|serve)([[:space:]]|$)|(docker compose|docker-compose) up)",
+    "startPortPattern": "(--port|--http-port|--listen|--bind|-p|-S)([[:space:]]*=[[:space:]]*|[[:space:]]+)[^[:space:]\"'`]+|(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0):[0-9]+|runserver[[:space:]]+[0-9.:]*[0-9]|[A-Z_]*PORT=[^[:space:]\"'`]+",
     "_comment_pluginPaths": [
       "Paths the plugin itself may create INSIDE a checkout. Each must be gitignored: an untracked file",
       "there is work to the teardown guard, so the worktree would never be torn down, and a",

@@ -359,7 +359,7 @@ is the rule most tempting to shave: nothing in a repository states which variabl
 selects a tenant database, or that a test database gets dropped wholesale by an env var. A wrong guess here
 does not produce a broken worktree. It corrupts a colleague's data.
 
-### Three more things detection reports for layer 3 — still facts, not conclusions
+### More things detection reports for layer 3 — still facts, not conclusions
 
 - **`compose`** — for each compose file, what names its project: an explicit top-level `name:`
   (every worktree then drives the *same* containers, rebuilt with whichever checkout's bind mounts ran
@@ -371,6 +371,14 @@ does not produce a broken worktree. It corrupts a colleague's data.
   variable in the **process** environment, which beats every env file the plugin writes into, so a
   session following those instructions inside a worktree runs against the shared state. The agent
   note calibration proposes must say not to copy the prefix.
+- **`start`** — a command the repo writes down for starting something: the `dev`, `start`, `serve`,
+  `server` and `preview` scripts of `package.json` and `composer.json`, every process in a `Procfile`,
+  and any line of the docs and task runners that matches a generic server invocation (`symfony serve`,
+  `rails s`, `manage.py runserver`, `php -S`, `uvicorn`, `vite`, `npm run dev`, `docker compose up`, …).
+  Beside each is the first port literal or port flag in it (`--port 5173`, `localhost:8000`,
+  `PORT=4000`), or nothing. A port in that field is usually a hardcoded one, which is exactly why a
+  port variable alone may isolate nothing. Which command is the dev server, and how it takes a port,
+  is setup's question.
 - **`ignore`** — whether each path the plugin itself creates inside a checkout
   (`.claude/worktrees/`, `.claude/worktree-no-runtime`) is gitignored. An untracked one is work to the
   teardown guard, so the worktree it sits in is never torn down.

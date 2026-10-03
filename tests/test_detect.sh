@@ -531,6 +531,39 @@ run_suite() {
   hasnt 'assign: a variable that is not a hint is not' 'assign|OTHER_THING' "$out"
   hasnt 'assign: a dotenv file is not a source of inline assignments' 'assign|TENANT_ID|.env|' "$out"
 
+  # --- HOW THE APP STARTS: start commands, with any port they pin -------------
+  # A port nothing reads isolates nothing; these records show setup each start command and the
+  # port literal or flag in it, so a hardcoded port is visible before runtime.port is written.
+  r=$(mkrepo starts package.json package-lock.json composer.json composer.lock)
+  printf '{"scripts":{"dev":"vite --port 5173","start":"node server.js","build":"vite build"}}' >"$r/package.json"
+  printf '{"scripts":{"serve":["php -S localhost:8000 -t public"]}}' >"$r/composer.json"
+  printf 'web: bundle exec rails s -p 3000\n# a comment: not a process\nworker: bin/jobs' >"$r/Procfile"
+  # shellcheck disable=SC2016  # markdown backticks under test
+  printf 'Run `symfony serve --port=8123 -d` first.\n\n    python manage.py runserver 0.0.0.0:8001\nnpm run dev\nvite build\n' >"$r/README.md"
+  printf 'up:\n\tPORT=4000 uvicorn app:main --reload\n' >"$r/Makefile"
+  commit_all "$r"
+  out=$(det "$r")
+  has 'start: a manifest dev script, with its port flag' 'start|package.json|scripts.dev|--port 5173|vite --port 5173' "$out"
+  has 'start: a script with no port in it has an empty port field' 'start|package.json|scripts.start||node server.js' "$out"
+  hasnt 'start: a script not named as a start script is not one' 'scripts.build' "$out"
+  has 'start: a composer script array, with the host:port it binds' \
+    'start|composer.json|scripts.serve|-S localhost:8000|["php -S localhost:8000 -t public"]' "$out"
+  has 'start: every Procfile process' 'start|Procfile|web|-p 3000|bundle exec rails s -p 3000' "$out"
+  has 'start: including the last line with no newline' 'start|Procfile|worker||bin/jobs' "$out"
+  hasnt 'start: a Procfile comment is not a process' 'start|Procfile|# a comment' "$out"
+  # shellcheck disable=SC2016  # markdown backticks under test
+  has 'start: a documented server command, with its flag' \
+    'start|README.md|line 1|--port=8123|Run `symfony serve --port=8123 -d` first.' "$out"
+  has 'start: a runserver address is a port' 'start|README.md|line 3|runserver 0.0.0.0:8001|python manage.py runserver 0.0.0.0:8001' "$out"
+  has 'start: a package-manager dev script named in docs' 'start|README.md|line 4||npm run dev' "$out"
+  hasnt 'start: a build is not a server' 'vite build' "$out"
+  has 'start: an inline PORT= is the port it pins' 'start|Makefile|line 2|PORT=4000|PORT=4000 uvicorn app:main --reload' "$out"
+  # The per-file cap keeps a long README from burying the rest.
+  r=$(mkrepo startcap composer.lock)
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'npm start\n' >>"$r/README.md"; done
+  commit_all "$r"
+  eq 'start: at most startLinesPerFile lines per file' 10 "$(det "$r" | grep -c '^start|README.md|')"
+
   # --- THE PLUGIN'S OWN PATHS must be gitignored --------------------------------
   r=$(mkrepo ignores composer.lock)
   out=$(det "$r")
