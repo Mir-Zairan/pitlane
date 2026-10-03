@@ -542,6 +542,34 @@ wt_guard_argv() {  # $1 = the command, for the message
   return 0
 }
 
+# Copy what is written to $1 onto stderr while it is written, until wt_capture_unfollow: the live
+# view of a captured install. A poller in the background rather than `tail -f`, because it has to
+# stop only once it has copied everything the finished command wrote, and `tail -f` cannot be told
+# that. It also stops if the hook itself has gone, so it never outlives the run it reports on.
+wt_capture_follow() {  # $1 = capture file; sets WT_CAPTURE_FOLLOWER
+  local file=$1 hook=$$
+  rm -f "$file.ended" 2>/dev/null
+  (
+    exec 3<"$file" || exit 0
+    while :; do
+      if [ -e "$file.ended" ] || ! kill -0 "$hook" 2>/dev/null; then
+        cat <&3 >&2
+        exit 0
+      fi
+      cat <&3 >&2
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+  ) </dev/null >/dev/null &
+  WT_CAPTURE_FOLLOWER=$!
+}
+
+wt_capture_unfollow() {  # $1 = capture file
+  : >"$1.ended" 2>/dev/null || kill "${WT_CAPTURE_FOLLOWER:-}" 2>/dev/null
+  wait "${WT_CAPTURE_FOLLOWER:-}" 2>/dev/null || true
+  rm -f "$1.ended" 2>/dev/null
+  return 0
+}
+
 # Run $1 inside the profile's toolchain, in directory $2, with a timeout of $3 seconds.
 #
 # Returns the command's own exit status, or 124 when `timeout` killed it — which the caller must
@@ -551,7 +579,7 @@ wt_guard_argv() {  # $1 = the command, for the message
 # It NEVER lets a failure escape as a shell error: the caller is a hook that must exit 0 whatever
 # happens, so every path here returns a status rather than tripping `set -e`.
 wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
-  local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0
+  local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0 capture=${WT_RUN_CAPTURE:-}
 
   [ -n "$cmd" ] || return 0
   # THE BACKSTOP. Every caller that runs a profile's command checks the approval first and records
@@ -596,13 +624,20 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   # but would abort the caller outright under `set -e`, which would make this file's promise that
   # nothing escapes as a shell error true only by accident of the current entrypoint's options.
   #
-  # WT_RUN_CAPTURE names a file to take the command's output instead, replayed to stderr once it
-  # ends, so the caller can read the error line back. A file rather than a `tee` pipe: a daemon the
-  # install leaves behind would hold a pipe open and hang the hook past its budget; it cannot hold
-  # up a file.
+  # WT_RUN_CAPTURE names a file to take the command's output instead, so the caller can read the
+  # error line back; wt_capture_follow copies it to stderr as it grows. A file rather than a `tee`
+  # pipe: a daemon the install leaves behind would hold a pipe open and hang the hook past its
+  # budget; it cannot hold up a file.
+  if [ -n "$capture" ]; then
+    if : >"$capture" 2>/dev/null; then
+      wt_capture_follow "$capture"
+    else
+      capture=''
+    fi
+  fi
   if command -v timeout >/dev/null 2>&1; then
-    if [ -n "${WT_RUN_CAPTURE:-}" ]; then
-      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >"$WT_RUN_CAPTURE" 2>&1 || rc=$?
+    if [ -n "$capture" ]; then
+      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
     else
       ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
     fi
@@ -610,15 +645,13 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
     # No coreutils `timeout` (a stock macOS host). Run unbounded rather than not at all, and say
     # so once: an unbounded install is a risk, but refusing to install is a certainty.
     wt_log "coreutils timeout is not on PATH — running \"$cmd\" without a time limit"
-    if [ -n "${WT_RUN_CAPTURE:-}" ]; then
-      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >"$WT_RUN_CAPTURE" 2>&1 || rc=$?
+    if [ -n "$capture" ]; then
+      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
     else
       ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
     fi
   fi
-  if [ -n "${WT_RUN_CAPTURE:-}" ]; then
-    cat "$WT_RUN_CAPTURE" >&2 2>/dev/null || true
-  fi
+  [ -z "$capture" ] || wt_capture_unfollow "$capture"
   # A step the cap stopped dies of SIGKILL: 137 through `timeout`. Say what happened, because "exit
   # 137" reads like a crash in the tool rather than the guard doing its job.
   if [ "$rc" -eq 137 ] && [ -n "$WT_GUARD_CAP" ]; then
@@ -1039,7 +1072,7 @@ wt_lock_release() {  # $1 = fd number
 # and nothing said otherwise), `dirty` (not done, for any other reason: out of time, out of memory,
 # not approved, a verify that failed after a clean exit). A `failed` install is NOT retried with
 # the same lockfile and command (wt_state_failure_stands): it would fail the same way, and each
-# attempt can cost minutes. Fields 7 and 8, after `when`, carry a `warn` or `failed` install's
+# attempt can cost minutes. Only `--finish --retry-failed` overrides that. Fields 7 and 8, after `when`, carry a `warn` or `failed` install's
 # exit code and its error line.
 #
 # NO PARTIAL TRUST, the same rule the profile has: unreadable, wrong version, unparseable, or an
@@ -1691,15 +1724,30 @@ wt_state_failure_stands() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = in
 # error, else the last non-empty one. Made safe to record and to show: escape sequences removed,
 # then everything outside printable ASCII (the record's separators included), capped at 160.
 wt_install_error_line() {  # $1 = file holding the install's output
-  local esc
-  esc=$(printf '\033')
   [ -r "${1-}" ] || return 0
-  tail -n 400 "$1" 2>/dev/null | tr '\r' '\n' | LC_ALL=C sed "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
-    | LC_ALL=C tr -cd '\n -~' \
-    | awk '{ sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
-           $0 != "" { last = $0; if (tolower($0) ~ /err|fail|fatal/) hit = $0 }
-           END { print (hit != "" ? hit : last) }' \
-    | cut -c1-160
+  # One awk for what was a six-stage pipeline. Only the last 400 lines count, as `tail -n 400`
+  # counted them: a match is kept with its line number and dropped at the end if it fell outside.
+  LC_ALL=C awk '
+    {
+      n = split($0, part, "\r")
+      for (i = 1; i <= n; i++) {
+        s = part[i]
+        gsub(/\033\[[0-9;?]*[A-Za-z]/, "", s)
+        gsub(/[^ -~]/, "", s)
+        sub(/^ +/, "", s)
+        sub(/ +$/, "", s)
+        if (s == "") continue
+        last = s; lastnr = NR
+        if (tolower(s) ~ /err|fail|fatal/) { hit = s; hitnr = NR }
+      }
+    }
+    END {
+      first = NR - 399
+      out = ""
+      if (hit != "" && hitnr >= first) out = hit
+      else if (lastnr >= first) out = last
+      print substr(out, 1, 160)
+    }' "$1" 2>/dev/null
 }
 
 # True if $1 contains a character that lets it stop being a value and start being syntax.
@@ -1904,9 +1952,17 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
   esac
 }
 
+# Where one dependency's install output is captured: beside the state file, so it goes when the
+# worktree goes, and overwritten by the next install of the same directory.
+wt_install_capture_path() {  # $1 = worktree, $2 = dependency dir
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-bootstrap.install.%s.log' "${p%/*}" "${2//[!A-Za-z0-9._-]/_}"
+}
+
 wt_dep_log_failure_stands() {  # $1 = dir, $2 = lock, $3 = recorded exit code, $4 = recorded error line
   local why="exit ${3:-?}${4:+: $4}"
-  wt_log "  $1: the recorded failure stands ($why) — not retrying an install that would fail the same way; it is retried once ${2:-its lockfile} or the install command changes"
+  wt_log "  $1: the recorded failure stands ($why) — not retrying an install that would fail the same way; it is retried once ${2:-its lockfile} or the install command changes, or now by: bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --finish --retry-failed"
 }
 
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
@@ -2006,8 +2062,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     fi
     # Settled before the lock and the deferral, so a standing failure neither waits for a lock nor
     # starts a background run that would only say this again. A hardlink is still tried below: its
-    # failure was the fallback install's, and the link may work now.
-    if [ "$strategy" = install ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+    # failure was the fallback install's, and the link may work now. WT_RETRY_FAILED (`--finish
+    # --retry-failed`, run on the user's word) is how a failure that was the network's, not the
+    # lockfile's, gets another go: nothing automatic can tell the two apart.
+    if [ "$strategy" = install ] && [ "${WT_RETRY_FAILED:-}" != 1 ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
       wt_dep_log_failure_stands "$dir" "$lock" "$WT_DEP_RC" "$WT_DEP_REASON"
       continue
     fi
@@ -2053,7 +2111,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     # Read before `doing` overwrites it: a hardlink only learns below whether it needs the install.
     stands=0 stood_rc='' stood_reason=''
-    if [ "$strategy" = hardlink ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+    if [ "$strategy" = hardlink ] && [ "${WT_RETRY_FAILED:-}" != 1 ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
       stands=1 stood_rc=$WT_DEP_RC stood_reason=$WT_DEP_REASON
     fi
 
@@ -2151,12 +2209,11 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       left=$(wt_budget_left "$deadline")
       wt_log "  $dir: installing (${left}s of the budget left)"
       started=$(date +%s 2>/dev/null) || started=''
-      capture=$(mktemp "${TMPDIR:-/tmp}/pitlane-install.XXXXXX" 2>/dev/null) || capture=''
+      capture=$(wt_install_capture_path "$worktree" "$dir")
       WT_RUN_CAPTURE=$capture wt_run_in_shell "$install" "$worktree" "$left"
       rc=$?
       reason=''
       [ "$rc" -eq 0 ] || reason=$(wt_install_error_line "$capture")
-      [ -z "$capture" ] || rm -f "$capture"
       elapsed=''
       [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
       case $rc in
@@ -2223,14 +2280,16 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   return 0
 }
 
-# What this worktree's bootstrap has NOT finished, one item per line: each dependency directory not
-# recorded done (or warn) for its current lockfile and install command, then
-# `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty output
-# means the worktree is complete. It is what the session is told, so it reads the state the steps
-# recorded rather than guessing. With $2 = attemptable, a dependency whose failure stands is left
-# out: what remains is what a run would actually try, which decides whether one is worth starting.
-wt_bootstrap_pending() {  # $1 = worktree, $2 = attemptable (optional)
-  local worktree=${1%/} mode=${2-} rec body dir lock strategy install verify _cksum lckhash ickhash seed
+# What this worktree's bootstrap has NOT finished, one item per line, in WT_PENDING: each dependency
+# directory not recorded done (or warn) for its current lockfile and install command, then
+# `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty means the
+# worktree is complete. It is what the session is told, so it reads the state the steps recorded
+# rather than guessing. WT_PENDING_ATTEMPTABLE is the same list less each dependency whose failure
+# stands: what a run would actually try, which decides whether one is worth starting. Globals, not
+# output, so one walk answers both: each item costs an expand and two checksums.
+wt_bootstrap_pending() {  # $1 = worktree
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed
+  WT_PENDING='' WT_PENDING_ATTEMPTABLE=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
@@ -2246,15 +2305,18 @@ wt_bootstrap_pending() {  # $1 = worktree, $2 = attemptable (optional)
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
     wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" && continue
-    if [ "$mode" = attemptable ] && wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
-      continue
-    fi
-    printf '%s\n' "$dir"
+    WT_PENDING+=${WT_PENDING:+$'\n'}$dir
+    wt_state_failure_stands "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" && continue
+    WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$dir
   done < <(printf '%s' "${PROFILE_RAW:-}")
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ] \
     && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
     seed=$(wt_runtime_state_get "$worktree" seedstatus) || seed=none
-    [ "$seed" = "done" ] || printf 'databases (seed: %s)\n' "${seed:-none}"
+    if [ "$seed" != "done" ]; then
+      seed="databases (seed: ${seed:-none})"
+      WT_PENDING+=${WT_PENDING:+$'\n'}$seed
+      WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$seed
+    fi
   fi
   return 0
 }

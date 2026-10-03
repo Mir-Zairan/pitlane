@@ -1492,6 +1492,8 @@ eq '...and, with no verify to say otherwise, as failed' failed "$(wt_state_statu
 # allowed, a peer-dependency complaint) has still produced a usable tree. The counter file proves
 # whether a later run re-ran the install.
 CNT=$TMP/install-count
+pending_all() { wt_bootstrap_pending "$1"; printf '%s' "$WT_PENDING"; }
+pending_attemptable() { wt_bootstrap_pending "$1"; printf '%s' "$WT_PENDING_ATTEMPTABLE"; }
 dep_line() {  # $1 = dir; the recorded dep record's fields, US shown as |
   local rec
   while IFS= read -r -d "$RS_" rec; do
@@ -1507,30 +1509,69 @@ eq 'non-zero install, passing verify: recorded as warn' warn "$(wt_state_status 
 eq '...which counts as present' 0 \
   "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" "$(wt_cksum_string "$WARNCMD")" install; echo $?)"
 contains '...and says so' 'installed with warnings' "$out"
+# The install's output is captured in the worktree's git dir, one file per dependency, and shown live.
+CAPF=$(wt_install_capture_path "$DWT" vendor)
+case $CAPF in "$(git -C "$DWT" rev-parse --absolute-git-dir)"/*) where=gitdir ;; *) where=$CAPF ;; esac
+eq "...its output captured in the worktree's git dir" gitdir "$where"
+contains '...holding what the install printed' 'progress 1/2' "$(cat "$CAPF" 2>/dev/null)"
+contains '...and copied to the log' 'progress 1/2' "$out"
+contains '...all of it, to the last line' 'Done in 1s' "$out"
+eq '...leaving no follower marker behind' no "$([ -e "$CAPF.ended" ] && echo yes || echo no)"
 rec=$(dep_line vendor)
-contains '...recording the exit code and the error line, escapes and non-ASCII stripped' \
-  '|warn|' "$rec"
-contains '...the exit code' '|1|ERR_FAKE_IGNORED_BUILDS one build  not allowed' "$rec"
+contains '...recorded as warn' '|warn|' "$rec"
+contains '...with the exit code and the error line, escapes and non-ASCII stripped' \
+  '|1|ERR_FAKE_IGNORED_BUILDS one build  not allowed' "$rec"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 eq '...and a second run does not re-run the install' x "$(cat "$CNT")"
 contains '...because it is up to date' 'already up to date' "$out"
 # shellcheck disable=SC2034
 PROFILE_PRESENT=1
-eq '...nor is it pending' '' "$(wt_bootstrap_pending "$DWT")"
+eq '...nor is it pending' '' "$(pending_all "$DWT")"
 
 # The reason is one bounded line of printable ASCII: nothing that could break the record.
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
-LONGCMD="mkdir -p vendor && touch vendor/autoload.php; printf 'error %0400d\\037tail\\036end\\n' 0 >&2; exit 3"
+LONGCMD="mkdir -p vendor && touch vendor/autoload.php; printf 'error %0400d\\n' 0 >&2; exit 3"
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock install "$LONGCMD" 'test -r vendor/autoload.php')
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 rec=$(dep_line vendor)
 reason=${rec##*|}
-eq 'the recorded reason is length-capped' yes "$([ "${#reason}" -le 160 ] && [ "${#reason}" -ge 100 ] && echo yes)"
-eq '...and the separators inside it are stripped, so the record still has its nine fields' 8 \
+eq 'the recorded reason is length-capped' 160 "${#reason}"
+contains '...with the exit code beside it' '|3|error 000' "$rec"
+# The record's own separators, inside the part of the line that is kept.
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install \
+  "mkdir -p vendor && touch vendor/autoload.php; printf 'error \\037ab\\036c\\n' >&2; exit 3" 'test -r vendor/autoload.php')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+rec=$(dep_line vendor)
+eq 'separators in the error line are stripped, so the record still has its nine fields' 8 \
   "$(printf '%s' "$rec" | tr '|' '\n' | wc -l | tr -d ' ')"
-contains '...with the exit code beside it' '|warn|' "$rec"
-contains '...of the right value' "|3|error 000" "$rec"
+eq '...leaving the text around them' 'error abc' "${rec##*|}"
+
+# The error line is the LAST one that looks like an error...
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "echo 'error: first'; echo 'Error: second'; echo done; exit 1" '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'of two error lines, the last is recorded' 'Error: second' "$(dep_line vendor | sed 's/.*|//')"
+# ...else the last non-empty line...
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install "printf 'resolving...\\nstopped at step 3\\n\\n'; exit 1" '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'with no error-looking line, the last non-empty one is recorded' 'stopped at step 3' \
+  "$(dep_line vendor | sed 's/.*|//')"
+# ...and nothing at all when the install printed nothing.
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'exit 1' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+rec=$(dep_line vendor)
+eq 'a silent install records an empty reason after its exit code' '|failed|W|1|' \
+  "$(printf '%s' "$rec" | sed 's/.*|failed|[0-9]*|/|failed|W|/')"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...and the message names only the exit code' 'stands (exit 1) —' "$out"
 
 # Non-zero, and verify fails: failed, exactly as before.
 rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
@@ -1541,7 +1582,7 @@ out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 eq 'non-zero install, failing verify: failed' failed "$(wt_state_status "$DWT" vendor)"
 contains '...the verify was run and said no' 'verify command failed' "$out"
 contains '...recording what went wrong' '|1|npm error ENOTFOUND registry' "$(dep_line vendor)"
-eq '...and it is pending' vendor "$(wt_bootstrap_pending "$DWT")"
+eq '...and it is pending' vendor "$(pending_all "$DWT")"
 
 # The same failure is not paid for again.
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
@@ -1551,15 +1592,15 @@ contains '...and what would make a retry worth it' 'composer.lock or the install
 contains '...naming it' 'npm error ENOTFOUND registry' "$out"
 eq '...and keeps it recorded as failed' failed "$(wt_state_status "$DWT" vendor)"
 contains '...with its reason intact' '|1|npm error ENOTFOUND registry' "$(dep_line vendor)"
-eq '...still pending' vendor "$(wt_bootstrap_pending "$DWT")"
-eq '...but not something a run would attempt' '' "$(wt_bootstrap_pending "$DWT" attemptable)"
+eq '...still pending' vendor "$(pending_all "$DWT")"
+eq '...but not something a run would attempt' '' "$(pending_attemptable "$DWT")"
 # A deferred start-up run does not hand it to the background either.
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks 'a deferred run does not schedule a standing failure' 'to be installed in the background' "$out"
 
 # A changed lockfile is a reason to try again.
 printf 'LOCKV3\n' > "$DWT/composer.lock"
-eq 'a changed lockfile makes it attemptable again' vendor "$(wt_bootstrap_pending "$DWT" attemptable)"
+eq 'a changed lockfile makes it attemptable again' vendor "$(pending_attemptable "$DWT")"
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq 'a changed lockfile retries the install' xx "$(cat "$CNT")"
 printf 'LOCKV1\n' > "$DWT/composer.lock"
@@ -1579,6 +1620,9 @@ eq 'non-zero install with no verify: failed even though it created the directory
   "$(wt_state_status "$DWT" vendor)"
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq '...and not retried' x "$(cat "$CNT")"
+out=$(WT_RETRY_FAILED=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq '...unless the run is told to retry failures' xx "$(cat "$CNT")"
+lacks '...which then does not call the failure standing' 'the recorded failure stands' "$out"
 
 # A hardlink that fell back to a failing install: the failure stands for the fallback too.
 rm -rf "$DWT/vendor" "$DREPO/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
@@ -1593,6 +1637,15 @@ eq '...still recorded failed, not left at doing' failed "$(wt_state_status "$DWT
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks '...nor deferred to the background' 'to be installed in the background' "$out"
 eq '...and the deferral leaves it failed' failed "$(wt_state_status "$DWT" vendor)"
+WT_RETRY_FAILED=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...though a run told to retry failures re-runs the fallback' xx "$(cat "$CNT")"
+# Its failure was the fallback's: once the main checkout has the directory, the link is tried.
+mkdir -p "$DREPO/vendor"; printf main > "$DREPO/vendor/autoload.php"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq '...and once the main checkout has it, the link is made' "done" "$(wt_state_status "$DWT" vendor)"
+eq '...without the install' xx "$(cat "$CNT")"
+contains '...said as a link' 'hardlinked from the main checkout' "$out"
+rm -rf "$DREPO/vendor"
 
 # An install that was STOPPED did not finish: it is retried, never recorded as a failure that
 # stands, and verify does not get to call it good.

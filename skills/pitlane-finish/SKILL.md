@@ -31,6 +31,13 @@ It prints progress on stderr and one status line on stdout as its last word:
   If the reason was **memory** ("memory is free", "memory cap"), Pitlane held the step back so it could
   not freeze the desktop: tell the user to close something heavy and run it again, or to set
   `PITLANE_MEMORY_MAX` (e.g. `PITLANE_MEMORY_MAX=12G`) if the step genuinely needs more.
+  If stderr says **"the recorded failure stands"**, an earlier install of that dependency failed and
+  Pitlane will not re-run it, automatically, until its lockfile or install command changes. Tell the
+  user which dependency failed and the recorded reason (the exit code and error line in brackets on
+  that line). If it looks transient (a network outage, a toolchain not on PATH, a full disk) and it
+  has been fixed, offer to retry it; **only if the user says yes**, run
+  `bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --finish --retry-failed`, in the background
+  as above.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
 

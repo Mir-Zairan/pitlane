@@ -1375,6 +1375,19 @@ lacks '...and the session is not told one is in progress' 'in the background' "$
 printf 'LOCK2\n' > "$WFL/composer.lock"
 ( cd "$WFL" && bash "$HOOK" --finish >/dev/null 2>&1 )
 eq 'failed: a changed lockfile retries the install' xx "$(cat "$TMP/fld-count")"
+# Nothing automatic can tell a network outage from a broken lockfile, so a failure that stands is
+# retried only when asked: a plain --finish leaves it, and names the way to ask.
+outF=$( cd "$WFL" && bash "$HOOK" --finish 2>"$TMP/err" ); errF=$(cat "$TMP/err")
+eq 'failed: a plain --finish does not retry a standing failure' xx "$(cat "$TMP/fld-count")"
+contains '...and names the retry' '--finish --retry-failed' "$errF"
+mkdir -p "$TMP/fld-tmp"
+outR=$( cd "$WFL" && TMPDIR=$TMP/fld-tmp bash "$HOOK" --finish --retry-failed 2>"$TMP/err" ); errR=$(cat "$TMP/err")
+eq 'failed: --finish --retry-failed re-runs it' xxx "$(cat "$TMP/fld-count")"
+eq '...reporting it still missing' 'Pitlane: still not complete — missing: vendor' "$outR"
+contains "...with the install's own output in the log" 'error: registry unreachable' "$errR"
+contains '...the output captured in the git dir' 'error: registry unreachable' \
+  "$(cat "$GDFL/worktree-bootstrap.install.vendor.log" 2>/dev/null)"
+eq '...and nothing left in TMPDIR' '' "$(ls -A "$TMP/fld-tmp")"
 
 # ---------------------------------------------------------------------------
 # The approval gate: nothing a profile names runs until that content is approved

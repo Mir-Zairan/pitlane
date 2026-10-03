@@ -45,12 +45,18 @@ set -uo pipefail
 #
 # `--finish --background` is the same run, started detached by a SessionStart that deferred its slow
 # steps (WT_DEFER below): it records its pid where /pitlane-finish and later sessions can see it.
-WT_FINISH='' WT_BACKGROUND=''
+#
+# `--finish --retry-failed` also re-runs an install whose recorded failure stands. Never automatic:
+# /pitlane-finish passes it only on the user's word, after showing them the recorded reason.
+WT_FINISH='' WT_BACKGROUND='' WT_RETRY_FAILED=''
 WT_BOOTSTRAP_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bootstrap.sh"
 export WT_BOOTSTRAP_SCRIPT
 if [ "${1-}" = --finish ]; then
   WT_FINISH=1
-  [ "${2-}" = --background ] && WT_BACKGROUND=1
+  case ${2-} in
+    --background) WT_BACKGROUND=1 ;;
+    --retry-failed) WT_RETRY_FAILED=1 ;;
+  esac
   # Either JSON backend: a jq-only host must not get an empty payload, which would make the
   # background run — and /pitlane-finish — silently do nothing.
   HOOK_INPUT=$(python3 -c 'import json,os; print(json.dumps({"hook_event_name":"SessionStart","source":"startup","cwd":os.getcwd()}))' 2>/dev/null) \
@@ -59,7 +65,7 @@ if [ "${1-}" = --finish ]; then
   WT_INPUT_READ=1
   export HOOK_INPUT WT_INPUT_READ
 fi
-export WT_FINISH WT_BACKGROUND
+export WT_FINISH WT_BACKGROUND WT_RETRY_FAILED
 
 # `bootstrap.sh --review` and `bootstrap.sh --approve <fingerprint>`, run from a worktree or the main
 # checkout: show what the profile there would run, and approve exactly that content. Never run by a
@@ -479,7 +485,8 @@ case $event in
     # one short notice when it is not, because a session that mistakes a half-set-up worktree for a
     # ready one goes on to install and clone by hand (measured: it is what sessions did before this
     # plugin existed). /pitlane-finish reads the same list as a plain status line.
-    pending=$(wt_bootstrap_pending "$worktree")
+    wt_bootstrap_pending "$worktree"
+    pending=$WT_PENDING
     if [ "${WT_FINISH:-}" = 1 ]; then
       if [ -z "$pending" ]; then
         printf 'Pitlane: this worktree is fully set up.\n'
@@ -498,8 +505,7 @@ case $event in
         wt_log "not run, pending approval: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
         wt_bootstrap_notice "$pending" approval
       # A run is started only for work it would attempt: an install whose failure stands is not.
-      elif [ "$WT_DEFER" = 1 ] && [ -n "$(wt_bootstrap_pending "$worktree" attemptable)" ] \
-        && wt_background_start "$worktree"; then
+      elif [ "$WT_DEFER" = 1 ] && [ -n "$WT_PENDING_ATTEMPTABLE" ] && wt_background_start "$worktree"; then
         wt_log "finishing in the background: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
         wt_bootstrap_notice "$pending" background
       else
