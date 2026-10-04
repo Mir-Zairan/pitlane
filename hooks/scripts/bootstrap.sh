@@ -397,6 +397,8 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
       "${PROFILE_EV_DETECTION:-}" "${PROFILE_EV_MARKERS:-}" "${PROFILE_EV_SHELL:-}" "$PROFILE_PATH" "$root"
   fi
   wt_warn_hardlinked_venvs "$root"
+  # One interpreter start when the profile has an uncopied hardlink, so inside the budget like drift.
+  [ "$(wt_budget_left "$deadline")" -le 0 ] || wt_warn_uncopied_links
 
   # Decided AFTER the copy: it is what brings a personal profile's seed and teardown scripts into
   # the worktree, and the fingerprint is of the files as they will run. Before anything executes.

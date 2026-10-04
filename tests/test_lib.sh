@@ -1895,6 +1895,38 @@ JSON
     rm -f "$VR/zero.lock"
   fi
 
+  # --- deps[].copy -----------------------------------------------------------
+  # Paths inside a hardlinked dir that must be real copies. An array inside each element, so it
+  # reaches bash as compact JSON, read identically on both backends; field 7 of group 1.
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","verify":"v","lockChecksum":"'"$VCK"'","copy":["composer","sub/installed.json"]}]}'
+  eq 'validate: a good copy list reports nothing' '' "$(vv)"
+  dep=''
+  while IFS= read -r -d "$RS" rec; do
+    case $rec in 1"$US"*) dep=${rec#1"$US"} ;; esac
+  done < <(wt_profile_scan "$VP")
+  eq 'scan: copy is the seventh deps field, as compact JSON' \
+    "vendor|composer.lock|hardlink|x|v|$VCK|[\"composer\",\"sub/installed.json\"]" "${dep//"$US"/|}"
+  eq 'copy: split one path per line' "composer"$'\n'"sub/installed.json" \
+    "$(wt_dep_copy_paths '["composer","sub/installed.json"]')"
+  eq 'copy: absent is an empty list' '0|' "$(out=$(wt_dep_copy_paths ''); echo "$?|$out")"
+  eq 'copy: [] is an empty list' '0|' "$(out=$(wt_dep_copy_paths '[]'); echo "$?|$out")"
+  for bad_in in '"composer"' '["composer",]' '[1]' '["../up"]' '["/abs"]' '["a b"]' '["."]' \
+    '["composer/"]' '["*.json"]' '["a\"b"]' '{"a":1}'; do
+    out=$(wt_dep_copy_paths "$bad_in"); rc=$?
+    eq "copy: $bad_in is refused" "1|" "$rc|$out"
+  done
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":["../../etc"]}]}'
+  contains 'validate: a copy path outside the dir is a violation' \
+    'deps[0].copy: must be an array of paths inside vendor' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":"composer"}]}'
+  contains 'validate: copy must be an array' 'deps[0].copy: must be an array of paths inside vendor' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":[]}]}'
+  eq 'validate: an empty copy list is fine' '' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"x","copy":["composer"]}]}'
+  eq 'validate: copy on an installed dir is not a violation' '' "$(vv)"
+  contains '...but it is said to do nothing' 'deps[0].copy only applies to strategy "hardlink"' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+
   # --- artifacts[] ------------------------------------------------------------
   # inputs is an array INSIDE each element, so it reaches bash as compact JSON; the splitter must
   # read it identically on both backends, and refuse anything that could become pathspec magic.

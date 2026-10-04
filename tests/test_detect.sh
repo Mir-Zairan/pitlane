@@ -213,6 +213,23 @@ run_suite() {
   eq 'verify: bundler with vendor/bundle keeps hardlink' 'hardlink' "$(field "$out" dep 5)"
   hasnt 'verify: and nothing is downgraded' 'depDowngrade' "$out"
   hasnt 'verify: nor its verify withheld' 'no default verify' "$out"
+  # --- paths a hardlinked dir must hold as real copies (ADR-022) ----------------
+  # composer and npm rewrite these in place, which through a shared inode is a write into the main
+  # checkout; setup writes them to deps[].copy.
+  eq 'copy: composer copies vendor/composer' 'depCopy|0|composer' "$(det "$TMP/$BACKEND/v_composer" | grep '^depCopy|')"
+  eq 'copy: npm copies its hidden lockfile' 'depCopy|0|.package-lock.json' "$(det "$TMP/$BACKEND/v_npm" | grep '^depCopy|')"
+  eq 'copy: yarn classic copies .yarn-integrity' 'depCopy|0|.yarn-integrity' "$(det "$TMP/$BACKEND/v_yarn1" | grep '^depCopy|')"
+  eq 'copy: a vendored bundle copies nothing' '' "$(det "$TMP/$BACKEND/v_bundle" | grep '^depCopy|' || true)"
+  eq 'copy: an installed dir is never given one' '' "$(det "$TMP/$BACKEND/v_pnpm" | grep '^depCopy|' || true)"
+  # A hardlink downgraded to install has nothing to copy.
+  eq 'copy: nor a hardlink downgraded to install' '' "$(det "$TMP/$BACKEND/v_nobundle" | grep '^depCopy|' || true)"
+  # Every hardlink rule says, and no other rule does: [] is an answer, absence is not.
+  eq 'table: every hardlink rule lists copyPaths, and only those' '' "$(python3 -c '
+import json, sys
+for r in json.load(open(sys.argv[1]))["deps"]:
+    if (r["strategy"] == "hardlink") != isinstance(r.get("copyPaths"), list):
+        print(r["markers"])' "$TABLE")"
+
   eq 'table: every rule that manages a directory carries a verify or says why it has none' '' \
     "$(printf '%s\n' "$rules" | grep -E '^[^|]+\|[^|]+\|\|$' || true)"
   eq 'table: and never both' '' "$(printf '%s\n' "$rules" | grep -E '^[^|]*\|[^|]*\|[^|]+\|[^|]+$' || true)"
@@ -451,6 +468,7 @@ run_suite() {
   has 'nested: its verify does too' "|cd 'tools/lint' && test -r vendor/autoload.php" "$out"
   has 'nested: and says why the root install does not cover it' 'depNote|2|nested: tools/lint' "$out"
   has 'nested: its OWN manifest is probed for hazards, and neutralised' 'hazard|2|composer-post-install|neutralise|--no-scripts' "$out"
+  has 'nested: its copy path is relative to its own dir, so it carries no prefix' 'depCopy|2|composer' "$out"
   has 'nested: and its migration is escalated like the root one would be' 'escalate|2|' "$out"
   has 'nested: a lockfile with no installed tree (a fixture) is dropped, saying so' \
     'dropped|tests/fixtures/app/composer.lock|tests/fixtures/app/vendor|a nested lockfile, but' "$out"

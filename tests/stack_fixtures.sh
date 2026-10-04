@@ -35,6 +35,12 @@
 #                           STACK_SERVE_PATH, STACK_SERVE_EXPECT
 #                                           what /pitlane-serve's app must answer at that path of
 #                                           its URL; {port} stands for the worktree's own
+#                           STACK_INPLACE   shell run in the first worktree, through the toolchain, that
+#                                           rewrites files of a hardlinked dir IN PLACE (ADR-022); the
+#                                           main checkout's copy must keep its bytes and inodes
+#                           STACK_INPLACE_NET the same for a command that needs the registry: one that
+#                                           fails is reported, not counted. Tracked files either changes
+#                                           are restored after it
 #                           STACK_ARTIFACTS the artifacts[] body, set BEFORE write_profile ('' = none)
 #                           STACK_ART_FILE  a file the build writes: the worktree with unchanged
 #                                           inputs holds a copy of the main checkout's
@@ -56,36 +62,45 @@
 # dir, lock, strategy, install and verify as detected — so the suite proves the detection defaults
 # against real installs. Where detection withholds a verify (a `no default verify:` depNote), the
 # developer supplies one; here that is a `dir=verify` argument, and supplying one detection already
-# proposes is a fixture error. Sets STACK_DEPS (the JSON body), STACK_DETECTED_LINKDIRS (the dirs it
-# chose to hardlink) and STACK_DETECT_ERRORS ('' when the fixture and detection agree).
+# proposes is a fixture error. A hardlinked entry gets `copy` from its `depCopy` records, `[]` when
+# there are none, as setup writes it. Sets STACK_DEPS (the JSON body), STACK_DETECTED_LINKDIRS (the
+# dirs it chose to hardlink), STACK_COPY (each copy path, joined to its dir) and STACK_DETECT_ERRORS
+# ('' when the fixture and detection agree).
 detect_deps() {  # $1 = repo, $@ = dir=verify for the entries detection gives none
   local repo=$1 out
   shift
   out=$(WT_SKIP_PROBES=1 bash "$SCRIPTS/detect.sh" "$repo" 2>/dev/null | python3 -c '
 import json, sys
 supplied = dict(a.split("=", 1) for a in sys.argv[1:])
-entries, links, errors = [], [], []
-for line in sys.stdin:
-    f = line.rstrip("\n").split("\t")
+entries, links, errors, copies = [], [], [], []
+lines = [line.rstrip("\n").split("\t") for line in sys.stdin]
+copy_of = {}
+for f in lines:
+    if f[0] == "depCopy":
+        copy_of.setdefault(f[1], []).append(f[2])
+for f in lines:
     if f[0] != "dep":
         continue
-    _, _, d, lock, strategy, install, verify = (f + [""] * 7)[:7]
+    _, n, d, lock, strategy, install, verify = (f + [""] * 7)[:7]
     if d in supplied:
         if verify:
             errors.append("detection proposes a verify for %s (%s); the fixture must not override it" % (d, verify))
         verify = supplied.pop(d)
     elif not verify and d and strategy != "skip":
         errors.append("detection withholds a verify for %s and the fixture supplies none" % d)
+    entry = {"dir": d or None, "lock": lock, "strategy": strategy, "install": install, "verify": verify}
     if strategy == "hardlink":
         links.append(d)
-    entries.append(json.dumps({"dir": d or None, "lock": lock, "strategy": strategy,
-                               "install": install, "verify": verify}))
+        entry["copy"] = copy_of.get(n, [])
+        copies += [d + "/" + c for c in entry["copy"]]
+    entries.append(json.dumps(entry))
 errors += ["the fixture supplies a verify for %s, which detection does not propose" % d for d in supplied]
 print(" ".join(links))
+print(" ".join(copies))
 print("; ".join(errors))
 print(",\n    ".join(entries))
-' "$@") || { STACK_DEPS='' STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='detect.sh or its conversion failed'; return 0; }
-  { read -r STACK_DETECTED_LINKDIRS; read -r STACK_DETECT_ERRORS; STACK_DEPS=$(cat); } <<<"$out"
+' "$@") || { STACK_DEPS='' STACK_DETECTED_LINKDIRS='' STACK_COPY='' STACK_DETECT_ERRORS='detect.sh or its conversion failed'; return 0; }
+  { read -r STACK_DETECTED_LINKDIRS; read -r STACK_COPY; read -r STACK_DETECT_ERRORS; STACK_DEPS=$(cat); } <<<"$out"
 }
 
 # The profile every runtime-isolating stack gets: the toolchain wrapper, the deps given, a port and
@@ -225,6 +240,8 @@ JS
   STACK_SERVE='node server.js {port}' STACK_SERVE_PATH=/ STACK_SERVE_EXPECT='ok {port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=node_modules STACK_LINKDIRS=node_modules
+  # Measured: adds the package and rewrites node_modules/.package-lock.json in place.
+  STACK_INPLACE_NET='npm install --no-audit --no-fund isarray@2.0.5'
   STACK_PROBE='node probe.js'
   STACK_EXPECT=ok
 }
@@ -301,6 +318,9 @@ PHP
   STACK_SERVE='php -S 127.0.0.1:{port} serve.php' STACK_SERVE_PATH=/ STACK_SERVE_EXPECT='ok {port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=vendor STACK_LINKDIRS=vendor
+  # Measured: both rewrite vendor/composer/autoload_*.php and installed.* in place.
+  STACK_INPLACE='composer dump-autoload -o --quiet'
+  STACK_INPLACE_NET='composer require --quiet --no-interaction --no-progress psr/container:^2.0'
   STACK_PROBE='php probe.php'
   STACK_EXPECT=ok
 }

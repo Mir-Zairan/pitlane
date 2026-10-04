@@ -27,21 +27,21 @@ First column is the marker file at the repo root. The strategy rationale: `insta
 where the tool has its own content-addressable store, `hardlink` where it materialises real bytes per
 project, `skip` where the artefacts are build output that a shared cache already handles.
 
-| Marker | `dir` | Strategy | Install command | Default `verify` |
-|---|---|---|---|---|
-| `composer.lock` | `vendor` | hardlink | `composer install --no-interaction --no-progress` | `test -r vendor/autoload.php` |
-| `pnpm-lock.yaml` | `node_modules` | install | `pnpm install --frozen-lockfile` | `test -f node_modules/.modules.yaml` |
-| `package-lock.json` | `node_modules` | hardlink | `npm ci` | `test -f node_modules/.package-lock.json` |
-| `yarn.lock` + `.yarnrc.yml` | `.yarn/cache` | install | `yarn install --immutable` | `test -f .yarn/install-state.gz` |
-| `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` | `test -f node_modules/.yarn-integrity` |
-| `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` | none² |
-| `uv.lock` | `.venv` | install | `uv sync --frozen` | `set -- .venv/lib/python*/site-packages/*.dist-info; test -d "$1"` |
-| `poetry.lock` | `.venv` | install | `poetry install` | none² |
-| `Pipfile.lock` | `.venv` | install | `pipenv sync` | none² |
-| `Gemfile.lock` | `vendor/bundle` | hardlink¹ | `bundle install` | `test -d vendor/bundle/ruby`¹ |
-| `mix.lock` | `deps` | hardlink | `mix deps.get` | none² |
-| `Cargo.lock` | — | skip | `cargo fetch` | — |
-| `go.sum` | — | skip | `go mod download` | — |
+| Marker | `dir` | Strategy | Install command | Default `verify` | `copyPaths`³ |
+|---|---|---|---|---|---|
+| `composer.lock` | `vendor` | hardlink | `composer install --no-interaction --no-progress` | `test -r vendor/autoload.php` | `composer` |
+| `pnpm-lock.yaml` | `node_modules` | install | `pnpm install --frozen-lockfile` | `test -f node_modules/.modules.yaml` | — |
+| `package-lock.json` | `node_modules` | hardlink | `npm ci` | `test -f node_modules/.package-lock.json` | `.package-lock.json` |
+| `yarn.lock` + `.yarnrc.yml` | `.yarn/cache` | install | `yarn install --immutable` | `test -f .yarn/install-state.gz` | — |
+| `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` | `test -f node_modules/.yarn-integrity` | `.yarn-integrity` |
+| `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` | none² | — |
+| `uv.lock` | `.venv` | install | `uv sync --frozen` | `set -- .venv/lib/python*/site-packages/*.dist-info; test -d "$1"` | — |
+| `poetry.lock` | `.venv` | install | `poetry install` | none² | — |
+| `Pipfile.lock` | `.venv` | install | `pipenv sync` | none² | — |
+| `Gemfile.lock` | `vendor/bundle` | hardlink¹ | `bundle install` | `test -d vendor/bundle/ruby`¹ | none |
+| `mix.lock` | `deps` | hardlink | `mix deps.get` | none² | none (unmeasured) |
+| `Cargo.lock` | — | skip | `cargo fetch` | — | — |
+| `go.sum` | — | skip | `go mod download` | — | — |
 
 ¹ `requiresDir: true` — bundler's in-project directory is **opt-in, not the default**. When it does
 not exist in the main checkout, detection withholds the default `verify` (it would fail in every
@@ -50,6 +50,11 @@ worktree) and says so in a `depNote`, and the `hardlink` falls back to `install`
 ² `noVerify` — no file exists that only a *finished* install writes, so the rule carries the reason
 instead of a check; detection passes it on as a `no default verify:` `depNote` and `/pitlane-setup`
 asks the developer for a check that names something this repo always installs.
+
+³ `copyPaths` — paths inside a hardlinked `dir` that its tool rewrites **in place**, so through the
+shared inode the write would land in the main checkout. Detection emits one `depCopy` record per path,
+`/pitlane-setup` writes them to `deps[].copy`, and bootstrap makes each a real copy right after the
+link. See the caveat below.
 
 ### `verify`: what it is for, and why each default is what it is
 
@@ -64,8 +69,9 @@ against a real install, and the venv, bun and mix ones against a failed one too:
 
 - **pnpm** writes `node_modules/.modules.yaml` on every install with at least one package. A lockfile
   with no dependencies at all writes none, so the check fails there; such a repo needs no entry.
-- **npm** writes the hidden lockfile `node_modules/.package-lock.json`. It travels with a hardlinked
-  tree, which is correct: the tree it describes came with it.
+- **npm** writes the hidden lockfile `node_modules/.package-lock.json`. In a hardlinked tree it is
+  a copy (`copyPaths`) with the main checkout's bytes, which is correct: the tree it describes came
+  with it.
 - **Yarn Berry** writes `.yarn/install-state.gz` under both Plug'n'Play and the `node-modules` linker —
   and Berry 4's global cache means `.yarn/cache` itself may never exist, so the check is not on `dir`.
 - **classic yarn** writes `node_modules/.yarn-integrity`.
@@ -118,6 +124,14 @@ into an array. Ordering plus a guard expresses the same thing with no nesting.
   main's venv and imports load main's source. Before detection version 3, poetry and pipenv proposed
   `hardlink` for an in-project `.venv`; every venv rule is now `install`, and the suite fails if a rule
   proposes `hardlink` for one.
+- **A hardlinked dir is shared bytes, and some tools write in place** (ADR-022, measured with the
+  real tools). composer rewrites `vendor/composer/autoload_*.php`, `installed.json`, `installed.php`
+  and `platform_check.php` in place on `dump-autoload`, `install --no-dev` and `require`; npm rewrites
+  `node_modules/.package-lock.json` on `npm install <pkg>`. Through a hardlink that is a write into the
+  main checkout. `copyPaths` names those paths and bootstrap copies them after the link. Not covered:
+  a package's own install script writing into its directory — `npm rebuild`, `yarn install --force`,
+  composer scripts — writes in place wherever it writes. Run those only in a dir that was installed,
+  or make the entry `install`. Bundler's `vendor/bundle` measured safe; mix is unmeasured.
 - **`Pipfile.lock`'s `.venv` is the exception, not the rule.** pipenv's *default* is a venv **outside**
   the project, under `~/.local/share/virtualenvs/<project>-<hash>`. `.venv` is used only when
   `PIPENV_VENV_IN_PROJECT` is set or a `.venv` already exists — so a check the developer writes must

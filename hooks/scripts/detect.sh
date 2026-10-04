@@ -41,6 +41,8 @@
 #                    (a NESTED project's dir and lock carry its directory, and its commands
 #                    start with `cd '<dir>' &&` — they run from the worktree root like the rest)
 #   depReason        <n> <why this strategy>
+#   depCopy          <n> <path inside the dep's dir>   (one per path; a hardlinked dir's file or
+#                    directory its tool rewrites in place, so bootstrap must copy it: deps[].copy)
 #   depNote          <n> <caveat worth reading>
 #   depDowngrade     <n> <from> <to> <why>
 #   dropped          <marker> <dir> <why it was not used>
@@ -487,11 +489,12 @@ claimed() {  # $1 = list, $2 = needle
 # is: same strategy, same hazards, same escalations.
 detect_deps_in() {  # $1 = directory prefix
   local pre=${1-} d_markers d_dir d_strategy d_install d_verify d_reason d_hazards d_when d_requires
-  local d_fallback d_notes d_noverify marker m strategy fallback install verify hid h_manifest h_probes h_action
+  local d_fallback d_notes d_noverify d_copy marker m strategy fallback install verify hid h_manifest h_probes h_action
+  local cpaths cpath
   local h_flag h_why x_id x_manifest x_probes x_action x_flag x_why hit probed pkey
   while IFS=$WT_US read -r -d "$WT_RS" \
         d_markers d_dir d_strategy d_install d_verify d_reason d_hazards \
-        d_when d_requires d_fallback d_notes d_noverify; do
+        d_when d_requires d_fallback d_notes d_noverify d_copy; do
   
     marker=''
     while IFS= read -r m; do
@@ -646,6 +649,17 @@ detect_deps_in() {  # $1 = directory prefix
     fi
     emit dep "$N" "$pre$d_dir" "$pre$marker" "$strategy" "$install" "$verify"
     emit depReason "$N" "$d_reason"
+    # Relative to the dep's own dir, so a nested entry's paths carry no prefix. Only a link shares
+    # inodes with the main checkout, so a downgraded hardlink has nothing to copy.
+    if [ "$strategy" = hardlink ]; then
+      if cpaths=$(wt_dep_copy_paths "$d_copy"); then
+        while IFS= read -r cpath; do
+          [ -z "$cpath" ] || emit depCopy "$N" "$cpath"
+        done <<<"$cpaths"
+      else
+        warn "detection.json: the copyPaths of the rule for $d_dir are not a list of paths inside it — none proposed"
+      fi
+    fi
     [ -n "$d_noverify" ] && emit depNote "$N" "no default verify: $d_noverify"
     [ -n "$d_notes" ] && emit depNote "$N" "$d_notes"
     if [ -n "$pre" ]; then
@@ -658,7 +672,7 @@ detect_deps_in() {  # $1 = directory prefix
   
     N=$((N + 1))
   done < <(wt_json_records deps markers dir strategy install verify reason hazards \
-           when.exists requiresDir fallbackStrategy notes noVerify <"$WT_DETECTION_JSON")
+           when.exists requiresDir fallbackStrategy notes noVerify copyPaths <"$WT_DETECTION_JSON")
 }
 
 detect_deps_in ''

@@ -1467,6 +1467,15 @@ start_hook "$WDR" >/dev/null
 contains "drift: the main checkout's lockfile moving on is reported" \
   'composer.lock in the main checkout has changed since calibration' "$(cat "$TMP/err")"
 
+# A hardlinked dir calibrated before deps[].copy existed, whose detection rule lists paths its package
+# manager rewrites in place: called out once, from the shipped table.
+UCL=$TMP/ucl
+make_repo "$UCL" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor"}'
+git -C "$UCL" worktree add -q "$UCL/.claude/worktrees/u" -b worktree-u 2>/dev/null
+start_hook "$UCL/.claude/worktrees/u" >/dev/null
+eq 'copy: an uncopied hardlinked vendor is warned about, once' 1 \
+  "$(grep -c 'vendor (composer): hardlinked, but its package manager rewrites those paths in place' "$TMP/err")"
+
 # The list is capped, so the line stays short however many dependencies are missing.
 CAP=$TMP/cap
 make_repo "$CAP" '{"dir":"d1","lock":"composer.lock","strategy":"install","install":"exit 1"},

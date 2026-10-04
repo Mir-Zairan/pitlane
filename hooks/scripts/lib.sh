@@ -1016,7 +1016,8 @@ wt_expand_url() {  # $1 = template
 #  24 artifacts
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
-# Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
+# Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum, copy — compact JSON,
+# split by wt_dep_copy_paths), group 2 = copy[],
 # group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
 # list. A plain string yields no group-4 records; the scalar carries it. Group 5 = artifacts[] (dir,
 # inputs, build, verify, link); `inputs` arrives as compact JSON, split by wt_artifact_inputs.
@@ -1033,7 +1034,7 @@ wt_profile_scan() {  # $1 = profile path
     runtime.slug runtime.env.vars copy evidence.shellMarker \
     runtime.port.var runtime.port.base runtime.port.span runtime.port \
     runtime.serve runtime.stop runtime.url artifacts \
-    -- deps dir lock strategy install verify lockChecksum \
+    -- deps dir lock strategy install verify lockChecksum copy \
     -- copy . \
     --kv runtime.env.vars \
     -- runtime.env.file . \
@@ -1133,6 +1134,17 @@ wt_artifact_inputs() {  # $1 = the rendered inputs value
     out+=$item$WT_NL
   done
   printf '%s' "$out"
+}
+
+# Split deps[].copy — the paths inside a hardlinked dir that must be real copies — into one path per
+# line, relative to the dep's dir. Absent or `[]` is an empty list. Otherwise the same rules as
+# artifacts[].inputs: quoted paths from the env file character set, none escaping the dir. No glob
+# is expanded: a path is copied only if it is there.
+wt_dep_copy_paths() {  # $1 = the rendered copy value
+  case ${1-} in
+    '' | '[]') return 0 ;;
+  esac
+  wt_artifact_inputs "$1"
 }
 
 # True when $1 is usable as artifacts[].dir: a relative path inside the repository, written one way
@@ -1248,7 +1260,7 @@ WT_STRATEGIES='install hardlink store skip'
 wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-read wt_profile_scan output
   local file=${1-} root=${2-} raw rec body version shell shellargs deps runtime boot seedt
   local evdet evmark evshell n=0 bad=0 dir lock strategy install verify cksum sum ndeps=0 ncopy=0
-  local slug envvars copy cpath
+  local slug envvars copy cpath dcopy
   local seedp downp envfile unk tok
   local portvar portbase portspan portobj ekey eval_ nkeys=0
   local ef efrest efseen efrebuilt efn
@@ -1334,7 +1346,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       esac
       ndeps=$((ndeps + 1))
       body=${rec#*"$WT_US"}
-      IFS=$WT_US read -r dir lock strategy install verify cksum <<<"$body" || true
+      IFS=$WT_US read -r dir lock strategy install verify cksum dcopy <<<"$body" || true
       # Index in the SAME numbering the file uses, so a message can be acted on directly.
       case $strategy in
         '') printf 'deps[%d].strategy: missing\n' "$n"; bad=1 ;;
@@ -1398,6 +1410,17 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         case $cksum in
           *[!0-9\ ]* | '') printf 'deps[%d].lockChecksum: "%s" is not cksum output\n' "$n" "$cksum"; bad=1 ;;
         esac
+      fi
+
+      # Paths bootstrap replaces inside the worktree's linked dir, from a committed file.
+      if [ -n "$dcopy" ]; then
+        if ! wt_dep_copy_paths "$dcopy" >/dev/null; then
+          printf 'deps[%d].copy: must be an array of paths inside %s (letters, digits and . _ - @ + /, no glob), got %s\n' \
+            "$n" "${dir:-the dir}" "$dcopy"
+          bad=1
+        elif [ "$dcopy" != '[]' ] && [ "$strategy" != hardlink ]; then
+          wt_log "deps[$n].copy only applies to strategy \"hardlink\" — it does nothing for \"${strategy:-?}\""
+        fi
       fi
 
       [ -z "$dir" ] || depdirs+="$dir "

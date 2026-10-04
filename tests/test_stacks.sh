@@ -133,6 +133,18 @@ exists() { [ -e "$1" ] && echo yes || echo no; }
 # shellcheck disable=SC2012
 inode() { ls -di -- "$1" 2>/dev/null | awk '{ print $1 }'; }
 
+# Every regular file under $1 as `path inode checksum`: what an in-place write through a shared inode
+# changes in the main checkout, where a content digest alone would miss a write of identical bytes.
+inode_snapshot() {  # $1 = directory or file
+  if [ -d "$1" ]; then
+    ( cd "$1" && find . -type f -print | LC_ALL=C sort | while IFS= read -r f; do
+        printf '%s %s %s\n' "$f" "$(inode "$f")" "$(cksum <"$f")"
+      done )
+  elif [ -e "$1" ]; then
+    printf '%s %s\n' "$(inode "$1")" "$(cksum <"$1")"
+  fi
+}
+
 # Show the end of a hook's stderr after a failed assertion about it.
 show_log() {  # $1 = log file
   [ -s "$1" ] && sed 's/^/      | /' "$1" | tail -n 15 >&2
@@ -294,9 +306,21 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   out=$(cd "$w" && bash "$HOOK" --finish 2>"$logs/$name.finish")
   eq "$name: --finish reports the worktree fully set up" 'Pitlane: this worktree is fully set up.' "$out"
   local d first f own
+  local c under
   for d in $STACK_LINKDIRS; do
-    first=$(cd "$r" && find "$d" -type f | LC_ALL=C sort | head -n 1)
+    first=$(cd "$r" && find "$d" -type f | LC_ALL=C sort | while IFS= read -r f; do
+      under=0
+      for c in $STACK_COPY; do case $f/ in "$c"/*) under=1 ;; esac; done
+      [ "$under" = 1 ] || { printf '%s\n' "$f"; break; }
+    done)
     eq "$name: $d is hardlinked from the main checkout, not reinstalled ($first)" "$(inode "$r/$first")" "$(inode "$w/$first")"
+  done
+  # What its package manager rewrites in place is the worktree's own copy (deps[].copy).
+  for c in $STACK_COPY; do
+    [ -e "$r/$c" ] || continue
+    first=$(cd "$r" && find "$c" -type f | LC_ALL=C sort | head -n 1)
+    ne "$name: $first is a copy, not a link into the main checkout" "$(inode "$r/$first")" "$(inode "$w/$first")"
+    eq "$name: ...with the main checkout's bytes" "$(cksum <"$r/$first")" "$(cksum <"$w/$first" 2>/dev/null)"
   done
   # The worktree is inside the main checkout, so a runtime that walks up parent directories finds
   # main's tree: only a file in the worktree's own tree proves its install happened.
@@ -340,6 +364,39 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   eq "$name: the stack's own runtime uses the dependencies in the worktree ($STACK_PROBE)" "$expect" "$out"
   [ "$out" = "$expect" ] || show_log "$logs/$name.probe"
   [ -z "$STACK_SERVE" ] || serve_check "$w" "$port" "$logs/$name.serve"
+  [ "$name" = alpha ] && inplace_check "$r" "$w" "$logs"
+}
+
+# ADR-022: commands that rewrite a hardlinked dir's files in place, run in the worktree, must leave
+# the main checkout's dependency trees byte-identical and on the same inodes. The worktree's copy
+# paths must change, or the command proved nothing.
+inplace_check() {  # $1 = repo, $2 = worktree, $3 = scratch dir for logs
+  local r=$1 w=$2 logs=$3 cmd kind d main_before main_after wt_before wt_after rc c
+  for kind in local net; do
+    cmd=$STACK_INPLACE
+    [ "$kind" = net ] && cmd=$STACK_INPLACE_NET
+    [ -n "$cmd" ] || continue
+    main_before='' wt_before=''
+    for d in $STACK_LINKDIRS; do main_before+=$(inode_snapshot "$r/$d"); done
+    for c in $STACK_COPY; do wt_before+=$(inode_snapshot "$w/$c"); done
+    tc "$w" "$cmd" >"$logs/inplace.$kind" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ "$kind" = net ]; then
+      printf 'NOTE [%s/%s] "%s" failed (offline?) — its in-place check is not counted\n' "$BACKEND" "$STACK" "$cmd" >&2
+      show_log "$logs/inplace.$kind"
+    else
+      eq "in place: \`$cmd\` runs in the worktree" 0 "$rc"
+      [ "$rc" -eq 0 ] || show_log "$logs/inplace.$kind"
+      wt_after=''
+      for c in $STACK_COPY; do wt_after+=$(inode_snapshot "$w/$c"); done
+      ne "in place: \`$cmd\` rewrote the worktree's copy paths ($STACK_COPY)" "$wt_before" "$wt_after"
+      main_after=''
+      for d in $STACK_LINKDIRS; do main_after+=$(inode_snapshot "$r/$d"); done
+      eq "in place: ...and the main checkout's $STACK_LINKDIRS kept every byte and inode" "$main_before" "$main_after"
+    fi
+    # The command may edit the manifest and lockfile; teardown keeps a worktree with changes.
+    git -C "$w" checkout -q -- .
+  done
 }
 
 remove_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
@@ -376,7 +433,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   STACK_SERVE='' STACK_SERVE_PATH='' STACK_SERVE_EXPECT=''
   # shellcheck disable=SC2034  # STACK_ARTIFACTS is read by write_profile, in stack_fixtures.sh
   STACK_ARTIFACTS='' STACK_ART_FILE='' STACK_ART_CHANGE='' STACK_ART_EXPECT=''
-  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS=''
+  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
   r=$dir/repo logs=$dir/logs STACK_DB=$dir/databases

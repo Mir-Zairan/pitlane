@@ -1450,10 +1450,11 @@ git -C "$DREPO" worktree add -q "$DWT" -b wt-dep1 2>/dev/null
 PROFILE_SHELL='' PROFILE_SHELLARGS=''
 FAR=$(( $(date +%s) + 600 ))
 
-dep_raw() {  # $1 = dir, $2 = lock, $3 = strategy, $4 = install, $5 = verify
-  printf '0%s%s1%s%s%s%s%s%s%s%s%s%s%s' \
-    "$US_" "$RS_" "$US_" "$1" "$US_" "$2" "$US_" "$3" "$US_" "$4" "$US_" "$5" "$RS_"
+dep_raw() {  # $1 = dir, $2 = lock, $3 = strategy, $4 = install, $5 = verify, $6 = copy as compact JSON
+  printf '0%s%s1%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
+    "$US_" "$RS_" "$US_" "$1" "$US_" "$2" "$US_" "$3" "$US_" "$4" "$US_" "$5" "$US_" "$US_" "${6-}" "$RS_"
 }
+ino() { stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"; }
 
 # --- install ---------------------------------------------------------------
 rm -rf "$DWT/vendor"
@@ -2168,6 +2169,78 @@ if [ "$(id -u)" != 0 ]; then
   lacks '...not a guess at the filesystem' 'different filesystem' "$out"
 fi
 rm -rf "$DWT/vendor" "$DREPO/vendor/bundle"
+
+# --- deps[].copy: paths a package manager rewrites in place are real copies ---
+# composer rewrites vendor/composer/*.php and npm node_modules/.package-lock.json through the inode
+# they share with the main checkout, so those paths are copied after the link and the rest stay linked.
+mkdir -p "$DREPO/vendor/composer/sub"
+printf 'MAIN-INSTALLED\n' > "$DREPO/vendor/composer/installed.json"
+printf 'MAIN-SUB\n' > "$DREPO/vendor/composer/sub/map.php"
+printf 'MAIN-LOCK\n' > "$DREPO/vendor/.package-lock.json"
+main_installed=$(ino "$DREPO/vendor/composer/installed.json")
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf COPYLINK > /dev/null' '' '["composer",".package-lock.json","not-there"]')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'copy: the dir is still reported hardlinked' 'hardlinked from the main checkout' "$out"
+eq '...the rest of it shares inodes with the main checkout' "$(ino "$DREPO/vendor/pkg/file.txt")" "$(ino "$DWT/vendor/pkg/file.txt")"
+ne 'copy: a listed dir is a real copy' "$main_installed" "$(ino "$DWT/vendor/composer/installed.json")"
+ne '...all the way down' "$(ino "$DREPO/vendor/composer/sub/map.php")" "$(ino "$DWT/vendor/composer/sub/map.php")"
+ne 'copy: a listed file is a real copy' "$(ino "$DREPO/vendor/.package-lock.json")" "$(ino "$DWT/vendor/.package-lock.json")"
+eq '...with the same bytes' 'MAIN-INSTALLED|MAIN-SUB|MAIN-LOCK' \
+  "$(cat "$DWT/vendor/composer/installed.json")|$(cat "$DWT/vendor/composer/sub/map.php")|$(cat "$DWT/vendor/.package-lock.json")"
+lacks 'copy: a listed path the dir does not have is no reason to install' 'installing instead' "$out"
+eq '...and nothing is made up for it' no "$([ -e "$DWT/vendor/not-there" ] && echo yes || echo no)"
+eq 'copy: no temporary copy is left behind' '' "$(cd "$DWT/vendor" && find . -name '*.wtcopy*')"
+# What the experiment measured: an in-place write in the worktree. It must not reach the main checkout.
+printf 'WORKTREE-WROTE\n' > "$DWT/vendor/composer/installed.json"
+printf 'WORKTREE-WROTE\n' > "$DWT/vendor/.package-lock.json"
+eq 'copy: an in-place write in the worktree leaves the main checkout alone' 'MAIN-INSTALLED|MAIN-LOCK' \
+  "$(cat "$DREPO/vendor/composer/installed.json")|$(cat "$DREPO/vendor/.package-lock.json")"
+eq '...which keeps its own inode' "$main_installed" "$(ino "$DREPO/vendor/composer/installed.json")"
+
+# A listed path reached through a symlink could copy, or replace, something outside the dir: the
+# link is dropped and the dir installed instead.
+for shape in parent self; do
+  rm -rf "$DWT/vendor" "$DREPO/vendor/linked"
+  mkdir -p "$DREPO/vendor/real"; printf 'R\n' > "$DREPO/vendor/real/f"
+  case $shape in
+    parent) ln -s real "$DREPO/vendor/linked"; cpath='["linked/f"]' ;;
+    self) ln -s real "$DREPO/vendor/linked"; cpath='["linked"]' ;;
+  esac
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "mkdir -p vendor && printf SYMINSTALL > vendor/m # $shape" '' "$cpath")
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains "copy: a path through a symlink ($shape) is refused" 'is reached through a symlink — installing instead' "$out"
+  eq '...and the dir is installed, not left half-linked' 'SYMINSTALL|no' \
+    "$(cat "$DWT/vendor/m" 2>/dev/null)|$([ -e "$DWT/vendor/pkg" ] && echo yes || echo no)"
+  eq '...the main checkout untouched' 'R' "$(cat "$DREPO/vendor/real/f")"
+done
+rm -rf "$DREPO/vendor/linked" "$DREPO/vendor/real"
+
+# A list the validator would have refused is not acted on half-way either.
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf BADLIST > vendor/m' '' '["../../escape"]')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'copy: an unreadable list falls back to an install' 'not a list of paths inside it — installing instead' "$out"
+eq '...which ran' 'BADLIST' "$(cat "$DWT/vendor/m" 2>/dev/null)"
+
+# A copy that fails mid-way (an unreadable file) leaves no half-linked tree behind.
+if [ "$(id -u)" != 0 ]; then
+  rm -rf "$DWT/vendor"
+  printf 'S\n' > "$DREPO/vendor/composer/secret"; chmod 000 "$DREPO/vendor/composer/secret"
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf CPFAIL > vendor/m' '' '["composer"]')
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  chmod 600 "$DREPO/vendor/composer/secret"
+  contains 'copy: a copy that fails says so' 'could not copy composer' "$out"
+  eq '...and installs over a cleared dir' 'CPFAIL|no' \
+    "$(cat "$DWT/vendor/m" 2>/dev/null)|$([ -e "$DWT/vendor/pkg" ] && echo yes || echo no)"
+  eq '...the main checkout untouched' 'MAIN-INSTALLED' "$(cat "$DREPO/vendor/composer/installed.json")"
+  rm -f "$DREPO/vendor/composer/secret"
+fi
+rm -rf "$DWT/vendor" "$DREPO/vendor/composer" "$DREPO/vendor/.package-lock.json"
 
 # --- hardlink falls back when the lockfiles differ -------------------------
 rm -rf "$DWT/vendor"
@@ -3103,6 +3176,47 @@ wt_warn_hardlinked_venvs "$VNR" 2>"$TMP/venv1"
 wt_warn_hardlinked_venvs "$VNR" 2>"$TMP/venv2"
 contains 'once per run: the first call warns' 'Python virtualenv' "$(cat "$TMP/venv1")"
 eq '...and a second round says nothing' '' "$(cat "$TMP/venv2")"
+
+# A profile calibrated before deps[].copy existed: a hardlinked dir whose detection rule lists paths
+# its package manager rewrites in place, with no `copy` of its own. Warned about, once per run.
+copy_warning() {  # $@ = dir:lock:strategy[:copy] entries; prints what wt_warn_uncopied_links logs
+  local e raw rest d l st cp
+  raw=$(printf '0%s%s' "$US_" "$RS_")
+  for e in "$@"; do
+    d=${e%%:*}; rest=${e#*:}; l=${rest%%:*}; rest=${rest#*:}
+    st=${rest%%:*}; cp=''; [ "$st" = "$rest" ] || cp=${rest#*:}
+    raw+=$(printf '1%s%s%s%s%s%s%sx%s%s%s%s%s' "$US_" "$d" "$US_" "$l" "$US_" "$st" "$US_" "$US_" "$US_" "$US_" "$cp" "$RS_")
+  done
+  PROFILE_RAW=$raw WT_COPY_WARNED='' wt_warn_uncopied_links 2>&1
+}
+out=$(copy_warning vendor:composer.lock:hardlink)
+contains 'an uncopied hardlinked dir is warned about' 'vendor (composer): hardlinked' "$out"
+contains '...naming the danger' 'rewrites those paths in place' "$out"
+contains '...and the fix' '/pitlane-setup' "$out"
+contains 'a file path, keyed on its lockfile' 'node_modules (.package-lock.json)' \
+  "$(copy_warning node_modules:package-lock.json:hardlink)"
+contains 'the rule for the dir the profile names, not the first with that lockfile' 'node_modules (.yarn-integrity)' \
+  "$(copy_warning node_modules:yarn.lock:hardlink)"
+contains 'a nested project too' 'app/vendor (composer)' "$(copy_warning app/vendor:app/composer.lock:hardlink)"
+eq 'not when its lockfile sits elsewhere' '' "$(copy_warning app/vendor:composer.lock:hardlink)"
+eq 'not with a copy list of its own' '' "$(copy_warning 'vendor:composer.lock:hardlink:["composer"]')"
+eq 'nor an explicitly empty one: the developer chose' '' "$(copy_warning 'vendor:composer.lock:hardlink:[]')"
+eq 'not for a rule with nothing to copy' '' "$(copy_warning vendor/bundle:Gemfile.lock:hardlink)"
+eq 'not for an installed dir' '' "$(copy_warning vendor:composer.lock:install)"
+eq 'not for a lockfile no rule knows' '' "$(copy_warning vendor:custom.lock:hardlink)"
+eq 'not for a dir no rule with that lockfile names' '' "$(copy_warning lib:composer.lock:hardlink)"
+contains 'several in one line' 'vendor (composer), node_modules (.package-lock.json): hardlinked' \
+  "$(copy_warning vendor:composer.lock:hardlink vendor/bundle:Gemfile.lock:hardlink node_modules:package-lock.json:hardlink)"
+eq 'no detection table: nothing to compare, nothing said' '' \
+  "$(WT_DETECTION_JSON=/nonexistent/table.json copy_warning vendor:composer.lock:hardlink)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(printf '0%s%s1%svendor%scomposer.lock%shardlink%sx%s%s%s' "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
+# shellcheck disable=SC2034  # read by wt_warn_uncopied_links
+WT_COPY_WARNED=''
+wt_warn_uncopied_links 2>"$TMP/copy1"
+wt_warn_uncopied_links 2>"$TMP/copy2"
+contains 'once per run: the first call warns' 'vendor (composer)' "$(cat "$TMP/copy1")"
+eq '...and a second round says nothing' '' "$(cat "$TMP/copy2")"
 # shellcheck disable=SC2034
 PROFILE_RAW=''
 # shellcheck disable=SC2034

@@ -50,6 +50,7 @@ human-readable companion to the table the script used.
 | `probe` | `ok` = the wrapper works. `fail` = show it prominently. `timeout` = **inconclusive**, not a failure; say so. |
 | `dep` `depReason` | One proposed dependency entry and why that strategy. A **nested** entry (its `dir` has a directory in front, its commands start `cd '<dir>' &&`, and a `depNote` says `nested:`) is a sub-project with its own lockfile, outside any JS workspace, that a root install does not populate. Present it as its own entry; the developer may know it is not needed in a worktree. (A nested JS tree in a repo that declares a workspace comes back as `dropped` instead — the root install may own it.) |
 | `depNote` | A caveat about this ecosystem. Worth showing. |
+| `depCopy` | A path inside that hardlinked entry's `dir` its package manager rewrites in place. Write every one for the entry, in order, to its `copy` array — `"copy": []` on a hardlinked entry with none. |
 | `depDowngrade` | The strategy changed because a directory is not there. Show the reason. |
 | `dropped` | A lockfile was NOT used. Always surface this — two live lockfiles for one directory is usually a mistake the developer wants to know about. |
 | `hazard` | A lifecycle script was found. `neutralise` = a flag was added to the proposal. `note` = kept, but say what it costs. |
@@ -97,6 +98,11 @@ Read the existing profile first if there is one.
   into main's venv and imports main's source. Propose the `install` command detection gives now, and
   a `verify` as step 3 says. Keep-theirs still applies — but if they keep `hardlink`, say in the agent
   note that they chose it knowing this.
+- **A hardlinked entry with no `copy` while detection emits `depCopy` for it** (bootstrap warns about
+  exactly this every session): raise it as an explicit addition, saying why — the package manager
+  rewrites those files in place, so a command in a worktree (`composer dump-autoload`,
+  `npm install <pkg>`) changes the main checkout's copy through the shared inode. Propose the
+  `depCopy` paths. Keep-theirs still applies; `"copy": []` records that they declined.
 - **An older `schemaVersion`:** migrate it, and say exactly what changed and why. Never drop a key
   you do not recognise without saying so.
 - **A second run on an unchanged repo must change nothing** and must say so plainly. If you find
@@ -106,7 +112,7 @@ Read the existing profile first if there is one.
 ## 3 — Present layers 1 and 2, with the reasons
 
 For each `dep`, show: the directory, the lockfile, the strategy, the install command, the `verify`
-command, and the one-line reason. The reason exists so the developer can **disagree** — make that easy, not
+command, for a hardlinked one the paths it copies instead (`depCopy`), and the one-line reason. The reason exists so the developer can **disagree** — make that easy, not
 rhetorical.
 
 **Every dependency gets a `verify`** — every one whose strategy is not `skip`. bootstrap believes it
@@ -443,6 +449,12 @@ developer confirms. Neutral wording; nothing about this plugin's internals. It s
   start command (which does not know this worktree's port), and find it at `$WORKTREE_URL` — set in
   the session's environment and in the env files named above — rather than at the main checkout's
   usual address;
+- only when a dependency dir is hardlinked: its files are shared with the main checkout's, so a
+  command that rewrites them in place writes into the main checkout too. Ordinary installs are safe
+  (the profile's `copy` paths are the worktree's own), but anything that re-runs package install
+  scripts — `npm rebuild`, `yarn install --force`, composer scripts — can write anywhere in the
+  package's directory. Run those only after the dir was installed for this worktree instead, or
+  re-run `/pitlane-setup` and make that dir `install`;
 - a worktree lives inside the main checkout, and dependency resolution can reach back into it: Node
   walks up the directory tree to the main checkout's `node_modules`, and a Python command can pick up
   the main checkout's virtualenv (an activated one, or one a tool finds above the worktree). When the

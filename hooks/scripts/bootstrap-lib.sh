@@ -253,7 +253,7 @@ wt_approval_still() {  # $1 = run directory
 # wraps those. A profile that runs nothing (config copies, hardlinks, ports, env overrides, a URL)
 # needs no approval.
 wt_profile_runs_commands() {
-  local rec body dir lock strategy install verify _cksum
+  local rec body dir lock strategy install verify _cksum _copy
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 1
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && { [ -n "${PROFILE_RT_SEED:-}" ] || [ -n "${PROFILE_RT_TEARDOWN:-}" ] \
     || [ -n "${PROFILE_RT_SERVE:-}" ] || [ -n "${PROFILE_RT_STOP:-}" ]; }; then
@@ -265,7 +265,7 @@ wt_profile_runs_commands() {
       *) continue ;;
     esac
     body=${rec#*"$WT_US"}
-    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    IFS=$WT_US read -r dir lock strategy install verify _cksum _copy <<<"$body" || true
     [ "$strategy" = skip ] && continue
     { [ -n "$install" ] || [ -n "$verify" ]; } && return 0
   done < <(printf '%s' "${PROFILE_RAW:-}")
@@ -332,7 +332,7 @@ wt_approval_record() {  # $1 = fingerprint, $2 = any directory inside the reposi
 # What the loaded profile would run in $1, for a human to read before approving it. stdout: this is
 # printed by `bootstrap.sh --review`, run by hand or by /pitlane-finish, never by a hook.
 wt_approval_describe() {  # $1 = run directory
-  local dir=${1%/} rec body ddir lock strategy install verify _cksum _inputs build _link
+  local dir=${1%/} rec body ddir lock strategy install verify _cksum _copy _inputs build _link
   printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
   printf 'Everything below is text from the branch, shown with control characters as ?:\n'
   [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
@@ -342,7 +342,7 @@ wt_approval_describe() {  # $1 = run directory
       *) continue ;;
     esac
     body=${rec#*"$WT_US"}
-    IFS=$WT_US read -r ddir lock strategy install verify _cksum <<<"$body" || true
+    IFS=$WT_US read -r ddir lock strategy install verify _cksum _copy <<<"$body" || true
     [ "$strategy" = skip ] && continue
     [ -n "$install" ] && printf '  %s (%s): install: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$install")"
     [ -n "$verify" ] && printf '  %s (%s): verify: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$verify")"
@@ -1894,10 +1894,11 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
 # checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
 # it is not always possible: a worktree on another filesystem cannot hardlink at all.
 #   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done.
-wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
+# $5 is deps[].copy as rendered: the paths inside the dir made real copies after the link.
+wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
   # No initialisers built from $1/$3 here: with fewer arguments than expected that is a fatal
   # unbound-variable error under `set -u`, which is precisely the crash this layer must not cause.
-  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} src dest err
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} copy=${5-} src dest err
 
   src=$root/$dir
   dest=$worktree/$dir
@@ -1948,12 +1949,49 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
   # ordinary situations, not errors: fall back rather than dying. Any partial tree is
   # removed first, or the install that follows would run on top of debris. cp's own first line is
   # what gets logged: guessing a cause blamed the filesystem for what was a missing directory.
-  if err=$(cp -al "$src" "$dest" 2>&1); then
-    return 0
+  if ! err=$(cp -al "$src" "$dest" 2>&1); then
+    rm -rf "$dest" 2>/dev/null
+    wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — installing instead"
+    return 1
   fi
-  rm -rf "$dest" 2>/dev/null
-  wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — installing instead"
-  return 1
+  # A tree with some paths still shared is the bug the copy list exists to prevent, so a copy that
+  # cannot be made costs the whole link, like any other hardlink failure.
+  if ! wt_unshare_dep_paths "$dest" "$dir" "$copy"; then
+    rm -rf "$dest" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+# Replace each deps[].copy path inside a freshly linked dir with a real copy (ADR-022): some package
+# managers rewrite files in place — composer's vendor/composer/*.php, npm's .package-lock.json — and
+# through a hardlink that write lands in the main checkout. The copy is made from the worktree's own
+# link and the link then removed; removing a link never touches the inode main still holds. A path the
+# dir does not have is skipped. Returns 1, having logged why, when a path cannot be copied.
+wt_unshare_dep_paths() {  # $1 = the linked dir in the worktree, $2 = dir as the profile names it, $3 = copy
+  local dest=${1%/} dir=${2-} list p target tmp err
+  list=$(wt_dep_copy_paths "${3-}") || {
+    wt_log "  $dir: its copy list is not a list of paths inside it — installing instead"
+    return 1
+  }
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    target=$dest/$p
+    # Through a symlink, the copy could read, and the removal replace, something outside the dir.
+    if [ -L "$target" ] || wt_has_symlinked_parent "$dest" "$p"; then
+      wt_log "  $dir: $p is reached through a symlink — installing instead"
+      return 1
+    fi
+    [ -e "$target" ] || continue
+    tmp=${target%/*}/.${target##*/}.wtcopy.$$
+    if ! err=$(cp -a -- "$target" "$tmp" 2>&1) || ! err=$(rm -rf -- "$target" 2>&1) \
+       || ! err=$(mv -- "$tmp" "$target" 2>&1); then
+      rm -rf -- "$tmp" 2>/dev/null
+      wt_log "  $dir: could not copy $p (${err%%"$WT_NL"*}) — installing instead"
+      return 1
+    fi
+  done <<<"$list"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2321,7 +2359,7 @@ wt_dep_log_failure_stands() {  # $1 = dir, $2 = lock, $3 = recorded exit code, $
 # hardlink after it undone when the budget ran out.
 wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local root=${1%/} worktree=${2%/} deadline=${3-}
-  local rec body dir lock strategy install verify _cksum n=-1
+  local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
 
@@ -2337,7 +2375,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     esac
     n=$((n + 1))
     body=${rec#*"$WT_US"}
-    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    IFS=$WT_US read -r dir lock strategy install verify _cksum dcopy <<<"$body" || true
     case $pass:$strategy in
       cheap:hardlink | cheap:skip | slow:install | slow:store) ;;
       slow:hardlink | slow:skip | cheap:*) continue ;;
@@ -2501,7 +2539,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # branch that touched its lockfile.
     effective=$strategy
     if [ "$strategy" = hardlink ]; then
-      wt_hardlink_dep "$root" "$worktree" "$dir" "$lock"
+      wt_hardlink_dep "$root" "$worktree" "$dir" "$lock" "$dcopy"
       case $? in
         0) effective=hardlink ;;
         2) effective=present ;;
@@ -3037,7 +3075,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # output `artmissing`, `artstanding` and `artwarn` alike, named by dir. Globals, not output, so one
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
-  local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed current
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current
   WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -3046,7 +3084,7 @@ wt_bootstrap_pending() {  # $1 = worktree
       *) continue ;;
     esac
     body=${rec#*"$WT_US"}
-    IFS=$WT_US read -r dir lock strategy install verify _cksum <<<"$body" || true
+    IFS=$WT_US read -r dir lock strategy install verify _cksum _copy <<<"$body" || true
     case $strategy in hardlink | install | store) ;; *) continue ;; esac
     { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
     [ "$strategy" = store ] && strategy=install
@@ -4246,7 +4284,7 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
   local tree=${1%/} evdet=${2-} evmark=${3-} evshell=${4-} profile=${5-} main=${6-}
   local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT}
   local raw rec body curdet m rdir gained='' lost='' curshell='' seen='' problems
-  local lock cksum now n=0 locks where=''
+  local lock cksum _copy now n=0 locks where=''
 
   # WHOSE LOCKFILE: THE MAIN CHECKOUT'S. lockChecksum is what calibration saw there, so main's
   # lockfile moving on is the case where the recorded install command may be out of date. A
@@ -4286,7 +4324,7 @@ wt_report_drift() {  # $1 = checkout, $2 = detectionVersion, $3 = markers, $4 = 
         *) continue ;;
       esac
       body=${rec#*"$WT_US"}
-      IFS=$WT_US read -r rdir lock _st _in _ve cksum <<<"$body" || true
+      IFS=$WT_US read -r rdir lock _st _in _ve cksum _copy <<<"$body" || true
       n=$((n + 1))
       [ -n "$lock" ] && [ -n "$cksum" ] || continue
       wt_is_safe_relpath "$lock" || continue
@@ -4398,6 +4436,57 @@ wt_warn_hardlinked_venvs() {  # $1 = main checkout
   [ -n "$venvs" ] || return 0
   WT_VENV_HARDLINK_WARNED=1
   wt_log "$(wt_visible "$venvs"): hardlinked, but a Python virtualenv — its scripts and paths name the main checkout, so installs here go into the main checkout's venv and imports load its source. Run /pitlane-setup to install it per worktree instead."
+}
+
+# A hardlinked dir whose package manager rewrites some of its files in place (ADR-022) needs those
+# paths in deps[].copy, or a command in the worktree — composer dump-autoload, npm install <pkg> —
+# writes through the shared inode into the main checkout. A profile calibrated before the field
+# existed has none. The detection table's copyPaths say which dirs need them; a rule applies when the
+# dep's lockfile is one of its markers and its dir is the rule's dir beside that lockfile. Only an
+# ABSENT copy is warned about: `[]` is the developer's answer. The table is read only when some
+# hardlinked entry lacks a copy, so a current profile pays no interpreter start. Once per run.
+WT_COPY_WARNED=''
+wt_warn_uncopied_links() {
+  local table=${WT_DETECTION_JSON:-$WT_DETECTION_JSON_DEFAULT} rec body dir lock strategy dcopy
+  local candidates='' raw markers rdir rstrategy rcopy pre named='' paths
+  [ -z "$WT_COPY_WARNED" ] && [ -n "${PROFILE_RAW:-}" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir lock strategy _ _ _ dcopy <<<"$body" || true
+    [ "$strategy" = hardlink ] && [ -z "$dcopy" ] && [ -n "$dir" ] && [ -n "$lock" ] || continue
+    candidates+=$dir$WT_US$lock$WT_RS
+  done < <(printf '%s' "$PROFILE_RAW")
+  [ -n "$candidates" ] && [ -r "$table" ] && wt_has_json || return 0
+  raw=$(wt_json_scan detectionVersion -- deps markers dir strategy copyPaths <"$table") || return 0
+
+  while IFS= read -r -d "$WT_RS" rec; do
+    IFS=$WT_US read -r dir lock <<<"$rec" || true
+    pre=''
+    [ "${lock%/*}" = "$lock" ] || pre=${lock%/*}/
+    while IFS= read -r -d "$WT_RS" body; do
+      case $body in
+        1"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      IFS=$WT_US read -r _ markers rdir rstrategy rcopy <<<"$body" || true
+      [ "$rstrategy" = hardlink ] && [ "$dir" = "$pre$rdir" ] || continue
+      case $markers in
+        *"\"${lock##*/}\""*) ;;
+        *) continue ;;
+      esac
+      paths=$(wt_dep_copy_paths "$rcopy") || continue
+      [ -n "$paths" ] || continue
+      named+=${named:+, }"$dir (${paths//"$WT_NL"/, })"
+      break
+    done <<<"$raw"
+  done <<<"$candidates"
+  [ -n "$named" ] || return 0
+  WT_COPY_WARNED=1
+  wt_log "$(wt_visible "$named"): hardlinked, but its package manager rewrites those paths in place, so a command run in the worktree changes the main checkout's copy too. Run /pitlane-setup to have them copied per worktree."
 }
 
 # True when a detection rule is already accounted for by the recorded evidence — either one of its
