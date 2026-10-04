@@ -30,16 +30,31 @@ comes ready to use and gets its own database and its own address, so each sessio
 | Feature | What you get |
 |---|---|
 | **Settings** | Copies `.env` and other ignored config into each copy, then points it at that copy's own database and port |
-| **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk |
-| **Database & port** | Each copy gets its own, so sessions never clash |
+| **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk. Files a package manager rewrites in place (Composer's autoloader, npm's `.package-lock.json`) are real copies, so a command run in one copy never reaches the main one |
+| **Honest status** | A check you approve decides whether packages are installed, not the installer's exit code. Each is reported as ready, ready with warnings, or missing with the reason, and any tracked file an install changed is named and never put back without your word |
+| **Database & port** | Each copy gets its own, so sessions never clash. Claude's own shell gets `WORKTREE_PORT` and `WORKTREE_URL` too |
+| **Build output** | Ignored build output (a front-end bundle, say) is copied from your main copy when its sources match, or built in the background when they don't |
+| **Your app, on request** | `/pitlane-serve` starts the app on that copy's own port and tells Claude the address |
 | **Pull requests** | `claude -w "#1234"` opens a PR in its own copy. You approve its setup before anything runs, and again after each new push |
 | **Approved commands only** | Nothing a branch's setup would run is run until you approve it, so a PR can't run code on your machine just by being opened |
 | **Reopening** | A copy that's already set up opens in seconds |
-| **No waiting** | Installs and the database finish in the background, so your first prompt starts at once |
+| **No waiting** | Installs, builds and the database finish in the background, so your first prompt starts at once |
 | **Light on your machine** | Setup runs at low priority under a memory cap, so it can't freeze your desktop |
-| **Cleanup** | `/pitlane-tidy` removes old copies, never unsaved work |
+| **Cleanup** | Removing a copy stops the server Pitlane started there, and `/pitlane-tidy` stops one left running and removes old copies, never unsaved work |
 
-Your app's server is not started for you: each copy is ready, and you run it when you need it.
+### What it does not do
+
+- **It starts nothing on its own.** Each copy is ready to run; the app runs only when you or Claude ask
+  for it with `/pitlane-serve`.
+- **It never edits your project's own scripts.** If a start command hardcodes its port, or a test helper
+  pins its own database, `/pitlane-setup` points it out and writes a command that uses the copy's port
+  instead. Changing the script is up to you.
+- **It stops only what it started.** A server you started by hand, in any copy, is yours to stop:
+  Pitlane never stops a process because of the port it holds or the folder it runs in.
+- **A copy inside your main checkout can reach the main checkout's packages.** `claude -w` puts copies
+  under `.claude/worktrees/`, so while a copy's own `node_modules` (or similar) is missing, Node and
+  Python can quietly find the main checkout's instead. Wait for setup (`/pitlane-finish`) before
+  trusting a run.
 
 ## Works with
 
@@ -87,7 +102,11 @@ It needs `bash`, `git`, and either `python3` or `jq`, on Linux or macOS.
    /pitlane-finish
    ```
 
-5. **Tidy up now and then.** When you are finished with some copies, type:
+5. **Run the app when you need it.** Type `/pitlane-serve`. It waits for setup, starts the app on this
+   copy's port, and replies `serving at <url>` or why it could not. `/pitlane-serve` stops it again,
+   and so does removing the copy.
+
+6. **Tidy up now and then.** When you are finished with some copies, type:
 
    ```
    /pitlane-tidy
@@ -95,6 +114,27 @@ It needs `bash`, `git`, and either `python3` or `jq`, on Linux or macOS.
 
    It shows what can be cleaned up and removes only what you choose. Anything with unsaved work is
    always kept.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/pitlane-setup` | Looks at the project once and saves how a copy is set up |
+| `/pitlane-finish` | Waits for or completes a copy's setup, and reports what is ready |
+| `/pitlane-serve` | Starts the copy's app on its own port, or stops the one Pitlane started |
+| `/pitlane-tidy` | Finds what old copies left behind and removes what you choose |
+
+The skills call one script, which you can also run yourself from inside a copy as
+`bash <plugin>/hooks/scripts/bootstrap.sh <option>`:
+
+| Option | What it does |
+|---|---|
+| `--finish` | Completes the setup now, with an hour to do it rather than the session start's budget |
+| `--finish --retry-failed` | The same, and also retries an install that failed before (it is not retried on its own until the lockfile or command changes) |
+| `--changed` | Lists the tracked files an install changed |
+| `--restore <path>` | Puts back one file `--changed` listed, and nothing else |
+| `--serve` / `--serve-stop` | Starts the app, or stops the server Pitlane started |
+| `--review` / `--approve <fingerprint>` | Shows the setup commands, then approves exactly what was shown |
 
 ## Questions
 
