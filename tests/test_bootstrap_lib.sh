@@ -2496,13 +2496,127 @@ PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' hardlink)
 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
 eq 'link "hardlink": the same inode as the main checkout'"'"'s' "$(inode_of "$AREPO/public/build/app.js")" \
   "$(inode_of "$AWT/public/build/app.js")"
-# Not approved and deferred: taking main's copy runs nothing, so neither holds it back.
+# Not approved: `dir` is the profile's word, so main's copy is not taken either (ADR-020).
 art_reset
 # shellcheck disable=SC2034
 PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
-WT_APPROVAL=no WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
-eq 'unapproved and deferred, inputs unchanged: still taken from the main checkout' 'from-main' \
-  "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+out=$(WT_APPROVAL=no wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'unapproved, inputs unchanged: main'"'"'s build is not taken' no "$([ -e "$AWT/public/build" ] && echo yes || echo no)"
+contains '...and says why' 'public/build: not taken or built — the profile'"'"'s commands are not approved' "$out"
+eq '...and nothing is recorded' '' "$(art_status)"
+# Deferred: a real copy is the background run's; a hardlink is cheap enough for start-up.
+art_reset
+out=$(WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'deferred, link copy: not copied at start-up' no "$([ -e "$AWT/public/build" ] && echo yes || echo no)"
+contains '...but in the background' 'public/build: to be copied from the main checkout in the background' "$out"
+eq '...and nothing is recorded' '' "$(art_status)"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' hardlink)
+WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'deferred, link hardlink: linked at start-up' "$(inode_of "$AREPO/public/build/app.js")" \
+  "$(inode_of "$AWT/public/build/app.js")"
+# A `doing` record at start-up is the background run's: no wait on its lock.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" doing
+out=$(WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'deferred, a build recorded doing: left to the background run' 'public/build: being built in the background' "$out"
+eq '...untouched' no "$([ -e "$AWT/public/build" ] && echo yes || echo no)"
+if command -v flock >/dev/null 2>&1; then
+  # The lock held by another run: start-up does not wait on it.
+  art_reset
+  ALOCK="$(wt_state_path "$AWT").build.lock"
+  # One process holding the lock, so killing it frees it: `flock path sleep` leaves its child holding it.
+  ( exec 9>"$ALOCK"; flock 9; exec sleep 30 ) &
+  ALOCKPID=$!
+  t0=$(date +%s)
+  sleep 0.3
+  out=$(WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+  eq 'deferred, the lock held elsewhere: no wait for it' yes "$([ $(( $(date +%s) - t0 )) -lt 5 ] && echo yes || echo no)"
+  contains '...and it is left to that run' 'public/build: another run here is working on it — leaving it alone' "$out"
+  kill "$ALOCKPID" 2>/dev/null; wait "$ALOCKPID" 2>/dev/null
+fi
+# A `doing` record with the lock free is a killed run's: it does not block.
+art_reset
+wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" doing
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a stale doing record, the lock free: taken from main' 'from-main' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+# Without flock (stock macOS) nothing can tell a live `doing` from a stale one, so it does not block.
+NOFLOCK=$TMP/noflock-bin
+if [ ! -d "$NOFLOCK" ]; then
+  mkdir -p "$NOFLOCK"
+  IFS=: read -r -a path_dirs <<<"$PATH"
+  for pd in "${path_dirs[@]}"; do
+    for exe in "$pd"/*; do
+      [ -x "$exe" ] || continue
+      case ${exe##*/} in flock) continue ;; esac
+      [ -e "$NOFLOCK/${exe##*/}" ] || ln -s "$exe" "$NOFLOCK/${exe##*/}" 2>/dev/null
+    done
+  done
+fi
+art_reset
+wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" doing
+out=$(PATH=$NOFLOCK WT_FLOCK_WARNED=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'no flock, a stale doing record: taken from main' 'from-main' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+contains '...saying it goes ahead unlocked' 'public/build: going ahead without the lock' "$out"
+lacks '...without claiming another run is working' 'another run here' "$out"
+# A dir that main does not gitignore is not main's build output, whatever the branch's .gitignore
+# says: a branch must not be able to name one of main's private dirs and have it copied out.
+art_reset
+printf '/secret/\n' >> "$AWT/.gitignore"
+git -C "$AWT" commit -qam 'branch ignores secret/'
+mkdir -p "$AREPO/secret"; printf 'private\n' > "$AREPO/secret/data"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw secret '["src"]' "printf x >> $ACNT; mkdir -p secret && printf built > secret/data" '' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'a dir gitignored only on the branch: main'"'"'s is not copied' built "$(cat "$AWT/secret/data" 2>/dev/null)"
+contains '...and says why' 'secret: not taken from the main checkout — there it is not gitignored' "$out"
+rm -rf "$AREPO/secret" "$AWT/secret"
+git -C "$AWT" revert --no-edit HEAD >/dev/null
+# A trailing slash would have cp nest main's dir inside the worktree's: refused.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build/ "$AINPUTS" "$ABUILD" '' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a dir with a trailing slash is refused' 'refusing "public/build/"' "$out"
+eq '...and nothing is taken' no "$([ -e "$AWT/public/build" ] && echo yes || echo no)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+# Taking main's copy is bounded by the budget: a copy that runs past it leaves nothing behind.
+SLOWCP=$TMP/slowcp-bin
+mkdir -p "$SLOWCP"
+printf '#!/bin/sh\nsleep 5\nexec %s "$@"\n' "$(command -v cp)" > "$SLOWCP/cp"
+chmod +x "$SLOWCP/cp"
+art_reset
+out=$(PATH=$SLOWCP:$PATH wt_art_take_main "$AREPO" "$AWT" public/build copy 1 2>&1); rc=$?
+eq 'a copy past its time: 2 (try again later)' 2 "$rc"
+contains '...saying so' 'ran past the 1s left in the budget' "$out"
+eq '...and nothing half-copied is left' no "$([ -e "$AWT/public/build" ] && echo yes || echo no)"
+# A copy that fails falls back to the build, leaving no half-copied tree for it to be recorded on.
+# Root reads an unreadable file anyway, so this is skipped as root.
+if [ "$(id -u)" != 0 ]; then
+  art_reset
+  printf 'secret\n' > "$AREPO/public/build/locked.js"; chmod 000 "$AREPO/public/build/locked.js"
+  out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+  contains 'a copy that fails: says it builds instead' 'public/build: could not copy it from the main checkout' "$out"
+  contains '...building instead' 'building instead' "$out"
+  eq '...the build ran' x "$(cat "$ACNT" 2>/dev/null)"
+  eq '...its output is the build'"'"'s' built "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+  eq '...with nothing of the failed copy left' no "$([ -e "$AWT/public/build/locked.js" ] && echo yes || echo no)"
+  chmod 600 "$AREPO/public/build/locked.js"; rm -f "$AREPO/public/build/locked.js"
+  # A worktree dir that cannot be cleared: cp would nest main's inside it, so it is built instead.
+  art_reset
+  mkdir -p "$AWT/public/build/stuck"; printf 'old\n' > "$AWT/public/build/stuck/old.js"
+  chmod 555 "$AWT/public/build/stuck"
+  wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" dirty
+  out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+  contains 'a dir rm -rf cannot clear: says so' 'public/build: could not clear what is in the worktree'"'"'s public/build — building instead' "$out"
+  eq '...main'"'"'s dir is not nested inside it' no "$([ -e "$AWT/public/build/build" ] && echo yes || echo no)"
+  eq '...and the build ran' built "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+  chmod 755 "$AWT/public/build/stuck"
+fi
 # A change OUTSIDE the inputs does not count.
 printf 'more\n' >> "$AWT/docs/notes.md"
 git -C "$AWT" commit -qam 'docs only'
@@ -2554,7 +2668,7 @@ eq 'a lockfile named in the inputs changed: built' 'built' "$(cat "$AWT/public/b
 art_reset
 out=$(WT_APPROVAL=no wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
 eq 'unapproved, inputs changed: nothing is built' no "$([ -e "$ACNT" ] && echo yes || echo no)"
-contains '...and says why' 'not built — the profile'"'"'s commands are not approved' "$out"
+contains '...and says why' 'not taken or built — the profile'"'"'s commands are not approved' "$out"
 eq '...and nothing is recorded' '' "$(art_status)"
 # shellcheck disable=SC2034
 PROFILE_PRESENT=1
@@ -2621,6 +2735,65 @@ art_reset
 PROFILE_RAW=$(art_raw public/build "$AINPUTS" "printf x >> $ACNT; mkdir -p public/build" '' '')
 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
 eq 'a build that exits 0 but writes nothing: failed' failed "$(art_status)"
+# Exit 0 but verify fails: dirty, no standing failure, built again next run.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" 'test -f public/build/nope.js' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'build exits 0, verify fails: dirty' dirty "$(art_status)"
+contains '...and says it is built again' 'the verify command failed (exit 1) — it will be built again next session' "$out"
+eq '...missing, not a standing failure' 'artmissing|public/build|dirty' "$(art_items)"
+eq '...and attemptable' 'build output public/build' "$(pending_attemptable "$AWT")"
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...built again by the next run' xx "$(cat "$ACNT")"
+# A build stopped — by its time limit, the OOM killer or the memory guard — is dirty, not failed.
+for stop_rc in 124 137 "$WT_GUARD_REFUSED"; do
+  art_reset
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(art_raw public/build "$AINPUTS" "printf x >> $ACNT; exit $stop_rc" '' '')
+  wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+  eq "a build stopped with $stop_rc: dirty" dirty "$(art_status)"
+  eq '...no standing failure' 'artmissing|public/build|dirty' "$(art_items)"
+  wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+  eq '...and the next run tries again' xx "$(cat "$ACNT")"
+done
+# Built, but no budget left for verify: dirty. The build itself spends the budget.
+art_reset
+ABUDGET=$TMP/budget-gone
+rm -f "$ABUDGET"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD; touch $ABUDGET" 'true' '')
+out=$(
+  # shellcheck disable=SC2329  # replaces the library's, called by wt_bootstrap_artifacts.
+  wt_budget_left() { if [ -e "$ABUDGET" ]; then printf 0; else printf 600; fi; }
+  wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1
+)
+eq 'built with no budget left for verify: dirty' dirty "$(art_status)"
+contains '...and says so' 'no budget left to verify' "$out"
+eq '...no standing failure' 'artmissing|public/build|dirty' "$(art_items)"
+rm -f "$ABUDGET"
+
+# A changed build command rebuilds a done build, and lifts a standing failure.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+ick_before=$(wt_art_state_read "$AWT" public/build; printf '%s' "$WT_DEP_ICK")
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD; true" '' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a done build whose command changed: built again' xx "$(cat "$ACNT")"
+ne '...and recorded for the new command' "$ick_before" "$(wt_art_state_read "$AWT" public/build; printf '%s' "$WT_DEP_ICK")"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$AFAIL" 'false' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a failed build...' failed "$(art_status)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...whose command changed: built again' xx "$(cat "$ACNT")"
+eq '...and done' "done" "$(art_status)"
 
 # --- the status line and /pitlane-serve name a missing build --------------------
 art_reset
@@ -2693,6 +2866,12 @@ printf 'LOCK9\n' > "$AWT/pnpm-lock.yaml"; git -C "$AWT" commit -qam 'lock 9'
 out=$(WT_NAME='a;b' wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
 contains 'a build interpolating an unsafe {name} is refused' 'refusing to run its commands' "$out"
 eq '...and not run' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build '["pnpm-lock.yaml"]' "$ABUILD" "echo {name}" '')
+out=$(WT_NAME='a;b' wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a verify interpolating an unsafe {name} is refused' 'public/build: refusing to run its commands — they interpolate {name}' "$out"
+eq '...and the build is not run either' no "$([ -e "$ACNT" ] && echo yes || echo no)"
 art_reset
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_RAW=''

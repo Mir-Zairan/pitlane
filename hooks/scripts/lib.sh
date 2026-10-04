@@ -1135,6 +1135,26 @@ wt_artifact_inputs() {  # $1 = the rendered inputs value
   printf '%s' "$out"
 }
 
+# True when $1 is usable as artifacts[].dir: a relative path inside the repository, written one way
+# only. `dir` is cleared with `rm -rf` and replaced with `cp`, and `cp src dist/` puts main's dir
+# INSIDE the target (dist/dist) while reporting success; `.` or an empty segment names the parent.
+# No whitespace: the scan turns a control character into a space, so "dist\nx" would arrive as a
+# different, real-looking dir.
+wt_is_artifact_dir() {  # $1 = candidate
+  local p=${1-} seg rest
+  wt_is_safe_relpath "$p" || return 1
+  case $p in
+    */ | *[[:space:][:cntrl:]]*) return 1 ;;
+  esac
+  rest=$p
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
+    case $seg in '' | .) return 1 ;; esac
+  done
+  return 0
+}
+
 # The allowed values for artifacts[].link. `copy` is the default: measured with vite 5 and esbuild,
 # a rebuild in place (vite with emptyOutDir off, as in watch mode or an outDir outside its root;
 # esbuild always) rewrites a same-named output file through the inode it shares with the main
@@ -1462,8 +1482,14 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       if [ -z "$adir" ]; then
         printf 'artifacts[%d].dir: missing\n' "$n"
         bad=1
-      elif ! wt_is_safe_relpath "$adir"; then
-        printf 'artifacts[%d].dir: "%s" must be a relative path inside the repository\n' "$n" "$adir"
+      elif ! wt_is_artifact_dir "$adir"; then
+        # Shown with control characters as ?: a newline would forge a second line of the report.
+        if wt_is_artifact_dir "${adir%/}"; then
+          printf 'artifacts[%d].dir: "%s" must not end in a slash — write "%s"\n' "$n" "$adir" "${adir%/}"
+        else
+          printf 'artifacts[%d].dir: "%s" must be a relative path inside the repository, with no whitespace and no "." or empty segment\n' \
+            "$n" "$(printf '%s' "$adir" | tr '[:cntrl:]' '?')"
+        fi
         bad=1
       else
         case $artdirs in
@@ -1476,7 +1502,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         # The trailing slash is what makes a directory-only pattern (`/dist/`) match a directory
         # that does not exist yet. Exit 1 is git's "not ignored"; anything else is no answer.
         if [ -n "$root" ]; then
-          wt_git "$root" check-ignore -q -- "${adir%/}/" >/dev/null 2>&1
+          wt_git "$root" check-ignore -q -- "$adir/" >/dev/null 2>&1
           if [ $? -eq 1 ]; then
             printf 'artifacts[%d].dir: "%s" is not gitignored — build output the branch tracks is not the plugin'"'"'s to replace\n' "$n" "$adir"
             bad=1

@@ -1006,6 +1006,8 @@ wt_lock_path() {  # $1 = main checkout, $2 = dependency dir
 
 # Acquire the lock at $1 on file descriptor $3, waiting at most $2 seconds (0: not at all).
 #   0 = held, 1 = not held (caller proceeds unlocked), 2 = could not even try.
+# WT_LOCK_NO_FLOCK=1 says a 1 was flock being absent, not another holder: a caller that reads
+# "someone holds it" as "someone is working" must not, or a record left by a killed run blocks forever.
 #
 # The fd is a parameter and applied with `eval` because bash 3.2 — the portability floor — has no
 # automatic descriptor allocation (`exec {fd}>` is 4.1+), and the engine nests two locks.
@@ -1016,8 +1018,10 @@ wt_lock_acquire() {  # $1 = lock path, $2 = wait seconds, $3 = fd number
   case $fd in '' | *[!0-9]* | 0 | 1 | 2) return 2 ;; esac
   [ -n "$lock" ] || return 2
   [ "$secs" = 0 ] || wt_is_seconds "$secs" || secs=$WT_LOCK_WAIT
+  WT_LOCK_NO_FLOCK=0
 
   if ! command -v flock >/dev/null 2>&1; then
+    WT_LOCK_NO_FLOCK=1
     # Stock macOS has no flock(1). Say so ONCE per run and carry on: an unserialised install is a
     # risk, refusing to install is a certainty. A mkdir-with-a-TTL substitute was considered and
     # rejected — a TTL is a guess, and one too short lets a second worktree barge into a running
@@ -2700,7 +2704,7 @@ wt_art_refusal() {  # $1 = checkout, $2 = dir
     printf 'it is a symlink'
     return 0
   fi
-  wt_git "$wt" check-ignore -q -- "${dir%/}/" >/dev/null 2>&1
+  wt_git "$wt" check-ignore -q -- "$dir/" >/dev/null 2>&1
   rc=$?
   case $rc in
     0) printf '' ;;
@@ -2709,26 +2713,60 @@ wt_art_refusal() {  # $1 = checkout, $2 = dir
   esac
 }
 
+# True when $1 is a real directory with at least one entry. Globbed rather than `ls -A`: it is asked
+# on every session's re-entry path, which spawns nothing else.
 wt_art_has_content() {  # $1 = directory
-  [ -d "${1-}" ] && [ ! -L "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
+  local entry
+  [ -d "${1-}" ] && [ ! -L "$1" ] || return 1
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [ -e "$entry" ] || [ -L "$entry" ]; then return 0; fi
+  done
+  return 1
+}
+
+# The checksum of an artifact's EXPANDED build command, into WT_ART_ICK. Memoised: the start-up
+# run's artifacts walk and the pending walk after it ask about the same commands, and each answer
+# is a cksum process.
+WT_ART_ICK_MEMO=''
+wt_art_build_ick() {  # $1 = expanded build command
+  local cmd=${1-} rest
+  case $WT_ART_ICK_MEMO in
+    *"$WT_RS$cmd$WT_US"*)
+      rest=${WT_ART_ICK_MEMO#*"$WT_RS$cmd$WT_US"}
+      WT_ART_ICK=${rest%%"$WT_RS"*}
+      return 0
+      ;;
+  esac
+  WT_ART_ICK=$(wt_cksum_string "$cmd")
+  WT_ART_ICK_MEMO+=$WT_RS$cmd$WT_US$WT_ART_ICK$WT_RS
 }
 
 # Put the main checkout's copy of $3 into the worktree: `cp -al` for link=hardlink, a real copy
-# otherwise. Returns 0 when it is in place, 1 to build instead. Whatever is in the worktree's dir is
-# replaced; the caller has established that nothing in it is tracked.
-wt_art_take_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = link
-  local root=${1%/} worktree=${2%/} dir=${3-} link=${4-} err
-  local -a cpflags=(-a)
+# otherwise, stopped after $5 seconds. Whatever is in the worktree's dir is replaced; the caller has
+# established that nothing in it is tracked.
+#   0 = in place, 1 = build instead, 2 = ran out of time (nothing left behind; the next run tries again).
+wt_art_take_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = link, $5 = seconds
+  local root=${1%/} worktree=${2%/} dir=${3-} link=${4-} secs=${5-} err rc=0
+  local -a cpflags=(-a) bound=()
   [ "$link" = hardlink ] && cpflags=(-al)
+  command -v timeout >/dev/null 2>&1 && wt_is_seconds "$secs" && bound=(timeout "$secs")
   rm -rf "${worktree:?}/${dir:?}" 2>/dev/null
+  # Still there, `cp` would put main's dir INSIDE it and report success.
+  if [ -e "$worktree/$dir" ] || [ -L "$worktree/$dir" ]; then
+    wt_log "  $dir: could not clear what is in the worktree's $dir — building instead"
+    return 1
+  fi
   if [ "${dir%/*}" != "$dir" ] && ! err=$(mkdir -p -- "$worktree/${dir%/*}" 2>&1); then
     wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — building instead"
     return 1
   fi
-  if err=$(cp "${cpflags[@]}" "$root/$dir" "$worktree/$dir" 2>&1); then
-    return 0
-  fi
+  err=$(${bound[@]+"${bound[@]}"} cp "${cpflags[@]}" "$root/$dir" "$worktree/$dir" 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] && return 0
   rm -rf "${worktree:?}/${dir:?}" 2>/dev/null
+  if [ "$rc" -eq 124 ] && [ "${#bound[@]}" -gt 0 ]; then
+    wt_log "  $dir: taking it from the main checkout ran past the ${secs}s left in the budget — left for the next run"
+    return 2
+  fi
   wt_log "  $dir: could not ${link:-copy} it from the main checkout (${err%%"$WT_NL"*}) — building instead"
   return 1
 }
@@ -2747,8 +2785,8 @@ wt_art_deps_ready() {  # $1 = worktree
 # Bootstrap every entry in artifacts[]. $3 is the epoch second the bootstrap must be finished by.
 wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
   local root=${1%/} worktree=${2%/} deadline=${3-}
-  local rec body dir inputs build verify link n=-1 list bad why ikey ick held lockpath
-  local left capture tracked_before tracking started elapsed rc reason outcome vrc
+  local rec body dir inputs build verify link n=-1 list bad why ikey ick held contended lockpath
+  local left capture tracked_before tracking started elapsed rc reason outcome vrc wait
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -2762,8 +2800,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
     link=${link:-copy}
 
     # Re-checked rather than assumed validated: what follows is `rm -rf` and `cp` on `dir`.
-    if [ -z "$dir" ] || ! wt_is_safe_relpath "$dir"; then
-      wt_log "artifacts[$n]: refusing \"$dir\" — not a relative path inside the repository"
+    if ! wt_is_artifact_dir "$dir"; then
+      wt_log "artifacts[$n]: refusing \"$(wt_visible "$dir")\" — not a relative path inside the repository, written without a trailing slash"
       continue
     fi
     if wt_has_symlinked_parent "$worktree" "$dir" || wt_has_symlinked_parent "$root" "$dir"; then
@@ -2786,7 +2824,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
     fi
     build=$(wt_expand "$build")
     verify=$(wt_expand "$verify")
-    ick=$(wt_cksum_string "$build")
+    wt_art_build_ick "$build"
+    ick=$WT_ART_ICK
 
     # First, and with no git call: the re-entry path of every session.
     wt_art_state_read "$worktree" "$dir" || true
@@ -2813,13 +2852,33 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       continue
     fi
 
+    # Before the lock and before anything is taken from the main checkout: `dir` is the profile's
+    # word, so an unapproved profile gets neither main's copy nor a build (ADR-020) — a branch could
+    # otherwise name any of main's gitignored dirs and have it copied out.
+    if [ "${WT_APPROVAL:-}" = no ]; then
+      wt_log "  $dir: not taken or built — the profile's commands are not approved"
+      continue
+    fi
+    # The start-up run never waits on the background run's lock: the first prompt is held for it.
+    if [ "${WT_DEFER:-0}" = 1 ] && [ "$WT_DEP_STATUS" = doing ]; then
+      wt_log "  $dir: being built in the background"
+      continue
+    fi
+
     # The background run and a session starting meanwhile must not both write the dir.
     lockpath="$(wt_state_path "$worktree").build.lock"
-    held=0
-    wt_lock_acquire "$lockpath" "$WT_LOCK_WAIT" 9
+    held=0 contended=0 wait=$WT_LOCK_WAIT
+    [ "${WT_DEFER:-0}" = 1 ] && wait=0
+    wt_lock_acquire "$lockpath" "$wait" 9
     case $? in
       0) held=1 ;;
-      1) wt_log "  $dir: another run here is working on it — continuing without the lock" ;;
+      1)
+        if [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; then
+          wt_log "  $dir: going ahead without the lock"
+        else
+          contended=1
+        fi
+        ;;
     esac
     if [ "$held" -eq 1 ] && wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ] \
       && wt_art_has_content "$worktree/$dir"; then
@@ -2832,18 +2891,45 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       esac
     fi
 
-    if [ "$held" -eq 0 ] && [ "$WT_DEP_STATUS" = doing ]; then
-      wt_log "  $dir: another run here is building it — leaving it alone"
+    # Only a CONTENDED lock says a `doing` record is live. Without flock nothing can tell, and
+    # trusting it would leave a build killed mid-way blocked for good.
+    if [ "$contended" -eq 1 ] && { [ "${WT_DEFER:-0}" = 1 ] || [ "$WT_DEP_STATUS" = doing ]; }; then
+      wt_log "  $dir: another run here is working on it — leaving it alone"
       continue
     fi
+    [ "$contended" -eq 1 ] && wt_log "  $dir: another run here holds the lock — continuing without it"
 
-    # Linking runs nothing, so it needs no approval, and it is cheap enough for the start-up run.
+    # Taken only when main's dir is gitignored IN THE MAIN CHECKOUT: the worktree's answer is the
+    # branch's .gitignore, and says nothing about what main keeps in that dir.
     if wt_art_has_content "$root/$dir" && wt_art_inputs_match_main "$root" "$worktree" "$list"; then
-      if wt_art_take_main "$root" "$worktree" "$dir" "$link"; then
-        wt_log "  $dir: $([ "$link" = hardlink ] && echo hardlinked || echo copied) from the main checkout (its inputs are unchanged)"
-        wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+      why=$(wt_art_refusal "$root" "$dir")
+      if [ -n "$why" ]; then
+        wt_log "  $dir: not taken from the main checkout — there $why — building it"
+      elif [ "${WT_DEFER:-0}" = 1 ] && [ "$link" = copy ]; then
+        # A real copy of a large build is seconds of the first prompt; the background run does it.
+        wt_log "  $dir: to be copied from the main checkout in the background"
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
+      else
+        left=$(wt_budget_left "$deadline")
+        if [ "$left" -le 0 ]; then
+          wt_log "  $dir: out of time before taking it from the main checkout — leaving it for the next session"
+          [ "$held" -eq 1 ] && wt_lock_release 9
+          continue
+        fi
+        wt_art_take_main "$root" "$worktree" "$dir" "$link" "$left"
+        case $? in
+          0)
+            wt_log "  $dir: $([ "$link" = hardlink ] && echo hardlinked || echo copied) from the main checkout (its inputs are unchanged)"
+            wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+            [ "$held" -eq 1 ] && wt_lock_release 9
+            continue
+            ;;
+          2)
+            [ "$held" -eq 1 ] && wt_lock_release 9
+            continue
+            ;;
+        esac
       fi
     elif ! wt_art_has_content "$root/$dir"; then
       wt_log "  $dir: the main checkout has no build output there — building it"
@@ -2851,11 +2937,6 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_log "  $dir: its inputs differ from the main checkout's — building it"
     fi
 
-    if [ "${WT_APPROVAL:-}" = no ]; then
-      wt_log "  $dir: not built — the profile's commands are not approved"
-      [ "$held" -eq 1 ] && wt_lock_release 9
-      continue
-    fi
     if [ "${WT_DEFER:-0}" = 1 ]; then
       wt_log "  $dir: to be built in the background"
       [ "$held" -eq 1 ] && wt_lock_release 9
@@ -3018,7 +3099,7 @@ wt_bootstrap_pending() {  # $1 = worktree
 # one for these inputs and this command. A missing one is attemptable only while no dependency's
 # failure stands, since a build needs its dependencies.
 wt_bootstrap_pending_artifacts() {  # $1 = worktree
-  local worktree=${1%/} rec body dir inputs build verify link list ick standing=0 name
+  local worktree=${1%/} rec body dir inputs build verify link list standing=0 name
   case ${WT_STATUS_ITEMS:-} in
     standing"$WT_US"* | *"$WT_NL"standing"$WT_US"*) standing=1 ;;
   esac
@@ -3031,11 +3112,11 @@ wt_bootstrap_pending_artifacts() {  # $1 = worktree
     # SC2034: verify and link are read POSITIONALLY to consume their fields.
     # shellcheck disable=SC2034
     IFS=$WT_US read -r dir inputs build verify link <<<"$body" || true
-    { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
+    wt_is_artifact_dir "$dir" || continue
     list=$(wt_artifact_inputs "$inputs") || continue
     name="build output $dir"
-    ick=$(wt_cksum_string "$(wt_expand "$build")")
-    if wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ]; then
+    wt_art_build_ick "$(wt_expand "$build")"
+    if wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$WT_ART_ICK" ]; then
       case $WT_DEP_STATUS in
         "done" | warn)
           if wt_art_has_content "$worktree/$dir"; then

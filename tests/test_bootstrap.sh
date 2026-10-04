@@ -2397,7 +2397,7 @@ eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server a
 # ---------------------------------------------------------------------------
 # Build output: artifacts[] end to end
 # ---------------------------------------------------------------------------
-# The main checkout has its own build. A worktree whose inputs match takes it at start-up; one whose
+# The main checkout has its own build. A worktree whose inputs match copies it in the background; one whose
 # branch changed an input builds it in the background, after the dependencies; an unapproved one
 # builds nothing; and /pitlane-serve refuses while it is missing.
 AR=$TMP/ar
@@ -2420,11 +2420,12 @@ mkdir -p "$AR/public/build"; printf 'from-main\n' > "$AR/public/build/app.js"
 WAS=$AR/.claude/worktrees/same
 git -C "$AR" worktree add -q "$WAS" -b worktree-same 2>/dev/null
 out=$(PITLANE_BACKGROUND=on start_hook "$WAS"); err=$(cat "$TMP/err")
-eq 'artifacts: inputs unchanged — the main checkout'"'"'s build is there when the session starts' 'from-main' \
-  "$(cat "$WAS/public/build/app.js" 2>/dev/null)"
-contains '...copied' 'public/build: copied from the main checkout' "$err"
-lacks '...and the session is not told it is missing' 'build output' "$out"
-(cd "$WAS" && bash "$HOOK" --finish >/dev/null 2>&1)
+eq 'artifacts: inputs unchanged — a real copy is not made in the hook' no "$([ -e "$WAS/public/build" ] && echo yes || echo no)"
+contains '...but in the background' 'public/build: to be copied from the main checkout in the background' "$err"
+contains '...and the session is told so' 'build output public/build missing (still building)' "$out"
+outF=$( (cd "$WAS" && bash "$HOOK" --finish 2>"$TMP/err") )
+eq '...the main checkout'"'"'s build, copied by the background run' 'from-main' "$(cat "$WAS/public/build/app.js" 2>/dev/null)"
+eq '...after which the worktree is complete' 'Pitlane: this worktree is fully set up.' "$outF"
 
 WAC=$AR/.claude/worktrees/changed
 git -C "$AR" worktree add -q "$WAC" -b worktree-changed 2>/dev/null
@@ -2450,6 +2451,7 @@ eq 'artifacts: unapproved — nothing is built' no "$([ -e "$WAU/public/build/ap
 contains '...and it is named as held back' 'build output public/build missing (held back)' "$out"
 outR=$( (unset PITLANE_TRUST_PROFILES; cd "$WAU" && bash "$HOOK" --review 2>/dev/null) )
 contains '...review shows the build command' 'public/build (build output): build: sleep 1 && mkdir -p public/build' "$outR"
+contains '...and its verify' 'public/build (build output): verify: test -f public/build/app.js' "$outR"
 # Trusted, but the build fails and verify fails: serve names the missing piece.
 python3 - "$WAU/.claude/worktree-profile.json" <<'PY'
 import json, sys

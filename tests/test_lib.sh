@@ -1919,6 +1919,25 @@ JSON
   contains 'validate: an artifact needs a dir' 'artifacts[0].dir: missing' "$(vv)"
   vw '{"schemaVersion":1,"artifacts":[{"dir":"../out","inputs":["src"],"build":"b"}]}'
   contains 'validate: an artifact dir outside the repo is a violation' 'artifacts[0].dir: "../out" must be a relative path' "$(vv)"
+  # `dir` is cleared with rm -rf and replaced with cp: one spelling only, and inside the repository.
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"public/build/","inputs":["src"],"build":"b"}]}'
+  contains 'validate: a trailing slash is refused, with the fix' 'artifacts[0].dir: "public/build/" must not end in a slash — write "public/build"' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"","inputs":["src"],"build":"b"}]}'
+  contains 'validate: an empty dir is refused' 'artifacts[0].dir: missing' "$(vv)"
+  for bad_dir in '.' '/abs/dist' './dist' 'public//build' 'public/./build' 'dist/.' '/'; do
+    vw '{"schemaVersion":1,"artifacts":[{"dir":"'"$bad_dir"'","inputs":["src"],"build":"b"}]}'
+    contains "validate: dir \"$bad_dir\" is refused" 'artifacts[0].dir: "'"$bad_dir"'" must be a relative path inside the repository' "$(vv)"
+  done
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist\nx","inputs":["src"],"build":"b"}]}'
+  got=$(vv)
+  contains 'validate: a dir with a newline is refused' 'must be a relative path inside the repository, with no whitespace' "$got"
+  eq '...on one line of the report' 1 "$(printf '%s\n' "$got" | grep -c 'artifacts\[0\].dir')"
+  for bad_dir in '' . / /abs dist/ ./dist a//b a/./b $'dist\nx' $'dist\tx' 'dist x'; do
+    eq "wt_is_artifact_dir refuses \"$bad_dir\"" 1 "$(wt_is_artifact_dir "$bad_dir"; echo $?)"
+  done
+  for good_dir in dist public/build .output a.b/c-d_e; do
+    eq "wt_is_artifact_dir accepts $good_dir" 0 "$(wt_is_artifact_dir "$good_dir"; echo $?)"
+  done
   vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":"src","build":"b"}]}'
   contains 'validate: inputs must be an array' 'artifacts[0].inputs: must be a non-empty array' "$(vv)"
   vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src","../../etc"],"build":"b"}]}'

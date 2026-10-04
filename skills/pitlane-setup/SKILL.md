@@ -183,10 +183,11 @@ fresh worktree, and an app whose pages load it cannot be checked without it. Sta
 records, then read the repo's build (the `build` script of `package.json`, the bundler config's output
 dir, a task runner) for others: an output dir is a candidate only if it is gitignored. For each, propose:
 
-- `dir` — the output dir. The validator refuses one that is not gitignored;
+- `dir` — the output dir, written without a trailing slash (`public/build`). The validator refuses one
+  that is not gitignored;
 - `inputs` — the tracked paths the build reads: source dirs, the bundler config, the manifest and the
-  lockfile. A worktree whose inputs match the main checkout's at HEAD gets main's copy at once; any
-  other builds in the background. Too few inputs hands a branch main's stale bundle, so err wide;
+  lockfile. A worktree whose inputs match the main checkout's at HEAD gets a copy of main's build
+  (where main gitignores `dir` too) in the background; any other builds there. Too few inputs hands a branch main's stale bundle, so err wide;
 - `build` — the repo's own build command (`pnpm run build`), run inside `shell` once approved;
 - `verify` — a cheap file test on something only a finished build writes (a manifest);
 - `link` — leave it out: the default `copy` is right, because bundlers rewrite output files in place and
@@ -371,7 +372,7 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
 - `runtime.serve`, `runtime.url`, `runtime.stop` — commands and a template from that same step.
   `serve` runs inside `shell`, from the worktree root; `url` may use only `{port}` and `{slug}`.
 - `artifacts[]` — from step 4's *Build output*. Each `dir` gitignored (check with `git check-ignore
-  <dir>/`), `inputs` plain paths only (letters, digits, `. _ - @ + /`), `build` required.
+  <dir>/`, then write `dir` WITHOUT that slash), `inputs` plain paths only (letters, digits, `. _ - @ + /`), `build` required.
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
   guard fires.
