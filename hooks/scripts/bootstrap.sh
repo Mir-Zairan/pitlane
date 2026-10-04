@@ -175,6 +175,23 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
   # approval. A server recorded as stopped by command is stopped by runtime.stop, which is the
   # profile's command: that needs both, like serve itself.
   if [ "$mode" = --serve-stop ]; then
+    # A /pitlane-serve still probing holds the serve lock and may not have recorded its server yet:
+    # stopping now would find nothing, or race the record it is about to write. Held until exit.
+    # Without flock(1) nothing is serialised, as in wt_serve_start.
+    wt_lock_acquire "$(wt_serve_lockfile "$worktree")" "${WT_SERVE_LOCK_SECONDS:-5}" 7
+    case $? in
+      0) ;;
+      1)
+        if command -v flock >/dev/null 2>&1; then
+          printf 'Pitlane: nothing stopped — a /pitlane-serve is still starting the app here; wait for it to finish, then stop it again.\n'
+          return 1
+        fi
+        ;;
+      *)
+        printf 'Pitlane: nothing stopped — cannot take the serve lock at %s.\n' "$(wt_serve_lockfile "$worktree")"
+        return 1
+        ;;
+    esac
     if wt_serve_record_read "$worktree" && [ "$WT_SERVE_STOPBY" = command ]; then
       if ! wt_has_json; then
         printf 'Pitlane: the server at %s was not stopped — only runtime.stop can stop it, and neither jq nor python3 is on PATH to read the profile.\n' "$WT_SERVE_URL"

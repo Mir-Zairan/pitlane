@@ -64,7 +64,8 @@ process start time, together with what its process group left running. A server 
 detached it is stopped by the profile's `runtime.stop` instead, which needs the profile approved like
 `--serve`. It never stops a process by its port. Its one line says what happened:
 `stopped the server at <url>`, `no server … is recorded`, `… had already exited`, `pid … now belongs
-to another process … left alone`, or `the server at <url> was not stopped — <why>` (relay the why). Then run `--serve` again to restart, for example after a config
+to another process … left alone`, `the server at <url> was not stopped — <why>` (relay the why), or `nothing stopped — a /pitlane-serve is
+still starting the app here` (let that /pitlane-serve finish, then stop it again). Then run `--serve` again to restart, for example after a config
 change the server does not reload. Offer a restart when the user wants one.
 
 ## The rules

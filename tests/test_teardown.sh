@@ -952,6 +952,32 @@ if [ "$(id -u)" != 0 ]; then
 else
   printf 'SKIP running as root, so no directory is undeletable\n' >&2
 fi
+
+# An install that leaves a daemon behind (a build server, a watcher) with every descriptor it was
+# given: the lock descriptors the hook held while it ran must not be among them, or the daemon holds
+# the worktree's bootstrap lock for as long as it lives and teardown keeps the worktree every time.
+RD=$TMP/repo-daemon
+make_repo "$RD"
+rm -rf "$RD/vendor"
+python3 -c 'import json, sys
+p, pidfile = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["deps"][0]["strategy"] = "install"
+d["deps"][0]["install"] = "mkdir -p vendor && printf installed > vendor/autoload.php && { sleep 300 </dev/null >/dev/null 2>&1 & echo $! > %s; }" % pidfile
+json.dump(d, open(p, "w"), indent=2)' "$RD/.claude/worktree-profile.json" "$TMP/install-daemon.pid"
+git -C "$RD" commit -qam 'install leaves a daemon'
+WD=$(create "$RD" daemon)
+daemon_pid=$(cat "$TMP/install-daemon.pid" 2>/dev/null)
+SERVED="$SERVED $daemon_pid"
+eq 'install daemon fixture: the install ran' installed "$(cat "$WD/vendor/autoload.php" 2>/dev/null)"
+eq 'install daemon fixture: its daemon is still running' yes \
+  "$(kill -0 "$daemon_pid" 2>/dev/null && echo yes || echo no)"
+out=$(remove "$(remove_payload "$WD" "$RD")" "$RD")
+err=$(cat "$TMP/err")
+eq 'install daemon: teardown exits 0' 0 "$(cat "$TMP/rc")"
+eq 'install daemon: the worktree is removed' no "$(exists "$WD")"
+lacks '...and no bootstrap lock was found held' 'a bootstrap is still running' "$err"
+kill "$daemon_pid" 2>/dev/null
 }
 
 for BACKEND in jq python3; do

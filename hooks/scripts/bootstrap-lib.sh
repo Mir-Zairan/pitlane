@@ -655,20 +655,23 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
       capture=''
     fi
   fi
+  # The child closes WT_LOCK_FDS: a daemon the command leaves behind (a build server, a watcher)
+  # would otherwise hold the caller's flocks for as long as it runs, and no later bootstrap,
+  # teardown or serve could take them.
   if command -v timeout >/dev/null 2>&1; then
     if [ -n "$capture" ]; then
-      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
+      ( wt_close_lock_fds; cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
     else
-      ( cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+      ( wt_close_lock_fds; cd "$dir" && exec timeout "$secs" "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
     fi
   else
     # No coreutils `timeout` (a stock macOS host). Run unbounded rather than not at all, and say
     # so once: an unbounded install is a risk, but refusing to install is a certainty.
     wt_log "coreutils timeout is not on PATH — running \"$cmd\" without a time limit"
     if [ -n "$capture" ]; then
-      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
+      ( wt_close_lock_fds; cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >"$capture" 2>&1 || rc=$?
     else
-      ( cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
+      ( wt_close_lock_fds; cd "$dir" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >&2 || rc=$?
     fi
   fi
   [ -z "$capture" ] || wt_capture_unfollow "$capture"
@@ -1064,6 +1067,19 @@ wt_lock_release() {  # $1 = fd number
   case ${1-} in '' | *[!0-9]*) return 0 ;; esac
   eval "exec $1>&-" 2>/dev/null || true
   return 0
+}
+
+# Every descriptor the engine's hooks hold a lock on: 7 the serve lock, 8 the worktree's bootstrap
+# lock, 9 a dependency-dir or allocation lock. A child running a profile's command closes them all
+# (wt_close_lock_fds); a new lock on any other descriptor belongs in this list.
+WT_LOCK_FDS='7 8 9'
+
+# Close WT_LOCK_FDS in the CURRENT shell — call it only inside the subshell about to exec a command.
+wt_close_lock_fds() {
+  local fd
+  for fd in $WT_LOCK_FDS; do
+    wt_lock_release "$fd"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -4054,9 +4070,8 @@ wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
   fi
   pidf="$log.pid"
   rm -f "$pidf" 2>/dev/null
-  # Descriptors 7 and 8 hold the serve lock and the bootstrap lock: a server inheriting either
-  # would hold it for as long as it runs.
-  ( exec 7>&- 8>&-
+  # A server inheriting a lock descriptor would hold that lock for as long as it runs.
+  ( wt_close_lock_fds
     cd "$wt" 2>/dev/null || exit 1
     # shellcheck disable=SC2016  # $$, $1 and $@ belong to the inner shell.
     exec "${detach[@]}" bash -c 'printf "%s\n" "$$" >"$1" || exit 1; shift; exec "$@"' pitlane-serve "$pidf" "${WT_CMD_ARGV[@]}"

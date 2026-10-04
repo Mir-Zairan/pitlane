@@ -2217,6 +2217,22 @@ data = open(p, encoding="latin-1").read()
 data += "\x1f".join(["serve", rec[0], rec[1], rec[2], "ck", rec[3], str(int(time.time()))]) + "\x1e"
 open(p, "w", encoding="latin-1").write(data)
 PY
+# A /pitlane-serve still holding the serve lock: --serve-stop waits, then refuses, and leaves the
+# server and its record alone.
+# shellcheck disable=SC2016  # $0 belongs to the inner shell.
+setsid bash -c 'exec 9>"$0"; flock -x 9; exec sleep 60' "$GDSR/worktree-serve.lock" </dev/null >/dev/null 2>&1 &
+holder=$!
+SV_KILL="$SV_KILL $holder"
+for _ in $(seq 1 50); do flock -n "$GDSR/worktree-serve.lock" true 2>/dev/null || break; sleep 0.1; done
+WT_SERVE_LOCK_SECONDS=1 serve_cli "$WSR" --serve-stop; out=$SV_OUT
+eq 'serve-stop: refused while a /pitlane-serve holds the serve lock' \
+  'Pitlane: nothing stopped — a /pitlane-serve is still starting the app here; wait for it to finish, then stop it again.' "$out"
+eq '...non-zero' 1 "$SV_RC"
+eq '...the server lives' yes "$(kill -0 "$SPID" 2>/dev/null && echo yes || echo no)"
+contains '...its record is kept' "$SPID" "$(serve_record "$WSR")"
+kill -s KILL -- "-$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
 serve_cli "$WSR" --serve-stop; out=$SV_OUT
 eq 'serve-stop: stops the server it started' "Pitlane: stopped the server at $SRVURL (pid $SPID)." "$out"
 eq '...exit 0' 0 "$SV_RC"
