@@ -403,6 +403,7 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   wt_approval_check "$worktree"
 
   wt_bootstrap_deps "$root" "$worktree" "$deadline"
+  wt_bootstrap_artifacts "$root" "$worktree" "$deadline"
   # THE DEADLINE IS PASSED IN. `timeouts.seedSeconds` and `timeouts.bootstrapSeconds` run inside
   # ONE hook invocation, so it is their SUM that must fit — a seed that took a fresh allowance
   # would let the platform kill the hook before any internal guard fired, which is the one failure

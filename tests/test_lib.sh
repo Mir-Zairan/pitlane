@@ -1232,6 +1232,7 @@ EOF
             "slug":"F13_slug",
             "port":{"var":"F17_PORTVAR","base":4100,"span":200},
             "serve":"F21_serve","stop":"F22_stop","url":"F23_url"},
+ "artifacts":[{"dir":"F24_dir","inputs":["F24_src"],"build":"F24_build"}],
  "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
  "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
  "copy":["F15_copy"]}
@@ -1260,6 +1261,7 @@ JSON
   eq 'scalars field 21 is runtime.serve'           'F21_serve'        "$WT_PS_SERVE"
   eq 'scalars field 22 is runtime.stop'            'F22_stop'         "$WT_PS_STOP"
   eq 'scalars field 23 is runtime.url'             'F23_url'          "$WT_PS_URL"
+  contains 'scalars field 24 is artifacts as compact JSON' 'F24_dir'  "$WT_PS_ARTIFACTS"
   # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
   # variables than the record has fields makes bash `read` pack the remainder into the last one —
   # but only visibly when the extra field is non-empty: `read` strips exactly one trailing
@@ -1267,9 +1269,9 @@ JSON
   # Counting the separators catches the scan list growing whether the new field has a value or not.
   scan_rec=$(wt_profile_scan "$SCP")
   scan_rec=${scan_rec%%"$RS"*}
-  eq 'the scalar record carries exactly 23 fields plus its tag' 23 \
+  eq 'the scalar record carries exactly 24 fields plus its tag' 24 \
     "$(printf '%s' "$scan_rec" | tr -cd "$US" | wc -c | tr -d ' ')"
-  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_URL"
+  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_ARTIFACTS"
   # An absent field is EMPTY, not a shift of everything after it.
   wt_profile_scalars "$(printf '%s' '{"schemaVersion":1,"evidence":{"shellMarker":"only"}}' \
     | wt_json_scan schemaVersion shell shellArgs deps runtime \
@@ -1892,6 +1894,72 @@ JSON
     contains 'drift: and reports it as a vanished lockfile' 'no longer exists' "$got"
     rm -f "$VR/zero.lock"
   fi
+
+  # --- artifacts[] ------------------------------------------------------------
+  # inputs is an array INSIDE each element, so it reaches bash as compact JSON; the splitter must
+  # read it identically on both backends, and refuse anything that could become pathspec magic.
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"public/build","inputs":["assets","pnpm-lock.yaml"],"build":"pnpm run build","verify":"test -f public/build/manifest.json"}]}'
+  eq 'validate: a good artifact reports nothing' '' "$(vv)"
+  art=''
+  while IFS= read -r -d "$RS" rec; do
+    case $rec in 5"$US"*) art=${rec#5"$US"} ;; esac
+  done < <(wt_profile_scan "$VP")
+  eq 'scan: an artifact is group 5, its inputs compact JSON' \
+    "public/build|[\"assets\",\"pnpm-lock.yaml\"]|pnpm run build|test -f public/build/manifest.json|" \
+    "${art//"$US"/|}"
+  eq 'inputs: split one path per line' "assets"$'\n'"pnpm-lock.yaml" \
+    "$(wt_artifact_inputs '["assets","pnpm-lock.yaml"]')"
+  for bad_in in '[]' '' '"src"' '["src",]' '[1]' '["../up"]' '["/abs"]' '["a b"]' '[":(glob)*"]' \
+    '["a\"b"]' '["src","x,y"]' '{"a":1}'; do
+    out=$(wt_artifact_inputs "$bad_in"); rc=$?
+    eq "inputs: $bad_in is refused" "1|" "$rc|$out"
+  done
+
+  vw '{"schemaVersion":1,"artifacts":[{"inputs":["src"],"build":"b"}]}'
+  contains 'validate: an artifact needs a dir' 'artifacts[0].dir: missing' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"../out","inputs":["src"],"build":"b"}]}'
+  contains 'validate: an artifact dir outside the repo is a violation' 'artifacts[0].dir: "../out" must be a relative path' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":"src","build":"b"}]}'
+  contains 'validate: inputs must be an array' 'artifacts[0].inputs: must be a non-empty array' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src","../../etc"],"build":"b"}]}'
+  contains 'validate: an input outside the repo is a violation' 'artifacts[0].inputs:' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src"]}]}'
+  contains 'validate: an artifact needs a build command' 'artifacts[0].build: missing' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src"],"build":"b","link":"symlink"}]}'
+  contains 'validate: link is copy or hardlink' 'artifacts[0].link: "symlink" is not one of copy|hardlink' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src"],"build":"b","link":"hardlink"},{"dir":"dist","inputs":["src"],"build":"c"}]}'
+  got=$(vv)
+  contains 'validate: one dir named twice is a violation' 'artifacts[1].dir: "dist" is named twice' "$got"
+  eq '...and only the second is blamed' 1 "$(printf '%s\n' "$got" | grep -c .)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"skip"}],"artifacts":[{"dir":"vendor","inputs":["src"],"build":"b"}]}'
+  contains 'validate: a dir that is also a deps dir is a violation' 'artifacts[0].dir: "vendor" is also a deps[] dir' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":{"dir":"dist"}}'
+  contains 'validate: artifacts must be an array' 'artifacts: must be an array' "$(vv)"
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"dist","inputs":["src"],"build":"b {nme}"}]}'
+  contains 'validate: a build command is scanned for unknown placeholders' 'nme' "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  # The fail-closed guard: a scan that loses the records of a non-empty artifacts array. Field 24.
+  vw '{"schemaVersion":1,"artifacts":[{"dir":"../x","inputs":["src"],"build":"b"}]}'
+  cpad=''
+  cn=0
+  while [ "$cn" -lt 22 ]; do cpad="$cpad$US"; cn=$((cn + 1)); done
+  SCALARONLY="0${US}1${cpad}${US}[{\"dir\":\"../x\"}]${RS}"
+  out=$(SCALARONLY="$SCALARONLY" bash -c ". '$LIB'
+    wt_json_scan() { printf '%s' \"\$SCALARONLY\"; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  contains 'validate: an artifacts array whose records are lost is a violation' \
+    'artifacts: is a non-empty array but could not be read' "$out"
+  contains '...and fails validation' '|rc=1' "$out"
+  # Gitignored, asked of git: a tracked-output dir is the branch's own files.
+  AGR=$TMP/agrepo
+  rm -rf "$AGR"; git init -q "$AGR"; mkdir -p "$AGR/.claude"
+  printf '/public/build/\n' >"$AGR/.gitignore"
+  printf '%s' '{"schemaVersion":1,"artifacts":[{"dir":"public/build","inputs":["src"],"build":"b"}]}' >"$AGR/.claude/worktree-profile.json"
+  eq 'validate: a gitignored artifact dir (not built yet) is fine' '' \
+    "$(wt_validate_profile "$AGR/.claude/worktree-profile.json" "$AGR" 2>/dev/null)"
+  printf '%s' '{"schemaVersion":1,"artifacts":[{"dir":"src","inputs":["src"],"build":"b"}]}' >"$AGR/.claude/worktree-profile.json"
+  contains 'validate: an artifact dir that is not gitignored is a violation' 'artifacts[0].dir: "src" is not gitignored' \
+    "$(wt_validate_profile "$AGR/.claude/worktree-profile.json" "$AGR" 2>/dev/null)"
 
   # --- caller safety --------------------------------------------------------
   # The caller runs `set -euo pipefail`; a library function returning non-zero, or

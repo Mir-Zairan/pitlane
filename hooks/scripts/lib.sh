@@ -1013,11 +1013,13 @@ wt_expand_url() {  # $1 = template
 #  17 runtime.port.var                18 runtime.port.base            19 runtime.port.span
 #  20 runtime.port
 #  21 runtime.serve  22 runtime.stop                23 runtime.url
+#  24 artifacts
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum), group 2 = copy[],
 # group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
-# list. A plain string yields no group-4 records; the scalar carries it.
+# list. A plain string yields no group-4 records; the scalar carries it. Group 5 = artifacts[] (dir,
+# inputs, build, verify, link); `inputs` arrives as compact JSON, split by wt_artifact_inputs.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
@@ -1030,11 +1032,12 @@ wt_profile_scan() {  # $1 = profile path
     runtime.seed runtime.teardown runtime.env.file \
     runtime.slug runtime.env.vars copy evidence.shellMarker \
     runtime.port.var runtime.port.base runtime.port.span runtime.port \
-    runtime.serve runtime.stop runtime.url \
+    runtime.serve runtime.stop runtime.url artifacts \
     -- deps dir lock strategy install verify lockChecksum \
     -- copy . \
     --kv runtime.env.vars \
-    -- runtime.env.file . <"$1"
+    -- runtime.env.file . \
+    -- artifacts dir inputs build verify link <"$1"
 }
 
 # Split the scalar record of a wt_profile_scan stream into named variables — the ONE place that
@@ -1075,7 +1078,7 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_SEED WT_PS_TEARDOWN WT_PS_ENVFILE \
     WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
     WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
-    WT_PS_SERVE WT_PS_STOP WT_PS_URL \
+    WT_PS_SERVE WT_PS_STOP WT_PS_URL WT_PS_ARTIFACTS \
     <<<"$body" || true
   WT_PS_ENVFILES=''
   case $WT_PS_ENVFILE in
@@ -1104,6 +1107,39 @@ wt_is_safe_envfile() {  # $1 = candidate
   esac
   wt_is_safe_relpath "$1"
 }
+
+# Split artifacts[].inputs — compact JSON, as the scan renders a nested array — into one path per
+# line. Returns 1, printing nothing, unless it is a non-empty array of quoted paths drawn from the
+# env file character set, each inside the repository. That set has no quote, comma or backslash, so
+# splitting the rendered text on commas is exact on both backends, and no element can carry git
+# pathspec magic (`:`) or a glob into the `git diff -- <inputs>` that decides whether to link.
+wt_artifact_inputs() {  # $1 = the rendered inputs value
+  local raw=${1-} item out=''
+  case $raw in
+    '[]' | '' ) return 1 ;;
+    '['*']') ;;
+    *) return 1 ;;
+  esac
+  raw=${raw#[}
+  raw=${raw%]}
+  while [ -n "$raw" ]; do
+    item=${raw%%,*}
+    if [ "$item" = "$raw" ]; then raw=''; else raw=${raw#*,}; [ -n "$raw" ] || return 1; fi
+    case $item in
+      '"'?*'"') item=${item#\"}; item=${item%\"} ;;
+      *) return 1 ;;
+    esac
+    wt_is_safe_envfile "$item" || return 1
+    out+=$item$WT_NL
+  done
+  printf '%s' "$out"
+}
+
+# The allowed values for artifacts[].link. `copy` is the default: measured with vite 5 and esbuild,
+# a rebuild in place (vite with emptyOutDir off, as in watch mode or an outDir outside its root;
+# esbuild always) rewrites a same-named output file through the inode it shares with the main
+# checkout, so a worktree's build would change the main checkout's.
+WT_ARTIFACT_LINKS='copy hardlink'
 
 # The only schemaVersion this build understands. A profile written by a newer plugin
 # warns and falls back to defaults rather than acting on fields it may misread.
@@ -1197,6 +1233,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local portvar portbase portspan portobj ekey eval_ nkeys=0
   local ef efrest efseen efrebuilt efn
   local serve stopcmd urltpl urlwhy
+  local artifacts adir ainputs abuild averify alink nart=0 depdirs=' ' artdirs=' '
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1239,7 +1276,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   slug=$WT_PS_SLUG;         envvars=$WT_PS_ENVVARS;   copy=$WT_PS_COPY
   evshell=$WT_PS_EVSHELL;   portvar=$WT_PS_PORTVAR;   portbase=$WT_PS_PORTBASE
   portspan=$WT_PS_PORTSPAN; portobj=$WT_PS_PORT;     serve=$WT_PS_SERVE
-  stopcmd=$WT_PS_STOP;      urltpl=$WT_PS_URL
+  stopcmd=$WT_PS_STOP;      urltpl=$WT_PS_URL;       artifacts=$WT_PS_ARTIFACTS
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -1343,6 +1380,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         esac
       fi
 
+      [ -z "$dir" ] || depdirs+="$dir "
       for tok in "$install" "$verify" "$dir" "$lock"; do
         [ -n "$tok" ] || continue
         unk=$(wt_unknown_placeholders "$tok") || wt_log "deps[$n]: \"$tok\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
@@ -1397,6 +1435,76 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     # file operations on, arriving in a committed file from anyone's branch.
     if [ "$ncopy" -eq 0 ]; then
       printf 'copy: is a non-empty array but could not be read — refusing to treat it as empty\n'
+      bad=1
+    fi
+  fi
+
+  # --- artifacts[] ----------------------------------------------------------
+  # Generated build output. `dir` is acted on with `rm -rf` (a partial build) and `cp`, so it gets
+  # the deps[].dir checks, and must be gitignored: a tracked dir would be the branch's own files.
+  # `build` is a command, so it is approved like an install before it runs (ADR-020).
+  if [ -n "$artifacts" ]; then
+    case $artifacts in
+      '['*']') ;;
+      *) printf 'artifacts: must be an array, got %s\n' "$artifacts"; bad=1; artifacts='' ;;
+    esac
+  fi
+  if [ -n "$artifacts" ] && [ "$artifacts" != '[]' ]; then
+    n=0
+    while IFS= read -r -d "$WT_RS" rec; do
+      case $rec in
+        5"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      nart=$((nart + 1))
+      body=${rec#*"$WT_US"}
+      IFS=$WT_US read -r adir ainputs abuild averify alink <<<"$body" || true
+      if [ -z "$adir" ]; then
+        printf 'artifacts[%d].dir: missing\n' "$n"
+        bad=1
+      elif ! wt_is_safe_relpath "$adir"; then
+        printf 'artifacts[%d].dir: "%s" must be a relative path inside the repository\n' "$n" "$adir"
+        bad=1
+      else
+        case $artdirs in
+          *" $adir "*) printf 'artifacts[%d].dir: "%s" is named twice\n' "$n" "$adir"; bad=1 ;;
+        esac
+        case $depdirs in
+          *" $adir "*) printf 'artifacts[%d].dir: "%s" is also a deps[] dir\n' "$n" "$adir"; bad=1 ;;
+        esac
+        artdirs+="$adir "
+        # The trailing slash is what makes a directory-only pattern (`/dist/`) match a directory
+        # that does not exist yet. Exit 1 is git's "not ignored"; anything else is no answer.
+        if [ -n "$root" ]; then
+          wt_git "$root" check-ignore -q -- "${adir%/}/" >/dev/null 2>&1
+          if [ $? -eq 1 ]; then
+            printf 'artifacts[%d].dir: "%s" is not gitignored — build output the branch tracks is not the plugin'"'"'s to replace\n' "$n" "$adir"
+            bad=1
+          fi
+        fi
+      fi
+      if ! wt_artifact_inputs "$ainputs" >/dev/null; then
+        printf 'artifacts[%d].inputs: must be a non-empty array of paths inside the repository (letters, digits and . _ - @ + /), got %s\n' "$n" "${ainputs:-nothing}"
+        bad=1
+      fi
+      if [ -z "$abuild" ]; then
+        printf 'artifacts[%d].build: missing — the command that writes %s\n' "$n" "${adir:-the dir}"
+        bad=1
+      fi
+      case " $WT_ARTIFACT_LINKS " in
+        *" ${alink:-copy} "*) ;;
+        *) printf 'artifacts[%d].link: "%s" is not one of %s\n' "$n" "$alink" "$(printf '%s' "$WT_ARTIFACT_LINKS" | tr ' ' '|')"; bad=1 ;;
+      esac
+      for tok in "$abuild" "$averify" "$adir"; do
+        [ -n "$tok" ] || continue
+        unk=$(wt_unknown_placeholders "$tok") || wt_log "artifacts[$n]: \"$tok\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
+      done
+      n=$((n + 1))
+    done < <(printf '%s' "$raw")
+    n=0
+    # The fail-closed guard deps[] and copy[] have, for the same reason.
+    if [ "$nart" -eq 0 ]; then
+      printf 'artifacts: is a non-empty array but could not be read — refusing to treat it as empty\n'
       bad=1
     fi
   fi

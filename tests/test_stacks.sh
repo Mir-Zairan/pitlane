@@ -284,6 +284,7 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 logs=$3 w out port expect
   w=$r/.claude/worktrees/$name
   git -C "$r" worktree add -q "$w" -b "worktree-$name" 2>/dev/null
+  [ "$name" != beta ] || [ -z "$STACK_ART_CHANGE" ] || (cd "$w" && bash -c "$STACK_ART_CHANGE")
   out=$(session_start "$w" "$logs/$name.start")
   # Fully set up: stdout is empty, or, with a serve profile, the one line naming /pitlane-serve (ADR-021).
   expect=''
@@ -312,6 +313,15 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
       *) eq "$name: the fixture names a file the worktree's own $d must hold" "a file under $d/" "none" ;;
     esac
   done
+  if [ -n "$STACK_ART_FILE" ] && [ "$name" = beta ]; then
+    eq "$name: an input changed on its branch, so its build output was built" "$STACK_ART_EXPECT" \
+      "$(cat "$w/$STACK_ART_FILE" 2>/dev/null)"
+  elif [ -n "$STACK_ART_FILE" ]; then
+    eq "$name: its inputs match, so it holds the main checkout's build output" "$(cat "$r/$STACK_ART_FILE")" \
+      "$(cat "$w/$STACK_ART_FILE" 2>/dev/null)"
+    ne "$name: ...as a copy, not a link a rebuild would write through" "$(inode "$r/$STACK_ART_FILE")" \
+      "$(inode "$w/$STACK_ART_FILE")"
+  fi
   eq "$name: the bootstrap left nothing untracked or modified, so teardown will not hold it" '' \
     "$(git -C "$w" status --porcelain)"
 
@@ -364,6 +374,8 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   t0=$SECONDS fail0=$fail
   STACK_DEPDIRS='' STACK_LINKDIRS='' STACK_OWNFILES='' STACK_PROBE='' STACK_EXPECT='' STACK_ENVFILE=''
   STACK_SERVE='' STACK_SERVE_PATH='' STACK_SERVE_EXPECT=''
+  # shellcheck disable=SC2034  # STACK_ARTIFACTS is read by write_profile, in stack_fixtures.sh
+  STACK_ARTIFACTS='' STACK_ART_FILE='' STACK_ART_CHANGE='' STACK_ART_EXPECT=''
   STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack

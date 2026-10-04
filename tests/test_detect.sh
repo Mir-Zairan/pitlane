@@ -362,6 +362,24 @@ run_suite() {
   has   'config: an ordinary gitignored local config file is proposed' 'config|ok.local.yml' "$out"
   hasnt 'config: an SSH-key-shaped name is refused by neverPropose' 'config|id_rsa.local.yml' "$out"
 
+  # --- build output -------------------------------------------------------------
+  # A hint only where something builds there: present, non-empty, gitignored.
+  r=$(mkrepo art package.json)
+  printf '/public/build/\n/dist/\n/build/\nout/\n' >"$r/.gitignore"
+  mkdir -p "$r/public/build" "$r/dist" "$r/out" "$r/.next" "$r/build"
+  : >"$r/public/build/manifest.json"
+  : >"$r/out/index.html"
+  : >"$r/.next/BUILD_ID"
+  printf 'x\n' >"$r/build/kept.js"
+  git -C "$r" add -f build/kept.js >/dev/null 2>&1
+  commit_all "$r"
+  out=$(det "$r")
+  has   'artifact: a present, gitignored build dir is a hint' 'artifact|public/build' "$out"
+  has   'artifact: so is out/' 'artifact|out' "$out"
+  hasnt 'artifact: an empty one is not' 'artifact|dist' "$out"
+  hasnt 'artifact: nor one that is not gitignored' 'artifact|.next' "$out"
+  hasnt 'artifact: nor one holding a tracked file' 'artifact|build' "$out"
+
   # --- layer 3 is hints only ---------------------------------------------------
   # Nothing here may conclude anything. A wrong guess does not break a worktree; it
   # corrupts a colleague's data.

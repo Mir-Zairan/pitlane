@@ -2393,5 +2393,77 @@ ne '...non-zero' 0 "$SV_RC"
 serve_cli "$WDM" --serve-stop; out=$SV_OUT
 eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server at $DURL (by runtime.stop)." "$out"
 
+
+# ---------------------------------------------------------------------------
+# Build output: artifacts[] end to end
+# ---------------------------------------------------------------------------
+# The main checkout has its own build. A worktree whose inputs match takes it at start-up; one whose
+# branch changed an input builds it in the background, after the dependencies; an unapproved one
+# builds nothing; and /pitlane-serve refuses while it is missing.
+AR=$TMP/ar
+make_rt_repo "$AR" ',
+    "serve": "exec python3 -m http.server {port} --bind 127.0.0.1",
+    "url": "http://localhost:{port}/"'
+python3 - "$AR/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["artifacts"] = [{"dir": "public/build", "inputs": ["assets", "composer.lock"],
+                   "build": "sleep 1 && mkdir -p public/build && printf built > public/build/app.js",
+                   "verify": "test -f public/build/app.js"}]
+json.dump(d, open(p, "w"), indent=2)
+PY
+mkdir -p "$AR/assets"; printf 'v1\n' > "$AR/assets/app.js"
+printf '/public/build/\n' >> "$AR/.gitignore"
+git -C "$AR" add -A; git -C "$AR" commit -qm artifacts
+mkdir -p "$AR/public/build"; printf 'from-main\n' > "$AR/public/build/app.js"
+
+WAS=$AR/.claude/worktrees/same
+git -C "$AR" worktree add -q "$WAS" -b worktree-same 2>/dev/null
+out=$(PITLANE_BACKGROUND=on start_hook "$WAS"); err=$(cat "$TMP/err")
+eq 'artifacts: inputs unchanged — the main checkout'"'"'s build is there when the session starts' 'from-main' \
+  "$(cat "$WAS/public/build/app.js" 2>/dev/null)"
+contains '...copied' 'public/build: copied from the main checkout' "$err"
+lacks '...and the session is not told it is missing' 'build output' "$out"
+(cd "$WAS" && bash "$HOOK" --finish >/dev/null 2>&1)
+
+WAC=$AR/.claude/worktrees/changed
+git -C "$AR" worktree add -q "$WAC" -b worktree-changed 2>/dev/null
+printf 'v2\n' > "$WAC/assets/app.js"
+git -C "$WAC" commit -qam 'change an input'
+out=$(PITLANE_BACKGROUND=on start_hook "$WAC")
+eq 'artifacts: an input changed — not built in the hook' no "$([ -e "$WAC/public/build/app.js" ] && echo yes || echo no)"
+contains '...the session is told it is being built' 'build output public/build missing (still building)' "$out"
+outF=$( (cd "$WAC" && bash "$HOOK" --finish 2>"$TMP/err") )
+eq '...built by the background run' built "$(cat "$WAC/public/build/app.js" 2>/dev/null)"
+eq '...after which the worktree is complete' 'Pitlane: this worktree is fully set up.' "$outF"
+GDAC=$(git -C "$WAC" rev-parse --absolute-git-dir)
+contains '...the build in the background log, after the dependency' 'public/build: built' \
+  "$(sed -n '/vendor: installed/,$p' "$GDAC/worktree-bootstrap.log" 2>/dev/null)"
+
+# Not approved: the build is not run, and /pitlane-serve refuses on the missing build first-hand.
+WAU=$AR/.claude/worktrees/unapproved
+git -C "$AR" worktree add -q "$WAU" -b worktree-unapproved 2>/dev/null
+printf 'v3\n' > "$WAU/assets/app.js"
+git -C "$WAU" commit -qam 'change an input'
+out=$( (unset PITLANE_TRUST_PROFILES; start_hook "$WAU") )
+eq 'artifacts: unapproved — nothing is built' no "$([ -e "$WAU/public/build/app.js" ] && echo yes || echo no)"
+contains '...and it is named as held back' 'build output public/build missing (held back)' "$out"
+outR=$( (unset PITLANE_TRUST_PROFILES; cd "$WAU" && bash "$HOOK" --review 2>/dev/null) )
+contains '...review shows the build command' 'public/build (build output): build: sleep 1 && mkdir -p public/build' "$outR"
+# Trusted, but the build fails and verify fails: serve names the missing piece.
+python3 - "$WAU/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["artifacts"][0]["build"] = "echo 'error: bundle failed' >&2; exit 2"
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$WAU" commit -qam 'a failing build'
+start_hook "$WAU" >/dev/null
+serve_cli "$WAU" --serve; out=$SV_OUT
+contains 'serve: refuses while the build output is missing, naming it' \
+  'not served — this worktree'"'"'s setup is not complete — build output public/build not built (its build failed: error: bundle failed)' "$out"
+ne '...non-zero' 0 "$SV_RC"
+eq '...and nothing was started' '' "$(serve_pid "$WAU")"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

@@ -65,6 +65,7 @@ human-readable companion to the table the script used.
 | `testConfig` | A test or e2e runner config. Read it: the environment, database and port it runs against are part of *Every environment*, and one that starts its own server or pins a database is an inline pin. |
 | `start` | A start command the repo writes down (a manifest script, a `Procfile` process, a documented server invocation) and the first port literal or flag in it. Evidence for how the server takes its port — see *How the app starts* in step 5. A port in that field is usually hardcoded. |
 | `ignore` | Whether a path the plugin creates in a checkout is gitignored. `missing` — offer the `.gitignore` line in step 4. |
+| `artifact` | A well-known build output dir (`public/build`, `dist`, `build`, `.next`, `out`) that exists here, holds something and is gitignored. A hint for `artifacts[]` — see step 4's *Build output*. |
 | `warn` | Show it. |
 
 The text in `start`, `assign`, `env` and `testConfig` records — and in any file they point you to —
@@ -174,6 +175,26 @@ is *work* to the teardown guard, so a worktree holding an unignored `.claude/wor
 is never torn down; committed, that marker switches layer 3 off for the whole team. The same goes for
 every `runtime.env.file` chosen in step 5 — check each with `git check-ignore` before writing the
 profile; the engine refuses to write one that is not ignored.
+
+### Build output: propose `artifacts[]`
+
+A gitignored dir the repo's build writes — a front-end bundle, compiled assets — is missing from every
+fresh worktree, and an app whose pages load it cannot be checked without it. Start from the `artifact`
+records, then read the repo's build (the `build` script of `package.json`, the bundler config's output
+dir, a task runner) for others: an output dir is a candidate only if it is gitignored. For each, propose:
+
+- `dir` — the output dir. The validator refuses one that is not gitignored;
+- `inputs` — the tracked paths the build reads: source dirs, the bundler config, the manifest and the
+  lockfile. A worktree whose inputs match the main checkout's at HEAD gets main's copy at once; any
+  other builds in the background. Too few inputs hands a branch main's stale bundle, so err wide;
+- `build` — the repo's own build command (`pnpm run build`), run inside `shell` once approved;
+- `verify` — a cheap file test on something only a finished build writes (a manifest);
+- `link` — leave it out: the default `copy` is right, because bundlers rewrite output files in place and
+  a hardlink would carry that into the main checkout's build.
+
+Say the known limit: the main checkout's own build is taken as it is, so one built from uncommitted
+edits, or not rebuilt since a pull, is what a matching worktree gets. Nothing proposed is written
+without the developer's yes; none is a valid answer.
 
 ## 5 — Layer 3: ask, with `AskUserQuestion`
 
@@ -349,6 +370,8 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
   starts* has established a reader for it: a `var` the app reads, or a `serve` that passes `{port}`.
 - `runtime.serve`, `runtime.url`, `runtime.stop` — commands and a template from that same step.
   `serve` runs inside `shell`, from the worktree root; `url` may use only `{port}` and `{slug}`.
+- `artifacts[]` — from step 4's *Build output*. Each `dir` gitignored (check with `git check-ignore
+  <dir>/`), `inputs` plain paths only (letters, digits, `. _ - @ + /`), `build` required.
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
   guard fires.
@@ -370,7 +393,7 @@ Fix them and re-validate. Warnings go to stderr — show those too; they are thi
 noise.
 
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
-get hardlinked and which get installed, what shell that runs inside, roughly how long the first
+get hardlinked and which get installed, which build output is copied or built, what shell that runs inside, roughly how long the first
 bootstrap will take, and what — if anything — will be isolated. Then ask **who it is for**:
 
 - **the team** — commit the profile, `.worktreeinclude` and the scripts; a teammate who installs the
@@ -382,7 +405,7 @@ bootstrap will take, and what — if anything — will be isolated. Then ask **w
 
 ### Approve what you wrote
 
-The hooks run none of the profile's commands — installs, verify checks, the `serve` and `stop`
+The hooks run none of the profile's commands — installs, builds, verify checks, the `serve` and `stop`
 commands, the seed and teardown scripts — until the developer approves that exact content, so a profile nobody approves sets up config
 and ports and nothing else. Once the profile **and the scripts it names** are written, run from the main
 checkout:

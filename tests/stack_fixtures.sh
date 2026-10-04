@@ -35,6 +35,14 @@
 #                           STACK_SERVE_PATH, STACK_SERVE_EXPECT
 #                                           what /pitlane-serve's app must answer at that path of
 #                                           its URL; {port} stands for the worktree's own
+#                           STACK_ARTIFACTS the artifacts[] body, set BEFORE write_profile ('' = none)
+#                           STACK_ART_FILE  a file the build writes: the worktree with unchanged
+#                                           inputs holds a copy of the main checkout's
+#                           STACK_ART_CHANGE shell run in the second worktree before its session
+#                                           starts, committing a change to an input, so its build
+#                                           output is built rather than taken from main. A branch
+#                                           must hold the commit too, or teardown keeps it as work
+#                           STACK_ART_EXPECT what STACK_ART_FILE then holds
 #                         It returns non-zero when the tool could not build the fixture (offline, a
 #                         registry down), which the suite reports as a SKIP, not a plugin failure.
 #
@@ -84,18 +92,20 @@ print(",\n    ".join(entries))
 # an env file, and a seed/teardown pair that create and remove "$STACK_DB/<slug>" — a database stand-in
 # outside the worktree, so "allocated" and "released" are both observable after the directory is gone.
 write_profile() {  # $1 = repo, $2 = deps[] body, $3 = env file, $4 = extra env.vars body (may be '')
-  local repo=$1 deps=$2 envfile=$3 extra=${4-} serve=''
+  local repo=$1 deps=$2 envfile=$3 extra=${4-} serve='' artifacts=''
   mkdir -p "$repo/.claude"
   [ -z "${STACK_SERVE:-}" ] || serve=",
     \"serve\": \"$STACK_SERVE\",
     \"url\": \"http://localhost:{port}/\""
+  [ -z "${STACK_ARTIFACTS:-}" ] || artifacts="
+  \"artifacts\": [$STACK_ARTIFACTS],"
   cat >"$repo/.claude/worktree-profile.json" <<JSON
 {
   "schemaVersion": 1,
   "shell": "$STACK_SHELL",
   "shellArgs": "argv",
   "copy": [],
-  "deps": [$deps],
+  "deps": [$deps],$artifacts
   "runtime": {
     "slug": "{slug}",
     "port": { "var": "APP_PORT", "base": $STACK_PORT_BASE, "span": 200 },
@@ -153,9 +163,17 @@ PHP
 stack_tools_pnpm() { echo node=nodejs pnpm=pnpm; }
 fixture_pnpm() {
   local r=$1
-  write_dev_config "$r" 'node_modules/'
-  mkdir -p "$r/packages/lib" "$r/packages/web"
-  printf '{ "name": "fixture-root", "private": true }\n' >"$r/package.json"
+  write_dev_config "$r" 'node_modules/' 'public/build/'
+  mkdir -p "$r/packages/lib" "$r/packages/web" "$r/assets"
+  printf '{ "name": "fixture-root", "private": true, "scripts": { "build": "node build.js" } }\n' >"$r/package.json"
+  # A front-end build of the shape bundlers leave: an output file and a manifest naming it.
+  printf 'export const version = 1;\n' >"$r/assets/app.js"
+  cat >"$r/build.js" <<'JS'
+const fs = require("fs");
+fs.mkdirSync("public/build", { recursive: true });
+fs.writeFileSync("public/build/app.js", "/* built */ " + fs.readFileSync("assets/app.js", "utf8"));
+fs.writeFileSync("public/build/manifest.json", JSON.stringify({ "assets/app.js": { file: "app.js" } }));
+JS
   printf 'packages:\n  - "packages/*"\n' >"$r/pnpm-workspace.yaml"
   printf '{ "name": "@fixture/lib", "version": "1.0.0", "main": "index.js", "dependencies": { "is-number": "7.0.0" } }\n' \
     >"$r/packages/lib/package.json"
@@ -170,8 +188,13 @@ const num = require.resolve("is-number", { paths: [path.dirname(lib)] });
 const own = lib.startsWith(root) && num.startsWith(root);
 process.stdout.write(own && require("@fixture/lib")(5) ? "ok" : "broken: " + lib + " " + num);
 JS
-  tc "$r" 'pnpm install' || return 1
+  tc "$r" 'pnpm install && pnpm run build' || return 1
   detect_deps "$r"
+  STACK_ARTIFACTS='{"dir": "public/build", "inputs": ["assets", "build.js", "pnpm-lock.yaml"],
+    "build": "pnpm run build", "verify": "test -f public/build/manifest.json"}'
+  STACK_ART_FILE=public/build/app.js
+  STACK_ART_CHANGE="printf 'export const version = 2;\\n' >assets/app.js && git commit -qam 'change an input' && git branch fixture-input-change"
+  STACK_ART_EXPECT='/* built */ export const version = 2;'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS='node_modules packages/lib/node_modules packages/web/node_modules'
   STACK_OWNFILES='node_modules/.modules.yaml packages/lib/node_modules/is-number/package.json

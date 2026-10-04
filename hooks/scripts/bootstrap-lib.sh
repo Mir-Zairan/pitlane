@@ -248,7 +248,8 @@ wt_approval_still() {  # $1 = run directory
 }
 
 # True when the loaded profile names anything that would be executed: an install or verify
-# command, a seed or a teardown script, a serve or stop command. `shell` alone runs nothing — it only
+# command, a seed or a teardown script, a serve or stop command, an artifact's build (which every
+# artifact has: the validator requires it). `shell` alone runs nothing — it only
 # wraps those. A profile that runs nothing (config copies, hardlinks, ports, env overrides, a URL)
 # needs no approval.
 wt_profile_runs_commands() {
@@ -268,6 +269,10 @@ wt_profile_runs_commands() {
     [ "$strategy" = skip ] && continue
     { [ -n "$install" ] || [ -n "$verify" ]; } && return 0
   done < <(printf '%s' "${PROFILE_RAW:-}")
+  # artifacts[]: a build command, or a verify.
+  case ${PROFILE_RAW:-} in
+    *"$WT_RS"5"$WT_US"*) return 0 ;;
+  esac
   return 1
 }
 
@@ -327,7 +332,7 @@ wt_approval_record() {  # $1 = fingerprint, $2 = any directory inside the reposi
 # What the loaded profile would run in $1, for a human to read before approving it. stdout: this is
 # printed by `bootstrap.sh --review`, run by hand or by /pitlane-finish, never by a hook.
 wt_approval_describe() {  # $1 = run directory
-  local dir=${1%/} rec body ddir lock strategy install verify _cksum
+  local dir=${1%/} rec body ddir lock strategy install verify _cksum _inputs build _link
   printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
   printf 'Everything below is text from the branch, shown with control characters as ?:\n'
   [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
@@ -341,6 +346,17 @@ wt_approval_describe() {  # $1 = run directory
     [ "$strategy" = skip ] && continue
     [ -n "$install" ] && printf '  %s (%s): install: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$install")"
     [ -n "$verify" ] && printf '  %s (%s): verify: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$strategy")" "$(wt_visible "$verify")"
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+  # artifacts[]: dir, inputs, build, verify, link.
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      5"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r ddir _inputs build verify _link <<<"$body" || true
+    [ -n "$build" ] && printf '  %s (build output): build: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$build")"
+    [ -n "$verify" ] && printf '  %s (build output): verify: %s\n' "$(wt_visible "${ddir:-?}")" "$(wt_visible "$verify")"
   done < <(printf '%s' "${PROFILE_RAW:-}")
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ]; then
     [ -n "${PROFILE_RT_SEED:-}" ] && printf '  seed script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_SEED")"
@@ -1219,7 +1235,8 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
 }
 
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
-# entries, and a partial write is the one thing a reader must never see.
+# entries, and a partial write is the one thing a reader must never see. WT_STATE_KIND=art writes
+# a build-output record instead, in the same fields (wt_art_state_set).
 wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line
   local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} when rec
 
@@ -1229,12 +1246,12 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
 
-  wt_state_join dep "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
+  wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
   rec=$WT_STATE_REC
   # The KEY is cleaned the same way the field was, or a `dir` carrying a stripped byte would never
   # match the record it just wrote and would append a duplicate on every session.
   wt_state_join "$dir"
-  wt_state_rewrite "$wt" dep "$WT_STATE_REC" "$rec"
+  wt_state_rewrite "$wt" "${WT_STATE_KIND:-dep}" "$WT_STATE_REC" "$rec"
 }
 
 # True when this dependency is recorded as finished AND the evidence still matches.
@@ -1685,6 +1702,7 @@ wt_cksum_file() {  # $1 = path
 # Read one dependency's record into WT_DEP_STRATEGY, WT_DEP_LCK, WT_DEP_ICK, WT_DEP_STATUS,
 # WT_DEP_RC and WT_DEP_REASON. Returns 1, with them all empty, when there is no usable record.
 # Globals rather than output so a caller in its own shell gets every field from one read.
+# WT_STATE_KIND=art reads a build-output record instead (wt_art_state_read).
 wt_state_dep_read() {  # $1 = worktree, $2 = dir
   local wt=${1%/} dir=${2-} file rec kind rest rdir rwhen seen=0
   WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_RC='' WT_DEP_REASON=''
@@ -1698,7 +1716,7 @@ wt_state_dep_read() {  # $1 = worktree, $2 = dir
         [ "${rest%%"$WT_US"*}" = "$WT_STATE_VERSION" ] || return 1
         seen=1
         ;;
-      dep)
+      "${WT_STATE_KIND:-dep}")
         [ "$seen" = 1 ] || return 1
         [ "${rest%%"$WT_US"*}" = "$dir" ] || continue
         # SC2034: rdir and rwhen are read POSITIONALLY to consume their fields.
@@ -2628,6 +2646,303 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Generated build output — artifacts[]
+# ---------------------------------------------------------------------------
+#
+# A gitignored dir the repo's build writes (public/build, dist): a fresh worktree has none, and an
+# app whose pages load a bundle cannot be checked without it. Taken from the main checkout when the
+# build's inputs are identical at both HEADs, built otherwise — after the dependencies, deferred to
+# the background run like an install, and decided by `verify` like one.
+#
+# One `art` record per dir, in the dep record's fields: `art dir build lck ick status when rc
+# reason`, where lck is the inputs key (wt_art_inputs_key) and ick the build command's checksum. A
+# done record stands while the command is unchanged and the dir is non-empty, NOT while the inputs
+# are: once a worktree has its build, keeping it current as the branch moves is the repo's own dev
+# tooling's job, and rebuilding on every commit would fight a running watcher. The inputs key
+# decides only whether a failed build stands.
+#
+# KNOWN LIMIT: the main checkout's copy is trusted to match its HEAD. A build made from uncommitted
+# edits, or not rebuilt since a pull, is taken as it is; nothing here can tell.
+
+wt_art_state_set() { WT_STATE_KIND=art wt_state_set "$@"; }
+wt_art_state_read() { WT_STATE_KIND=art wt_state_dep_read "$@"; }
+
+# The inputs as they are at the worktree's HEAD: a checksum of their tree entries, so it changes
+# when any file under them changes in a commit, and not for uncommitted edits.
+wt_art_inputs_key() {  # $1 = worktree, $2 = inputs, one per line
+  local p out
+  local -a paths=()
+  while IFS= read -r p; do [ -z "$p" ] || paths+=("$p"); done <<<"${2-}"
+  [ "${#paths[@]}" -gt 0 ] || { printf ''; return 0; }
+  out=$(wt_git "$1" ls-tree HEAD -- "${paths[@]}" 2>/dev/null) || out=''
+  wt_cksum_string "inputs:$out"
+}
+
+# True when the inputs are identical at the main checkout's HEAD and the worktree's: the main
+# checkout's build is then the one this worktree's own build would produce.
+wt_art_inputs_match_main() {  # $1 = main checkout, $2 = worktree, $3 = inputs, one per line
+  local mainhead p
+  local -a paths=()
+  while IFS= read -r p; do [ -z "$p" ] || paths+=("$p"); done <<<"${3-}"
+  [ "${#paths[@]}" -gt 0 ] || return 1
+  mainhead=$(wt_git "$1" rev-parse -q --verify HEAD 2>/dev/null) || return 1
+  wt_git "$2" diff --quiet "$mainhead" HEAD -- "${paths[@]}" >/dev/null 2>&1
+}
+
+# Why the plugin may not write $2 in checkout $1, or nothing. It is cleared with `rm -rf` and
+# replaced, so it must be gitignored and no symlink. check-ignore consults the index, so a dir that
+# holds a force-added tracked file is "not ignored" (measured), and the trailing slash lets a
+# dir-only pattern (`/dist/`) match a dir that does not exist yet.
+wt_art_refusal() {  # $1 = checkout, $2 = dir
+  local wt=${1%/} dir=${2-} rc
+  if [ -L "$wt/$dir" ]; then
+    printf 'it is a symlink'
+    return 0
+  fi
+  wt_git "$wt" check-ignore -q -- "${dir%/}/" >/dev/null 2>&1
+  rc=$?
+  case $rc in
+    0) printf '' ;;
+    1) printf 'it is not gitignored, or holds tracked files' ;;
+    *) printf 'git could not say whether it is gitignored (exit %s)' "$rc" ;;
+  esac
+}
+
+wt_art_has_content() {  # $1 = directory
+  [ -d "${1-}" ] && [ ! -L "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
+}
+
+# Put the main checkout's copy of $3 into the worktree: `cp -al` for link=hardlink, a real copy
+# otherwise. Returns 0 when it is in place, 1 to build instead. Whatever is in the worktree's dir is
+# replaced; the caller has established that nothing in it is tracked.
+wt_art_take_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = link
+  local root=${1%/} worktree=${2%/} dir=${3-} link=${4-} err
+  local -a cpflags=(-a)
+  [ "$link" = hardlink ] && cpflags=(-al)
+  rm -rf "${worktree:?}/${dir:?}" 2>/dev/null
+  if [ "${dir%/*}" != "$dir" ] && ! err=$(mkdir -p -- "$worktree/${dir%/*}" 2>&1); then
+    wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — building instead"
+    return 1
+  fi
+  if err=$(cp "${cpflags[@]}" "$root/$dir" "$worktree/$dir" 2>&1); then
+    return 0
+  fi
+  rm -rf "${worktree:?}/${dir:?}" 2>/dev/null
+  wt_log "  $dir: could not ${link:-copy} it from the main checkout (${err%%"$WT_NL"*}) — building instead"
+  return 1
+}
+
+# True when every dependency is installed (done or warn), so a build has what it needs. Reads the
+# items wt_bootstrap_pending sets, and leaves them set.
+wt_art_deps_ready() {  # $1 = worktree
+  local kind name detail
+  wt_bootstrap_pending "$1"
+  while IFS=$WT_US read -r kind name detail; do
+    case $kind in missing | standing) return 1 ;; esac
+  done <<<"${WT_STATUS_ITEMS:-}"
+  return 0
+}
+
+# Bootstrap every entry in artifacts[]. $3 is the epoch second the bootstrap must be finished by.
+wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
+  local root=${1%/} worktree=${2%/} deadline=${3-}
+  local rec body dir inputs build verify link n=-1 list bad why ikey ick held lockpath
+  local left capture tracked_before tracking started elapsed rc reason outcome vrc
+
+  [ -n "${PROFILE_RAW:-}" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      5"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    n=$((n + 1))
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir inputs build verify link <<<"$body" || true
+    link=${link:-copy}
+
+    # Re-checked rather than assumed validated: what follows is `rm -rf` and `cp` on `dir`.
+    if [ -z "$dir" ] || ! wt_is_safe_relpath "$dir"; then
+      wt_log "artifacts[$n]: refusing \"$dir\" — not a relative path inside the repository"
+      continue
+    fi
+    if wt_has_symlinked_parent "$worktree" "$dir" || wt_has_symlinked_parent "$root" "$dir"; then
+      wt_log "artifacts[$n]: refusing \"$dir\" — one of its parent directories is a symlink"
+      continue
+    fi
+    if ! list=$(wt_artifact_inputs "$inputs"); then
+      wt_log "artifacts[$n]: refusing $dir — its inputs are not a list of paths inside the repository"
+      continue
+    fi
+    case " $WT_ARTIFACT_LINKS " in
+      *" $link "*) ;;
+      *) wt_log "artifacts[$n]: refusing $dir — link \"$link\" is not one of $WT_ARTIFACT_LINKS"; continue ;;
+    esac
+    bad=$(wt_unsafe_command_placeholder "$build")
+    [ -n "$bad" ] || bad=$(wt_unsafe_command_placeholder "$verify")
+    if [ -n "$bad" ]; then
+      wt_log "  $dir: refusing to run its commands — they interpolate {$bad}, whose value contains shell metacharacters"
+      continue
+    fi
+    build=$(wt_expand "$build")
+    verify=$(wt_expand "$verify")
+    ick=$(wt_cksum_string "$build")
+
+    # First, and with no git call: the re-entry path of every session.
+    wt_art_state_read "$worktree" "$dir" || true
+    if [ "$WT_DEP_ICK" = "$ick" ] && wt_art_has_content "$worktree/$dir"; then
+      case $WT_DEP_STATUS in
+        "done" | warn) wt_log "  $dir: already up to date"; continue ;;
+      esac
+    fi
+    why=$(wt_art_refusal "$worktree" "$dir")
+    if [ -n "$why" ]; then
+      wt_log "  $dir: not touched — $why, and the plugin replaces only gitignored build output"
+      continue
+    fi
+    ikey=$(wt_art_inputs_key "$worktree" "$list")
+    # A dir already there with no record of ours is the developer's own build: left alone.
+    if [ -z "$WT_DEP_STATUS" ] && wt_art_has_content "$worktree/$dir"; then
+      wt_log "  $dir: already present in the worktree — leaving it alone"
+      wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+      continue
+    fi
+    if [ "${WT_RETRY_FAILED:-}" != 1 ] && [ "$WT_DEP_STATUS" = failed ] && [ "$WT_DEP_LCK" = "$ikey" ] \
+      && [ "$WT_DEP_ICK" = "$ick" ]; then
+      wt_log "  $dir: the recorded build failure stands (exit ${WT_DEP_RC:-?}${WT_DEP_REASON:+: $WT_DEP_REASON}) — it is retried once its inputs or build command change, or now by: bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --finish --retry-failed"
+      continue
+    fi
+
+    # The background run and a session starting meanwhile must not both write the dir.
+    lockpath="$(wt_state_path "$worktree").build.lock"
+    held=0
+    wt_lock_acquire "$lockpath" "$WT_LOCK_WAIT" 9
+    case $? in
+      0) held=1 ;;
+      1) wt_log "  $dir: another run here is working on it — continuing without the lock" ;;
+    esac
+    if [ "$held" -eq 1 ] && wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ] \
+      && wt_art_has_content "$worktree/$dir"; then
+      case $WT_DEP_STATUS in
+        "done" | warn)
+          wt_log "  $dir: another run finished it while we waited"
+          wt_lock_release 9
+          continue
+          ;;
+      esac
+    fi
+
+    if [ "$held" -eq 0 ] && [ "$WT_DEP_STATUS" = doing ]; then
+      wt_log "  $dir: another run here is building it — leaving it alone"
+      continue
+    fi
+
+    # Linking runs nothing, so it needs no approval, and it is cheap enough for the start-up run.
+    if wt_art_has_content "$root/$dir" && wt_art_inputs_match_main "$root" "$worktree" "$list"; then
+      if wt_art_take_main "$root" "$worktree" "$dir" "$link"; then
+        wt_log "  $dir: $([ "$link" = hardlink ] && echo hardlinked || echo copied) from the main checkout (its inputs are unchanged)"
+        wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+    elif ! wt_art_has_content "$root/$dir"; then
+      wt_log "  $dir: the main checkout has no build output there — building it"
+    else
+      wt_log "  $dir: its inputs differ from the main checkout's — building it"
+    fi
+
+    if [ "${WT_APPROVAL:-}" = no ]; then
+      wt_log "  $dir: not built — the profile's commands are not approved"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    if [ "${WT_DEFER:-0}" = 1 ]; then
+      wt_log "  $dir: to be built in the background"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    if ! wt_art_deps_ready "$worktree"; then
+      wt_log "  $dir: not built — the dependencies it builds from are not installed"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    left=$(wt_budget_left "$deadline")
+    if [ "$left" -le 0 ]; then
+      wt_log "  $dir: out of time before building — leaving it for the next session"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    if ! wt_toolchain_warm "$worktree" "$deadline"; then
+      wt_log "  $dir: needs the toolchain, which is not ready — leaving it for /pitlane-finish or the next session"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    capture=$(wt_install_capture_path "$worktree" "build.$dir") || capture=''
+    tracked_before='' tracking=0
+    if wt_tracked_changes "$worktree" "$deadline"; then
+      tracked_before=$WT_TRACKED_CHANGES tracking=1
+    fi
+    left=$(wt_budget_left "$deadline")
+    if [ "$left" -le 0 ]; then
+      wt_log "  $dir: the budget ran out before the build could start — leaving it for the next session"
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
+    fi
+    wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" doing || true
+    wt_log "  $dir: building (${left}s of the budget left)"
+    started=$(date +%s 2>/dev/null) || started=''
+    WT_RUN_CAPTURE=$capture wt_run_in_shell "$build" "$worktree" "$left"
+    rc=$?
+    [ "$tracking" -eq 0 ] || wt_install_note_changes "$worktree" "build.$dir" "$tracked_before" "$deadline"
+    reason=''
+    [ "$rc" -eq 0 ] || reason=$(wt_install_error_line "$capture")
+    elapsed=''
+    [ -n "$started" ] && elapsed=$(( $(date +%s) - started ))
+
+    # By deps' rules: verify decides over the exit code, a stopped build stays `dirty`. With no
+    # verify, a build that exits 0 must at least have written something.
+    outcome=dirty
+    case $rc in
+      0) outcome="done" ;;
+      124 | 137 | "$WT_GUARD_REFUSED") ;;
+      *) outcome=failed ;;
+    esac
+    case $rc in
+      0) wt_log "  $dir: built${elapsed:+ in ${elapsed}s}" ;;
+      124) wt_log "  $dir: the build ran past the ${left}s left in the budget and was stopped" ;;
+      137 | "$WT_GUARD_REFUSED") wt_log "  $dir: not built for lack of memory — left for /pitlane-finish or the next session" ;;
+      *) wt_log "  $dir: the build command failed (exit $rc)" ;;
+    esac
+    if [ "$outcome" = "done" ] && ! wt_art_has_content "$worktree/$dir"; then
+      outcome=failed reason="the build exited 0 but left $dir empty"
+      wt_log "  $dir: $reason"
+    fi
+    if [ -n "$verify" ]; then
+      left=$(wt_budget_left "$deadline")
+      if [ "$left" -le 0 ]; then
+        wt_log "  $dir: no budget left to verify — recording it as needing another look"
+        outcome=dirty
+      else
+        WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
+        vrc=$?
+        if [ "$vrc" -eq 0 ] && [ "$outcome" = failed ]; then
+          outcome=warn
+          wt_log "  $dir: built with warnings — the build exited $rc${reason:+ (\"$reason\")}, but its verify passed, so it counts as built"
+        elif [ "$vrc" -ne 0 ] && [ "$outcome" = "done" ]; then
+          outcome=dirty
+          wt_log "  $dir: the verify command failed (exit $vrc) — it will be built again next session"
+        fi
+      fi
+    fi
+    case $outcome in
+      warn | failed) wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "$outcome" "$rc" "$reason" || true ;;
+      *) wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "$outcome" || true ;;
+    esac
+    [ "$held" -eq 1 ] && wt_lock_release 9
+  done < <(printf '%s' "$PROFILE_RAW")
+  return 0
+}
+
 # What this worktree's bootstrap has NOT finished, one item per line, in WT_PENDING: each dependency
 # directory not recorded done (or warn) for its current lockfile and install command, then
 # `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty means the
@@ -2637,8 +2952,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # WT_STATUS_ITEMS is every imperfect item with what the state says about it, for
 # wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
 # failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
-# seed's status) or `warn` (present, installed with warnings; detail its reason). Globals, not
-# output, so one walk answers all three: each item costs an expand and two checksums.
+# seed's status) or `warn` (present, installed with warnings; detail its reason), and for build
+# output `artmissing`, `artstanding` and `artwarn` alike, named by dir. Globals, not output, so one
+# walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
   local worktree=${1%/} rec body dir lock strategy install verify _cksum lckhash ickhash seed current
   WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS=''
@@ -2683,6 +2999,7 @@ wt_bootstrap_pending() {  # $1 = worktree
     WT_STATUS_ITEMS+=missing$WT_US$dir$WT_US$WT_DEP_STATUS$WT_NL
     WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$dir
   done < <(printf '%s' "${PROFILE_RAW:-}")
+  wt_bootstrap_pending_artifacts "$worktree"
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_SEED:-}" ] \
     && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
     seed=$(wt_runtime_state_get "$worktree" seedstatus) || seed=none
@@ -2693,6 +3010,56 @@ wt_bootstrap_pending() {  # $1 = worktree
       WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$seed
     fi
   fi
+  return 0
+}
+
+# wt_bootstrap_pending's half for artifacts[], by wt_bootstrap_artifacts' rules: present when
+# recorded done or warn for this build command and the dir is not empty; a failure that stands is
+# one for these inputs and this command. A missing one is attemptable only while no dependency's
+# failure stands, since a build needs its dependencies.
+wt_bootstrap_pending_artifacts() {  # $1 = worktree
+  local worktree=${1%/} rec body dir inputs build verify link list ick standing=0 name
+  case ${WT_STATUS_ITEMS:-} in
+    standing"$WT_US"* | *"$WT_NL"standing"$WT_US"*) standing=1 ;;
+  esac
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      5"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    # SC2034: verify and link are read POSITIONALLY to consume their fields.
+    # shellcheck disable=SC2034
+    IFS=$WT_US read -r dir inputs build verify link <<<"$body" || true
+    { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
+    list=$(wt_artifact_inputs "$inputs") || continue
+    name="build output $dir"
+    ick=$(wt_cksum_string "$(wt_expand "$build")")
+    if wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ]; then
+      case $WT_DEP_STATUS in
+        "done" | warn)
+          if wt_art_has_content "$worktree/$dir"; then
+            if [ "$WT_DEP_STATUS" = warn ]; then
+              wt_dep_recorded_reason
+              WT_STATUS_ITEMS+=artwarn$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
+            fi
+            continue
+          fi
+          ;;
+        failed)
+          if [ "$WT_DEP_LCK" = "$(wt_art_inputs_key "$worktree" "$list")" ]; then
+            WT_PENDING+=${WT_PENDING:+$'\n'}$name
+            wt_dep_recorded_reason
+            WT_STATUS_ITEMS+=artstanding$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
+            continue
+          fi
+          ;;
+      esac
+    fi
+    WT_PENDING+=${WT_PENDING:+$'\n'}$name
+    WT_STATUS_ITEMS+=artmissing$WT_US$dir$WT_US$WT_DEP_STATUS$WT_NL
+    [ "$standing" = 1 ] || WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$name
+  done < <(printf '%s' "${PROFILE_RAW:-}")
   return 0
 }
 
@@ -2727,7 +3094,7 @@ WT_STATUS_SHOWN=3
 # them, and retrying is the user's call.
 wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = background | approval | empty, $4 = deadline for asking git which changed files remain (empty = WT_STATUS_SECONDS)
   local worktree=${1%/} when=${2-} how=${3-} deadline=${4-} kind name detail why path n=0 nchanged=0 standing=0
-  local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary app=''
+  local script=${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh} list='' changed='' summary app='' built_standing=0
   local -a absent_items=() warned_items=()
   while IFS=$WT_US read -r kind name detail; do
     case $kind in
@@ -2753,6 +3120,20 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
         absent_items+=("$name missing ($why)")
         ;;
       warn) warned_items+=("$name ready with warnings ($detail)") ;;
+      artstanding)
+        standing=$((standing + 1)) built_standing=1
+        absent_items+=("build output $name missing (build failed: $detail)")
+        ;;
+      artmissing)
+        case $how:$when in
+          approval:*) why='held back' ;;
+          background:*) why='still building' ;;
+          *:finish) why='not built; stderr says why' ;;
+          *) why='not built yet' ;;
+        esac
+        absent_items+=("build output $name missing ($why)")
+        ;;
+      artwarn) warned_items+=("build output $name ready with warnings ($detail)") ;;
     esac
   done <<<"${WT_STATUS_ITEMS:-}"
   for summary in ${absent_items[@]+"${absent_items[@]}"} ${warned_items[@]+"${warned_items[@]}"}; do
@@ -2786,8 +3167,8 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
       wt_approval_held_line "$summary"
     elif [ "$standing" -gt 0 ]; then
       # shellcheck disable=SC2016
-      printf 'Pitlane: still not complete — %s. A failed install is not retried while its lockfile and install command are unchanged; retry it with `bash "%s" --finish --retry-failed` only on the user'"'"'s word.\n' \
-        "$summary" "$script"
+      printf 'Pitlane: still not complete — %s. A failed install is not retried while its lockfile and install command are unchanged%s; retry it with `bash "%s" --finish --retry-failed` only on the user'"'"'s word.\n' \
+        "$summary" "$([ "$built_standing" = 0 ] || echo ', nor a failed build while its inputs and build command are')" "$script"
     else
       printf 'Pitlane: still not complete — %s.\n' "$summary"
     fi
@@ -2814,7 +3195,7 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
   elif [ "$how" = background ]; then
     printf 'Pitlane: this worktree is still being set up in the background — %s. It usually takes a few minutes. Work that needs none of those can start now. Before running anything that does (tests, builds, the app, database queries), run /pitlane-finish: it waits for the background setup and reports what is ready. Do not install dependencies or create databases by hand meanwhile; the background setup is doing it.%s\n' "$summary" "$app"
   elif [ -z "${WT_PENDING_ATTEMPTABLE:-}" ]; then
-    printf 'Pitlane: this worktree is not fully set up — %s. An install that failed is not retried while its lockfile and install command are unchanged, so running /pitlane-finish will not fix this. Tell the user why it failed; if they say the cause is fixed, /pitlane-finish can retry on their word. Do not install dependencies by hand.%s\n' "$summary" "$app"
+    printf 'Pitlane: this worktree is not fully set up — %s. An install that failed is not retried while its lockfile and install command are unchanged%s, so running /pitlane-finish will not fix this. Tell the user why it failed; if they say the cause is fixed, /pitlane-finish can retry on their word. Do not install dependencies by hand.%s\n' "$summary" "$([ "$built_standing" = 0 ] || echo ', nor a failed build while its inputs and build command are')" "$app"
   else
     printf 'Pitlane: this worktree is not fully set up yet — %s. Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup.%s\n' "$summary" "$app"
   fi
@@ -3520,7 +3901,8 @@ wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
 }
 
 # What the app needs and this worktree lacks, joined for one line, into WT_SERVE_MISSING: each
-# dependency not installed (a `warn` one is installed, and does not count) and an unseeded database.
+# dependency not installed (a `warn` one is installed, and does not count), build output not built,
+# and an unseeded database.
 wt_serve_missing() {  # $1 = worktree
   local kind name detail
   WT_SERVE_MISSING=''
@@ -3530,6 +3912,8 @@ wt_serve_missing() {  # $1 = worktree
       missing) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not installed" ;;
       standing) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not installed (its install failed: $detail)" ;;
       seed) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"$name not seeded (seed: $detail)" ;;
+      artmissing) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"build output $name not built" ;;
+      artstanding) WT_SERVE_MISSING+=${WT_SERVE_MISSING:+, }"build output $name not built (its build failed: $detail)" ;;
     esac
   done <<<"${WT_STATUS_ITEMS:-}"
   WT_SERVE_MISSING=$(wt_visible "$WT_SERVE_MISSING")

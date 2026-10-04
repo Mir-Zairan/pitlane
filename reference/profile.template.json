@@ -16,7 +16,8 @@
     "`runtime` block means TOUCH NOTHING, which is a valid and deliberately offered outcome.",
     "",
     "EVERY PATH FIELD IS CONTAINED, AND THAT IS AN ENFORCED INVARIANT, NOT A CONVENTION.",
-    "`deps[].dir`, `deps[].lock`, `copy[]`, `runtime.env.file`, `runtime.seed` and `runtime.teardown`",
+    "`deps[].dir`, `deps[].lock`, `copy[]`, `artifacts[].dir`, `artifacts[].inputs`, `runtime.env.file`,",
+    "`runtime.seed` and `runtime.teardown`",
     "are all relative to the repo root and must resolve INSIDE it. Absolute paths, any `..` component,",
     "and empty or `.` values are rejected by validation before anything acts on them.",
     "This is not defensive tidiness: because the profile is committed, it arrives with any branch anyone",
@@ -127,6 +128,42 @@
     }
   ],
 
+  "_comment_artifacts": [
+    "OPTIONAL. Generated build output the app needs and a fresh worktree lacks, because it is",
+    "gitignored: a front-end bundle, a compiled asset dir. Calibration proposes entries from the",
+    "output dirs the repo's build writes (detect.sh reports well-known ones as `artifact` hints).",
+    "  dir     the output directory. MUST be gitignored and hold no tracked file: the plugin clears",
+    "          and replaces it, so the profile is refused otherwise.",
+    "  inputs  the tracked paths the build reads, lockfiles included: source dirs, the bundler",
+    "          config, pnpm-lock.yaml. Letters, digits and . _ - @ + / only. When they are identical at",
+    "          the main checkout's HEAD and the worktree's (`git diff --quiet <main HEAD> HEAD --",
+    "          <inputs>`) and the main checkout has a non-empty `dir`, that copy is taken at session",
+    "          start, running nothing. Otherwise `build` runs in the background after the",
+    "          dependencies, like an install.",
+    "  build   the command that writes `dir`, run inside `shell`. A command, so the profile needs",
+    "          approving before it runs (ADR-020). A failed build is not retried until its inputs",
+    "          at HEAD or the command change, or on `--finish --retry-failed`.",
+    "  verify  OPTIONAL, EXPECTED: a cheap check that `dir` is usable, run in the host shell. It",
+    "          decides over the build's exit code, as for deps. Without one, a build must exit 0",
+    "          and leave `dir` non-empty.",
+    "  link    `copy` (the default) or `hardlink`: how the main checkout's copy is taken. Copy,",
+    "          because bundlers rewrite output files in place (measured: esbuild always; vite when",
+    "          emptyOutDir is off, as in watch mode), which through a hardlink rewrites the main",
+    "          checkout's build too. `hardlink` only for output nothing rebuilds in place.",
+    "Once built or taken, a worktree's build output is its own: keeping it current as the branch",
+    "moves is the repo's dev tooling's job, so a later commit to an input does not rebuild it.",
+    "KNOWN LIMIT: the main checkout's copy is trusted to match its HEAD. A build made from",
+    "uncommitted edits, or not redone since a pull, is taken as it is; the plugin cannot tell."
+  ],
+  "artifacts": [
+    {
+      "dir": "public/build",
+      "inputs": ["assets", "vite.config.js", "package.json", "pnpm-lock.yaml"],
+      "build": "pnpm run build",
+      "verify": "test -f public/build/manifest.json"
+    }
+  ],
+
   "_comment_runtime": [
     "OMIT THIS WHOLE BLOCK to leave runtime alone. Nothing in here is ever inferred: nothing",
     "in a repository states that an env var selects a tenant database, and guessing corrupts data that",
@@ -189,7 +226,7 @@
     "port, {worktree} the absolute worktree path, {root} the main checkout.",
     "SUBSTITUTION IS NOT QUOTING. {slug} and {port} are constrained by construction; {name}, {worktree}",
     "and {root} are raw text that can come from a colleague's branch name, so a consumer putting one in",
-    "command position must quote it itself. The engine refuses to run an install, verify, serve or stop",
+    "command position must quote it itself. The engine refuses to run an install, build, verify, serve or stop",
     "command, or to write an env.vars value, whose {name}, {worktree} or {root} would carry shell syntax."
   ],
   "_comment_runtime_optout": [

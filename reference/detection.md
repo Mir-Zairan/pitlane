@@ -337,6 +337,14 @@ classes rather than one-offs:
 
 Secrets belong in a copied `.env`, never in the committed profile.
 
+## Generated build output
+
+A gitignored directory the repo's build writes (`public/build`, `dist`, `build`, `.next`, `out` —
+`detection.json`'s `artifactCandidates`) is absent from a fresh worktree, and an app whose pages load
+a bundle cannot be run without it. Detection reports an **`artifact`** record for each candidate that
+exists in the checkout, holds something and is gitignored. That is a hint: which command builds it, and
+which tracked paths it is built from (its `inputs`), is setup's question, answered into `artifacts[]`.
+
 ## Layer 3: hints, never conclusions
 
 `detection.json`'s `runtimeHints` block lists **where to look** and **what shape to look for** — port

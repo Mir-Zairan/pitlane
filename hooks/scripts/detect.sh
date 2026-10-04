@@ -60,6 +60,8 @@
 #   env              <name> <file> file|<VAR>|--env   (an environment the repo runs in: a .env.<name>
 #                    file, or <name> assigned to an environment selector in its scripts or configs)
 #   testConfig       <file>                     (a tracked test or e2e runner config)
+#   artifact         <dir>                      (well-known build output, present and gitignored:
+#                    a hint for artifacts[], never a decision)
 #   ignore          <path> ok|missing           (a path the plugin creates in a checkout)
 #   warn             <message>
 #
@@ -1051,6 +1053,21 @@ while IFS= read -r f; do
 done <<<"$TEST_CONFIGS"
 if [ "$TEST_CONFIGS_TRUNCATED" -gt 0 ]; then
   warn "only the first $TEST_CONFIG_MAX of $TEST_CONFIGS_TRUNCATED test configs are listed; the rest need the same environment question"
+fi
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+# A well-known output dir that is there, holds something, and is gitignored: something builds it
+# here, and a fresh worktree will not have it. check-ignore consults the index, so a dir holding a
+# tracked file is not reported.
+if [ "$IS_GIT" = 1 ]; then
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ] || continue
+    [ -n "$(ls -A "$ROOT/$p" 2>/dev/null)" ] || continue
+    wt_git "$ROOT" check-ignore -q -- "$p/" 2>/dev/null && emit artifact "$p"
+  done < <(json_array_items "$(wt_json_get artifactCandidates.dirs <"$WT_DETECTION_JSON")")
 fi
 
 # ---------------------------------------------------------------------------

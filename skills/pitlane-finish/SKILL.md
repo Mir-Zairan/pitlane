@@ -44,6 +44,9 @@ first three and then "and N more" — and, when an install changed tracked files
   it has been fixed, offer to retry it; **only if the user says yes**, run
   `bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --finish --retry-failed`, in the background
   as above.
+  A `build output <dir> missing (build failed: …)` is the same for a build: not re-run until its
+  inputs at HEAD or its build command change, or the user agrees to `--retry-failed`. A `build output
+  <dir> ready with warnings` built, exited non-zero, and passed its verify; it counts as built.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
 

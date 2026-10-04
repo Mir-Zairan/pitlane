@@ -2442,6 +2442,262 @@ eq 'a tree is not deleted on the strength of an unreadable state file' 'KEEPME' 
   "$(cat "$DWT/vendor/keep.txt" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
+# Build output — artifacts[]
+# ---------------------------------------------------------------------------
+# A real main checkout with a build of its own, and a worktree whose inputs are or are not the same.
+# The fake build counts its runs, so "not built" is observable rather than inferred.
+AREPO=$TMP/arepo
+git init -q "$AREPO"
+git -C "$AREPO" config user.email t@example.com
+git -C "$AREPO" config user.name t
+mkdir -p "$AREPO/src" "$AREPO/docs"
+printf '/public/build/\n/dist/\n' > "$AREPO/.gitignore"
+printf 'v1\n' > "$AREPO/src/app.js"
+printf 'readme\n' > "$AREPO/docs/notes.md"
+printf 'LOCK1\n' > "$AREPO/pnpm-lock.yaml"
+git -C "$AREPO" add -A
+git -C "$AREPO" commit -qm init
+mkdir -p "$AREPO/public/build"
+printf 'from-main\n' > "$AREPO/public/build/app.js"
+AWT=$AREPO/.claude/worktrees/art1
+git -C "$AREPO" worktree add -q "$AWT" -b wt-art1 2>/dev/null
+ACNT=$TMP/build-count
+ABUILD="printf x >> $ACNT; mkdir -p public/build && printf built > public/build/app.js"
+AINPUTS='["src","pnpm-lock.yaml"]'
+
+art_raw() {  # $1 = dir, $2 = inputs (compact JSON), $3 = build, $4 = verify, $5 = link
+  printf '0%s%s5%s%s%s%s%s%s%s%s%s%s%s' \
+    "$US_" "$RS_" "$US_" "$1" "$US_" "$2" "$US_" "$3" "$US_" "$4" "$US_" "${5-}" "$RS_"
+}
+art_reset() {  # a worktree with no build output and no record
+  rm -rf "$AWT/public" "$ACNT"
+  rm -f "$(wt_state_path "$AWT")"
+}
+# shellcheck disable=SC2012  # the names are the fixture's own, and ls -i is the portable inode read.
+inode_of() { ls -i "$1" 2>/dev/null | awk '{print $1}'; }
+art_status() { wt_art_state_read "$AWT" "${1:-public/build}" || true; printf '%s' "$WT_DEP_STATUS"; }
+
+# --- inputs unchanged: the main checkout's build is taken ---------------------
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'artifact, inputs unchanged: the main checkout'"'"'s build is taken' 'from-main' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+eq '...without running the build' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+ne '...as a COPY by default, not a link into the main checkout' "$(inode_of "$AREPO/public/build/app.js")" \
+  "$(inode_of "$AWT/public/build/app.js")"
+contains '...and says so' 'copied from the main checkout' "$out"
+eq '...recorded done' "done" "$(art_status)"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a second run finds it up to date' 'public/build: already up to date' "$out"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' hardlink)
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'link "hardlink": the same inode as the main checkout'"'"'s' "$(inode_of "$AREPO/public/build/app.js")" \
+  "$(inode_of "$AWT/public/build/app.js")"
+# Not approved and deferred: taking main's copy runs nothing, so neither holds it back.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+WT_APPROVAL=no WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'unapproved and deferred, inputs unchanged: still taken from the main checkout' 'from-main' \
+  "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+# A change OUTSIDE the inputs does not count.
+printf 'more\n' >> "$AWT/docs/notes.md"
+git -C "$AWT" commit -qam 'docs only'
+art_reset
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a commit outside the inputs still takes the main checkout'"'"'s build' 'from-main' \
+  "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+
+# An uncommitted edit is not the branch: what decides is HEAD.
+art_reset
+printf 'v3-uncommitted\n' > "$AWT/src/app.js"
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'an uncommitted edit to an input: the main checkout'"'"'s build is still taken' 'from-main' \
+  "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+git -C "$AWT" checkout -q -- src/app.js
+
+# --- the main checkout has no build: built ------------------------------------
+art_reset
+mv "$AREPO/public/build" "$TMP/main-build-aside"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'main has no build output: built' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+eq '...once' x "$(cat "$ACNT" 2>/dev/null)"
+contains '...and says why' 'the main checkout has no build output there' "$out"
+eq '...recorded done' "done" "$(art_status)"
+mv "$TMP/main-build-aside" "$AREPO/public/build"
+# An EMPTY main build is no build.
+art_reset
+mkdir -p "$TMP/empty-aside"; mv "$AREPO/public/build/app.js" "$TMP/empty-aside/"
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'an empty main build output: built' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+mv "$TMP/empty-aside/app.js" "$AREPO/public/build/"
+
+# --- an input changed on the worktree's branch: built ------------------------
+printf 'v2\n' > "$AWT/src/app.js"
+git -C "$AWT" commit -qam 'change an input'
+art_reset
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'an input changed in the branch: built, not taken from main' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+contains '...and says why' 'its inputs differ from the main checkout' "$out"
+git -C "$AWT" revert --no-edit HEAD >/dev/null
+# The lockfile is an input too.
+printf 'LOCK2\n' > "$AWT/pnpm-lock.yaml"
+git -C "$AWT" commit -qam 'bump the lockfile'
+art_reset
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a lockfile named in the inputs changed: built' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+
+# --- held back: unapproved, deferred, dependencies missing ---------------------
+art_reset
+out=$(WT_APPROVAL=no wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'unapproved, inputs changed: nothing is built' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+contains '...and says why' 'not built — the profile'"'"'s commands are not approved' "$out"
+eq '...and nothing is recorded' '' "$(art_status)"
+# shellcheck disable=SC2034
+PROFILE_PRESENT=1
+art_items() { wt_bootstrap_pending "$AWT"; printf '%s' "${WT_STATUS_ITEMS//"$US_"/|}"; }
+eq '...so it is pending' 'artmissing|public/build|' "$(art_items)"
+eq '...by name' 'build output public/build' "$(pending_all "$AWT")"
+eq '...and attemptable' 'build output public/build' "$(pending_attemptable "$AWT")"
+out=$(WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'deferred, inputs changed: not built at start-up' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+contains '...but in the background' 'public/build: to be built in the background' "$out"
+# A build needs its dependencies: one that is not installed holds the build back.
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'true' '')${PROFILE_RAW#0"$US_$RS_"}
+printf 'L\n' > "$AWT/composer.lock"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'a dependency not installed: not built' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+contains '...and says why' 'the dependencies it builds from are not installed' "$out"
+wt_state_set "$AWT" vendor install "$(wt_cksum_file "$AWT/composer.lock")" "$(wt_cksum_string true)" failed 1 'boom'
+eq '...a dependency whose failure stands makes the build not attemptable' '' "$(pending_attemptable "$AWT")"
+eq '...though still pending' $'vendor\nbuild output public/build' "$(pending_all "$AWT")"
+rm -f "$AWT/composer.lock"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+eq 'profile with only an artifact runs commands (needs approval)' 0 \
+  "$(PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=0 wt_profile_runs_commands; echo $?)"
+
+# --- verify decides, as for deps ----------------------------------------------
+AFAIL="printf x >> $ACNT; mkdir -p public/build && printf partial > public/build/app.js; printf 'error: one chunk too big\\n' >&2; exit 1"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$AFAIL" 'test -f public/build/app.js' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'build fails, verify passes: warn' warn "$(art_status)"
+contains '...and says so' 'built with warnings' "$out"
+eq '...a status item with its reason' 'artwarn|public/build|error: one chunk too big' "$(art_items)"
+eq '...and not pending' '' "$(pending_all "$AWT")"
+contains 'status: a warned build reads "ready with warnings"' 'build output public/build ready with warnings (error: one chunk too big)' \
+  "$(wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" finish '')"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$AFAIL" 'test -f public/build/nope.js' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'build fails, verify fails: failed' failed "$(art_status)"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq '...and is not re-run while its inputs and command are unchanged' x "$(cat "$ACNT")"
+contains '...saying the failure stands' 'the recorded build failure stands' "$out"
+eq '...a standing status item' 'artstanding|public/build|error: one chunk too big' "$(art_items)"
+eq '...pending, but not attemptable' 'build output public/build|' "$(pending_all "$AWT")|$(pending_attemptable "$AWT")"
+out=$(wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start '')
+contains 'status: a failed build is named as such' 'build output public/build missing (build failed: error: one chunk too big)' "$out"
+contains '...and the retry rule names builds' 'nor a failed build while its inputs and build command are' "$out"
+WT_RETRY_FAILED=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '--retry-failed re-runs it' xx "$(cat "$ACNT")"
+# A changed input lifts the standing failure.
+printf 'v4\n' > "$AWT/src/app.js"
+git -C "$AWT" commit -qam 'another input change'
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a changed input retries a failed build' xxx "$(cat "$ACNT")"
+# Exit 0 with nothing written, and no verify to ask: not built.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "printf x >> $ACNT; mkdir -p public/build" '' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a build that exits 0 but writes nothing: failed' failed "$(art_status)"
+
+# --- the status line and /pitlane-serve name a missing build --------------------
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+out=$(wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start background)
+contains 'status: a build in progress is named' 'build output public/build missing (still building)' "$out"
+out=$(wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start approval)
+contains 'status: an unapproved build is held back' 'build output public/build missing (held back)' "$out"
+wt_serve_missing "$AWT"
+eq 'serve: a missing build is a named missing piece' 'build output public/build not built' "$WT_SERVE_MISSING"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$AFAIL" 'false' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+wt_serve_missing "$AWT"
+eq 'serve: a failed build is named with its reason' \
+  'build output public/build not built (its build failed: error: one chunk too big)' "$WT_SERVE_MISSING"
+# A recorded build whose dir was deleted since is missing again.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'a build in place is not missing' '' "$(art_items)"
+rm -rf "$AWT/public/build"
+eq '...until its dir is deleted' 'artmissing|public/build|done' "$(art_items)"
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...when the next run builds it again' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+
+# --- what is never touched ----------------------------------------------------
+# The developer's own build, with no record of ours, is left as it is.
+art_reset
+mkdir -p "$AWT/public/build"; printf 'mine\n' > "$AWT/public/build/app.js"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'a build already in the worktree is left alone' 'mine' "$(cat "$AWT/public/build/app.js")"
+contains '...and says so' 'already present in the worktree' "$out"
+# A dir that is not gitignored is the branch's own files: never cleared, never built into.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw src "$AINPUTS" "$ABUILD" '' '')
+mv "$AREPO/public/build" "$TMP/main-build-aside"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a dir that is not gitignored is refused' 'src: not touched — it is not gitignored' "$out"
+eq '...and its tracked files are intact' 'v4' "$(cat "$AWT/src/app.js")"
+eq '...and nothing is built' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+# Gitignored, but holding a force-added tracked file.
+mkdir -p "$AWT/dist"; printf 'tracked\n' > "$AWT/dist/keep.js"
+git -C "$AWT" add -f dist/keep.js && git -C "$AWT" commit -qm 'force-add into dist'
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw dist "$AINPUTS" "$ABUILD" '' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a gitignored dir holding a tracked file is refused' 'dist: not touched — it is not gitignored, or holds tracked files' "$out"
+eq '...and the tracked file is intact' 'tracked' "$(cat "$AWT/dist/keep.js")"
+mv "$TMP/main-build-aside" "$AREPO/public/build"
+# A symlinked dir would have the build written, and cleared, wherever it points.
+art_reset
+mkdir -p "$AWT/public" "$TMP/link-target"; printf 'outside\n' > "$TMP/link-target/app.js"
+ln -s "$TMP/link-target" "$AWT/public/build"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' '')
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a symlinked artifact dir is refused' 'public/build: not touched — it is a symlink' "$out"
+eq '...and what it points at is intact' 'outside' "$(cat "$TMP/link-target/app.js")"
+rm -f "$AWT/public/build"
+# A command interpolating an unsafe placeholder is not run.
+art_reset
+# shellcheck disable=SC2034
+PROFILE_RAW=$(art_raw public/build '["pnpm-lock.yaml"]' "printf x >> $ACNT; echo {name}" '' '')
+printf 'LOCK9\n' > "$AWT/pnpm-lock.yaml"; git -C "$AWT" commit -qam 'lock 9'
+out=$(WT_NAME='a;b' wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains 'a build interpolating an unsafe {name} is refused' 'refusing to run its commands' "$out"
+eq '...and not run' no "$([ -e "$ACNT" ] && echo yes || echo no)"
+art_reset
+# shellcheck disable=SC2034
+PROFILE_PRESENT=0 PROFILE_RAW=''
+
+# ---------------------------------------------------------------------------
 # Drift reporting
 # ---------------------------------------------------------------------------
 # Against the REAL reference/detection.json — a fixture table would only prove the fixture, and the
