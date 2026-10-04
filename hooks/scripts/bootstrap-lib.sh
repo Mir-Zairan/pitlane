@@ -1907,6 +1907,12 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
     wt_log "  $dir: the main checkout has no $dir to link from — installing instead"
     return 1
   fi
+  # `cp -al` copies a symlink as a symlink, so the worktree's dir would BE main's target, and making
+  # its copy paths real copies would delete and replace them there.
+  if [ -L "$src" ]; then
+    wt_log "  $dir: the main checkout's $dir is a symlink — installing instead"
+    return 1
+  fi
   # An empty source would "succeed" and leave an empty dependency directory that then looks
   # installed to everything downstream.
   if [ -z "$(ls -A "$src" 2>/dev/null)" ]; then
@@ -1925,7 +1931,7 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
     wt_log "  $dir: $lock differs from the main checkout — installing instead"
     return 1
   fi
-  if [ -e "$dest" ]; then
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
     # A distinct code, not success: the caller must not report a link it did not make.
     wt_log "  $dir: already present in the worktree — leaving it alone"
     return 2
@@ -1968,30 +1974,75 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
 # through a hardlink that write lands in the main checkout. The copy is made from the worktree's own
 # link and the link then removed; removing a link never touches the inode main still holds. A path the
 # dir does not have is skipped. Returns 1, having logged why, when a path cannot be copied.
-wt_unshare_dep_paths() {  # $1 = the linked dir in the worktree, $2 = dir as the profile names it, $3 = copy
-  local dest=${1%/} dir=${2-} list p target tmp err
+# With $4, main's counterpart of $1, only paths still sharing a file with it are copied, each logged:
+# the repair of a worktree linked before its copy list existed, or killed before it was applied.
+wt_unshare_dep_paths() {  # $1 = linked dir in the worktree, $2 = dir as the profile names it, $3 = copy, $4 = main's dir
+  local dest=${1%/} dir=${2-} main=${4-} list p target tmp err then=' — installing instead'
+  [ -z "$main" ] || then=" — it still shares files with the main checkout's, so a command run here can change them; run /pitlane-finish to retry"
   list=$(wt_dep_copy_paths "${3-}") || {
-    wt_log "  $dir: its copy list is not a list of paths inside it — installing instead"
+    wt_log "  $dir: its copy list is not a list of paths inside it$then"
     return 1
   }
+  if [ -L "$dest" ]; then
+    wt_log "  $dir: is a symlink$then"
+    return 1
+  fi
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     target=$dest/$p
     # Through a symlink, the copy could read, and the removal replace, something outside the dir.
     if [ -L "$target" ] || wt_has_symlinked_parent "$dest" "$p"; then
-      wt_log "  $dir: $p is reached through a symlink — installing instead"
+      wt_log "  $dir: $p is reached through a symlink$then"
       return 1
     fi
     [ -e "$target" ] || continue
+    [ -z "$main" ] || wt_shares_inode "$target" "$main/$p" || continue
     tmp=${target%/*}/.${target##*/}.wtcopy.$$
     if ! err=$(cp -a -- "$target" "$tmp" 2>&1) || ! err=$(rm -rf -- "$target" 2>&1) \
        || ! err=$(mv -- "$tmp" "$target" 2>&1); then
       rm -rf -- "$tmp" 2>/dev/null
-      wt_log "  $dir: could not copy $p (${err%%"$WT_NL"*}) — installing instead"
+      wt_log "  $dir: could not copy $p (${err%%"$WT_NL"*})$then"
       return 1
     fi
+    [ -z "$main" ] || wt_log "  $dir: $p shared its files with the main checkout — made a real copy"
   done <<<"$list"
   return 0
+}
+
+# True when $1 in the worktree still shares an inode with $2 in the main checkout. A dir is judged by
+# its first-level files, all builtin tests, because this runs on every session start and a `cp -al`
+# shares every file alike; only a dir with no file at its top level costs a `find`.
+wt_shares_inode() {  # $1 = path in the worktree, $2 = its counterpart in the main checkout
+  local a=${1%/} b=${2%/} f any=0
+  [ -e "$b" ] || return 1
+  if [ ! -d "$a" ]; then
+    [ "$a" -ef "$b" ]
+    return
+  fi
+  for f in "$a"/* "$a"/.[!.]* "$a"/..?*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    any=1
+    [ "$f" -ef "$b/${f##*/}" ] && return 0
+  done
+  [ "$any" = 0 ] || return 1
+  [ -n "$(find "$a" -type f -links +1 -print 2>/dev/null | head -n 1)" ]
+}
+
+# Make an already present hardlinked dir's copy paths real copies where they still share with the
+# main checkout: a worktree linked before deps[].copy existed has a `done` record and the write-through
+# all the same. Called for a `done` dir and for one found present, never mid-link: an interrupted link
+# is recorded `doing`, and that dir is cleared and linked again. Idempotent, and builtin tests only
+# when nothing is shared. Never fails the dependency: a dir it cannot repair is left, and said so.
+wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy
+  local root=${1%/} worktree=${2%/} dir=${3-} copy=${4-}
+  case $copy in '' | '[]') return 0 ;; esac
+  [ -n "$dir" ] && [ -d "$root/$dir" ] && [ ! "$worktree" -ef "$root" ] || return 0
+  if [ -L "$worktree/$dir" ]; then
+    wt_log "  $dir: is a symlink in the worktree, so its copy paths cannot be made its own — a command run here changes whatever it points at"
+    return 0
+  fi
+  [ -d "$worktree/$dir" ] || return 0
+  wt_unshare_dep_paths "$worktree/$dir" "$dir" "$copy" "$root/$dir" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -2445,6 +2496,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
       wt_log "  $dir: already up to date"
+      [ "$strategy" != hardlink ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy"
       continue
     fi
     # Settled before the lock and the deferral, so a standing failure neither waits for a lock nor
@@ -2542,7 +2594,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_hardlink_dep "$root" "$worktree" "$dir" "$lock" "$dcopy"
       case $? in
         0) effective=hardlink ;;
-        2) effective=present ;;
+        2) effective=present
+           # Not over an interrupted link another process may still be finishing.
+           [ "$status" = doing ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy" ;;
         *) effective=install ;;
       esac
       if [ "$effective" = install ] && [ "$stands" -eq 1 ]; then

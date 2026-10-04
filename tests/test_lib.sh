@@ -1915,6 +1915,34 @@ JSON
     out=$(wt_dep_copy_paths "$bad_in"); rc=$?
     eq "copy: $bad_in is refused" "1|" "$rc|$out"
   done
+  long_path=$(printf 'a%.0s' $(seq 1 256))
+  for bad_in in '[""]' '["a/../b"]' '["a/./b"]' '["a//b"]' $'["a\nb"]' '["a\\nb"]' '["a;b"]' \
+    '["é"]' "[\"$long_path\"]"; do
+    out=$(wt_dep_copy_paths "$bad_in"); rc=$?
+    eq "copy: hostile $(printf '%q' "${bad_in:0:20}") is refused" "1|" "$rc|$out"
+  done
+  eq 'copy: a path of 255 bytes is not too long' "${long_path:1}" "$(wt_dep_copy_paths "[\"${long_path:1}\"]")"
+
+  # wt_warn_uncopied_links matches the detection table's markers and copyPaths by their rendering,
+  # so both backends must render the shipped table byte for byte alike, in the shape it expects.
+  det=$(wt_json_scan detectionVersion -- deps markers dir strategy copyPaths \
+    <"$REPO_ROOT/reference/detection.json")
+  contains 'detection: markers render as a compact quoted array' "[\"composer.lock\"]${US}vendor${US}hardlink${US}[\"composer\"]" "$det"
+  copy_rules=0
+  while IFS= read -r -d "$RS" rec; do
+    case $rec in 1"$US"*) ;; *) continue ;; esac
+    IFS=$US read -r _ _ _ _ rcopy <<<"$rec"
+    [ -n "$rcopy" ] || continue
+    copy_rules=$((copy_rules + 1))
+    wt_dep_copy_paths "$rcopy" >/dev/null
+    eq "detection: copyPaths $rcopy is a list the engine reads" 0 $?
+  done <<<"$det"
+  ne 'detection: some rule has copyPaths, so the loop above checked something' 0 "$copy_rules"
+  if [ -z "${DETECTION_RENDERED:-}" ]; then
+    DETECTION_RENDERED=$det
+  else
+    eq 'detection: both backends render markers and copyPaths identically' "$DETECTION_RENDERED" "$det"
+  fi
   vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":["../../etc"]}]}'
   contains 'validate: a copy path outside the dir is a violation' \
     'deps[0].copy: must be an array of paths inside vendor' "$(vv)"

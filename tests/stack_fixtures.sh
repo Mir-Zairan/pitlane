@@ -240,7 +240,9 @@ JS
   STACK_SERVE='node server.js {port}' STACK_SERVE_PATH=/ STACK_SERVE_EXPECT='ok {port}'
   write_profile "$r" "$STACK_DEPS" .env.local
   STACK_DEPDIRS=node_modules STACK_LINKDIRS=node_modules
-  # Measured: adds the package and rewrites node_modules/.package-lock.json in place.
+  # Measured: both rewrite node_modules/.package-lock.json in place. The uninstall needs no registry,
+  # so the property is asserted offline too; it runs after the probe and the serve check.
+  STACK_INPLACE='npm uninstall --offline --no-audit --no-fund is-number'
   STACK_INPLACE_NET='npm install --no-audit --no-fund isarray@2.0.5'
   STACK_PROBE='node probe.js'
   STACK_EXPECT=ok

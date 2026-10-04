@@ -1138,13 +1138,19 @@ wt_artifact_inputs() {  # $1 = the rendered inputs value
 
 # Split deps[].copy — the paths inside a hardlinked dir that must be real copies — into one path per
 # line, relative to the dep's dir. Absent or `[]` is an empty list. Otherwise the same rules as
-# artifacts[].inputs: quoted paths from the env file character set, none escaping the dir. No glob
-# is expanded: a path is copied only if it is there.
+# artifacts[].inputs, and each path written one way only (no `.` or empty segment, at most 255
+# bytes): bootstrap replaces it with `rm -rf` and `mv`. No glob is expanded: a path is copied only if
+# it is there. LC_ALL=C so the character set is bytes, not whatever a locale folds into A-Z.
 wt_dep_copy_paths() {  # $1 = the rendered copy value
+  local LC_ALL=C list p
   case ${1-} in
     '' | '[]') return 0 ;;
   esac
-  wt_artifact_inputs "$1"
+  list=$(wt_artifact_inputs "$1") || return 1
+  while IFS= read -r p; do
+    { [ "${#p}" -le 255 ] && wt_is_artifact_dir "$p"; } || return 1
+  done <<<"$list"
+  printf '%s\n' "$list"
 }
 
 # True when $1 is usable as artifacts[].dir: a relative path inside the repository, written one way

@@ -2,9 +2,10 @@
 #
 # Exercises hooks/scripts/bootstrap-lib.sh — the bootstrap engine.
 #
-# Unlike tests/test_lib.sh this suite is NOT run once per JSON backend: nothing in the engine
-# parses JSON. It reads the PROFILE_* variables lib.sh already produced, so the cross-backend
-# parity guard belongs to that suite and repeating it here would only double the runtime.
+# Unlike tests/test_lib.sh this suite is NOT run once per JSON backend: the engine mostly reads the
+# PROFILE_* variables lib.sh already produced, so the cross-backend parity guard belongs to that
+# suite and repeating it here would only double the runtime. The few engine readers of the detection
+# table match on its rendering, and those assertions loop over the backends themselves.
 #
 # Deliberately not `set -e`: a failed assertion must not stop the remaining ones.
 set -uo pipefail
@@ -2240,6 +2241,67 @@ if [ "$(id -u)" != 0 ]; then
   eq '...the main checkout untouched' 'MAIN-INSTALLED' "$(cat "$DREPO/vendor/composer/installed.json")"
   rm -f "$DREPO/vendor/composer/secret"
 fi
+# A worktree linked before its profile had a copy list — or by an older plugin — shares every file
+# with the main checkout and has a `done` record. Each run repairs it, logging what it copied, and
+# leaves the rest linked; once repaired, a run does nothing.
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf OLDLINK > /dev/null' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" >/dev/null 2>&1
+eq 'repair: the old-style link shares the copy paths, as the fixture needs' yes \
+  "$([ "$DWT/vendor/composer/installed.json" -ef "$DREPO/vendor/composer/installed.json" ] && echo yes)"
+main_snap=$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json .package-lock.json)
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'printf OLDLINK > /dev/null' '' '["composer",".package-lock.json"]')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'repair: a done dir is still checked' 'already up to date' "$out"
+contains '...its shared copy dir is made a real copy, and said so' 'composer shared its files with the main checkout — made a real copy' "$out"
+contains '...and its shared copy file' '.package-lock.json shared its files with the main checkout' "$out"
+ne '...the dir no longer shares' "$(ino "$DREPO/vendor/composer/installed.json")" "$(ino "$DWT/vendor/composer/installed.json")"
+ne '...all the way down' "$(ino "$DREPO/vendor/composer/sub/map.php")" "$(ino "$DWT/vendor/composer/sub/map.php")"
+ne '...nor the file' "$(ino "$DREPO/vendor/.package-lock.json")" "$(ino "$DWT/vendor/.package-lock.json")"
+eq '...the rest stays linked' "$(ino "$DREPO/vendor/pkg/file.txt")" "$(ino "$DWT/vendor/pkg/file.txt")"
+eq '...and the main checkout is untouched' "$main_snap" \
+  "$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json .package-lock.json)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'repair: a second run has nothing to repair' 'made a real copy' "$out"
+# A tree from before the plugin recorded anything: found present, repaired all the same.
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+cp -al "$DREPO/vendor" "$DWT/vendor"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'repair: a present dir with no record is repaired too' 'composer shared its files with the main checkout' "$out"
+ne '...really' "$(ino "$DREPO/vendor/composer/installed.json")" "$(ino "$DWT/vendor/composer/installed.json")"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks '...once' 'made a real copy' "$out"
+eq '...the main checkout untouched' "$main_snap" \
+  "$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json .package-lock.json)"
+# A dir whose top level holds only directories is judged by what lies below.
+rm -rf "$DWT/vendor"; cp -al "$DREPO/vendor" "$DWT/vendor"
+out=$(wt_repair_shared_copy_paths "$DREPO" "$DWT" vendor '["composer/sub"]' 2>&1)
+contains 'repair: a dir with only files further down is still found shared' 'composer/sub shared its files' "$out"
+eq 'repair: an unshared dir is no reason to copy' '' "$(wt_repair_shared_copy_paths "$DREPO" "$DWT" vendor '["composer/sub"]' 2>&1)"
+# A symlinked dir in the worktree is not repaired through: what it points at is not the worktree's.
+rm -rf "$DWT/vendor"; ln -s "$DREPO/vendor" "$DWT/vendor"
+out=$(wt_repair_shared_copy_paths "$DREPO" "$DWT" vendor '["composer"]' 2>&1)
+contains 'repair: a symlinked dir is warned about' 'is a symlink in the worktree' "$out"
+eq '...and nothing it points at is replaced' "$main_snap" \
+  "$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json .package-lock.json)"
+rm -f "$DWT/vendor"
+
+# The main checkout's dir as a symlink: `cp -al` would copy the symlink, and the copy paths would be
+# replaced wherever it points. Refused before any link, and installed instead.
+SHARED=$TMP/shared-vendor
+rm -rf "$SHARED"; mv "$DREPO/vendor" "$SHARED"; ln -s "$SHARED" "$DREPO/vendor"
+shared_snap=$(cd "$SHARED" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json)
+rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink 'mkdir -p vendor && printf SYMSRC > vendor/m' '' '["composer"]')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains "copy: a symlinked dir in the main checkout is not linked" "the main checkout's vendor is a symlink — installing instead" "$out"
+eq '...the worktree gets a real install' 'SYMSRC|no' "$(cat "$DWT/vendor/m" 2>/dev/null)|$([ -L "$DWT/vendor" ] && echo yes || echo no)"
+eq '...and nothing it points at changed' "$shared_snap" \
+  "$(cd "$SHARED" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat composer/installed.json)"
+rm -rf "$DWT/vendor"; rm -f "$DREPO/vendor"; mv "$SHARED" "$DREPO/vendor"
 rm -rf "$DWT/vendor" "$DREPO/vendor/composer" "$DREPO/vendor/.package-lock.json"
 
 # --- hardlink falls back when the lockfiles differ -------------------------
@@ -3081,6 +3143,27 @@ eq 'and both agree when it has NOT drifted: the file route is silent' '' \
 # shellcheck disable=SC2034
 PROFILE_RAW=$(raw_with "$CK")
 eq '...as is the loaded-profile route' '' "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
+# A record carrying a copy list after its lockChecksum: the checksum is still the sixth field, so a
+# reader that lost track of the seventh would report drift on every hardlinked dir, or miss it.
+raw_copy_with() {  # $1 = lockChecksum to record
+  printf '0%s%s1%svendor%scomposer.lock%shardlink%sx%s%s%s%s["composer"]%s' \
+    "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$1" "$US_" "$RS_"
+}
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_copy_with "$CK")
+eq 'drift: a matching record with a copy list is silent on the loaded-profile route' '' \
+  "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(raw_copy_with "1 1")
+contains '...and a stale one is still reported' 'has changed since calibration' \
+  "$(wt_report_drift "$DRTREE" '' '' '' 2>&1)"
+cat > "$DRTREE/p-copy.json" <<JSON
+{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink",
+ "install":"x","lockChecksum":"$CK","copy":["composer",".package-lock.json"]}]}
+JSON
+# shellcheck disable=SC2034
+PROFILE_RAW=''
+eq '...and silent on the file route too' '' "$(wt_report_drift "$DRTREE" '' '' '' "$DRTREE/p-copy.json" 2>&1)"
 
 # With everything matching and no evidence, it says nothing at all.
 # shellcheck disable=SC2034
@@ -3189,26 +3272,42 @@ copy_warning() {  # $@ = dir:lock:strategy[:copy] entries; prints what wt_warn_u
   done
   PROFILE_RAW=$raw WT_COPY_WARNED='' wt_warn_uncopied_links 2>&1
 }
-out=$(copy_warning vendor:composer.lock:hardlink)
-contains 'an uncopied hardlinked dir is warned about' 'vendor (composer): hardlinked' "$out"
-contains '...naming the danger' 'rewrites those paths in place' "$out"
-contains '...and the fix' '/pitlane-setup' "$out"
-contains 'a file path, keyed on its lockfile' 'node_modules (.package-lock.json)' \
-  "$(copy_warning node_modules:package-lock.json:hardlink)"
-contains 'the rule for the dir the profile names, not the first with that lockfile' 'node_modules (.yarn-integrity)' \
-  "$(copy_warning node_modules:yarn.lock:hardlink)"
-contains 'a nested project too' 'app/vendor (composer)' "$(copy_warning app/vendor:app/composer.lock:hardlink)"
-eq 'not when its lockfile sits elsewhere' '' "$(copy_warning app/vendor:composer.lock:hardlink)"
-eq 'not with a copy list of its own' '' "$(copy_warning 'vendor:composer.lock:hardlink:["composer"]')"
-eq 'nor an explicitly empty one: the developer chose' '' "$(copy_warning 'vendor:composer.lock:hardlink:[]')"
-eq 'not for a rule with nothing to copy' '' "$(copy_warning vendor/bundle:Gemfile.lock:hardlink)"
-eq 'not for an installed dir' '' "$(copy_warning vendor:composer.lock:install)"
-eq 'not for a lockfile no rule knows' '' "$(copy_warning vendor:custom.lock:hardlink)"
-eq 'not for a dir no rule with that lockfile names' '' "$(copy_warning lib:composer.lock:hardlink)"
-contains 'several in one line' 'vendor (composer), node_modules (.package-lock.json): hardlinked' \
-  "$(copy_warning vendor:composer.lock:hardlink vendor/bundle:Gemfile.lock:hardlink node_modules:package-lock.json:hardlink)"
-eq 'no detection table: nothing to compare, nothing said' '' \
-  "$(WT_DETECTION_JSON=/nonexistent/table.json copy_warning vendor:composer.lock:hardlink)"
+# The warning matches on how the backend renders markers and copyPaths, so it runs on each backend
+# this machine has: one that rendered them differently would silence it.
+copy_warning_suite() {
+  local out
+  out=$(copy_warning vendor:composer.lock:hardlink)
+  contains 'an uncopied hardlinked dir is warned about' 'vendor (composer): hardlinked' "$out"
+  contains '...naming the danger' 'rewrites those paths in place' "$out"
+  contains '...and the fix' '/pitlane-setup' "$out"
+  contains 'a file path, keyed on its lockfile' 'node_modules (.package-lock.json)' \
+    "$(copy_warning node_modules:package-lock.json:hardlink)"
+  contains 'the rule for the dir the profile names, not the first with that lockfile' 'node_modules (.yarn-integrity)' \
+    "$(copy_warning node_modules:yarn.lock:hardlink)"
+  contains 'a nested project too' 'app/vendor (composer)' "$(copy_warning app/vendor:app/composer.lock:hardlink)"
+  eq 'not when its lockfile sits elsewhere' '' "$(copy_warning app/vendor:composer.lock:hardlink)"
+  eq 'not with a copy list of its own' '' "$(copy_warning 'vendor:composer.lock:hardlink:["composer"]')"
+  eq 'nor an explicitly empty one: the developer chose' '' "$(copy_warning 'vendor:composer.lock:hardlink:[]')"
+  eq 'not for a rule with nothing to copy' '' "$(copy_warning vendor/bundle:Gemfile.lock:hardlink)"
+  eq 'not for an installed dir' '' "$(copy_warning vendor:composer.lock:install)"
+  eq 'not for a lockfile no rule knows' '' "$(copy_warning vendor:custom.lock:hardlink)"
+  eq 'not for a dir no rule with that lockfile names' '' "$(copy_warning lib:composer.lock:hardlink)"
+  contains 'several in one line' 'vendor (composer), node_modules (.package-lock.json): hardlinked' \
+    "$(copy_warning vendor:composer.lock:hardlink vendor/bundle:Gemfile.lock:hardlink node_modules:package-lock.json:hardlink)"
+  eq 'no detection table: nothing to compare, nothing said' '' \
+    "$(WT_DETECTION_JSON=/nonexistent/table.json copy_warning vendor:composer.lock:hardlink)"
+}
+for COPY_BACKEND in python3 jq; do
+  if ! command -v "$COPY_BACKEND" >/dev/null 2>&1; then
+    printf 'NOTE: %s not on PATH — wt_warn_uncopied_links not exercised on it\n' "$COPY_BACKEND" >&2
+    continue
+  fi
+  if [ "$COPY_BACKEND" = python3 ]; then
+    WT_JSON_BACKEND=python3 copy_warning_suite
+  else
+    WT_JSON_BACKEND='' copy_warning_suite
+  fi
+done
 # shellcheck disable=SC2034
 PROFILE_RAW=$(printf '0%s%s1%svendor%scomposer.lock%shardlink%sx%s%s%s' "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_")
 # shellcheck disable=SC2034  # read by wt_warn_uncopied_links
