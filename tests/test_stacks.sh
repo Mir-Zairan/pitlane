@@ -451,6 +451,54 @@ donor_check() {  # $1 = repo, $2 = scratch dir for logs
   remove_worktree "$r" gamma "$logs"
 }
 
+# A dir linked from the main checkout whose branch then commits a lockfile change is installed fresh,
+# not over the link: the branch's install runs a real in-place writer (relink_setup_<stack>), and the
+# main checkout's tree must keep every byte and inode.
+relink_check() {  # $1 = repo, $2 = scratch dir for logs
+  local r=$1 logs=$2 z f main_before main_after out
+  [ -n "$STACK_RELINK_FILE" ] && [ -n "$STACK_LOCK_CHANGE" ] || return 0
+  z=$r/.claude/worktrees/zeta
+  git -C "$r" worktree add -q "$z" -b worktree-zeta 2>/dev/null
+  session_start "$z" "$logs/zeta.start" >/dev/null
+  eq "zeta: $STACK_RELINK_FILE is hardlinked from the main checkout" "$(inode "$r/$STACK_RELINK_FILE")" \
+    "$(inode "$z/$STACK_RELINK_FILE")"
+  # Before the writer exists: npm runs a root postinstall even for `--package-lock-only`, and that one
+  # would be the developer's own command writing through the link, which this check is not about.
+  if ! tc "$z" "$STACK_LOCK_CHANGE" >"$logs/relink.lockchange" 2>&1; then
+    printf 'NOTE [%s/%s] "%s" failed (offline?) — the relink check is not counted\n' "$BACKEND" "$STACK" "$STACK_LOCK_CHANGE" >&2
+    show_log "$logs/relink.lockchange"
+  else
+    "relink_setup_$STACK" "$z"
+    git -C "$z" add -A
+    git -C "$z" commit -qm 'changes the lockfile, and patches a dependency in place on install'
+    approve "$z"
+    main_before=''
+    for f in $STACK_LINKDIRS; do main_before+=$(inode_snapshot "$r/$f"); done
+    session_start "$z" "$logs/zeta.restart" >/dev/null
+    out=$(cd "$z" && bash "$HOOK" --finish 2>"$logs/zeta.finish")
+    # `npm install` may rewrite the tracked lockfile, which --finish rightly reports.
+    eq 'zeta: --finish reports the worktree set up' yes "$(case $out in
+      'Pitlane: this worktree is fully set up.' | 'Pitlane: this worktree is set up, with warnings — an install changed '*) echo yes ;;
+      *) printf '%s' "$out" ;; esac)"
+    out=$(cat "$logs/zeta.restart" "$logs/zeta.finish" "$(git -C "$z" rev-parse --absolute-git-dir)/worktree-bootstrap.log" 2>/dev/null)
+    contains 'zeta: its lockfile changed, so the linked copy is removed before the install' \
+      'changed since it was linked — removing the linked copy and installing fresh' "$out"
+    contains "zeta: ...the branch's install patched its own $STACK_RELINK_FILE" 'patched by the branch' \
+      "$(cat "$z/$STACK_RELINK_FILE" 2>/dev/null)"
+    for f in $STACK_LINKDIRS; do
+      eq "zeta: ...and no file in its $f is a link any more" '' "$(find "$z/$f" -type f -links +1 -print)"
+    done
+    main_after=''
+    for f in $STACK_LINKDIRS; do main_after+=$(inode_snapshot "$r/$f"); done
+    eq "zeta: ...while the main checkout's $STACK_LINKDIRS kept every byte and inode" "$main_before" "$main_after"
+  fi
+  git -C "$z" checkout -q -- .
+  # Kept on another ref, so the teardown does not hold the worktree for its unmerged commits.
+  git -C "$r" branch -f relink-kept worktree-zeta
+  remove_worktree "$r" zeta "$logs"
+  git -C "$r" branch -qD relink-kept
+}
+
 remove_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 w
   w=$r/.claude/worktrees/$name
@@ -485,7 +533,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   STACK_SERVE='' STACK_SERVE_PATH='' STACK_SERVE_EXPECT=''
   # shellcheck disable=SC2034  # STACK_ARTIFACTS is read by write_profile, in stack_fixtures.sh
   STACK_ARTIFACTS='' STACK_ART_FILE='' STACK_ART_CHANGE='' STACK_ART_EXPECT=''
-  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET='' STACK_LOCK_CHANGE=''
+  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET='' STACK_LOCK_CHANGE='' STACK_RELINK_FILE=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
   r=$dir/repo logs=$dir/logs STACK_DB=$dir/databases
@@ -523,6 +571,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
     p_beta=$WT_PORT_SEEN
     ne 'two worktrees get distinct ports' "$p_alpha" "$p_beta"
     donor_check "$r" "$logs"
+    relink_check "$r" "$logs"
     if [ -n "$STACK_SERVE" ]; then
       # Both apps at once, each on its own port: the case a hardcoded start command cannot serve.
       contains "alpha's app still answers beside beta's" "${STACK_SERVE_EXPECT//\{port\}/$p_alpha}" \

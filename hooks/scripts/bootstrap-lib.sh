@@ -2260,6 +2260,39 @@ wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy
     "worktree $(wt_name_from_path "$donor")" || true
 }
 
+# Before an install over hardlink dir $2 already in worktree $1: when any of its files is still a
+# link, remove the dir so the install starts from nothing. Package managers mostly replace files, but
+# a lifecycle script that writes a package's existing file in place (a patch step, a postinstall)
+# writes through a shared inode into the tree it was linked from. Removing our links never touches
+# that tree's files. Returns 1, having said why, when the install must not run over the dir.
+wt_clear_linked_dep() {  # $1 = worktree, $2 = dir, $3 = lock, $4 = 1 when the dependency's lock is held
+  local worktree=${1%/} dir=${2-} lock=${3-} dest err
+  dest=$worktree/$dir
+  [ -n "$dir" ] && [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
+  # Any link count above one, not a comparison with main or the recorded donor: no package manager
+  # with a hardlink rule creates hardlinks itself, so a shared file is one `cp -al` made — and the
+  # other tree may be a worktree that took ours as its donor, which no record here names, while a
+  # deferred fallback has already dropped the donor field. A false positive costs a fresh install,
+  # never a write elsewhere. A linked tree's first file ends the walk.
+  [ -n "$(find "$dest" -type f -links +1 -print 2>/dev/null | head -n 1)" ] || return 0
+  # Without the lock another session may be installing into this very dir. Without flock (stock
+  # macOS) nothing is serialised anyway, and refusing would leave the dir uninstalled for good.
+  if [ "${4-}" != 1 ] && [ "${WT_LOCK_NO_FLOCK:-0}" != 1 ]; then
+    wt_log "  $dir: $lock changed since it was linked, but another process holds its lock — not installing over files it shares with another tree; retried next run"
+    return 1
+  fi
+  if ! wt_is_safe_relpath "$dir" || wt_has_symlinked_parent "$worktree" "$dir"; then
+    wt_log "  $dir: not a plain path inside the worktree — not installing over files it shares with another tree"
+    return 1
+  fi
+  wt_log "  $dir: $lock changed since it was linked — removing the linked copy and installing fresh"
+  if ! err=$(rm -rf -- "$dest" 2>&1); then
+    wt_log "  $dir: could not remove the linked copy (${err%%"$WT_NL"*}) — not installing over files it may still share with another tree; retried next run"
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # The toolchain, started once and on demand
 # ---------------------------------------------------------------------------
@@ -2867,6 +2900,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
       if ! wt_toolchain_warm "$worktree" "$deadline"; then
         wt_log "  $dir: needs the toolchain, which is not ready — leaving it for /pitlane-finish or the next session"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      # Here, with the install: a deferred one reaches this only in the background run.
+      if [ "$strategy" = hardlink ] && ! wt_clear_linked_dep "$worktree" "$dir" "$lock" "$held"; then
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue

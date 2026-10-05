@@ -2638,6 +2638,120 @@ eq '...and with the donor gone too, nothing fails' "0|" "$rc|$(printf '%s' "$out
 mv "$TMP/main-vendor" "$DREPO/vendor"
 rm -rf "$DONORS/donor-a/vendor/composer" "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 
+# --- a linked dir whose lockfile changed is installed fresh, not over the link ------
+# The install appends to files the link shares, as a package's own script may write in place: run
+# over the linked tree, it would write into the tree the dir was linked from.
+RINSTALL='mkdir -p vendor/pkg && printf FRESH >> vendor/pkg/file.txt && { [ ! -f vendor/locked/f ] || printf FRESH >> vendor/locked/f; } && printf DINSTALLED > vendor/m'
+relink() {  # $1 = the worktree's lockfile; vendor linked afresh and recorded done; sets out
+  rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+  printf '%s\n' "$1" > "$DWT/composer.lock"
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+}
+# A PATH holding every command on ours but flock, in $NOFLOCK: stock macOS.
+make_noflock_bin() {
+  local path_dirs pd exe
+  NOFLOCK=$TMP/noflock-bin
+  [ ! -d "$NOFLOCK" ] || return 0
+  mkdir -p "$NOFLOCK"
+  IFS=: read -r -a path_dirs <<<"$PATH"
+  for pd in "${path_dirs[@]}"; do
+    for exe in "$pd"/*; do
+      [ -x "$exe" ] || continue
+      case ${exe##*/} in flock) continue ;; esac
+      [ -e "$NOFLOCK/${exe##*/}" ] || ln -s "$exe" "$NOFLOCK/${exe##*/}" 2>/dev/null
+    done
+  done
+}
+tree_snap() { (cd "$1" && find . -type f -exec ls -i {} + | LC_ALL=C sort; find . -type f -exec cksum {} + | LC_ALL=C sort); }
+present() { [ -e "$1" ] && echo present || echo absent; }
+printf 'STALE\n' > "$DREPO/vendor/stale.txt"; printf 'STALE\n' > "$DONORS/donor-a/vendor/stale.txt"
+
+relink LOCKV1
+eq 'relink: linked from the main checkout first' main "$(linked_from)"
+rmain=$(tree_snap "$DREPO/vendor")
+printf 'LOCKV3\n' > "$DWT/composer.lock"
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'relink: at start-up with installs deferred, the install waits for the background run' 'vendor: to be installed in the background' "$out"
+lacks '...and so does the removal' 'removing the linked copy' "$out"
+eq '...the linked dir is left as it is' main "$(linked_from)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'relink: the run that installs removes the linked dir first' \
+  'vendor: composer.lock changed since it was linked — removing the linked copy and installing fresh' "$out"
+eq '...and installs into a fresh dir' 'FRESH|DINSTALLED|absent' \
+  "$(cat "$DWT/vendor/pkg/file.txt")|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/stale.txt")"
+eq '...no file of which is a link any more' '' "$(find "$DWT/vendor" -type f -links +1)"
+eq "...while the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+eq '...recorded done' "done" "$(wt_state_status "$DWT" vendor)"
+
+donor_rec donor-a "done" 100 '' "$(wt_cksum_string "$RINSTALL")"
+relink LOCKV2
+eq 'relink: linked from a donor first' donor-a "$(linked_from)"
+rdonor=$(tree_snap "$DONORS/donor-a/vendor")
+rmain=$(tree_snap "$DREPO/vendor")
+printf 'LOCKV3\n' > "$DWT/composer.lock"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'relink: a donor-linked dir whose lockfile changed is removed first too' \
+  'vendor: composer.lock changed since it was linked — removing the linked copy and installing fresh' "$out"
+eq '...and installed fresh' 'FRESH|DINSTALLED|absent' \
+  "$(cat "$DWT/vendor/pkg/file.txt")|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/stale.txt")"
+eq '...sharing no inode' '' "$(find "$DWT/vendor" -type f -links +1)"
+eq "...the donor's tree kept every byte and inode" "$rdonor" "$(tree_snap "$DONORS/donor-a/vendor")"
+eq "...and so did the main checkout's" "$rmain" "$(tree_snap "$DREPO/vendor")"
+
+# A dir that was installed shares nothing: the install reconciles it in place, as it always has.
+relink LOCKV3
+eq 'relink: a dir no tree can give is installed' install "$(linked_from)"
+printf 'OWN\n' > "$DWT/vendor/keep.txt"
+printf 'LOCKV4\n' > "$DWT/composer.lock"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'relink: an installed dir whose lockfile changed is not removed' 'removing the linked copy' "$out"
+eq '...the install runs over it in place' 'OWN|FRESHFRESH' "$(cat "$DWT/vendor/keep.txt")|$(cat "$DWT/vendor/pkg/file.txt")"
+
+# Without the dependency's lock another session may be installing into the dir: left linked.
+relink LOCKV1
+printf 'LOCKV3\n' > "$DWT/composer.lock"
+rmain=$(tree_snap "$DREPO/vendor")
+exec 7>"$(wt_lock_path "$DREPO" vendor)"; flock -n 7
+out=$(WT_LOCK_WAIT=0 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+exec 7>&-
+contains 'relink: without the lock a linked dir is neither removed nor installed over' \
+  'another process holds its lock — not installing over files it shares' "$out"
+eq '...it stays linked, the install not run' main "$(linked_from)"
+eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+eq '...and it is retried next run' dirty "$(wt_state_status "$DWT" vendor)"
+# Without flock nothing is serialised at all: the dir is cleared and installed, or it never would be.
+make_noflock_bin
+out=$(PATH=$NOFLOCK WT_FLOCK_WARNED=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'relink: with no flock on PATH the linked dir is still removed first' \
+  'removing the linked copy and installing fresh' "$out"
+eq '...and installed fresh' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/vendor/stale.txt")"
+eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+
+# A removal that fails part-way leaves files still shared: nothing is installed over them.
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$DREPO/vendor/locked"; printf 'L\n' > "$DREPO/vendor/locked/f"
+  relink LOCKV1
+  chmod 555 "$DWT/vendor/locked"
+  rmain=$(tree_snap "$DREPO/vendor")
+  printf 'LOCKV3\n' > "$DWT/composer.lock"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains 'relink: a linked dir that cannot be removed says so' 'vendor: could not remove the linked copy (' "$out"
+  eq '...the install does not run' absent "$(present "$DWT/vendor/m")"
+  eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  eq '...and it is not done, so the next run retries' dirty "$(wt_state_status "$DWT" vendor)"
+  chmod 755 "$DWT/vendor/locked"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains '...which removes it once it can' 'removing the linked copy and installing fresh' "$out"
+  eq '...and installs into a fresh dir' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/vendor/locked")"
+  eq "...main's tree still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  rm -rf "$DREPO/vendor/locked"
+fi
+rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+donor_rec donor-a "done" 100
+
 git -C "$DREPO" worktree remove --force "$DONORS/donor-a"
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 printf 'LOCKV1\n' > "$DWT/composer.lock"
@@ -3007,18 +3121,7 @@ wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" doin
 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
 eq 'a stale doing record, the lock free: taken from main' 'from-main' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
 # Without flock (stock macOS) nothing can tell a live `doing` from a stale one, so it does not block.
-NOFLOCK=$TMP/noflock-bin
-if [ ! -d "$NOFLOCK" ]; then
-  mkdir -p "$NOFLOCK"
-  IFS=: read -r -a path_dirs <<<"$PATH"
-  for pd in "${path_dirs[@]}"; do
-    for exe in "$pd"/*; do
-      [ -x "$exe" ] || continue
-      case ${exe##*/} in flock) continue ;; esac
-      [ -e "$NOFLOCK/${exe##*/}" ] || ln -s "$exe" "$NOFLOCK/${exe##*/}" 2>/dev/null
-    done
-  done
-fi
+make_noflock_bin
 art_reset
 wt_art_state_set "$AWT" public/build build k "$(wt_cksum_string "$ABUILD")" doing
 out=$(PATH=$NOFLOCK WT_FLOCK_WARNED=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)

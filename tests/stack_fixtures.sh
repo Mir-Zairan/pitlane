@@ -250,8 +250,32 @@ JS
   STACK_INPLACE_NET='npm install --no-audit --no-fund isarray@2.0.5'
   # A lockfile change that needs no registry: the root package's version is recorded in it.
   STACK_LOCK_CHANGE='npm pkg set version=1.0.1 && npm install --package-lock-only --offline --no-audit --no-fund'
+  STACK_RELINK_FILE=node_modules/is-number/README.md
   STACK_PROBE='node probe.js'
   STACK_EXPECT=ok
+}
+
+# The branch's in-place writer for relink_check: a root postinstall that patches a dependency's file
+# in place, as patch-package does, run by an install that keeps the existing tree — `npm ci` empties
+# node_modules first, so it never writes through a link.
+relink_setup_npm() {  # $1 = worktree
+  printf '%s\n' "const fs = require(\"fs\"), p = \"$STACK_RELINK_FILE\";" \
+    'fs.writeFileSync(p, fs.readFileSync(p, "utf8") + "patched by the branch\n");' >"$1/patch.js"
+  python3 - "$1" <<'PY'
+import json, sys
+w = sys.argv[1]
+with open(w + "/package.json") as f:
+    pkg = json.load(f)
+pkg.setdefault("scripts", {})["postinstall"] = "node patch.js"
+with open(w + "/package.json", "w") as f:
+    json.dump(pkg, f, indent=2)
+p = w + "/.claude/worktree-profile.json"
+with open(p) as f:
+    text = f.read()
+assert '"install": "npm ci"' in text
+with open(p, "w") as f:
+    f.write(text.replace('"install": "npm ci"', '"install": "npm install --no-audit --no-fund"'))
+PY
 }
 
 # --- 3. bun: its own global cache, so it installs ---------------------------------------------------
