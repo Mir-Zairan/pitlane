@@ -2552,7 +2552,12 @@ git -C "$DONORS/donor-a" checkout -q wt-donor-a
 git -C "$DREPO" config branch.wt-dep1.merge refs/pull/9/head
 run_donor
 eq "donor: a pull request's worktree links from no sibling" install "$(linked_from)"
-contains '...and says so' "pull request's or unapproved worktree links from no other worktree" "$out"
+contains "...and says it installs its own copy" "vendor: a pull request's worktree installs its own copy" "$out"
+# The link step's own refusal stays, behind the one above.
+rm -rf "$DWT/vendor"
+out=$(wt_hardlink_dep "$DREPO" "$DWT" vendor composer.lock '' "$DLOCK2" "$DICK" '' "$FAR" 2>&1); hl_rc=$?
+eq "...and asked to link it directly, it still refuses a donor" "1|none" "$hl_rc|$(linked_from)"
+contains '...saying so' "pull request's or unapproved worktree links from no other worktree" "$out"
 git -C "$DREPO" config --unset branch.wt-dep1.merge
 
 # The verify needs time to run: with none left the donor is skipped, not trusted unverified.
@@ -2893,6 +2898,55 @@ if [ "$(id -u)" != 0 ]; then
   eq "...the main checkout's tree untouched" 'MAIN|L' "$(cat "$TRM/vendor/pkg/file.txt")|$(cat "$TRM/vendor/locked/f")"
 fi
 rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
+
+# --- a pull request's worktree installs its hardlink deps, from the main checkout too -----------
+# A linked tree shares inodes with main both ways: the PR's own scripts would write into main's files.
+relink LOCKV1
+eq 'pr: (fixture) an ordinary worktree with main'"'"'s lockfile still links from main' main "$(linked_from)"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+rmain=$(tree_snap "$DREPO/vendor")
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq "pr: with main's lockfile, a pull request's worktree installs" install "$(linked_from)"
+contains '...and says why, once' \
+  "vendor: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways" "$out"
+eq '...once' 1 "$(printf '%s\n' "$out" | grep -c "installs its own copy")"
+lacks '...not linked from main' 'hardlinked from' "$out"
+eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
+eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+wt_state_dep_read "$DWT" vendor
+eq '...recorded done as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...which the next run finds up to date' 'vendor: already up to date' "$out"
+lacks '...without saying it again' 'installs its own copy' "$out"
+PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
+eq '...and nothing is pending' '' "$WT_PENDING"
+
+# Linked before this change: the next run with installs deferred leaves it for the background run,
+# which moves the linked copy into the git dir and installs fresh.
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+relink LOCKV1
+eq 'pr: (fixture) linked from main while not yet a pull request' main "$(linked_from)"
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
+eq 'pr: a linked dir recorded done is pending again' vendor "$WT_PENDING_ATTEMPTABLE"
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...at start-up it is left for the background run' 'vendor: to be installed in the background' "$out"
+contains '...saying why' "vendor: a pull request's worktree installs its own copy" "$out"
+eq '...still linked meanwhile' main "$(linked_from)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...the run that installs clears the linked copy first' \
+  "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy and installing fresh" "$out"
+eq '...and installs into a fresh dir' "install|absent" "$(linked_from)|$(present "$DWT/vendor/stale.txt")"
+eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
+eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+eq '...nothing left in the git dir or beside the dir' '|' \
+  "$(ls -A "$(wt_removed_dep_admin_dir "$DWT")" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+eq '...recorded done' "done" "$(wt_state_status "$DWT" vendor)"
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'pr: no longer a pull request, it says nothing of its own copy' 'installs its own copy' "$out"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 
 # The aside name and its one matcher, which the /pitlane-tidy sweep shares: exact shape only.
 eq 'aside name: the dir'"'"'s base, our marker, the pid and a random number' '.node_modules.pitlane-removed.12.345' \

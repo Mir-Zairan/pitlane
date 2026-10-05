@@ -2357,8 +2357,8 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
 # a lifecycle script that writes a package's existing file in place (a patch step, a postinstall)
 # writes through a shared inode into the tree it was linked from. Removing our links never touches
 # that tree's files. Returns 1, having said why, when the install must not run over the dir.
-wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock
-  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} dest probe aside admin err
+wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock, $6 = why it is cleared, for the log
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} dest probe aside admin err why
   dest=$worktree/$dir
   [ -n "$dir" ] && [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
   # The main checkout's own dir is the tree every link points back to: never ours to remove.
@@ -2371,20 +2371,21 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
   # errs or says anything on stderr (an unreadable subdir hides its files) counts as linked.
   probe=$( { find "$dest" -type f -links +1 -print 2>&1 || echo "find exited $?"; } | head -n 1) || true
   [ -n "$probe" ] || return 0
+  why=${6:-$lock changed since it was linked}
   # Without the lock another session may be installing into this very dir. Without flock (stock
   # macOS) nothing is serialised anyway, and refusing would leave the dir uninstalled for good.
   case ${5-}:${WT_LOCK_NO_FLOCK:-0} in
     0:* | *:1) ;;
-    2:*) wt_log "  $dir: $lock changed since it was linked, but its lock could not be opened — not installing over files it shares with another tree; retried next run"
+    2:*) wt_log "  $dir: $why, but its lock could not be opened — not installing over files it shares with another tree; retried next run"
          return 1 ;;
-    *) wt_log "  $dir: $lock changed since it was linked, but another process holds its lock — not installing over files it shares with another tree; retried next run"
+    *) wt_log "  $dir: $why, but another process holds its lock — not installing over files it shares with another tree; retried next run"
        return 1 ;;
   esac
   if ! wt_is_safe_relpath "$dir" || wt_has_symlinked_parent "$worktree" "$dir"; then
     wt_log "  $dir: not a plain path inside the worktree — not installing over files it shares with another tree"
     return 1
   fi
-  wt_log "  $dir: $lock changed since it was linked — removing the linked copy and installing fresh"
+  wt_log "  $dir: $why — removing the linked copy and installing fresh"
   # Renamed aside first, then removed: an `rm -rf` that fails part-way at the dir's own path would
   # leave a half tree a later install could run over and record done. Into the admin dir when it is
   # on the same device (wt_removed_dep_admin_dir says why); else within the dir's own parent.
@@ -2769,6 +2770,16 @@ wt_dep_log_failure_stands() {  # $1 = dir, $2 = lock, $3 = recorded exit code, $
   wt_log "  $1: the recorded failure stands ($why) — not retrying an install that would fail the same way; it is retried once ${2:-its lockfile} or the install command changes, or now by: bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --finish --retry-failed"
 }
 
+# 1 when worktree $1 installs its `hardlink` dependencies rather than linking them, else 0, in
+# WT_OWN_COPY: a pull request's worktree (wt_is_pr_worktree). A linked tree shares every inode outside
+# the copy paths with the main checkout both ways, so the PR's own scripts, run by its approved install
+# or by the session, would write into main's files. Asked once per pass over deps[], not memoised
+# across calls: a branch's upstream can be set between two runs in one shell.
+wt_own_copy_judge() {  # $1 = worktree
+  WT_OWN_COPY=0
+  ! wt_is_pr_worktree "$1" || WT_OWN_COPY=1
+}
+
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
 #
 # TWO PASSES, cheapest first: hardlinked entries (a second or so each, and no toolchain needed), then
@@ -2779,7 +2790,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
-  local verify_tpl linked_from lock_rc
+  local verify_tpl linked_from lock_rc own_copy clear_why
+  WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
 
@@ -2794,6 +2806,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     n=$((n + 1))
     body=${rec#*"$WT_US"}
     IFS=$WT_US read -r dir lock strategy install verify _cksum dcopy <<<"$body" || true
+    # Installed as its own copy, and recorded `install`: a record from before this, `hardlink`, then
+    # no longer matches, so a dir linked then is cleared and installed by the next deferred run.
+    own_copy=0
+    if [ "$strategy" = hardlink ]; then
+      [ -n "$WT_OWN_COPY" ] || wt_own_copy_judge "$worktree"
+      [ "$WT_OWN_COPY" = 0 ] || own_copy=1 strategy=install
+    fi
     case $pass:$strategy in
       cheap:hardlink | cheap:skip | slow:install | slow:store) ;;
       slow:hardlink | slow:skip | cheap:*) continue ;;
@@ -2870,6 +2889,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
       continue
     fi
+    [ "$own_copy" = 0 ] || wt_log "  $dir: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways"
     # Settled before the lock and the deferral, so a standing failure neither waits for a lock nor
     # starts a background run that would only say this again. A hardlink is still tried below: its
     # failure was the fallback install's, and the link may work now. WT_RETRY_FAILED (`--finish
@@ -2945,7 +2965,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     fi
     # What a removal moved aside and could not finish (wt_clear_linked_dep). Under the lock, or with
     # no flock to take: the same rule as the partial dir above.
-    if [ "$strategy" = hardlink ] && { [ "$held" -eq 1 ] || [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; }; then
+    if { [ "$strategy" = hardlink ] || [ "$own_copy" = 1 ]; } && { [ "$held" -eq 1 ] || [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; }; then
       wt_sweep_removed_dep "$worktree" "$dir"
     fi
 
@@ -3028,7 +3048,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         continue
       fi
       # Here, with the install: a deferred one reaches this only in the background run.
-      if [ "$strategy" = hardlink ] && ! wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc"; then
+      clear_why="$lock changed since it was linked"
+      [ "$own_copy" = 0 ] || clear_why="it was linked, and a pull request's worktree keeps its own copy"
+      if { [ "$strategy" = hardlink ] || [ "$own_copy" = 1 ]; } \
+        && ! wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc" "$clear_why"; then
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
@@ -3518,7 +3541,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
   local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current
-  WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS=''
+  WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS='' WT_OWN_COPY=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
@@ -3530,6 +3553,11 @@ wt_bootstrap_pending() {  # $1 = worktree
     case $strategy in hardlink | install | store) ;; *) continue ;; esac
     { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
     [ "$strategy" = store ] && strategy=install
+    # As wt_bootstrap_deps records it.
+    if [ "$strategy" = hardlink ]; then
+      [ -n "$WT_OWN_COPY" ] || wt_own_copy_judge "$worktree"
+      [ "$WT_OWN_COPY" = 0 ] || strategy=install
+    fi
     install=$(wt_expand "$install")
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
