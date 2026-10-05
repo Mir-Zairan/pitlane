@@ -2372,8 +2372,9 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
 # that tree's files. Returns 1, having said why, when the install must not run over the dir.
 # With $7 `aside` it only moves the dir into the admin dir, an instant rename, leaving the removal to
 # the sweep of the run that installs: 0 when moved (or nothing is linked), 3 when the admin dir cannot
-# take it, 1, silently, when the lock or the path forbids it.
-wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock, $6 = why it is cleared, for the log, $7 = `aside` or empty
+# take it, 1, silently, when the lock or the path forbids it. With $7 `remove` it removes the dir as
+# a step that installs nothing, and says so.
+wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock, $6 = why it is cleared, for the log, $7 = `aside`, `remove` or empty
   local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} mode=${7-} dest probe aside admin err why
   dest=$worktree/$dir
   [ -n "$dir" ] && [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
@@ -2402,7 +2403,11 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
     [ "$mode" = aside ] || wt_log "  $dir: not a plain path inside the worktree — not installing over files it shares with another tree"
     return 1
   fi
-  [ "$mode" = aside ] || wt_log "  $dir: $why — removing the linked copy and installing fresh"
+  case $mode in
+    aside) ;;
+    remove) wt_log "  $dir: $why — removing the linked copy; nothing installs it here" ;;
+    *) wt_log "  $dir: $why — removing the linked copy and installing fresh" ;;
+  esac
   # Renamed aside first, then removed: an `rm -rf` that fails part-way at the dir's own path would
   # leave a half tree a later install could run over and record done. Into the admin dir when it is
   # on the same device (wt_removed_dep_admin_dir says why); else within the dir's own parent.
@@ -2807,8 +2812,10 @@ wt_own_copy_judge() {  # $1 = worktree
 # tree it shares with the main checkout until some later run installs. An instant move into the admin
 # dir; where that cannot be had, removed outright when $6 is 1, else left for the run that installs.
 # $5 is wt_lock_acquire's status for the dep's lock, or empty to try it here without waiting.
+# 0 when the dir was there and is now out of the worktree, so the caller records the dep not done.
 wt_own_copy_unlink() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = lock status or empty, $6 = 1 to remove it when it cannot be moved
-  local why="it was linked, and a pull request's worktree keeps its own copy" status=${5-} took=0 rc=0
+  local why="it was linked, and a pull request's worktree keeps its own copy" status=${5-} took=0 rc=0 had=0
+  [ ! -d "${2%/}/$3" ] || [ -L "${2%/}/$3" ] || had=1
   if [ -z "$status" ]; then
     wt_lock_acquire "$(wt_lock_path "$1" "$3")" 0 9 || status=$?
     [ -n "$status" ] || status=0 took=1
@@ -2816,13 +2823,13 @@ wt_own_copy_unlink() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = lo
   wt_clear_linked_dep "$1" "$2" "$3" "$4" "$status" "$why" aside || rc=$?
   if [ "$rc" = 3 ]; then
     if [ "${6-}" = 1 ]; then
-      wt_clear_linked_dep "$1" "$2" "$3" "$4" "$status" "$why" || true
+      wt_clear_linked_dep "$1" "$2" "$3" "$4" "$status" "$why" remove || true
     else
       wt_log "  $3: $why — the linked copy stays until the run that installs removes it (the worktree's git dir is on another device)"
     fi
   fi
   [ "$took" = 0 ] || wt_lock_release 9
-  return 0
+  [ "$had" = 1 ] && [ ! -e "${2%/}/$3" ]
 }
 
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
@@ -2937,7 +2944,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     [ "$own_copy" = 0 ] || wt_log "  $dir: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways"
     # Read before `doing` replaces the record: a dir it says was linked is moved out of use at each
     # step below that leaves it uninstalled (wt_own_copy_unlink). Gated on the record so a tree that
-    # was never linked is not walked on every start-up.
+    # was never linked is not walked on every start-up. Once moved, the record is rewritten `dirty`:
+    # its `done` would tell a run that no longer counts this a PR's worktree the missing dir is current.
     own_linked=0
     if [ "$own_copy" = 1 ] && wt_state_dep_read "$worktree" "$dir" && [ "$WT_DEP_STRATEGY" = hardlink ]; then
       own_linked=1
@@ -2956,21 +2964,27 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # recorded either — the state still says "not done", which is what the session is told.
     if [ "${WT_APPROVAL:-}" = no ] && [ "$strategy" = install ]; then
       wt_log "  $dir: not installed — the profile's commands are not approved"
-      [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 1
+      if [ "$own_linked" = 1 ] && wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 1; then
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+      fi
       continue
     fi
 
     # Deferred: an install is the slow part, and the background run that follows does it.
     if [ "${WT_DEFER:-0}" = 1 ] && [ "$strategy" = install ]; then
       wt_log "  $dir: to be installed in the background"
-      [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 0
+      if [ "$own_linked" = 1 ] && wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 0; then
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+      fi
       continue
     fi
 
     left=$(wt_budget_left "$deadline")
     if [ "$left" -le 0 ]; then
       wt_log "  $dir: out of time before starting — leaving it for the next session"
-      [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 0
+      if [ "$own_linked" = 1 ] && wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 0; then
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+      fi
       continue
     fi
 
@@ -3031,7 +3045,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     if [ "$left" -le 0 ]; then
       wt_log "  $dir: the budget ran out while waiting — leaving it for the next session"
       wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
-      [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0
+      [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0 || true
       [ "$held" -eq 1 ] && wt_lock_release 9
       continue
     fi
@@ -3083,7 +3097,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       if [ -z "$install" ]; then
         wt_log "  $dir: no install command to run — leaving it empty"
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
-        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 1
+        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 1 || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
@@ -3095,14 +3109,15 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       if [ "$left" -le 0 ]; then
         wt_log "  $dir: the budget ran out before the install could start — leaving it for the next session"
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
-        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0
+        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0 || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
       if ! wt_toolchain_warm "$worktree" "$deadline"; then
         wt_log "  $dir: needs the toolchain, which is not ready — leaving it for /pitlane-finish or the next session"
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
-        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 1
+        # Moved aside only: a toolchain still starting has already spent this start-up's budget.
+        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0 || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi

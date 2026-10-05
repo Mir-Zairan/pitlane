@@ -29,6 +29,8 @@ export PITLANE_TRUST_PROFILES
 unset XDG_CONFIG_HOME
 # Claude Code sets this for a SessionStart hook; a test run must not append to a real session's file.
 unset CLAUDE_ENV_FILE
+# Exported into a session started in a Pitlane worktree; the SubagentStart cases decide their own.
+unset WORKTREE_PORT WORKTREE_URL
 # A corepack-managed pnpm keeps ITSELF in $HOME/.cache/node/corepack. Moving HOME makes corepack
 # think pnpm is not installed and try to download it, which fails offline and read as "pnpm cannot
 # produce a lockfile" — the long-standing failure of this suite. Only the tool's own cache is kept;
@@ -1918,6 +1920,14 @@ eq 'subagent: a worktree with no port of its own says the inherited ones do not 
   'Pitlane: this worktree, say"hi, has no app port of its own — the WORKTREE_PORT/WORKTREE_URL this subagent inherited belong to worktree serve-me and do not apply here' \
   "$(printf '%s' "$out" | sa_context)"
 eq '...and nothing at all under a parent with no port' '' "$(subagent_hook "$SNRW" "$SNR")"
+# A backslash is escaped, and a control character dropped, so the line stays one valid JSON string.
+SNRW2=$SNR/.claude/worktrees/$'back\\slash\ttab'
+git -C "$SNR" worktree add -q "$SNRW2" -b back-slash 2>/dev/null
+out=$(subagent_hook "$SNRW2" "$WSV")
+eq 'subagent: a backslash and a tab in the name, escaped and dropped' \
+  'Pitlane: this worktree, back\slashtab, has no app port of its own — the WORKTREE_PORT/WORKTREE_URL this subagent inherited belong to worktree serve-me and do not apply here' \
+  "$(printf '%s' "$out" | sa_context)"
+eq '...on one line' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
 # Never fails the subagent: outside any repository, and on a payload that is not JSON.
 out=$(subagent_hook "$TMP" "")
 eq 'subagent: outside any repository, nothing on stdout' '' "$out"

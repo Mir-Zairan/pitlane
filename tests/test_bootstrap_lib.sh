@@ -2105,6 +2105,12 @@ wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq 'lockfile rewritten by an install with warnings: warn' warn "$(wt_state_status "$DWT" vendor)"
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq '...and not re-run either' x "$(cat "$CNT")"
+eq '...recorded as it was before, too' "$(git -C "$DWT" show HEAD:composer.lock | cksum)" \
+  "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_LCK_BEFORE")"
+git -C "$DWT" checkout -q -- composer.lock
+eq '...so with the lockfile restored nothing is pending' '' "$(pending_all "$DWT")"
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...nor re-run' x "$(cat "$CNT")"
 git -C "$DWT" checkout -q -- composer.lock; rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
 
 # Where git cannot say, nothing is recorded, and nothing is captured into the working tree.
@@ -2410,6 +2416,18 @@ contains 'donor: with none to use, the old message stands' 'composer.lock differ
 donor_rec donor-a "done" 100 "$(printf 'LOCKV1\n' | cksum)"
 run_donor
 eq 'donor: a sibling whose lockfile changed since its install is not used' install "$(linked_from)"
+# A sibling whose install rewrote its lockfile matches ours by the lockfile as it was before.
+donor_rec_before() {  # $1 = lock cksum as the install left it, $2 = as it was before
+  wt_state_join dep vendor hardlink "$1" "$DICK" "done" 100 '' '' '' "$2"
+  printf 'wtstate%s%s%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$WT_STATE_REC" "$RS_" \
+    > "$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)/worktree-bootstrap-state"
+}
+donor_rec_before REWRITTEN "$DLOCK2"
+run_donor
+eq 'donor: a sibling recorded against our lockfile as it was before its install is used' donor-a "$(linked_from)"
+donor_rec_before REWRITTEN OTHERBEFORE
+run_donor
+eq '...one matching neither is not' install "$(linked_from)"
 donor_rec donor-a "done" 100
 printf 'LOCKV3\n' > "$DONORS/donor-a/composer.lock"
 run_donor
@@ -3029,7 +3047,69 @@ for pr_exit in approval empty-install budget; do
   contains '...the linked copy is moved out of the worktree all the same' 'moved the linked copy out of the worktree, into its git dir' "$out"
   eq '...no tree shared with main is left in it' absent "$(present "$DWT/vendor")"
   eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  eq '...and the dep is recorded not done' dirty "$(wt_state_status "$DWT" vendor)"
 done
+# Recorded not done, a worktree that stops being a pull request's links the dir again rather than
+# calling the missing one current.
+pr_relink
+WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" >/dev/null 2>&1
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'pr: moved out of use, then no longer a pull request: not called up to date' 'already up to date' "$out"
+eq '...linked from main again' main "$(linked_from)"
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+
+# The steps past the dep's lock. wt_budget_left is stood in for, counting its calls in a file, so the
+# budget runs out at exactly the check under test: the first passes the step before the lock, the
+# second the one after the wait, the third the one before the install.
+PBUDGET=$TMP/pr-budget-calls
+budget_out_after() {  # $1 = how many budget checks pass; sets out
+  local passes=$1
+  rm -f "$PBUDGET"
+  out=$(
+    # shellcheck disable=SC2329  # called by the engine, in place of its own
+    wt_budget_left() {
+      local n
+      n=$(( $(cat "$PBUDGET" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$n" > "$PBUDGET"
+      if [ "$n" -gt "$passes" ]; then printf 0; else printf 600; fi
+    }
+    wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1
+  )
+}
+for pr_exit in waiting before-install toolchain; do
+  pr_relink
+  case $pr_exit in
+    waiting) budget_out_after 1; why='the budget ran out while waiting' ;;
+    before-install) budget_out_after 2; why='the budget ran out before the install could start' ;;
+    toolchain) out=$(PROFILE_SHELL=fake-shell WT_TOOLCHAIN=broken wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+      why='needs the toolchain, which is not ready' ;;
+  esac
+  contains "pr, $pr_exit: not installed" "vendor: $why" "$out"
+  contains '...the linked copy is moved out of the worktree' 'moved the linked copy out of the worktree, into its git dir' "$out"
+  eq '...no tree shared with main is left in it' absent "$(present "$DWT/vendor")"
+  eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  eq '...recorded not done' dirty "$(wt_state_status "$DWT" vendor)"
+done
+# Another process holds the dep's lock, or it cannot be opened: the linked copy is not touched.
+pr_relink
+exec 7>"$(wt_lock_path "$DREPO" vendor)"; flock -n 7
+WT_LOCK_WAIT=0 budget_out_after 1
+exec 7>&-
+contains 'pr, lock held elsewhere: the run goes on without it' 'another worktree is working on it' "$out"
+contains '...and stops at the budget' 'vendor: the budget ran out while waiting' "$out"
+lacks '...the linked copy is not moved' 'moved the linked copy' "$out"
+eq '...it stays' main "$(linked_from)"
+eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+pr_relink
+plock=$(wt_lock_path "$DREPO" vendor)
+mv "$plock" "$TMP/pr-lock-real"; ln -s "$TMP/pr-lock-real" "$plock"
+budget_out_after 1
+rm -f "$plock"; mv "$TMP/pr-lock-real" "$plock"
+contains 'pr, lock that cannot be opened: stops at the budget' 'vendor: the budget ran out while waiting' "$out"
+lacks '...the linked copy is not moved' 'moved the linked copy' "$out"
+eq '...it stays' main "$(linked_from)"
+eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
 
 # The git dir on another device: no instant move, so start-up leaves the linked copy to the run that
 # installs, and says so; a step with no later install (unapproved) removes it outright.
@@ -3044,10 +3124,20 @@ contains 'pr, git dir on another device: start-up says the linked copy stays for
   'vendor: it was linked, and a pull request'"'"'s worktree keeps its own copy — the linked copy stays until the run that installs removes it' "$out"
 eq '...and leaves it, rather than copy the tree across devices' main "$(linked_from)"
 out=$(PATH=$PFAKESTAT:$PATH WT_APPROVAL=no wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains '...unapproved, nothing will install it, so it is removed outright' 'removing the linked copy and installing fresh' "$out"
+contains '...unapproved, nothing will install it, so it is removed outright' \
+  "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy; nothing installs it here" "$out"
+lacks '...not said to be installed fresh' 'installing fresh' "$out"
 eq '...gone' "absent|$rmain" "$(present "$DWT/vendor")|$(tree_snap "$DREPO/vendor")"
 eq '...nothing left beside it or in the git dir' '|' \
   "$(ls -A "$PADMIN" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+
+# The toolchain step, with the git dir on another device, only leaves it: no outright removal there.
+pr_relink
+out=$(PATH=$PFAKESTAT:$PATH PROFILE_SHELL=fake-shell WT_TOOLCHAIN=broken wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr, toolchain, git dir on another device: the linked copy stays for the install' \
+  'the linked copy stays until the run that installs removes it' "$out"
+lacks '...not removed outright inside the start-up budget' 'removing the linked copy' "$out"
+eq '...left in place' main "$(linked_from)"
 
 # A PR worktree whose own tree was never linked is not touched by these steps.
 git -C "$DREPO" config --unset branch.wt-dep1.merge
@@ -3617,6 +3707,22 @@ eq '...it is pending, and attemptable, so a background run is started for it' \
 eq '...as out of date, not missing' 'artstale|public/build|' "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; printf '%s' "${WT_STATUS_ITEMS//"$US_"/|}")"
 contains '...which the status line says' 'build output public/build out of date (its inputs changed in a commit; rebuilding in the background)' \
   "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start background)"
+contains '...with no background run, as changed since it was built' \
+  'build output public/build out of date (its inputs changed in a commit since it was built)' \
+  "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start '')"
+contains '...after a --finish that did not rebuild it, pointing at stderr' \
+  'build output public/build out of date (its inputs changed in a commit, and it was not rebuilt; stderr says why)' \
+  "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" finish '')"
+# Behind a dependency whose failure stands, a run would not rebuild it either.
+stale_raw=$PROFILE_RAW
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'true' '')${PROFILE_RAW#0"$US_$RS_"}
+printf 'L\n' > "$AWT/composer.lock"
+wt_state_set "$AWT" vendor install "$(wt_cksum_file "$AWT/composer.lock")" "$(wt_cksum_string true)" failed 1 'boom'
+eq 'stale: behind a dependency whose failure stands, not attemptable' '' "$(PROFILE_PRESENT=1 pending_attemptable "$AWT")"
+eq '...though still pending' $'vendor\nbuild output public/build' "$(PROFILE_PRESENT=1 pending_all "$AWT")"
+rm -f "$AWT/composer.lock"
+PROFILE_RAW=$stale_raw
 out=$(WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
 eq 'stale: a --finish run rebuilds it' xx "$(cat "$ACNT")"
 contains '...saying why' 'public/build: its inputs changed in a commit since it was built — bringing it up to date' "$out"
