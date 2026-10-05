@@ -140,8 +140,10 @@ The skills call one script, which you can also run yourself from inside a copy a
 
 **Is it safe to open someone else's pull request?** Pitlane runs nothing from it without asking. It
 copies settings and assigns the port, then shows you the setup commands and waits for your approval,
-and it asks again after every new push. Approving lets the install run the pull request's own package
-scripts, so read its changes first, as you would before installing it by hand.
+and it asks again after every new push. When the pull request leaves the lockfile alone, approving
+gives it a private copy of your main copy's packages, which runs nothing of its own. When it changes
+the lockfile, approving lets the install run the pull request's own package scripts, so read its
+changes first, as you would before installing it by hand.
 
 **Does it slow down starting a session?** No. Only the quick steps run before your first prompt;
 installs and the database finish in the background.
