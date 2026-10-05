@@ -2664,7 +2664,7 @@ make_noflock_bin() {
     done
   done
 }
-tree_snap() { (cd "$1" && find . -type f -exec ls -i {} + | LC_ALL=C sort; find . -type f -exec cksum {} + | LC_ALL=C sort); }
+tree_snap() { (cd "$1" || exit 1; find . -type f -exec ls -i {} + | LC_ALL=C sort; find . -type f -exec cksum {} + | LC_ALL=C sort); }
 present() { [ -e "$1" ] && echo present || echo absent; }
 printf 'STALE\n' > "$DREPO/vendor/stale.txt"; printf 'STALE\n' > "$DONORS/donor-a/vendor/stale.txt"
 
@@ -2729,22 +2729,78 @@ contains 'relink: with no flock on PATH the linked dir is still removed first' \
 eq '...and installed fresh' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/vendor/stale.txt")"
 eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
 
-# A removal that fails part-way leaves files still shared: nothing is installed over them.
+# The lock could not even be opened (a symlinked lock file): said as such, not as another holder.
+relink LOCKV1
+printf 'LOCKV3\n' > "$DWT/composer.lock"
+rmain=$(tree_snap "$DREPO/vendor")
+rlock=$(wt_lock_path "$DREPO" vendor)
+mv "$rlock" "$TMP/relink-lock-real"; ln -s "$TMP/relink-lock-real" "$rlock"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+rm -f "$rlock"; mv "$TMP/relink-lock-real" "$rlock"
+contains 'relink: a lock that cannot be opened is named as that' \
+  'vendor: composer.lock changed since it was linked, but its lock could not be opened' "$out"
+lacks '...not as another holder' 'another process holds its lock' "$out"
+eq '...the dir stays linked, the install not run' "main|absent" "$(linked_from)|$(present "$DWT/vendor/m")"
+eq "...the main checkout's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+eq '...and it is retried next run' dirty "$(wt_state_status "$DWT" vendor)"
+
+# The main checkout itself, by any path that resolves to it, is never cleared: its tree is the source.
+ln -s "$DREPO" "$TMP/main-alias"
+out=$(wt_clear_linked_dep "$DREPO" "$TMP/main-alias" vendor composer.lock 0 2>&1); rc=$?
+eq 'relink: a worktree that resolves to the main checkout removes nothing' "0|" "$rc|$out"
+eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+out=$(wt_clear_linked_dep "$DREPO" "$DREPO/" vendor composer.lock 0 2>&1); rc=$?
+eq '...nor does the main checkout named as itself' "0|" "$rc|$out"
+eq "...still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+rm -f "$TMP/main-alias"
+
 if [ "$(id -u)" != 0 ]; then
+  # A walk that cannot see every file fails closed: an installed dir with an unreadable subdir is
+  # treated as linked (here the lock is held elsewhere, so it is reported and left alone).
+  relink LOCKV3
+  eq 'relink: a dir no tree can give is installed (for the walk test)' install "$(linked_from)"
+  mkdir -p "$DWT/vendor/sealed"; printf 'S\n' > "$DWT/vendor/sealed/f"; chmod 000 "$DWT/vendor/sealed"
+  out=$(wt_clear_linked_dep "$DREPO" "$DWT" vendor composer.lock 1 2>&1); rc=$?
+  chmod 755 "$DWT/vendor/sealed"
+  eq 'relink: an unreadable subdir counts as linked' 1 "$rc"
+  contains '...and the dir is not installed over' 'another process holds its lock' "$out"
+  eq '...nor removed' "present|S" "$(present "$DWT/vendor/m")|$(cat "$DWT/vendor/sealed/f")"
+  out=$(wt_clear_linked_dep "$DREPO" "$DWT" vendor composer.lock 1 2>&1); rc=$?
+  eq '...while the same dir, readable and sharing nothing, is left for the install' "0|" "$rc|$out"
+
+  # The rename aside fails (the worktree's root is read-only): the tree and the record stay whole.
+  relink LOCKV1
+  printf 'LOCKV3\n' > "$DWT/composer.lock"
+  rwt=$(tree_snap "$DWT/vendor")
+  chmod 555 "$DWT"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  chmod 755 "$DWT"
+  contains 'relink: a linked dir that cannot be moved aside says so' 'vendor: could not move the linked copy aside to remove it (' "$out"
+  eq '...every file of it is still there, unchanged' "$rwt" "$(tree_snap "$DWT/vendor")"
+  eq '...the install does not run' absent "$(present "$DWT/vendor/m")"
+  eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  eq '...and it is not done, so the next run retries' dirty "$(wt_state_status "$DWT" vendor)"
+  eq '...nothing was left beside it' '' "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+
+  # The removal of the moved-aside copy fails part-way: no half tree is left at vendor itself.
   mkdir -p "$DREPO/vendor/locked"; printf 'L\n' > "$DREPO/vendor/locked/f"
   relink LOCKV1
   chmod 555 "$DWT/vendor/locked"
   rmain=$(tree_snap "$DREPO/vendor")
   printf 'LOCKV3\n' > "$DWT/composer.lock"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  contains 'relink: a linked dir that cannot be removed says so' 'vendor: could not remove the linked copy (' "$out"
-  eq '...the install does not run' absent "$(present "$DWT/vendor/m")"
+  contains 'relink: a moved-aside copy that cannot be removed says so' \
+    'vendor: could not remove the linked copy moved aside to .vendor.pitlane-removed.' "$out"
+  eq '...the dir itself is gone, not half there' absent "$(present "$DWT/vendor")"
+  leftover=$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)
+  ne '...the leftover sits beside it' '' "$leftover"
   eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
-  eq '...and it is not done, so the next run retries' dirty "$(wt_state_status "$DWT" vendor)"
-  chmod 755 "$DWT/vendor/locked"
+  eq '...and it is not done, so the next run installs' dirty "$(wt_state_status "$DWT" vendor)"
+  chmod 755 "$DWT/$leftover/locked"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  contains '...which removes it once it can' 'removing the linked copy and installing fresh' "$out"
-  eq '...and installs into a fresh dir' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/vendor/locked")"
+  contains '...which removes the leftover' "vendor: removed $leftover, a linked copy an earlier run moved aside" "$out"
+  eq '...and installs into a fresh dir' "done|DINSTALLED|absent|absent" \
+    "$(wt_state_status "$DWT" vendor)|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/locked")|$(present "$DWT/$leftover")"
   eq "...main's tree still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
   rm -rf "$DREPO/vendor/locked"
 fi
