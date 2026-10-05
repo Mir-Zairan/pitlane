@@ -1029,6 +1029,35 @@ eq 'removed dep (admin dir): it is gone, the symlink and the look-alikes kept' '
   "$(exists "$LA") $( [ -L "$LAS" ] && echo yes || echo no) $(exists "$WLA/node_modules.4.5") $(exists "$WLA/vendor.4") $(exists "$WLA/vendor.4.x") $(exists "$WLA/.vendor.pitlane-removed.4.5") $(cat "$TGT/precious")"
 rm -rf "$WLA"
 
+# --- A pull request's copy of main's tree, made in a temp of its own name (wt_own_copy_from_main):
+# never listed while the process in its name lives — it is being made — and listed as an interrupted
+# copy once that process is gone.
+WLC=$(git -C "$WL" rev-parse --absolute-git-dir)/pitlane-copying
+sh -c 'exit 0' &
+dead=$!
+wait "$dead"
+CLIVE=$WLC/vendor.$$.1
+CDEAD=$WLC/vendor.$dead.2
+BLIVE=$WL/.vendor.pitlane-copying.$$.3
+BDEAD=$WL/.vendor.pitlane-copying.$dead.4
+mkdir -p "$CLIVE/pkg" "$CDEAD/pkg" "$BLIVE" "$BDEAD"
+head -c 20000 /dev/zero >"$CDEAD/pkg/big.bin"
+prune "$RL"
+eq 'copying: a copy whose process lives is not listed, in the git dir or beside the dir' '|' \
+  "$(field removed-dep-leftover "$CLIVE" 5)|$(field removed-dep-leftover "$BLIVE" 5)"
+eq 'copying: one whose process is gone is offered, in the git dir and beside the dir' 'delete|delete' \
+  "$(field removed-dep-leftover "$CDEAD" 5)|$(field removed-dep-leftover "$BDEAD" 5)"
+contains 'copying: labelled an interrupted copy, naming its pid' "an interrupted copy of the main checkout's vendor into $WL (its process, pid $dead, is gone)" \
+  "$(field removed-dep-leftover "$CDEAD" 6)"
+eq 'copying: with its bytes by du' "$(du_bytes "$CDEAD")" "$(field removed-dep-leftover "$CDEAD" 4)"
+id_cdead=$(field removed-dep-leftover "$CDEAD" 1)
+id_bdead=$(field removed-dep-leftover "$BDEAD" 1)
+prune "$RL" --apply "$id_cdead" "$id_bdead"
+eq 'copying: apply exits 0' 0 "$(cat "$TMP/rc")"
+eq 'copying: the interrupted ones are gone, the live ones kept' 'no no yes yes' \
+  "$(exists "$CDEAD") $(exists "$BDEAD") $(exists "$CLIVE") $(exists "$BLIVE")"
+rm -rf "$WLC" "$BLIVE"
+
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------

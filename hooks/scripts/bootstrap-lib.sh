@@ -2279,13 +2279,14 @@ wt_removed_dep_name() {  # $1 = dir, $2 = pid, $3 = a random number
   printf '.%s.pitlane-removed.%s.%s' "${1##*/}" "$2" "$3"
 }
 
-# True if entry name $1 is exactly what wt_removed_dep_name makes for dependency dir $2. The /pitlane-tidy
-# sweep (prune.sh) matches with this too, so a name only resembling ours is never removed.
-wt_is_removed_dep_name() {  # $1 = entry name, $2 = dir
-  local name=${1-} base=${2##*/} rest pid rand
+# True if entry name $1 is exactly what wt_removed_dep_name makes for dependency dir $2 — or, with $3
+# `pitlane-copying`, wt_copying_dep_name. The /pitlane-tidy sweep (prune.sh) matches with this too, so
+# a name only resembling ours is never removed.
+wt_is_removed_dep_name() {  # $1 = entry name, $2 = dir, $3 = marker (default pitlane-removed)
+  local name=${1-} base=${2##*/} marker=${3:-pitlane-removed} rest pid rand
   [ -n "$base" ] || return 1
-  case $name in ".$base.pitlane-removed."*) ;; *) return 1 ;; esac
-  rest=${name#".$base.pitlane-removed."}
+  case $name in ".$base.$marker."*) ;; *) return 1 ;; esac
+  rest=${name#".$base.$marker."}
   pid=${rest%%.*}
   rand=${rest#*.}
   [ "$pid" != "$rest" ] || return 1
@@ -2333,6 +2334,26 @@ wt_is_removed_dep_admin_name() {  # $1 = entry name, $2 = dir
   return 0
 }
 
+# Where wt_own_copy_from_main makes its copy before renaming it into place: `pitlane-copying/` beside
+# `pitlane-removed/`, entries named as wt_removed_dep_admin_name names them; else beside the dir, as
+# wt_copying_dep_name. Not the removal's names: a copy still being made is no leftover, and
+# /pitlane-tidy lists one only once the pid in its name is gone (wt_dep_temp_pid).
+wt_copying_dep_admin_dir() {  # $1 = worktree
+  local admin
+  admin=$(wt_removed_dep_admin_dir "$1") || return 1
+  printf '%s/pitlane-copying' "${admin%/*}"
+}
+
+wt_copying_dep_name() {  # $1 = dir, $2 = pid, $3 = a random number
+  printf '.%s.pitlane-copying.%s.%s' "${1##*/}" "$2" "$3"
+}
+
+# The pid in a name wt_removed_dep_admin_name or wt_copying_dep_name made, on stdout.
+wt_dep_temp_pid() {  # $1 = entry name
+  local pid=${1%.*}
+  printf '%s' "${pid##*.}"
+}
+
 # True when paths $1 and $2 are on one device. A plain `mv` between two devices copies the whole tree
 # and then deletes it, which is the wrong trade for a move meant to be instant; 1 when either is unknown.
 wt_same_device() {  # $1, $2 = existing paths
@@ -2342,21 +2363,28 @@ wt_same_device() {  # $1, $2 = existing paths
   [ -n "$a" ] && [ "$a" = "$b" ]
 }
 
-# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then, and
-# what an interrupted wt_own_copy_from_main left in the same places, in the worktree's admin dir and
-# beside the dir. Only real dirs with names only we make.
-wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
-  local worktree=${1%/} dir=${2-} parent admin leftover err
+# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then, in
+# the worktree's admin dir and beside the dir. With $3 = 1, the caller holding the dep's lock (a real
+# flock, which every copy of the dir is made under), what an interrupted wt_own_copy_from_main left
+# too: without it, a copy still being made is not ours to judge. Only real dirs with names only we make.
+wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir, $3 = 1 to sweep interrupted copies too
+  local worktree=${1%/} dir=${2-} parent admin cadmin='' leftover err
+  local -a copying=()
   wt_is_safe_relpath "$dir" && ! wt_has_symlinked_parent "$worktree" "$dir" || return 0
   parent=$worktree
   case $dir in */*) parent=$worktree/${dir%/*} ;; esac
   admin=$(wt_removed_dep_admin_dir "$worktree") && [ -d "$admin" ] && [ ! -L "$admin" ] || admin=''
-  for leftover in ${admin:+"$admin"/*} "$parent/.${dir##*/}.pitlane-removed."*; do
-    if [ "${leftover%/*}" = "$admin" ]; then
-      wt_is_removed_dep_admin_name "${leftover##*/}" "$dir" || continue
-    else
-      wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
-    fi
+  if [ "${3-}" = 1 ]; then
+    cadmin=$(wt_copying_dep_admin_dir "$worktree") && [ -d "$cadmin" ] && [ ! -L "$cadmin" ] || cadmin=''
+    copying=(${cadmin:+"$cadmin"/*} "$parent/.${dir##*/}.pitlane-copying."*)
+  fi
+  for leftover in ${admin:+"$admin"/*} "$parent/.${dir##*/}.pitlane-removed."* ${copying[@]+"${copying[@]}"}; do
+    case ${leftover%/*} in
+      "$admin" | "$cadmin") wt_is_removed_dep_admin_name "${leftover##*/}" "$dir" || continue ;;
+      *) wt_is_removed_dep_name "${leftover##*/}" "$dir" \
+           || { [ "${3-}" = 1 ] && wt_is_removed_dep_name "${leftover##*/}" "$dir" pitlane-copying; } \
+           || continue ;;
+    esac
     [ -d "$leftover" ] && [ ! -L "$leftover" ] || continue
     if err=$(rm -rf -- "$leftover" 2>&1); then
       wt_log "  $dir: removed $leftover, a tree an earlier run left aside"
@@ -2845,35 +2873,72 @@ wt_own_copy_source_fits() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
   cmp -s "$root/$lock" "$worktree/$lock"
 }
 
-# WT_CP_REFLINK: yes when this `cp` takes `--reflink=auto` (GNU coreutils), no when it does not (BSD,
-# busybox), '' until asked. Tried once per process on an empty file in dir $1, not assumed from the
-# platform. On a copy-on-write filesystem (btrfs, XFS, bcachefs) a reflinked copy shares blocks until
-# either side writes, so a large tree copies in moments; elsewhere GNU cp copies as plain `cp -a` does.
-WT_CP_REFLINK=''
-wt_cp_reflink_judge() {  # $1 = a writable directory
-  local probe=${1%/}/.pitlane-reflink-probe.$$
+# What this machine's `cp` and `mv` take, judged once per process in a scratch dir under TMPDIR (never
+# in the worktree), not assumed from the platform. WT_CP_REFLINK: yes when `cp` takes `--reflink=auto`
+# (GNU coreutils). On a copy-on-write filesystem (btrfs, XFS, bcachefs) a reflinked copy shares blocks
+# until either side writes, so a large tree copies in moments; elsewhere GNU cp copies as plain `cp -a`
+# does. WT_MV_T: yes when `mv` takes `-T`, which renames onto a path that has become a directory as a
+# failure instead of moving into it. Both no where they do not (BSD, busybox), '' until asked.
+WT_CP_REFLINK='' WT_MV_T=''
+wt_copy_tools_judge() {
+  local probe
   [ -z "$WT_CP_REFLINK" ] || return 0
-  WT_CP_REFLINK=no
-  if : >"$probe.a" 2>/dev/null && cp --reflink=auto -- "$probe.a" "$probe.b" >/dev/null 2>&1; then
+  WT_CP_REFLINK=no WT_MV_T=no
+  probe=$(mktemp -d "${TMPDIR:-/tmp}/pitlane-reflink-probe.XXXXXX" 2>/dev/null) || return 0
+  if : >"$probe/a" 2>/dev/null && cp --reflink=auto -- "$probe/a" "$probe/b" >/dev/null 2>&1; then
     WT_CP_REFLINK=yes
   fi
-  rm -f -- "$probe.a" "$probe.b" 2>/dev/null
+  if mkdir -- "$probe/c" 2>/dev/null && mv -T -- "$probe/c" "$probe/d" >/dev/null 2>&1 && [ -d "$probe/d" ]; then
+    WT_MV_T=yes
+  fi
+  rm -rf -- "$probe" 2>/dev/null
   return 0
 }
 
-# Whether copy $1, to be renamed to $2, holds a symlink that would point into main checkout $3 rather
-# than into worktree $4: 0 with the first as `<path in the dir> -> <target>` in WT_COPY_ESCAPE, 1 when
-# none, 2 when the copy cannot be listed (the caller fails closed). A relative target is resolved,
-# by text, from where the link will sit; one with no `..` component stays below the link's own dir
-# and is not looked at. Absolute targets elsewhere (a system toolchain, a store path) are what main's
-# tree points at too: only main's own files are a write the copy exists to keep away from.
+# The physical path of $1 into WT_RESOLVED, each symlink on it followed as the kernel follows it: a
+# `..` after a link climbs from where the link points, not from the link's name. A component that
+# does not exist ends the resolution, the rest kept as text (a dangling link resolves as far as it
+# exists); so does one past the 40th link followed, a loop's. One readlink per link. A relative $1
+# is taken from $2, which must already be physical: its components are not looked at again.
+wt_resolve_physical() {  # $1 = path, $2 = the physical dir a relative $1 starts from
+  local rest=${1-} out='' seg target hops=0
+  case $rest in /*) ;; *) out=${2%/} ;; esac
+  while [ -n "$rest" ]; do
+    case $rest in
+      */*) seg=${rest%%/*} rest=${rest#*/} ;;
+      *) seg=$rest rest='' ;;
+    esac
+    case $seg in
+      '' | .) continue ;;
+      ..) out=${out%/*}; continue ;;   # `out` holds no link, so its text parent is its real one
+    esac
+    if [ "$hops" -lt 40 ] && [ -L "$out/$seg" ] && target=$(readlink -- "$out/$seg" 2>/dev/null); then
+      hops=$((hops + 1))
+      case $target in /*) out='' ;; esac
+      rest=$target${rest:+/$rest}
+      continue
+    fi
+    out=$out/$seg
+  done
+  WT_RESOLVED=${out:-/}
+}
+
+# Whether dependency dir $1, a copy in place in worktree $3, holds a symlink that resolves into main
+# checkout $2 rather than into the worktree (one inside main is the worktree's): 0 with the first as
+# `<path in the dir> -> <target>` in WT_COPY_ESCAPE, 1 when none, 2 when the dir cannot be listed (the
+# caller fails closed). Resolved on disk, where the link sits (wt_resolve_physical): a `..` after a
+# symlink in the tree, or a path through one of the worktree's own, goes where the filesystem takes
+# it. A bare name is not looked at: it is in the tree, and a link there is looked at itself. Absolute
+# targets elsewhere (a system toolchain, a store path) are what main's tree points at too: only
+# main's own files are a write the copy exists to keep away from.
 # One `find` for the whole tree; on GNU find it also prints the targets, else one readlink per link.
-wt_copy_symlink_escape() {  # $1 = copy, $2 = its final path, $3 = main checkout, $4 = worktree
-  local copy=${1%/} final=${2%/} root=${3%/} worktree=${4%/} rootp worktreep link target at gnu=0 listed=0
+wt_copy_symlink_escape() {  # $1 = dir, $2 = main checkout, $3 = worktree
+  local dir=${1%/} root=${2%/} worktree=${3%/} dirp rootp worktreep link target at gnu=0 listed=0
   WT_COPY_ESCAPE=''
+  dirp=$(cd -P -- "$dir" 2>/dev/null && pwd -P) || return 2
   rootp=$(cd -P -- "$root" 2>/dev/null && pwd -P) || rootp=$root
   worktreep=$(cd -P -- "$worktree" 2>/dev/null && pwd -P) || worktreep=$worktree
-  ! find "$copy" -maxdepth 0 -printf '' >/dev/null 2>&1 || gnu=1
+  ! find "$dir" -maxdepth 0 -printf '' >/dev/null 2>&1 || gnu=1
   # The empty name after find's own output marks a listing that finished: a find that failed part-way
   # (an unreadable subdir) never prints it.
   while IFS= read -r -d '' link; do
@@ -2887,39 +2952,60 @@ wt_copy_symlink_escape() {  # $1 = copy, $2 = its final path, $3 = main checkout
       break
     fi
     case $target in
-      /*) at=$target ;;
-      .. | ../* | */.. | */../*) at=${link#"$copy"} at=$final${at%/*}/$target ;;
+      /*) wt_resolve_physical "$target" ;;
+      */* | ..) at=${link#"$dir"}
+         wt_resolve_physical "$target" "$dirp${at%/*}" ;;
       *) continue ;;
     esac
-    wt_collapse_dotdot_into "$at/"
-    case ${WT_COLLAPSED%/}/ in
-      "$worktree"/* | "$worktreep"/*) ;;
-      "$root"/* | "$rootp"/*)
-        WT_COPY_ESCAPE="${link#"$copy"/} -> $target"
+    case $WT_RESOLVED/ in
+      "$worktreep"/*) ;;
+      "$rootp"/*)
+        WT_COPY_ESCAPE="${link#"$dir"/} -> $target"
         return 0
         ;;
     esac
   done < <(
     if [ "$gnu" = 1 ]; then
-      find "$copy" -type l -printf '%p\0%l\0' 2>/dev/null && printf '\0\0'
+      find "$dir" -type l -printf '%p\0%l\0' 2>/dev/null && printf '\0\0'
     else
-      find "$copy" -type l -print0 2>/dev/null && printf '\0'
+      find "$dir" -type l -print0 2>/dev/null && printf '\0'
     fi
   )
   [ "$listed" = 1 ] || return 2
   return 1
 }
 
+# Take worktree $1's dependency dir $2, a copy that must not stay, out of use: renamed where
+# wt_clear_linked_dep renames a dir it removes, so what `rm` cannot finish is swept as its leftovers
+# are, then removed. True once the dir is gone from the worktree.
+wt_discard_dep_copy() {  # $1 = worktree, $2 = dir
+  local worktree=${1%/} dir=${2-} dest aside admin
+  dest=$worktree/$dir
+  if admin=$(wt_removed_dep_admin_dir "$worktree") && mkdir -p -- "$admin" 2>/dev/null && [ ! -L "$admin" ] \
+    && wt_same_device "${dest%/*}" "$admin"; then
+    aside=$admin/$(wt_removed_dep_admin_name "$dir" "$$" "${RANDOM:-0}")
+  else
+    aside=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
+  fi
+  if [ ! -e "$aside" ] && [ ! -L "$aside" ] && mv -- "$dest" "$aside" 2>/dev/null; then
+    rm -rf -- "$aside" 2>/dev/null
+    return 0
+  fi
+  rm -rf -- "$dest" 2>/dev/null
+  [ ! -e "$dest" ] && [ ! -L "$dest" ]
+}
+
 # Give pull request worktree $2 its own copy of the main checkout's dependency dir $3, which
-# wt_own_copy_source_fits has approved and the caller has cleared: `cp -a` (`--reflink=auto` where
-# cp takes it) into a temp named and placed as wt_clear_linked_dep's removals are — the admin dir on
-# the dir's device, else beside the dir — so an interrupted copy is swept like one, and teardown and
-# /pitlane-tidy know it. Its symlinks are checked there, then it is renamed into place: the dir is
-# never a half copy. The copy is stopped after $4 seconds. Its size is logged: a copy costs disk.
-#   0 = in place, 1 = install instead (said why), 2 = ran out of time (nothing left; the next run tries again).
+# wt_own_copy_source_fits has approved and the caller has cleared, holding the dep's lock and having
+# recorded it `doing`: `cp -a` (`--reflink=auto` where cp takes it) into a temp of its own name
+# (wt_copying_dep_admin_dir) on the dir's device, renamed into place: the dir is never a half copy.
+# Its symlinks are then checked where they sit, and a tree with one leading back into main is taken
+# out again. The copy is stopped after $4 seconds. Its size is logged, within what is left of them.
+#   0 = in place, 1 = install instead (said why), 2 = ran out of time (nothing left; the next run tries
+#   again), 3 = refused and could not be removed (left `doing`, which the next run clears).
 wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
-  local root=${1%/} worktree=${2%/} dir=${3-} secs=${4-} dest tmp admin err rc=0 started elapsed size note=''
-  local -a flags=(-a) bound=()
+  local root=${1%/} worktree=${2%/} dir=${3-} secs=${4-} dest tmp admin err rc=0 started elapsed left size note='' why
+  local -a flags=(-a) bound=() mvt=()
   dest=$worktree/$dir
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     wt_log "  $dir: already present in the worktree, sharing no file with another tree — installing over it rather than copying the main checkout's"
@@ -2929,18 +3015,19 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
     wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — installing instead"
     return 1
   fi
-  if admin=$(wt_removed_dep_admin_dir "$worktree") && mkdir -p -- "$admin" 2>/dev/null && [ ! -L "$admin" ] \
+  if admin=$(wt_copying_dep_admin_dir "$worktree") && mkdir -p -- "$admin" 2>/dev/null && [ ! -L "$admin" ] \
     && wt_same_device "${dest%/*}" "$admin"; then
     tmp=$admin/$(wt_removed_dep_admin_name "$dir" "$$" "${RANDOM:-0}")
   else
-    tmp=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
+    tmp=${dest%/*}/$(wt_copying_dep_name "$dir" "$$" "${RANDOM:-0}")
   fi
   if [ -e "$tmp" ] || [ -L "$tmp" ]; then
     wt_log "  $dir: could not copy it from the main checkout (${tmp##*/} exists) — installing instead"
     return 1
   fi
-  wt_cp_reflink_judge "${tmp%/*}"
+  wt_copy_tools_judge
   [ "$WT_CP_REFLINK" = no ] || flags+=(--reflink=auto) note=', copy-on-write where the filesystem allows'
+  [ "$WT_MV_T" = no ] || mvt=(-T)
   command -v timeout >/dev/null 2>&1 && wt_is_seconds "$secs" && bound=(timeout "$secs")
   started=$(date +%s 2>/dev/null) || started=''
   err=$(${bound[@]+"${bound[@]}"} cp "${flags[@]}" -- "$root/$dir" "$tmp" 2>&1) || rc=$?
@@ -2953,35 +3040,55 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
     wt_log "  $dir: could not copy it from the main checkout (${err%%"$WT_NL"*}) — installing instead"
     return 1
   fi
-  # A symlink main's tree holds into main itself would, copied, still lead the PR's writes there.
-  wt_copy_symlink_escape "$tmp" "$dest" "$root" "$worktree"
-  case $? in
-    0) rm -rf -- "$tmp" 2>/dev/null
-       wt_log "  $dir: the main checkout's copy has a symlink pointing back into it ($WT_COPY_ESCAPE) — installing instead"
-       return 1 ;;
-    2) rm -rf -- "$tmp" 2>/dev/null
-       wt_log "  $dir: could not list the symlinks in the main checkout's copy — installing instead"
-       return 1 ;;
-  esac
-  # Re-tested: were it there now, `mv` would put the copy inside it.
+  # Re-tested, and `mv -T` where it exists: a dir appearing at $dest meanwhile would take the copy
+  # inside it. Where `mv` has no -T, that is looked for after the rename and undone.
   err="$dir appeared in the worktree meanwhile"
-  if [ -e "$dest" ] || [ -L "$dest" ] || ! err=$(mv -- "$tmp" "$dest" 2>&1); then
+  if [ -e "$dest" ] || [ -L "$dest" ] || ! err=$(mv ${mvt[@]+"${mvt[@]}"} -- "$tmp" "$dest" 2>&1); then
     rm -rf -- "$tmp" 2>/dev/null
     wt_log "  $dir: could not move the copy into place (${err%%"$WT_NL"*}) — installing instead"
     return 1
   fi
-  elapsed=''
+  if [ "${#mvt[@]}" -eq 0 ] && { [ -e "$dest/${tmp##*/}" ] || [ -L "$dest/${tmp##*/}" ]; }; then
+    rm -rf -- "${dest:?}/${tmp##*/}" 2>/dev/null
+    wt_log "  $dir: appeared in the worktree while the copy was made — installing over it rather than copying the main checkout's"
+    return 1
+  fi
+  # A symlink main's tree holds into main itself would, copied, still lead the PR's writes there.
+  wt_copy_symlink_escape "$dest" "$root" "$worktree"
+  case $? in
+    0) why="the main checkout's copy has a symlink pointing back into it ($WT_COPY_ESCAPE)" ;;
+    2) why="could not list the symlinks in the main checkout's copy" ;;
+    *) why='' ;;
+  esac
+  if [ -n "$why" ]; then
+    if wt_discard_dep_copy "$worktree" "$dir"; then
+      wt_log "  $dir: $why — installing instead"
+      return 1
+    fi
+    wt_log "  $dir: $why, and the copy could not be removed — the next run clears it and installs"
+    return 3
+  fi
+  elapsed='' size=''
   [ -z "$started" ] || elapsed=$(( $(date +%s) - started ))
-  size=$(du -sh -- "$dest" 2>/dev/null) && size=${size%%[[:space:]]*} || size=''
+  # Measured within what is left of the copy's seconds: `du` walks every file, and on a large tree
+  # that is a second copy's worth of time. Not measured where nothing can bound it.
+  if [ "${#bound[@]}" -gt 0 ] && [ -n "$elapsed" ]; then
+    left=$((secs - elapsed))
+    if [ "$left" -gt 0 ]; then
+      size=$(timeout "$left" du -sh -- "$dest" 2>/dev/null) && size=${size%%[[:space:]]*} || size=''
+    fi
+  fi
   wt_log "  $dir: copied from the main checkout${elapsed:+ in ${elapsed}s}${size:+ ($size$note)}"
   return 0
 }
 
-# wt_state_is_done for dependency $2, where a pull request's own copy ($6 = 1) recorded `copy` counts
-# as current for its `install` too: either made a private tree for this lockfile and command.
+# wt_state_is_done for dependency $2, where a pull request's own copy ($6 = 1) recorded `own-copy`
+# counts as current for its `install` too: either made a private tree for this lockfile and command.
+# `copy` is the spelling the first version of this wrote, read the same.
 wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy
   wt_state_is_done "$1" "$2" "$3" "$4" "$5" && return 0
-  [ "${6-}" = 1 ] && wt_state_is_done "$1" "$2" "$3" "$4" copy
+  [ "${6-}" = 1 ] || return 1
+  wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy
 }
 
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
@@ -3197,9 +3304,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
     fi
     # What a removal moved aside and could not finish (wt_clear_linked_dep). Under the lock, or with
-    # no flock to take: the same rule as the partial dir above.
+    # no flock to take: the same rule as the partial dir above. An interrupted copy only under the
+    # lock (held is never 1 without flock): without it, another run may be making that copy now.
     if { [ "$strategy" = hardlink ] || [ "$own_copy" = 1 ]; } && { [ "$held" -eq 1 ] || [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; }; then
-      wt_sweep_removed_dep "$worktree" "$dir"
+      wt_sweep_removed_dep "$worktree" "$dir" "$held"
     fi
 
     # The budget may have gone while waiting for the lock and clearing the tree. Without this
@@ -3272,6 +3380,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         0) effective=copy ;;
         2) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
            [ "$held" -eq 1 ] && wt_lock_release 9
+           continue ;;
+        3) [ "$held" -eq 1 ] && wt_lock_release 9
            continue ;;
       esac
     fi
@@ -3406,9 +3516,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # either counts as current (wt_dep_lock_matches): the developer may restore it. A tracked one it
     # rewrote is in the `changed` record (wt_install_note_changes), so the user is still told.
     lck_before=''
-    # Recorded as what it is: a later run takes `copy` for current (wt_dep_is_done), and nothing that
-    # mends or moves a LINKED tree (wt_own_copy_unlink, wt_repair_shared_copy_paths) reads it as one.
-    [ "$effective" != copy ] || strategy=copy
+    # Recorded as what it is, as an artifact's is: a later run takes `own-copy` for current
+    # (wt_dep_is_done), and nothing that mends or moves a LINKED tree (wt_own_copy_unlink,
+    # wt_repair_shared_copy_paths) reads it as one.
+    [ "$effective" != copy ] || strategy='own-copy'
     if [ "$effective" = install ]; then
       case $outcome in
         "done" | warn)
@@ -3885,7 +3996,8 @@ wt_bootstrap_pending() {  # $1 = worktree
     current=0
     if wt_state_dep_read "$worktree" "$dir" && wt_dep_lock_matches "$lckhash" "$WT_DEP_LCK" "$WT_DEP_LCK_BEFORE" \
       && [ "$WT_DEP_ICK" = "$ickhash" ] \
-      && { [ "$WT_DEP_STRATEGY" = "$strategy" ] || { [ "$own" = 1 ] && [ "$WT_DEP_STRATEGY" = copy ]; }; }; then
+      && { [ "$WT_DEP_STRATEGY" = "$strategy" ] \
+        || { [ "$own" = 1 ] && { [ "$WT_DEP_STRATEGY" = own-copy ] || [ "$WT_DEP_STRATEGY" = copy ]; }; }; }; then
       current=1
     fi
     if [ "$current" = 1 ]; then

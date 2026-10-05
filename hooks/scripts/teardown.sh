@@ -167,11 +167,14 @@ if [ "$present" = 1 ]; then
   # What a fresh install moved into the git dir and could not remove (wt_clear_linked_dep) is ours. A
   # read-only tree there (Go's module cache is one) lets `git worktree remove` delete the checkout and
   # then fail on the git dir, leaving a registration that `git worktree prune` cannot remove either.
-  if [ -n "$admin" ] && [ -d "$admin/pitlane-removed" ] && [ ! -L "$admin/pitlane-removed" ]; then
-    chmod -R u+w -- "$admin/pitlane-removed" 2>/dev/null
-    rm -rf -- "${admin:?}/pitlane-removed" 2>/dev/null \
-      || wt_log "could not remove $admin/pitlane-removed, dependency copies a fresh install moved aside"
-  fi
+  # A copy of main's a pull request's worktree was making (wt_own_copy_from_main) is the same.
+  for leftovers in pitlane-removed pitlane-copying; do
+    if [ -n "$admin" ] && [ -d "$admin/$leftovers" ] && [ ! -L "$admin/$leftovers" ]; then
+      chmod -R u+w -- "$admin/$leftovers" 2>/dev/null
+      rm -rf -- "${admin:?}/$leftovers" 2>/dev/null \
+        || wt_log "could not remove $admin/$leftovers, dependency copies a fresh install moved aside or a copy left"
+    fi
+  done
 
   # A single --force: it takes the gitignored dependency directories with it. Never -f -f.
   out=$(wt_git "$root" worktree remove --force "$worktree" 2>&1) || {

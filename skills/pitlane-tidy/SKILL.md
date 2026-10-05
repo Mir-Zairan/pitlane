@@ -72,8 +72,9 @@ registration of a worktree that is gone), `runtime-leftover` (a runtime allocati
 `server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
 as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record),
 `removed-dep-leftover` (a copy of a hardlinked dependency dir — `.vendor.pitlane-removed.<pid>.<n>`
-beside `vendor/` — that a fresh install moved aside and could not finish removing, in the main
-checkout or a live worktree; the next setup of that dependency there removes it too, and applying it
+beside `vendor/` — that a fresh install moved aside and could not finish removing, or an interrupted
+copy of the main checkout's tree a pull request's worktree was making — `.vendor.pitlane-copying.<pid>.<n>`,
+listed only once that pid is gone — in the main checkout or a live worktree; the next setup of that dependency there removes it too, and applying it
 is refused while a Pitlane run holds that worktree), `abandoned` (a subagent worktree — `agent-<hex>` — that is
 unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
 `WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live

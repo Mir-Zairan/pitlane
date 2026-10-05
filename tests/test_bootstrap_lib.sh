@@ -2991,7 +2991,7 @@ eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap
 eq '...no temp left in the git dir or beside the dir' '|' \
   "$(ls -A "$(wt_removed_dep_admin_dir "$DWT")" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
 wt_state_dep_read "$DWT" vendor
-eq '...recorded done as a copy' "done|copy" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+eq '...recorded done as its own copy, spelled as an artifact'"'"'s is' "done|own-copy" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains '...which the next run finds up to date' 'vendor: already up to date' "$out"
 lacks '...without saying it again' 'rather than link it' "$out"
@@ -3204,11 +3204,15 @@ git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
 PCADMIN=$(wt_removed_dep_admin_dir "$DWT")
+PCCOPYING=$(wt_copying_dep_admin_dir "$DWT")
 pc_reset() {  # no vendor, no record, no leftovers, main's lockfile
-  rm -rf "$DWT/vendor" "$PCADMIN"; rm -f "$(wt_state_path "$DWT")"
+  rm -rf "$DWT/vendor" "$PCADMIN" "$PCCOPYING"; rm -f "$(wt_state_path "$DWT")"
   printf 'LOCKV1\n' > "$DWT/composer.lock"
 }
-pc_leftovers() { printf '%s|%s' "$(ls -A "$PCADMIN" 2>/dev/null)" "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"; }
+pc_leftovers() {
+  printf '%s|%s' "$(cd "$PCADMIN" 2>/dev/null && ls -A)$(cd "$PCCOPYING" 2>/dev/null && ls -A)" \
+    "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* .vendor.pitlane-copying.* 2>/dev/null)"
+}
 
 # A relative symlink inside the tree is kept as it is, and so resolves inside the worktree.
 mkdir -p "$DREPO/vendor/bin"
@@ -3268,28 +3272,77 @@ out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'pr copy: a target ending in .. that lands in main is refused' 'pointing back into it (bin/up -> ../../../../..)' "$out"
 rm -f "$DREPO/vendor/bin/up"
 
-# The scan's arms, on its own: what counts, and a listing that fails is a refusal.
-mkdir -p "$TMP/scan/copy/a"
-pc_scan() { wt_copy_symlink_escape "$TMP/scan/copy" "$DWT/vendor" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE"; }
+# Resolved on disk, not by text: a `..` after a symlink climbs from where that symlink points. Here
+# u1 is the worktree itself, so u1/vendor/u1/../../.. is main, while its text collapses to vendor.
+ln -s .. "$DREPO/vendor/u1"
+ln -s u1/vendor/u1/../../.. "$DREPO/vendor/u2"
+pc_reset
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a chain of two links that climbs into main is refused' \
+  "vendor: the main checkout's copy has a symlink pointing back into it (u2 -> u1/vendor/u1/../../..) — installing instead" "$out"
+eq '...installed instead, nothing left behind' "install|" "$(linked_from)|$(pc_leftovers | tr -d '|')"
+rm -f "$DREPO/vendor/u1" "$DREPO/vendor/u2"
+# Through a symlink the worktree itself holds (a tracked one, in a pull request): followed, too.
+ln -s "$DREPO" "$DWT/shared"
+ln -s ../shared/composer.lock "$DREPO/vendor/thru"
+pc_reset
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains "pr copy: a link through the worktree's own symlink into main is refused" \
+  'pointing back into it (thru -> ../shared/composer.lock)' "$out"
+eq '...installed instead' install "$(linked_from)"
+rm -f "$DREPO/vendor/thru" "$DWT/shared"
+
+# The scan's arms, on its own, over a dir in place in the worktree: what counts, and a listing that
+# fails is a refusal.
+PCS=$DWT/scanned
+mkdir -p "$PCS/a"
+pc_scan() { wt_copy_symlink_escape "$PCS" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE"; }
 eq 'scan: no symlinks, nothing found' '1:' "$(pc_scan)"
-ln -s "$DWT/composer.lock" "$TMP/scan/copy/a/own"
+ln -s "$DWT/composer.lock" "$PCS/a/own"
 eq "scan: an absolute link into the worktree itself is its own" '1:' "$(pc_scan)"
-ln -s "$DREPO/.git" "$TMP/scan/copy/a/git"
+ln -s ../../composer.lock "$PCS/a/rel"
+eq "scan: a relative one that stays in the worktree is kept" '1:' "$(pc_scan)"
+ln -s "$DREPO/.git" "$PCS/a/git"
 eq "scan: one into main's git dir is main's" "0:a/git -> $DREPO/.git" "$(pc_scan)"
-rm -f "$TMP/scan/copy/a/git"
-ln -s "$DWT/../other/vendor" "$TMP/scan/copy/a/sib"
+rm -f "$PCS/a/git"
+ln -s "$DWT/../other/vendor" "$PCS/a/sib"
 eq "scan: one into another worktree under main counts as main's" "0:a/sib -> $DWT/../other/vendor" "$(pc_scan)"
-rm -f "$TMP/scan/copy/a/sib"
-ln -s ..lookalike "$TMP/scan/copy/a/dots"
+rm -f "$PCS/a/sib"
+ln -s ..lookalike "$PCS/a/dots"
 eq 'scan: a name starting with dots is not a climb' '1:' "$(pc_scan)"
+ln -s ../nowhere/x "$PCS/a/dangling"
+eq 'scan: a dangling link inside the worktree is kept' '1:' "$(pc_scan)"
+ln -s "$DREPO/nowhere/x" "$PCS/a/dangling-main"
+eq 'scan: a dangling link into main resolves as far as it exists: main' "0:a/dangling-main -> $DREPO/nowhere/x" "$(pc_scan)"
+rm -f "$PCS/a/dangling-main"
+ln -s ./loop2 "$PCS/a/loop1"
+ln -s ./loop1 "$PCS/a/loop2"
+eq 'scan: a loop stops at the hop limit, and stays in the tree' '1:' "$(pc_scan)"
+ln -s "$DREPO" "$DWT/shared"
+ln -s "$DWT/shared/composer.lock" "$PCS/a/through"
+eq "scan: an absolute link through the worktree's own symlink into main is main's" \
+  "0:a/through -> $DWT/shared/composer.lock" "$(pc_scan)"
+rm -f "$PCS/a/through" "$DWT/shared"
+ln -s .. "$PCS/u1"
+ln -s u1/scanned/u1/../../.. "$PCS/u2"
+eq 'scan: two links whose text stays in the tree, on disk in main' "0:u2 -> u1/scanned/u1/../../.." "$(pc_scan)"
+rm -f "$PCS/u1" "$PCS/u2"
 # shellcheck disable=SC2329  # stands in for find inside the scan
 eq 'scan: a find that fails is a refusal' '2:' "$(find() { return 1; }; pc_scan)"
+eq 'scan: a dir that is not there is a refusal' '2:' \
+  "$(wt_copy_symlink_escape "$DWT/not-there" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE")"
 # Without GNU find's -printf: one readlink per link, the same answer.
-ln -s ../../../../../composer.lock "$TMP/scan/copy/a/climb"
+ln -s ../../../../../composer.lock "$PCS/a/climb"
 # shellcheck disable=SC2329  # stands in for find inside the scan
 eq 'scan, plain find: a climb into main is found' "0:a/climb -> ../../../../../composer.lock" \
   "$(find() { case " $* " in *' -printf '*) return 1 ;; esac; command find "$@"; }; pc_scan)"
-rm -rf "$TMP/scan"
+rm -rf "$PCS"
+# The resolution on its own: a link mid-path is followed before the `..` after it.
+mkdir -p "$TMP/rp/real/deep"
+ln -s real/deep "$TMP/rp/ln"
+wt_resolve_physical "$TMP/rp/ln/../x/y"
+eq 'resolve: .. after a link climbs from its target, a missing rest kept as text' "$(cd -P "$TMP/rp" && pwd -P)/real/x/y" "$WT_RESOLVED"
+rm -rf "$TMP/rp"
 
 # cp stood in for: one that fails part-way, one that hangs, one without --reflink, one that logs.
 REALCP=$(command -v cp)
@@ -3352,7 +3405,64 @@ out=$(pc_with_cp cp-noreflink wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 eq 'pr copy: a cp without --reflink still copies, with plain cp -a' copy "$(linked_from)"
 lacks '...without the copy failing' 'could not copy' "$out"
 lacks '...nor claiming copy-on-write' 'copy-on-write' "$out"
-eq '...no probe file left' '' "$(compgen -G "$PCADMIN/.pitlane-reflink-probe.*")"
+# The probe for what cp and mv take is made under TMPDIR, never in the worktree or its git dir.
+pc_reset
+mkdir -p "$TMP/pc-tmpdir"
+out=$(TMPDIR=$TMP/pc-tmpdir wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'pr copy: the tool probe leaves nothing in TMPDIR, the git dir or the worktree' '|||' \
+  "$(ls -A "$TMP/pc-tmpdir")|$(compgen -G "$PCADMIN/*probe*")|$(compgen -G "$PCCOPYING/*probe*")|$(compgen -G "$DWT/*probe*")"
+eq '...and copies' copy "$(linked_from)"
+
+# A dir appearing at the copy's place after the last test and before the rename: `mv -T` fails
+# rather than move the copy inside it; where mv has no -T, the copy found inside it is taken out.
+REALMV=$(command -v mv)
+# shellcheck disable=SC2016  # the stand-in's own script, expanded when it runs
+{
+  printf '#!/bin/sh\ncase "$*" in *pitlane-reflink-probe*) exec %s "$@" ;; esac\n' "$REALMV"
+  printf 'for a; do last=$a; done\ncase $last in */vendor) mkdir -p "$last" && : > "$last/raced" ;; esac\n'
+  printf 'exec %s "$@"\n' "$REALMV"
+} > "$PCBIN/mv-races"
+chmod +x "$PCBIN/mv-races"
+pc_with_mv() { mkdir -p "$PCBIN/mv.d"; ln -sf "$PCBIN/mv-races" "$PCBIN/mv.d/mv"; PATH=$PCBIN/mv.d:$PATH "$@"; }
+pc_reset
+out=$(pc_with_mv wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy, mv -T: a dir that appeared first fails the rename' 'vendor: could not move the copy into place (' "$out"
+eq '...nothing moved inside it, no temp left' 'present|||' "$(present "$DWT/vendor/raced")|$(compgen -G "$DWT/vendor/vendor.*"; compgen -G "$DWT/vendor/.vendor.pitlane-*")|$(pc_leftovers)"
+pc_reset
+out=$(WT_CP_REFLINK=no WT_MV_T=no pc_with_mv wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy, mv without -T: the copy found inside the dir is taken out' \
+  'vendor: appeared in the worktree while the copy was made — installing over it' "$out"
+eq '...nothing of it left inside, no temp left' 'present|||' "$(present "$DWT/vendor/raced")|$(compgen -G "$DWT/vendor/vendor.*"; compgen -G "$DWT/vendor/.vendor.pitlane-*")|$(pc_leftovers)"
+
+# The size after the copy is measured within what is left of the budget, never past it.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nexec sleep 30\n' > "$PCBIN/du-hangs"
+chmod +x "$PCBIN/du-hangs"
+mkdir -p "$PCBIN/du.d"; ln -sf "$PCBIN/du-hangs" "$PCBIN/du.d/du"
+pc_reset
+t0=$(date +%s)
+out=$(PATH=$PCBIN/du.d:$PATH wt_bootstrap_deps "$DREPO" "$DWT" "$(( $(date +%s) + 3 ))" 2>&1)
+eq 'pr copy: a du that hangs is stopped with the budget' yes "$([ $(( $(date +%s) - t0 )) -lt 15 ] && echo yes)"
+contains '...the copy still logged, without a size' 'vendor: copied from the main checkout in ' "$out"
+eq '...and in place' copy "$(linked_from)"
+
+# A copy interrupted by a killed run leaves its temp under its own name; the next run, under the
+# dep's lock, removes it. Without the lock it is not judged: another run may be making it.
+pc_reset
+mkdir -p "$PCCOPYING/vendor.999999.1/pkg" "$DWT/.vendor.pitlane-copying.999999.2"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: an interrupted copy in the git dir is removed under the lock' "vendor: removed $PCCOPYING/vendor.999999.1" "$out"
+contains '...and one beside the dir' "vendor: removed $DWT/.vendor.pitlane-copying.999999.2" "$out"
+eq '...both gone' '|' "$(pc_leftovers)"
+mkdir -p "$PCCOPYING/vendor.999999.1" "$DWT/.vendor.pitlane-copying.999999.2"
+wt_sweep_removed_dep "$DWT" vendor '' 2>/dev/null
+eq '...not swept without the lock' 'present|present' \
+  "$(present "$PCCOPYING/vendor.999999.1")|$(present "$DWT/.vendor.pitlane-copying.999999.2")"
+wt_sweep_removed_dep "$DWT" vendor 1 2>/dev/null
+eq '...swept with it' 'absent|absent' \
+  "$(present "$PCCOPYING/vendor.999999.1")|$(present "$DWT/.vendor.pitlane-copying.999999.2")"
+eq 'copying name: its own marker, not a removal'"'"'s' '.vendor.pitlane-copying.12.345|no|yes|12' \
+  "$(wt_copying_dep_name vendor 12 345)|$(wt_is_removed_dep_name .vendor.pitlane-copying.12.345 vendor && echo yes || echo no)|$(wt_is_removed_dep_name .vendor.pitlane-copying.12.345 vendor pitlane-copying && echo yes || echo no)|$(wt_dep_temp_pid .vendor.pitlane-copying.12.345)"
 
 # Deferred at start-up: nothing is copied then, and nothing is left half-made.
 pc_reset
@@ -3385,6 +3495,12 @@ eq '...not for a worktree that installs as such' 1 "$(wt_dep_is_done "$DWT" vend
   "$(wt_cksum_string "$RINSTALL")" install 0; echo $?)"
 eq '...nor for another lockfile' 1 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_string other)" \
   "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+# A record spelled `copy`, as the first version wrote it, is read the same.
+wt_state_set "$DWT" vendor copy "$(wt_cksum_file "$DWT/composer.lock")" "$(wt_cksum_string "$RINSTALL")" 'done'
+eq '...a record spelled copy is current too' 0 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
+eq '...and not pending' '' "$WT_PENDING"
 printf 'LOCKV8\n' > "$DWT/composer.lock"
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks '...its lockfile changed: the copy is not moved aside as a link at start-up' 'linked copy' "$out"
