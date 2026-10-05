@@ -3163,7 +3163,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # the background run like an install, and decided by `verify` like one.
 #
 # One `art` record per dir, in the dep record's fields: `art dir build lck ick status when rc
-# reason`, where lck is the inputs key (wt_art_inputs_key) and ick the build command's checksum. A
+# reason`, where lck is the inputs key (wt_art_inputs_key) and ick the build command's checksum; the
+# strategy field is `own-copy` instead of `build` where a pull request's worktree copies (wt_art_strategy). A
 # done record stands while the command is unchanged and the dir is non-empty, NOT while the inputs
 # are: once a worktree has its build, keeping it current as the branch moves is the repo's own dev
 # tooling's job, and rebuilding on every commit would fight a running watcher. The inputs key
@@ -3274,6 +3275,18 @@ wt_art_take_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = link, $5 = seco
   return 1
 }
 
+# How build output with link $2 is put into worktree $1, in WT_ART_LINK, and the strategy its record
+# carries, in WT_ART_STRATEGY: `build`, or `own-copy` where a pull request's worktree copies what the
+# profile hardlinks (wt_own_copy_judge says why; a watcher rewrites its output in place, through a
+# shared inode into main's). A record that differs, one linked before this, is no longer up to date,
+# so the dir is replaced. WT_OWN_COPY memoises the judgement for one walk.
+wt_art_strategy() {  # $1 = worktree, $2 = link
+  WT_ART_LINK=${2-} WT_ART_STRATEGY=build
+  [ "$WT_ART_LINK" = hardlink ] || return 0
+  [ -n "${WT_OWN_COPY:-}" ] || wt_own_copy_judge "$1"
+  [ "$WT_OWN_COPY" = 0 ] || WT_ART_LINK=copy WT_ART_STRATEGY=own-copy
+}
+
 # True when every dependency is installed (done or warn), so a build has what it needs. Reads the
 # items wt_bootstrap_pending sets, and leaves them set.
 wt_art_deps_ready() {  # $1 = worktree
@@ -3290,6 +3303,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local rec body dir inputs build verify link n=-1 list bad why ikey ick held contended lockpath
   local left capture tracked_before tracking started elapsed rc reason outcome vrc wait
+  WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -3319,6 +3333,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       *" $link "*) ;;
       *) wt_log "artifacts[$n]: refusing $dir — link \"$link\" is not one of $WT_ARTIFACT_LINKS"; continue ;;
     esac
+    wt_art_strategy "$worktree" "$link"
+    link=$WT_ART_LINK
     bad=$(wt_unsafe_command_placeholder "$build")
     [ -n "$bad" ] || bad=$(wt_unsafe_command_placeholder "$verify")
     if [ -n "$bad" ]; then
@@ -3332,11 +3348,12 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 
     # First, and with no git call: the re-entry path of every session.
     wt_art_state_read "$worktree" "$dir" || true
-    if [ "$WT_DEP_ICK" = "$ick" ] && wt_art_has_content "$worktree/$dir"; then
+    if [ "$WT_DEP_ICK" = "$ick" ] && [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ] && wt_art_has_content "$worktree/$dir"; then
       case $WT_DEP_STATUS in
         "done" | warn) wt_log "  $dir: already up to date"; continue ;;
       esac
     fi
+    [ "$WT_ART_STRATEGY" = build ] || wt_log "  $dir: a pull request's worktree takes its own copy — a linked one would share files with the main checkout both ways"
     why=$(wt_art_refusal "$worktree" "$dir")
     if [ -n "$why" ]; then
       wt_log "  $dir: not touched — $why, and the plugin replaces only gitignored build output"
@@ -3346,7 +3363,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
     # A dir already there with no record of ours is the developer's own build: left alone.
     if [ -z "$WT_DEP_STATUS" ] && wt_art_has_content "$worktree/$dir"; then
       wt_log "  $dir: already present in the worktree — leaving it alone"
-      wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+      wt_art_state_set "$worktree" "$dir" "$WT_ART_STRATEGY" "$ikey" "$ick" "done" || true
       continue
     fi
     if [ "${WT_RETRY_FAILED:-}" != 1 ] && [ "$WT_DEP_STATUS" = failed ] && [ "$WT_DEP_LCK" = "$ikey" ] \
@@ -3384,7 +3401,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
         ;;
     esac
     if [ "$held" -eq 1 ] && wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ] \
-      && wt_art_has_content "$worktree/$dir"; then
+      && [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ] && wt_art_has_content "$worktree/$dir"; then
       case $WT_DEP_STATUS in
         "done" | warn)
           wt_log "  $dir: another run finished it while we waited"
@@ -3424,7 +3441,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
         case $? in
           0)
             wt_log "  $dir: $([ "$link" = hardlink ] && echo hardlinked || echo copied) from the main checkout (its inputs are unchanged)"
-            wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "done" || true
+            wt_art_state_set "$worktree" "$dir" "$WT_ART_STRATEGY" "$ikey" "$ick" "done" || true
             [ "$held" -eq 1 ] && wt_lock_release 9
             continue
             ;;
@@ -3472,7 +3489,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       [ "$held" -eq 1 ] && wt_lock_release 9
       continue
     fi
-    wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" doing || true
+    wt_art_state_set "$worktree" "$dir" "$WT_ART_STRATEGY" "$ikey" "$ick" doing || true
     wt_log "  $dir: building (${left}s of the budget left)"
     started=$(date +%s 2>/dev/null) || started=''
     WT_RUN_CAPTURE=$capture wt_run_in_shell "$build" "$worktree" "$left"
@@ -3519,8 +3536,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
     fi
     case $outcome in
-      warn | failed) wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "$outcome" "$rc" "$reason" || true ;;
-      *) wt_art_state_set "$worktree" "$dir" build "$ikey" "$ick" "$outcome" || true ;;
+      warn | failed) wt_art_state_set "$worktree" "$dir" "$WT_ART_STRATEGY" "$ikey" "$ick" "$outcome" "$rc" "$reason" || true ;;
+      *) wt_art_state_set "$worktree" "$dir" "$WT_ART_STRATEGY" "$ikey" "$ick" "$outcome" || true ;;
     esac
     [ "$held" -eq 1 ] && wt_lock_release 9
   done < <(printf '%s' "$PROFILE_RAW")
@@ -3617,14 +3634,16 @@ wt_bootstrap_pending_artifacts() {  # $1 = worktree
       *) continue ;;
     esac
     body=${rec#*"$WT_US"}
-    # SC2034: verify and link are read POSITIONALLY to consume their fields.
+    # SC2034: verify is read POSITIONALLY to consume its field.
     # shellcheck disable=SC2034
     IFS=$WT_US read -r dir inputs build verify link <<<"$body" || true
     wt_is_artifact_dir "$dir" || continue
     list=$(wt_artifact_inputs "$inputs") || continue
     name="build output $dir"
     wt_art_build_ick "$(wt_expand "$build")"
-    if wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$WT_ART_ICK" ]; then
+    wt_art_strategy "$worktree" "${link:-copy}"
+    if wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$WT_ART_ICK" ] \
+      && { [ "$WT_DEP_STATUS" = failed ] || [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ]; }; then
       case $WT_DEP_STATUS in
         "done" | warn)
           if wt_art_has_content "$worktree/$dir"; then

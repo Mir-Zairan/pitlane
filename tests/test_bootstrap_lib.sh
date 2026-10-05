@@ -3316,6 +3316,37 @@ PROFILE_RAW=$(art_raw public/build "$AINPUTS" "$ABUILD" '' hardlink)
 WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
 eq 'deferred, link hardlink: linked at start-up' "$(inode_of "$AREPO/public/build/app.js")" \
   "$(inode_of "$AWT/public/build/app.js")"
+# A pull request's worktree copies what the profile hardlinks: its watcher rewrites outputs in place,
+# which through a shared inode would write into main's build.
+art_reset
+git -C "$AREPO" config branch.wt-art1.merge refs/pull/12/head
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'pr, link hardlink: main'"'"'s build is taken' 'from-main' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+eq '...as a copy: no file of it shares an inode' '' "$(find "$AWT/public/build" -type f -links +1)"
+contains '...saying why' "public/build: a pull request's worktree takes its own copy" "$out"
+contains '...and that it copied' 'public/build: copied from the main checkout' "$out"
+wt_art_state_read "$AWT" public/build
+eq '...recorded done, as its own copy' "done|own-copy" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains '...which the next run finds up to date' 'public/build: already up to date' "$out"
+# Linked before this: no longer up to date, and replaced by a copy (in the background when deferred).
+git -C "$AREPO" config --unset branch.wt-art1.merge
+art_reset
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'pr: (fixture) linked while not yet a pull request' "$(inode_of "$AREPO/public/build/app.js")" \
+  "$(inode_of "$AWT/public/build/app.js")"
+git -C "$AREPO" config branch.wt-art1.merge refs/pull/12/head
+eq 'pr: a linked build output recorded done is pending again' 'build output public/build' \
+  "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; printf '%s' "$WT_PENDING_ATTEMPTABLE")"
+out=$(WT_DEFER=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+contains '...at start-up its copy is left for the background run' 'public/build: to be copied from the main checkout in the background' "$out"
+amain=$(inode_of "$AREPO/public/build/app.js")
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...which replaces it with a copy' "from-main|" "$(cat "$AWT/public/build/app.js")|$(find "$AWT/public/build" -type f -links +1)"
+eq "...main's file keeps its inode" "$amain" "$(inode_of "$AREPO/public/build/app.js")"
+wt_art_state_read "$AWT" public/build
+eq '...recorded as its own copy' "done|own-copy" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+git -C "$AREPO" config --unset branch.wt-art1.merge
 # A `doing` record at start-up is the background run's: no wait on its lock.
 art_reset
 # shellcheck disable=SC2034
