@@ -399,6 +399,58 @@ inplace_check() {  # $1 = repo, $2 = worktree, $3 = scratch dir for logs
   done
 }
 
+# A hardlink donor: two worktrees whose branches carry the same lockfile change. The first installs
+# (main's lockfile differs); the second links from the first, and an in-place rewrite run there must
+# leave the first worktree's tree and the main checkout's keeping every byte and inode.
+donor_check() {  # $1 = repo, $2 = scratch dir for logs
+  local r=$1 logs=$2 g d out first f p c under rc donor_before main_before
+  [ -n "$STACK_LOCK_CHANGE" ] || return 0
+  g=$r/.claude/worktrees/gamma d=$r/.claude/worktrees/delta
+  git -C "$r" worktree add -q "$g" -b worktree-gamma 2>/dev/null
+  if ! tc "$g" "$STACK_LOCK_CHANGE" >"$logs/lockchange" 2>&1; then
+    printf 'NOTE [%s/%s] "%s" failed (offline?) — the donor check is not counted\n' "$BACKEND" "$STACK" "$STACK_LOCK_CHANGE" >&2
+    show_log "$logs/lockchange"
+    git -C "$r" worktree remove --force "$g"
+    git -C "$r" branch -qD worktree-gamma
+    return 0
+  fi
+  git -C "$g" commit -qam 'changes the lockfile'
+  git -C "$r" worktree add -q "$d" -b worktree-delta worktree-gamma 2>/dev/null
+  session_start "$g" "$logs/gamma.start" >/dev/null
+  contains "gamma: its lockfile differs from the main checkout's, so it installs" \
+    'differs from the main checkout — installing instead' "$(cat "$logs/gamma.start")"
+  session_start "$d" "$logs/delta.start" >/dev/null
+  out=$(cat "$logs/delta.start")
+  for f in $STACK_LINKDIRS; do
+    contains "delta: $f is hardlinked from worktree gamma" "$f: hardlinked from worktree gamma (" "$out"
+    first=$(cd "$g" && find "$f" -type f | LC_ALL=C sort | while IFS= read -r p; do
+      under=0
+      for c in $STACK_COPY; do case $p/ in "$c"/*) under=1 ;; esac; done
+      [ "$under" = 1 ] || { printf '%s\n' "$p"; break; }
+    done)
+    eq "delta: ...sharing gamma's inodes ($first)" "$(inode "$g/$first")" "$(inode "$d/$first")"
+    ne "delta: ...not the main checkout's" "$(inode "$r/$first")" "$(inode "$d/$first")"
+  done
+  [ "$out" = "${out#*hardlinked from worktree}" ] && show_log "$logs/delta.start"
+  donor_before='' main_before=''
+  for f in $STACK_LINKDIRS; do
+    donor_before+=$(inode_snapshot "$g/$f"); main_before+=$(inode_snapshot "$r/$f")
+  done
+  tc "$d" "$STACK_INPLACE" >"$logs/donor.inplace" 2>&1
+  rc=$?
+  eq "delta: \`$STACK_INPLACE\` runs" 0 "$rc"
+  [ "$rc" -eq 0 ] || show_log "$logs/donor.inplace"
+  local donor_after='' main_after=''
+  for f in $STACK_LINKDIRS; do
+    donor_after+=$(inode_snapshot "$g/$f"); main_after+=$(inode_snapshot "$r/$f")
+  done
+  eq "delta: ...and gamma's $STACK_LINKDIRS kept every byte and inode" "$donor_before" "$donor_after"
+  eq "delta: ...and so did the main checkout's" "$main_before" "$main_after"
+  git -C "$d" checkout -q -- .
+  remove_worktree "$r" delta "$logs"
+  remove_worktree "$r" gamma "$logs"
+}
+
 remove_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 w
   w=$r/.claude/worktrees/$name
@@ -433,7 +485,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   STACK_SERVE='' STACK_SERVE_PATH='' STACK_SERVE_EXPECT=''
   # shellcheck disable=SC2034  # STACK_ARTIFACTS is read by write_profile, in stack_fixtures.sh
   STACK_ARTIFACTS='' STACK_ART_FILE='' STACK_ART_CHANGE='' STACK_ART_EXPECT=''
-  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET=''
+  STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET='' STACK_LOCK_CHANGE=''
   STACK_PORT_BASE=$((20000 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
   r=$dir/repo logs=$dir/logs STACK_DB=$dir/databases
@@ -470,6 +522,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
     exercise_worktree "$r" beta "$logs"
     p_beta=$WT_PORT_SEEN
     ne 'two worktrees get distinct ports' "$p_alpha" "$p_beta"
+    donor_check "$r" "$logs"
     if [ -n "$STACK_SERVE" ]; then
       # Both apps at once, each on its own port: the case a hardcoded start command cannot serve.
       contains "alpha's app still answers beside beta's" "${STACK_SERVE_EXPECT//\{port\}/$p_alpha}" \

@@ -1069,10 +1069,11 @@ wt_lock_release() {  # $1 = fd number
   return 0
 }
 
-# Every descriptor the engine's hooks hold a lock on: 7 the serve lock, 8 the worktree's bootstrap
-# lock, 9 a dependency-dir or allocation lock. A child running a profile's command closes them all
-# (wt_close_lock_fds); a new lock on any other descriptor belongs in this list.
-WT_LOCK_FDS='7 8 9'
+# Every descriptor the engine's hooks hold a lock on: 6 a donor worktree's bootstrap lock
+# (wt_hardlink_donor_find), 7 the serve lock, 8 the worktree's bootstrap lock, 9 a dependency-dir or
+# allocation lock. A child running a profile's command closes them all (wt_close_lock_fds); a new
+# lock on any other descriptor belongs in this list.
+WT_LOCK_FDS='6 7 8 9'
 
 # Close WT_LOCK_FDS in the CURRENT shell — call it only inside the subshell about to exec a command.
 wt_close_lock_fds() {
@@ -1257,8 +1258,10 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
 # entries, and a partial write is the one thing a reader must never see. WT_STATE_KIND=art writes
 # a build-output record instead, in the same fields (wt_art_state_set).
-wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line
-  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} when rec
+# $9, the worktree a hardlinked dir was linked from (wt_hardlink_donor_find), is appended only when
+# set, so every other record keeps the shape older readers know.
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line, $9 = donor worktree
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} donor=${9-} when rec
 
   # Recorded but never compared: it answers "when did this last happen" for a developer looking at
   # a worktree that seems stale, and gives prune something to age entries by. It is deliberately
@@ -1266,7 +1269,11 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
 
-  wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
+  if [ -n "$donor" ]; then
+    wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor"
+  else
+    wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
+  fi
   rec=$WT_STATE_REC
   # The KEY is cleaned the same way the field was, or a `dir` carrying a stripped byte would never
   # match the record it just wrote and would append a duplicate on every session.
@@ -1720,14 +1727,19 @@ wt_cksum_file() {  # $1 = path
 }
 
 # Read one dependency's record into WT_DEP_STRATEGY, WT_DEP_LCK, WT_DEP_ICK, WT_DEP_STATUS,
-# WT_DEP_RC and WT_DEP_REASON. Returns 1, with them all empty, when there is no usable record.
-# Globals rather than output so a caller in its own shell gets every field from one read.
-# WT_STATE_KIND=art reads a build-output record instead (wt_art_state_read).
+# WT_DEP_WHEN, WT_DEP_RC, WT_DEP_REASON and WT_DEP_DONOR. Returns 1, with them all empty, when there
+# is no usable record. Globals rather than output so a caller in its own shell gets every field from
+# one read. WT_STATE_KIND=art reads a build-output record instead (wt_art_state_read).
 wt_state_dep_read() {  # $1 = worktree, $2 = dir
-  local wt=${1%/} dir=${2-} file rec kind rest rdir rwhen seen=0
-  WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_RC='' WT_DEP_REASON=''
-  file=$(wt_state_path "$wt")
-  [ -r "$file" ] || return 1
+  wt_state_dep_read_file "$(wt_state_path "${1%/}")" "${2-}"
+}
+
+# wt_state_dep_read on a state file named directly: another worktree's, read without a git call.
+wt_state_dep_read_file() {  # $1 = state file, $2 = dir
+  local file=${1-} dir=${2-} rec kind rest rdir seen=0
+  WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_WHEN='' WT_DEP_RC=''
+  WT_DEP_REASON='' WT_DEP_DONOR=''
+  [ -n "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
     rest=${rec#*"$WT_US"}
@@ -1739,10 +1751,10 @@ wt_state_dep_read() {  # $1 = worktree, $2 = dir
       "${WT_STATE_KIND:-dep}")
         [ "$seen" = 1 ] || return 1
         [ "${rest%%"$WT_US"*}" = "$dir" ] || continue
-        # SC2034: rdir and rwhen are read POSITIONALLY to consume their fields.
+        # SC2034: rdir is read POSITIONALLY to consume its field.
         # shellcheck disable=SC2034
-        IFS=$WT_US read -r rdir WT_DEP_STRATEGY WT_DEP_LCK WT_DEP_ICK WT_DEP_STATUS rwhen \
-          WT_DEP_RC WT_DEP_REASON <<<"$rest" || true
+        IFS=$WT_US read -r rdir WT_DEP_STRATEGY WT_DEP_LCK WT_DEP_ICK WT_DEP_STATUS WT_DEP_WHEN \
+          WT_DEP_RC WT_DEP_REASON WT_DEP_DONOR <<<"$rest" || true
         return 0
         ;;
     esac
@@ -1903,49 +1915,57 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
   if [ "$1" -le "$now" ]; then printf '0'; else printf '%s' $(($1 - now)); fi
 }
 
-# Populate one dependency directory by copying the main checkout's with hardlinks.
+# Populate one dependency directory by copying the main checkout's with hardlinks — or, when the main
+# checkout cannot give it, another worktree's (wt_hardlink_donor_find).
 #
 # Returns 0 on success, 1 to say "fall back to a real install". A hardlink copy of a 400 MB
 # vendor/ is near-instant and costs almost no disk, but it is only VALID when the two
 # checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
 # it is not always possible: a worktree on another filesystem cannot hardlink at all.
 #   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done.
-# $5 is deps[].copy as rendered: the paths inside the dir made real copies after the link.
-wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
+# $5 is deps[].copy as rendered: the paths inside the dir made real copies after the link. $6-$9
+# are what a donor is judged by; without $6 and $7 only the main checkout is linked from. On 0,
+# WT_LINK_DONOR is the worktree linked from ('' = the main checkout) and WT_LINK_WHY why main was not.
+wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy, $6 = lock cksum, $7 = install cksum, $8 = verify, unexpanded, $9 = deadline
   # No initialisers built from $1/$3 here: with fewer arguments than expected that is a fatal
   # unbound-variable error under `set -u`, which is precisely the crash this layer must not cause.
-  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} copy=${5-} src dest err
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} copy=${5-} src dest err why=''
 
+  WT_LINK_DONOR='' WT_LINK_WHY=''
   src=$root/$dir
   dest=$worktree/$dir
 
-  if [ ! -d "$src" ]; then
-    wt_log "  $dir: the main checkout has no $dir to link from — installing instead"
-    return 1
-  fi
   # `cp -al` copies a symlink as a symlink, so the worktree's dir would BE main's target, and making
   # its copy paths real copies would delete and replace them there.
   if [ -L "$src" ]; then
     wt_log "  $dir: the main checkout's $dir is a symlink — installing instead"
     return 1
   fi
+  if [ ! -d "$src" ]; then
+    why="the main checkout has no $dir to link from"
   # An empty source would "succeed" and leave an empty dependency directory that then looks
   # installed to everything downstream.
-  if [ -z "$(ls -A "$src" 2>/dev/null)" ]; then
-    wt_log "  $dir: the main checkout's $dir is empty — installing instead"
-    return 1
-  fi
+  elif [ -z "$(ls -A "$src" 2>/dev/null)" ]; then
+    why="the main checkout's $dir is empty"
   # THE VALIDITY TEST. Hardlinking a tree built for a different lockfile gives a worktree
   # dependencies its own branch never asked for, which is worse than a slow install because it
   # looks like it worked. `cmp -s` rather than two checksums: it is exact and stops at the first
   # differing byte.
-  if [ -z "$lock" ] || [ ! -f "$root/$lock" ] || [ ! -f "$worktree/$lock" ]; then
+  elif [ -z "$lock" ] || [ ! -f "$root/$lock" ] || [ ! -f "$worktree/$lock" ]; then
     wt_log "  $dir: cannot compare $lock between the checkouts — installing instead"
     return 1
+  elif ! cmp -s "$root/$lock" "$worktree/$lock"; then
+    why="$lock differs from the main checkout"
   fi
-  if ! cmp -s "$root/$lock" "$worktree/$lock"; then
-    wt_log "  $dir: $lock differs from the main checkout — installing instead"
-    return 1
+  if [ -n "$why" ]; then
+    # Over a dir already there an install is what reconciles it with the lockfile; a link cannot.
+    if [ -e "$dest" ] || [ -L "$dest" ] || [ -z "${6-}" ] \
+       || ! wt_hardlink_donor_find "$root" "$worktree" "$dir" "$lock" "${6-}" "${7-}" "${8-}" "${9-}"; then
+      wt_log "  $dir: $why — installing instead"
+      return 1
+    fi
+    WT_LINK_DONOR=$WT_DONOR WT_LINK_WHY=$why
+    src=$WT_DONOR/$dir
   fi
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     # A distinct code, not success: the caller must not report a link it did not make.
@@ -1958,10 +1978,12 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
   # symlinked ancestors, so the parent can only land inside the worktree.
   if [ "${dir%/*}" != "$dir" ]; then
     if ! wt_is_safe_relpath "$dir" || wt_has_symlinked_parent "$worktree" "$dir"; then
+      [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
       wt_log "  $dir: not a plain path inside the worktree — installing instead"
       return 1
     fi
     if ! err=$(mkdir -p -- "${dest%/*}" 2>&1); then
+      [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
       wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — installing instead"
       return 1
     fi
@@ -1971,11 +1993,15 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
   # ordinary situations, not errors: fall back rather than dying. Any partial tree is
   # removed first, or the install that follows would run on top of debris. cp's own first line is
   # what gets logged: guessing a cause blamed the filesystem for what was a missing directory.
+  # The donor's lock is held for the copy alone: once linked, its own runs cannot reach our inodes
+  # except through the copy paths, which are made real copies next.
   if ! err=$(cp -al "$src" "$dest" 2>&1); then
+    [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
     rm -rf "$dest" 2>/dev/null
     wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — installing instead"
     return 1
   fi
+  [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
   # A tree with some paths still shared is the bug the copy list exists to prevent, so a copy that
   # cannot be made costs the whole link, like any other hardlink failure.
   if ! wt_unshare_dep_paths "$dest" "$dir" "$copy"; then
@@ -1985,16 +2011,162 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy
   return 0
 }
 
+# How many linked worktrees one donor search looks at, in the order git's admin dirs sort. Each costs
+# a few builtin file reads; only the ones whose record qualifies cost a `cmp` and a lock.
+WT_DONOR_SCAN_MAX=${WT_DONOR_SCAN_MAX:-20}
+
+# The checkout of the linked worktree whose admin dir is $1, in WT_ADMIN_WORKTREE; 1 when its pointer
+# cannot be read. `git worktree add --relative-paths` (and worktree.useRelativePaths, git 2.48+)
+# writes the pointer RELATIVE TO THE ADMIN DIRECTORY: resolved against the working directory instead,
+# every worktree would look like a deleted orphan.
+wt_admin_worktree() {  # $1 = admin dir, <common>/worktrees/<id>
+  local admin=${1%/} wtpath
+  WT_ADMIN_WORKTREE=''
+  [ -r "$admin/gitdir" ] || return 1
+  IFS= read -r wtpath <"$admin/gitdir" || return 1
+  wtpath=${wtpath%/.git}
+  case $wtpath in
+    /*) ;;
+    *) wtpath=$admin/$wtpath ;;
+  esac
+  # Only a path with `..` in it pays the command substitution's fork.
+  case $wtpath in
+    */../*) WT_ADMIN_WORKTREE=$(wt_collapse_dotdot "$wtpath") ;;
+    *) WT_ADMIN_WORKTREE=$wtpath ;;
+  esac
+}
+
+# True when the worktree checked out at $2, registered at admin dir $1, is a pull request's
+# (ADR-020): named `pr-<digits>`, or on a branch whose upstream is a `refs/pull/*` ref. Any location,
+# not only under the worktrees dir: this decides what may feed another worktree, so it errs wide.
+# $3 is `git config --get-regexp '^branch\..*\.merge$'`, read once by the caller.
+wt_donor_is_pr() {  # $1 = admin dir, $2 = worktree, $3 = branch merge config
+  local admin=${1%/} wt=${2%/} merges=${3-} name head line key branch
+  name=${wt##*/}
+  case $name in
+    pr-*) case ${name#pr-} in '' | *[!0-9]*) ;; *) return 0 ;; esac ;;
+  esac
+  [ -n "$merges" ] || return 1
+  IFS= read -r head <"$admin/HEAD" 2>/dev/null || return 1
+  case $head in
+    'ref: refs/heads/'*) branch=${head#ref: refs/heads/} ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r line; do
+    key=${line%% *}
+    [ "$key" = "branch.$branch.merge" ] || continue
+    case ${line#* } in refs/pull/*) return 0 ;; esac
+  done <<<"$merges"
+  return 1
+}
+
+# True when donor $1's record for $2 is `done` by the same strategy (hardlink), install command and
+# lockfile as ours. Its lockfile then equals ours (checked by the caller with `cmp`), so the record
+# matching OUR checksum is the record matching the donor's CURRENT lockfile: not changed since.
+wt_donor_record_fits() {  # $1 = admin dir, $2 = dir, $3 = lock cksum, $4 = install cksum
+  wt_state_dep_read_file "${1%/}/worktree-bootstrap-state" "${2-}" || return 1
+  [ "$WT_DEP_STATUS" = "done" ] && [ "$WT_DEP_STRATEGY" = hardlink ] \
+    && [ "$WT_DEP_LCK" = "${3-}" ] && [ "$WT_DEP_ICK" = "${4-}" ]
+}
+
+# Find another linked worktree to hardlink dependency dir $3 from, when the main checkout cannot give
+# it. NOT the shared store ADR-004 deferred: the donor's dir is only read, by one `cp -al`, and this
+# worktree's copy is its own from then on. A donor qualifies only when all of these hold:
+#   - a registered linked worktree whose checkout exists and points back at its admin dir; not this
+#     worktree, not the main checkout;
+#   - not a pull request's (wt_donor_is_pr): its approved install ran that PR's own package scripts;
+#   - its record for $3 is `done`, by the same strategy and install command, for the lockfile it has
+#     now, which is byte-identical to ours;
+#   - its $3 is a real, non-empty directory with no symlinked ancestor, and passes $7, our verify,
+#     run there — and with a verify to run, an unapproved profile gets no donor at all;
+#   - its bootstrap lock is free: a worktree being set up, or torn down, is skipped, not waited for.
+# The most recent `done` wins, ties by path. Sets WT_DONOR and returns 0 with that donor's lock HELD
+# on fd 6, for the caller to release once it has copied; 1 when none qualifies.
+wt_hardlink_donor_find() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = lock cksum, $6 = install cksum, $7 = verify, unexpanded, $8 = deadline
+  local root=${1%/} mine=${2%/} dir=${3-} lock=${4-} lck=${5-} ick=${6-} vtpl=${7-} deadline=${8-}
+  local common admin wtpath line gitdir seen=0 ranked='' merges='' merges_read=0 tab=$'\t'
+  local rest any f verify left
+  WT_DONOR=''
+  [ -n "$dir" ] && [ -n "$lock" ] && [ -n "$lck" ] && [ -n "$ick" ] && [ -f "$mine/$lock" ] || return 1
+  [ -z "$vtpl" ] || [ "${WT_APPROVAL:-}" != no ] || return 1
+
+  # wt_prime_paths left the common dir in the lock-dir memo; only an unprimed caller asks git.
+  if [ "${WT_LOCKDIR_FOR:-}" = "$root" ] && [ "${WT_LOCKDIR_IS:-}" != "$root/.claude/worktree-locks" ] \
+     && [ "${WT_LOCKDIR_IS%/worktree-locks}" != "${WT_LOCKDIR_IS:-}" ]; then
+    common=${WT_LOCKDIR_IS%/worktree-locks}
+  else
+    common=$(wt_git_common_dir "$root") || return 1
+  fi
+  [ -d "$common/worktrees" ] || return 1
+
+  for admin in "$common"/worktrees/*/; do
+    admin=${admin%/}
+    [ -d "$admin" ] || continue
+    [ "$seen" -lt "$WT_DONOR_SCAN_MAX" ] || break
+    wt_admin_worktree "$admin" || continue
+    wtpath=$WT_ADMIN_WORKTREE
+    [ -n "$wtpath" ] && [ ! "$wtpath" -ef "$mine" ] || continue
+    seen=$((seen + 1))
+    # A checkout deleted, moved or replaced by hand no longer belongs to this registration.
+    IFS= read -r line <"$wtpath/.git" 2>/dev/null || continue
+    gitdir=${line#gitdir: }
+    case $gitdir in /*) ;; *) gitdir=$wtpath/$gitdir ;; esac
+    [ "$gitdir" -ef "$admin" ] || continue
+    wt_donor_record_fits "$admin" "$dir" "$lck" "$ick" || continue
+    if [ "$merges_read" = 0 ]; then
+      merges=$(wt_git "$root" config --get-regexp '^branch\..*\.merge$' 2>/dev/null) || merges=''
+      merges_read=1
+    fi
+    wt_donor_is_pr "$admin" "$wtpath" "$merges" && continue
+    case $WT_DEP_WHEN in '' | *[!0-9]*) WT_DEP_WHEN=0 ;; esac
+    ranked+="$WT_DEP_WHEN$tab$wtpath$tab$admin$WT_NL"
+  done
+  [ -n "$ranked" ] || return 1
+  case ${ranked%"$WT_NL"} in
+    *"$WT_NL"*) ranked=$(printf '%s' "$ranked" | LC_ALL=C sort -t "$tab" -k1,1nr -k2,2) ;;
+  esac
+
+  while IFS="$tab" read -r _ wtpath rest; do
+    [ -n "$wtpath" ] || continue
+    admin=$rest
+    wt_lock_acquire "$admin/worktree-bootstrap-state.lock" 0 6 || continue
+    # Re-read under its lock: a run may have finished, or started over, since the scan.
+    if wt_donor_record_fits "$admin" "$dir" "$lck" "$ick" && cmp -s "$wtpath/$lock" "$mine/$lock" \
+       && [ -d "$wtpath/$dir" ] && [ ! -L "$wtpath/$dir" ] && ! wt_has_symlinked_parent "$wtpath" "$dir"; then
+      any=0
+      for f in "$wtpath/$dir"/* "$wtpath/$dir"/.[!.]* "$wtpath/$dir"/..?*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        any=1
+        break
+      done
+      if [ "$any" = 1 ]; then
+        [ -n "$vtpl" ] || { WT_DONOR=$wtpath; return 0; }
+        left=$(wt_budget_left "$deadline")
+        if [ "$left" -gt 0 ] && [ -z "$(WT_PATH=$wtpath wt_unsafe_command_placeholder "$vtpl")" ]; then
+          verify=$(WT_PATH=$wtpath wt_expand "$vtpl")
+          if WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$wtpath" "$left"; then
+            WT_DONOR=$wtpath
+            return 0
+          fi
+        fi
+      fi
+    fi
+    wt_lock_release 6
+  done <<<"$ranked"
+  return 1
+}
+
 # Replace each deps[].copy path inside a freshly linked dir with a real copy (ADR-022): some package
 # managers rewrite files in place — composer's vendor/composer/*.php, npm's .package-lock.json — and
 # through a hardlink that write lands in the main checkout. The copy is made from the worktree's own
 # link and the link then removed; removing a link never touches the inode main still holds. A path the
 # dir does not have is skipped. Returns 1, having logged why, when a path cannot be copied.
-# With $4, main's counterpart of $1, only paths still sharing a file with it are copied, each logged:
-# the repair of a worktree linked before its copy list existed, or killed before it was applied.
-wt_unshare_dep_paths() {  # $1 = linked dir in the worktree, $2 = dir as the profile names it, $3 = copy, $4 = main's dir
-  local dest=${1%/} dir=${2-} main=${4-} list p target tmp err then=' — installing instead'
-  [ -z "$main" ] || then=" — it still shares files with the main checkout's, so a command run here can change them; run /pitlane-finish to retry"
+# With $4, main's counterpart of $1 (or the donor's, named by $5), only paths still sharing a file
+# with it are copied, each logged: the repair of a worktree linked before its copy list existed, or
+# killed before it was applied.
+wt_unshare_dep_paths() {  # $1 = linked dir in the worktree, $2 = dir as the profile names it, $3 = copy, $4 = the dir it may share with, $5 = whose that is
+  local dest=${1%/} dir=${2-} main=${4-} whose=${5:-the main checkout} list p target tmp err then=' — installing instead'
+  [ -z "$main" ] || then=" — it still shares files with $whose's, so a command run here can change them; run /pitlane-finish to retry"
   list=$(wt_dep_copy_paths "${3-}") || {
     wt_log "  $dir: its copy list is not a list of paths inside it$then"
     return 1
@@ -2020,7 +2192,7 @@ wt_unshare_dep_paths() {  # $1 = linked dir in the worktree, $2 = dir as the pro
       wt_log "  $dir: could not copy $p (${err%%"$WT_NL"*})$then"
       return 1
     fi
-    [ -z "$main" ] || wt_log "  $dir: $p shared its files with the main checkout — made a real copy"
+    [ -z "$main" ] || wt_log "  $dir: $p shared its files with $whose — made a real copy"
   done <<<"$list"
   return 0
 }
@@ -2045,20 +2217,25 @@ wt_shares_inode() {  # $1 = path in the worktree, $2 = its counterpart in the ma
 }
 
 # Make an already present hardlinked dir's copy paths real copies where they still share with the
-# main checkout: a worktree linked before deps[].copy existed has a `done` record and the write-through
-# all the same. Called for a `done` dir and for one found present, never mid-link: an interrupted link
-# is recorded `doing`, and that dir is cleared and linked again. Idempotent, and builtin tests only
-# when nothing is shared. Never fails the dependency: a dir it cannot repair is left, and said so.
-wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy
-  local root=${1%/} worktree=${2%/} dir=${3-} copy=${4-}
+# main checkout, or with $5, the worktree it was linked from (its record's donor field): a worktree
+# linked before deps[].copy existed has a `done` record and the write-through all the same. Called
+# for a `done` dir and for one found present, never mid-link: an interrupted link is recorded
+# `doing`, and that dir is cleared and linked again. Idempotent, and builtin tests only when nothing
+# is shared. Never fails the dependency: a dir it cannot repair is left, and said so.
+wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy, $5 = donor worktree
+  local root=${1%/} worktree=${2%/} dir=${3-} copy=${4-} donor=${5-}
   case $copy in '' | '[]') return 0 ;; esac
-  [ -n "$dir" ] && [ -d "$root/$dir" ] && [ ! "$worktree" -ef "$root" ] || return 0
+  [ -n "$dir" ] && [ ! "$worktree" -ef "$root" ] || return 0
+  [ -n "$donor" ] && [ -d "$donor/$dir" ] && [ ! "$donor" -ef "$worktree" ] || donor=''
+  [ -d "$root/$dir" ] || [ -n "$donor" ] || return 0
   if [ -L "$worktree/$dir" ]; then
     wt_log "  $dir: is a symlink in the worktree, so its copy paths cannot be made its own — a command run here changes whatever it points at"
     return 0
   fi
   [ -d "$worktree/$dir" ] || return 0
-  wt_unshare_dep_paths "$worktree/$dir" "$dir" "$copy" "$root/$dir" || true
+  [ ! -d "$root/$dir" ] || wt_unshare_dep_paths "$worktree/$dir" "$dir" "$copy" "$root/$dir" || true
+  [ -z "$donor" ] || wt_unshare_dep_paths "$worktree/$dir" "$dir" "$copy" "$donor/$dir" \
+    "worktree $(wt_name_from_path "$donor")" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -2429,6 +2606,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
+  local verify_tpl linked_from
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
 
@@ -2505,6 +2683,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # Placeholders expand HERE, not at read time, so the checksum recorded in the state file is
     # of the command that actually ran.
     install=$(wt_expand "$install")
+    verify_tpl=$verify
     verify=$(wt_expand "$verify")
 
     lckhash=$(wt_cksum_file "$worktree/$lock")
@@ -2512,7 +2691,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
       wt_log "  $dir: already up to date"
-      [ "$strategy" != hardlink ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy"
+      if [ "$strategy" = hardlink ]; then
+        wt_state_dep_read "$worktree" "$dir" || true
+        wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy" "$WT_DEP_DONOR"
+      fi
       continue
     fi
     # Settled before the lock and the deferral, so a standing failure neither waits for a lock nor
@@ -2577,7 +2759,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # ONLY WHEN THE LOCK IS HELD. Without the lock, another worktree may be mid-install into this
     # very directory — deleting under it destroys its work and leaves both sessions believing
     # they succeeded.
-    status=$(wt_state_status "$worktree" "$dir")
+    # The donor field too, before `doing` drops it: a dir found present keeps being compared with it.
+    wt_state_dep_read "$worktree" "$dir" || true
+    status=$WT_DEP_STATUS linked_from=$WT_DEP_DONOR
     if [ "$status" = doing ] && [ -e "$worktree/$dir" ]; then
       if [ "$held" -eq 1 ]; then
         wt_log "  $dir: a previous run was interrupted — clearing the partial directory"
@@ -2607,13 +2791,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # branch that touched its lockfile.
     effective=$strategy
     if [ "$strategy" = hardlink ]; then
-      wt_hardlink_dep "$root" "$worktree" "$dir" "$lock" "$dcopy"
+      wt_hardlink_dep "$root" "$worktree" "$dir" "$lock" "$dcopy" "$lckhash" "$ickhash" "$verify_tpl" "$deadline"
       case $? in
-        0) effective=hardlink ;;
+        0) effective=hardlink linked_from=$WT_LINK_DONOR ;;
         2) effective=present
            # Not over an interrupted link another process may still be finishing.
-           [ "$status" = doing ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy" ;;
-        *) effective=install ;;
+           [ "$status" = doing ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy" "$linked_from" ;;
+        *) effective=install linked_from='' ;;
       esac
       if [ "$effective" = install ] && [ "$stands" -eq 1 ]; then
         wt_dep_log_failure_stands "$dir" "$lock" "$stood_rc" "$stood_reason"
@@ -2629,6 +2813,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
+    else
+      linked_from=''
     fi
 
     rc=0 reason=''
@@ -2693,6 +2879,8 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         137 | "$WT_GUARD_REFUSED") wt_log "  $dir: not installed for lack of memory — left for /pitlane-finish or the next session" ;;
         *) wt_log "  $dir: the install command failed (exit $rc) — the worktree may be incomplete" ;;
       esac
+    elif [ "$effective" = hardlink ] && [ -n "$linked_from" ]; then
+      wt_log "  $dir: hardlinked from worktree $(wt_name_from_path "$linked_from") ($WT_LINK_WHY)"
     elif [ "$effective" = hardlink ]; then
       wt_log "  $dir: hardlinked from the main checkout"
     fi
@@ -2749,7 +2937,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     fi
     case $outcome in
       warn | failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
-      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" || true ;;
+      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" '' '' "$linked_from" || true ;;
     esac
 
     [ "$held" -eq 1 ] && wt_lock_release 9
@@ -4658,7 +4846,7 @@ wt_collapse_dotdot() {  # $1 = path
 # trustworthy is worse than one that admits it, because the seed's whole fail-closed rule rests on
 # this number.
 wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
-  local root=${1%/} mine=${2%/} common admin gitdirf wtpath slug port
+  local root=${1%/} mine=${2%/} common admin wtpath slug port
 
   # SC2034: these two ARE the function's results — see the header for why they are set
   # rather than printed.
@@ -4676,24 +4864,12 @@ wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
   for admin in "$common"/worktrees/*/; do
     admin=${admin%/}
     [ -d "$admin" ] || continue                      # an unmatched glob
-    gitdirf=$admin/gitdir
-    if [ ! -r "$gitdirf" ]; then
+    if ! wt_admin_worktree "$admin"; then
       # shellcheck disable=SC2034
       WT_SIBLINGS_OK=0                               # an entry we cannot classify at all
       continue
     fi
-    # shellcheck disable=SC2034
-    IFS= read -r wtpath <"$gitdirf" || { WT_SIBLINGS_OK=0; continue; }
-    wtpath=${wtpath%/.git}
-    # `git worktree add --relative-paths` (and worktree.useRelativePaths, git 2.48+) writes this
-    # pointer RELATIVE TO THE ADMIN DIRECTORY. Resolving it against the hook's working directory
-    # instead would make every sibling look like a deleted orphan — collision avoidance would stop
-    # working silently, while the flag still claimed the scan was trustworthy.
-    case $wtpath in
-      /*) ;;
-      *) wtpath=$admin/$wtpath ;;
-    esac
-    wtpath=$(wt_collapse_dotdot "$wtpath")
+    wtpath=$WT_ADMIN_WORKTREE
     [ "$wtpath" = "$mine" ] && continue              # ourselves
     # The orphan check: the admin directory outlives an `rm -rf` of the checkout.
     [ -n "$wtpath" ] && [ -d "$wtpath" ] || continue

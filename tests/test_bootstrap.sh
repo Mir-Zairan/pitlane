@@ -479,6 +479,29 @@ eq 'composer-shaped: the tree really shares inodes, so a big vendor costs no dis
 eq 'composer-shaped: the profile copy[] config came across, so the worktree is runnable' 'SECRET=1' \
   "$(cat "$WC/.env" 2>/dev/null)"
 
+# --- a hardlink donor: another worktree on the same lockfile change ---------------------------
+# Two branches carry the same lockfile change, so neither can link from the main checkout. The
+# first installs; the second, through the real SessionStart hook, links from the first.
+RD2=$TMP/donorish
+make_repo "$RD2" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor/pkg && printf \"installed $$\" > vendor/pkg/big.php","verify":"test -r vendor/pkg/big.php","copy":["composer"]}'
+mkdir -p "$RD2/vendor/pkg"; printf 'MAIN\n' > "$RD2/vendor/pkg/big.php"
+WD1=$RD2/.claude/worktrees/first
+WD2=$RD2/.claude/worktrees/second
+git -C "$RD2" worktree add -q "$WD1" -b worktree-first 2>/dev/null
+printf 'LOCK-CHANGED\n' > "$WD1/composer.lock"
+git -C "$WD1" commit -qam 'changes the lockfile'
+git -C "$RD2" worktree add -q "$WD2" -b worktree-second worktree-first 2>/dev/null
+run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WD1\"}" "$WD1" >/dev/null
+contains 'donor: the first worktree installs, its lockfile differing from main' 'composer.lock differs from the main checkout — installing instead' "$(cat "$TMP/err")"
+mkdir -p "$WD1/vendor/composer"; printf 'FIRST\n' > "$WD1/vendor/composer/installed.php"
+out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WD2\"}" "$WD2")
+contains 'donor: the second links from the first' 'vendor: hardlinked from worktree first (composer.lock differs from the main checkout)' "$(cat "$TMP/err")"
+eq '...printing nothing to stdout' '' "$out"
+eq '...sharing its inodes' yes "$([ "$WD2/vendor/pkg/big.php" -ef "$WD1/vendor/pkg/big.php" ] && echo yes)"
+eq "...not the main checkout's" MAIN "$(cat "$RD2/vendor/pkg/big.php")"
+eq '...its copy paths its own' no "$([ "$WD2/vendor/composer/installed.php" -ef "$WD1/vendor/composer/installed.php" ] && echo yes || echo no)"
+eq '...with the bytes they had' FIRST "$(cat "$WD2/vendor/composer/installed.php" 2>/dev/null)"
+
 # --- an unsupported or cross-filesystem hardlink --------------------------------------------
 # A second filesystem cannot be arranged inside one repository, so the failure is injected where
 # the engine actually observes it: `cp -al` returning non-zero. That is exactly what a

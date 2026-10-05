@@ -2314,6 +2314,209 @@ contains 'a worktree whose lockfile differs is NOT given the main checkout tree'
 eq '...it gets a real install instead' 'FELLBACK' "$(cat "$DWT/vendor/m" 2>/dev/null)"
 printf 'LOCKV1\n' > "$DWT/composer.lock"
 
+# --- hardlink donors: another worktree with the same lockfile ------------------
+# When the main checkout cannot give a hardlinked dir (its lockfile differs, it has none), a linked
+# worktree whose identical lockfile is recorded `done` can. Every rule a donor must meet has a case
+# here that links from the donor once the rule is dropped.
+DONORS=$TMP/donors
+DINSTALL='mkdir -p vendor && printf DINSTALLED > vendor/m'
+DLOCK2=$(printf 'LOCKV2\n' | cksum)
+DICK=$(wt_cksum_string "$DINSTALL")
+mk_donor() {  # $1 = name; a linked worktree whose lockfile is LOCKV2 and whose vendor is filled
+  local w=$DONORS/$1
+  git -C "$DREPO" worktree add -q "$w" -b "wt-$1" 2>/dev/null
+  printf 'LOCKV2\n' > "$w/composer.lock"
+  mkdir -p "$w/vendor/pkg"; printf 'DONOR-%s\n' "$1" > "$w/vendor/pkg/file.txt"
+}
+donor_rec() {  # $1 = name, $2 = status, $3 = when, $4 = lock cksum, $5 = install cksum, $6 = strategy
+  wt_state_join dep vendor "${6:-hardlink}" "${4:-$DLOCK2}" "${5:-$DICK}" "$2" "$3"
+  printf 'wtstate%s%s%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$WT_STATE_REC" "$RS_" \
+    > "$(git -C "$DONORS/$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state"
+}
+# Where the worktree's vendor came from: main, a donor's name, install, or none.
+linked_from() {
+  local f=$DWT/vendor/pkg/file.txt n
+  [ "$(cat "$DWT/vendor/m" 2>/dev/null)" = DINSTALLED ] && { echo install; return; }
+  [ -e "$f" ] || { echo none; return; }
+  [ "$f" -ef "$DREPO/vendor/pkg/file.txt" ] && { echo main; return; }
+  for n in "$DONORS"/*/; do
+    n=${n%/}
+    [ "$f" -ef "$n/vendor/pkg/file.txt" ] && { echo "${n##*/}"; return; }
+  done
+  echo copy
+}
+run_donor() {  # $1 = verify, $2 = copy; sets out
+  rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$DINSTALL" "${1-}" "${2-}")
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+}
+printf 'LOCKV2\n' > "$DWT/composer.lock"
+mkdir -p "$DREPO/vendor/pkg"; printf 'REAL\n' > "$DREPO/vendor/pkg/file.txt"
+dmain_snap=$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat pkg/file.txt)
+mk_donor donor-a
+donor_rec donor-a "done" 100
+run_donor
+eq 'donor: the lockfile differs from main, so the done sibling with the same one gives the tree' donor-a "$(linked_from)"
+contains '...and says so' 'vendor: hardlinked from worktree donor-a (composer.lock differs from the main checkout)' "$out"
+lacks '...not an install' 'installing instead' "$out"
+eq '...the main checkout untouched' "$dmain_snap" \
+  "$(cd "$DREPO/vendor" && find . -type f -exec ls -i {} + | LC_ALL=C sort; cat pkg/file.txt)"
+wt_state_dep_read "$DWT" vendor
+eq '...recorded done, naming the donor' "done|$DONORS/donor-a" "$WT_DEP_STATUS|$WT_DEP_DONOR"
+# In this shell, not a $(...): a subshell's exit would release a lock left held.
+rm -rf "$DWT/vendor"
+wt_hardlink_dep "$DREPO" "$DWT" vendor composer.lock '' "$DLOCK2" "$DICK" '' "$FAR" 2>/dev/null
+eq '...the donor lock is not left held' 0 \
+  "$( (exec 5>"$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)/worktree-bootstrap-state.lock"; flock -n 5); echo $?)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...and a second run finds it up to date' 'already up to date' "$out"
+
+for st in warn failed doing dirty; do
+  donor_rec donor-a "$st" 100
+  run_donor
+  eq "donor: a sibling recorded $st is not used" install "$(linked_from)"
+done
+contains 'donor: with none to use, the old message stands' 'composer.lock differs from the main checkout — installing instead' "$out"
+
+donor_rec donor-a "done" 100 "$(printf 'LOCKV1\n' | cksum)"
+run_donor
+eq 'donor: a sibling whose lockfile changed since its install is not used' install "$(linked_from)"
+donor_rec donor-a "done" 100
+printf 'LOCKV3\n' > "$DONORS/donor-a/composer.lock"
+run_donor
+eq 'donor: a sibling whose lockfile now differs from ours is not used' install "$(linked_from)"
+printf 'LOCKV2\n' > "$DONORS/donor-a/composer.lock"
+donor_rec donor-a "done" 100 '' "$(wt_cksum_string 'composer install --no-dev')"
+run_donor
+eq 'donor: a sibling installed by another command is not used' install "$(linked_from)"
+donor_rec donor-a "done" 100 '' '' install
+run_donor
+eq 'donor: a sibling whose record is of another strategy is not used' install "$(linked_from)"
+
+donor_rec donor-a "done" 100
+git -C "$DREPO" config branch.wt-donor-a.merge refs/pull/7/head
+run_donor
+eq "donor: a sibling on a pull request's ref is not used" install "$(linked_from)"
+git -C "$DREPO" config --unset branch.wt-donor-a.merge
+mk_donor pr-123
+donor_rec pr-123 "done" 200
+run_donor
+eq 'donor: a pull-request worktree is not used, though it is the most recent' donor-a "$(linked_from)"
+git -C "$DREPO" worktree remove --force "$DONORS/pr-123"
+
+mv "$DONORS/donor-a/vendor" "$TMP/donor-real"; ln -s "$TMP/donor-real" "$DONORS/donor-a/vendor"
+run_donor
+eq 'donor: a symlinked dir is not used' install "$(linked_from)"
+lacks '...not even tried' 'is a symlink' "$out"
+rm "$DONORS/donor-a/vendor"; mkdir -p "$DONORS/donor-a/vendor"
+run_donor
+eq 'donor: an empty dir is not used' install "$(linked_from)"
+rmdir "$DONORS/donor-a/vendor"; mv "$TMP/donor-real" "$DONORS/donor-a/vendor"
+# A nested dir under a symlinked parent: the link would read through it.
+mkdir -p "$TMP/donor-parent/bundle/pkg"; printf 'B\n' > "$TMP/donor-parent/bundle/pkg/file.txt"
+mv "$DONORS/donor-a/vendor" "$TMP/donor-real"; ln -s "$TMP/donor-parent" "$DONORS/donor-a/vendor"
+wt_state_join dep vendor/bundle hardlink "$DLOCK2" "$DICK" "done" 100
+printf 'wtstate%s%s%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$WT_STATE_REC" "$RS_" \
+  > "$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)/worktree-bootstrap-state"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor/bundle composer.lock hardlink "$DINSTALL" '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'donor: a dir under a symlinked parent is not used' 'hardlinked from worktree' "$out"
+rm "$DONORS/donor-a/vendor"; mv "$TMP/donor-real" "$DONORS/donor-a/vendor"; rm -rf "$TMP/donor-parent"
+donor_rec donor-a "done" 100
+
+# Being set up (or torn down) right now: its bootstrap lock is held, so it is skipped, not waited for.
+exec 5>"$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)/worktree-bootstrap-state.lock"
+flock -n 5
+run_donor
+exec 5>&-
+eq 'donor: a sibling whose bootstrap lock is held is not used' install "$(linked_from)"
+
+mk_donor donor-b
+donor_rec donor-b "done" 200
+run_donor
+eq 'donor: of two, the most recent done is chosen' donor-b "$(linked_from)"
+donor_rec donor-a "done" 300
+run_donor
+eq '...whichever that is' donor-a "$(linked_from)"
+donor_rec donor-b "done" 300
+run_donor
+eq '...ties by path' donor-a "$(linked_from)"
+donor_rec donor-a warn 300
+WT_DONOR_SCAN_MAX=1 run_donor
+eq 'donor: the scan stops at WT_DONOR_SCAN_MAX worktrees' install "$(linked_from)"
+WT_DONOR_SCAN_MAX=2 run_donor
+eq '...and finds the one within it' donor-b "$(linked_from)"
+git -C "$DREPO" worktree remove --force "$DONORS/donor-b"
+donor_rec donor-a "done" 100
+
+# The verify is run in the donor, against the donor: {worktree} is the donor's path there.
+run_donor 'test -f {worktree}/vendor/pkg/file.txt'
+eq 'donor: a sibling passing the verify is used' donor-a "$(linked_from)"
+run_donor 'test -f vendor/pkg/absent'
+eq 'donor: a sibling failing the verify is not used' install "$(linked_from)"
+WT_APPROVAL=no run_donor 'test -f vendor/pkg/file.txt'
+eq 'donor: with a verify that may not run, no sibling is used' none "$(linked_from)"
+lacks '...and its verify is not tried' 'not running' "$out"
+WT_APPROVAL=no run_donor ''
+eq '...while with no verify a link needs no approval' donor-a "$(linked_from)"
+
+# Copy paths are unshared from the DONOR: an in-place write in this worktree must not reach it.
+mkdir -p "$DONORS/donor-a/vendor/composer"; printf 'DONOR-INSTALLED\n' > "$DONORS/donor-a/vendor/composer/installed.json"
+donor_installed=$(ino "$DONORS/donor-a/vendor/composer/installed.json")
+run_donor '' '["composer"]'
+eq 'donor copy: linked from the donor' donor-a "$(linked_from)"
+ne '...its copy path is a real copy, not the donor inode' "$donor_installed" "$(ino "$DWT/vendor/composer/installed.json")"
+printf 'WORKTREE-WROTE\n' > "$DWT/vendor/composer/installed.json"
+eq '...so a write here leaves the donor alone' "DONOR-INSTALLED|$donor_installed" \
+  "$(cat "$DONORS/donor-a/vendor/composer/installed.json")|$(ino "$DONORS/donor-a/vendor/composer/installed.json")"
+# A link made before the copy list existed: repaired against the donor its record names.
+rm -rf "$DWT/vendor"; cp -al "$DONORS/donor-a/vendor" "$DWT/vendor"
+wt_state_set "$DWT" vendor hardlink "$DLOCK2" "$DICK" "done" '' '' "$DONORS/donor-a"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'donor repair: a done dir still sharing with its donor is repaired' 'composer shared its files with worktree donor-a — made a real copy' "$out"
+ne '...really' "$donor_installed" "$(ino "$DWT/vendor/composer/installed.json")"
+eq '...the rest stays linked' donor-a "$(linked_from)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks '...once' 'made a real copy' "$out"
+rm -rf "$DONORS/donor-a/vendor/composer"
+
+# The main checkout, when it can give the tree, is still the source.
+printf 'LOCKV1\n' > "$DWT/composer.lock"; printf 'LOCKV1\n' > "$DONORS/donor-a/composer.lock"
+donor_rec donor-a "done" 100 "$(printf 'LOCKV1\n' | cksum)"
+run_donor
+eq 'donor: a lockfile equal to main links from main, a donor or not' main "$(linked_from)"
+contains '...and says so' 'hardlinked from the main checkout' "$out"
+printf 'LOCKV2\n' > "$DWT/composer.lock"; printf 'LOCKV2\n' > "$DONORS/donor-a/composer.lock"
+donor_rec donor-a "done" 100
+
+# The main checkout with no dir at all: a donor gives it.
+mv "$DREPO/vendor" "$TMP/main-vendor"
+run_donor
+eq 'donor: main has no dir, the donor gives it' donor-a "$(linked_from)"
+contains '...and says why' '(the main checkout has no vendor to link from)' "$out"
+mv "$TMP/main-vendor" "$DREPO/vendor"
+
+# A checkout that no longer points back at its registration is not that worktree.
+cp "$DONORS/donor-a/.git" "$TMP/donor-a.git"
+printf 'gitdir: %s\n' "$TMP/nowhere" > "$DONORS/donor-a/.git"
+run_donor
+eq 'donor: a checkout whose .git points elsewhere is not used' install "$(linked_from)"
+cp "$TMP/donor-a.git" "$DONORS/donor-a/.git"
+# A registration whose checkout was deleted by hand is no donor.
+mv "$DONORS/donor-a" "$TMP/donor-a-moved"
+run_donor
+eq 'donor: a sibling whose checkout is gone is not used' install "$(linked_from)"
+mv "$TMP/donor-a-moved" "$DONORS/donor-a"
+run_donor
+eq '...and is used once it is back' donor-a "$(linked_from)"
+
+git -C "$DREPO" worktree remove --force "$DONORS/donor-a"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+printf 'LOCKV1\n' > "$DWT/composer.lock"
+
 # --- hardlink falls back when the main checkout has nothing to link --------
 rm -rf "$DWT/vendor" "$DREPO/vendor"
 # shellcheck disable=SC2034

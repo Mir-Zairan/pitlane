@@ -49,6 +49,10 @@
 #                                           output is built rather than taken from main. A branch
 #                                           must hold the commit too, or teardown keeps it as work
 #                           STACK_ART_EXPECT what STACK_ART_FILE then holds
+#                           STACK_LOCK_CHANGE shell run in a worktree, through the toolchain, that
+#                                           changes the lockfile; committed and shared by a second
+#                                           worktree, which must hardlink from the first
+#                                           ('' = no donor check)
 #                         It returns non-zero when the tool could not build the fixture (offline, a
 #                         registry down), which the suite reports as a SKIP, not a plugin failure.
 #
@@ -244,6 +248,8 @@ JS
   # so the property is asserted offline too; it runs after the probe and the serve check.
   STACK_INPLACE='npm uninstall --offline --no-audit --no-fund is-number'
   STACK_INPLACE_NET='npm install --no-audit --no-fund isarray@2.0.5'
+  # A lockfile change that needs no registry: the root package's version is recorded in it.
+  STACK_LOCK_CHANGE='npm pkg set version=1.0.1 && npm install --package-lock-only --offline --no-audit --no-fund'
   STACK_PROBE='node probe.js'
   STACK_EXPECT=ok
 }
@@ -323,6 +329,7 @@ PHP
   # Measured: both rewrite vendor/composer/autoload_*.php and installed.* in place.
   STACK_INPLACE='composer dump-autoload -o --quiet'
   STACK_INPLACE_NET='composer require --quiet --no-interaction --no-progress psr/container:^2.0'
+  STACK_LOCK_CHANGE='composer require --quiet --no-interaction --no-progress --no-install psr/container:^2.0'
   STACK_PROBE='php probe.php'
   STACK_EXPECT=ok
 }
