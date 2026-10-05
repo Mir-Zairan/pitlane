@@ -17,8 +17,8 @@
 #   id  kind  path  bytes  action  reason
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
-#   kind    orphan-dir | stale-admin | server-leftover | runtime-leftover | ledger-junk | abandoned | held;
-#           `store` is reserved
+#   kind    orphan-dir | stale-admin | server-leftover | runtime-leftover | ledger-junk |
+#           removed-dep-leftover | abandoned | held; `store` is reserved
 #           for a future finder of unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
@@ -59,6 +59,9 @@
 #     ones a WorktreeCreate hook created, and fires no WorktreeRemove for them (measured, 2.1.286);
 #     its periodic sweep skips them too. Nothing else would ever reap them, or the database a seed
 #     made for each. Applying one runs teardown.sh on it, so the guard is the teardown hook's own.
+#     Inside a live worktree, or the main checkout, only a `removed-dep-leftover` is ever removed: a
+#     hardlinked dependency dir a fresh install renamed aside (wt_clear_linked_dep) and could not
+#     finish removing, matched by its exact name beside the profile's dir and never searched for.
 #   * no process is killed but a server-leftover's, and that only on --apply: the one server
 #     /pitlane-serve recorded starting in a worktree now gone, found through its serve mirror
 #     (bootstrap-lib.sh), signalled only while its recorded start identity matches. Never a process
@@ -123,6 +126,7 @@ WT_PRUNE_FINDERS=(
   wt_find_server_leftovers
   wt_find_runtime_leftovers
   wt_find_ledger_junk
+  wt_find_removed_dep_leftovers
   wt_find_abandoned_worktrees
   wt_find_held_worktrees
   # TODO: wt_find_unreferenced_stores — dependency stores under the store root that no live
@@ -139,6 +143,8 @@ WT_PRUNE_FINDERS=(
 # or empty.
 PRUNE_ID=() PRUNE_KIND=() PRUNE_PATH=() PRUNE_BYTES=() PRUNE_ACTION=() PRUNE_REASON=()
 PRUNE_KEY=() PRUNE_MEASURE=()
+# Set only for a removed-dep-leftover: the checkout it lies in, and the profile's dir it was.
+PRUNE_OWNER=() PRUNE_DEP=()
 
 wt_prune_item_id() {  # $1 = kind, $2 = key
   local sum
@@ -217,8 +223,11 @@ wt_prune_shared_note() {  # $1 = path
 #                      not inside one, and hold none
 #   WT_PRUNE_TEARDOWN  what a runtime leftover would be applied as: teardown, forget, or refuse
 #                      with WT_PRUNE_TEARDOWN_WHY
+#   WT_PRUNE_HARDLINK_DIRS  the main checkout's profile's `hardlink` dependency dirs, each a plain
+#                      relative path
 WT_PRUNE_ROOT='' WT_PRUNE_COMMON='' WT_PRUNE_WTDIR='' WT_PRUNE_TEARDOWN='' WT_PRUNE_TEARDOWN_WHY=''
 WT_PRUNE_LIVE=() WT_PRUNE_LOCKED=() WT_PRUNE_ORPHANS=() WT_PRUNE_LIVE_LOCKED=()
+WT_PRUNE_HARDLINK_DIRS=()
 
 wt_prune_list_live() {
   local listed line wt='' physical n=0
@@ -304,6 +313,27 @@ wt_prune_judge_teardown() {
   fi
 }
 
+# The profile just loaded by wt_prune_judge_teardown, read once here: a later finder may load others.
+wt_prune_list_hardlink_dirs() {
+  local rec body dir strategy
+  WT_PRUNE_HARDLINK_DIRS=()
+  [ "${PROFILE_PRESENT:-0}" = 1 ] && [ -n "${PROFILE_RAW:-}" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      1"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r dir _ strategy _ <<<"$body" || true
+    dir=${dir%/}
+    if [ "$strategy" != hardlink ] || ! wt_is_safe_relpath "$dir"; then
+      continue
+    fi
+    case " ${WT_PRUNE_HARDLINK_DIRS[*]-} " in *" $dir "*) continue ;; esac
+    WT_PRUNE_HARDLINK_DIRS[${#WT_PRUNE_HARDLINK_DIRS[@]}]=$dir
+  done < <(printf '%s' "$PROFILE_RAW")
+}
+
 wt_prune_survey() {  # $1 = main checkout
   WT_PRUNE_ROOT=$1
   WT_PRUNE_COMMON='' WT_PRUNE_WTDIR='' WT_PRUNE_ORPHANS=()
@@ -319,13 +349,14 @@ wt_prune_survey() {  # $1 = main checkout
     fi
   fi
   wt_prune_judge_teardown
+  wt_prune_list_hardlink_dirs
 }
 
 # Run every finder against a fresh survey. Returns 1 when the repository cannot be surveyed.
 wt_prune_discover() {  # $1 = main checkout
   local finder
   PRUNE_ID=() PRUNE_KIND=() PRUNE_PATH=() PRUNE_BYTES=() PRUNE_ACTION=() PRUNE_REASON=()
-  PRUNE_KEY=() PRUNE_MEASURE=()
+  PRUNE_KEY=() PRUNE_MEASURE=() PRUNE_OWNER=() PRUNE_DEP=()
   wt_prune_survey "$1" || return 1
   for finder in "${WT_PRUNE_FINDERS[@]}"; do
     "$finder"
@@ -711,6 +742,45 @@ wt_find_ledger_junk() {
   done
 }
 
+# The parent a dependency dir $2 of checkout $1 is renamed aside within, on stdout; returns 1 when
+# that is not a plain directory inside the checkout, which no leftover is ever looked for under.
+wt_prune_removed_dep_parent() {  # $1 = checkout, $2 = dir
+  local checkout=$1 dir=$2 parent=$1
+  case $dir in */*) parent=$checkout/${dir%/*} ;; esac
+  wt_is_safe_relpath "$dir" && ! wt_has_symlinked_parent "$checkout" "$dir" \
+    && [ -d "$parent" ] && wt_prune_still_itself "$parent" || return 1
+  printf '%s' "$parent"
+}
+
+# Only the parents of the profile's hardlink dirs, in the main checkout and each live worktree, and
+# only names wt_is_removed_dep_name accepts: never a walk of the tree. A symlink of that name is
+# listed to say it is not followed.
+wt_find_removed_dep_leftovers() {
+  local checkout dir parent leftover n
+  for checkout in "$WT_PRUNE_ROOT" ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
+    for dir in ${WT_PRUNE_HARDLINK_DIRS[@]+"${WT_PRUNE_HARDLINK_DIRS[@]}"}; do
+      parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") || continue
+      for leftover in "$parent/.${dir##*/}.pitlane-removed."*; do
+        wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
+        wt_prune_find_item "$(wt_prune_item_id removed-dep-leftover "$leftover")" >/dev/null && continue
+        n=${#PRUNE_ID[@]}
+        if [ -L "$leftover" ]; then
+          wt_prune_add removed-dep-leftover "$leftover" "$leftover" - refuse \
+            "named like a copy of $dir moved aside, but a symlink — never followed, and not removed" ''
+        elif [ -d "$leftover" ]; then
+          wt_prune_add removed-dep-leftover "$leftover" "$leftover" "$(wt_prune_bytes "$leftover")" delete \
+            "$(wt_prune_join_reasons "a copy of $dir in $checkout that a fresh install moved aside and could not finish removing; the next setup of $dir there removes it too"$'\n'"$(wt_prune_shared_note "$leftover")")" \
+            "$leftover"
+        else
+          continue
+        fi
+        PRUNE_OWNER[n]=$checkout
+        PRUNE_DEP[n]=$dir
+      done
+    done
+  done
+}
+
 # Why the live worktree at $1 is NOT an abandoned subagent worktree, or nothing when it is one.
 # Staleness is judged on the checkout, not its admin dir: the guard's own `git status` refreshes
 # the index, so asking about the admin dir after the guard would always answer "just touched".
@@ -1012,6 +1082,36 @@ wt_apply_server_leftover() {  # $1 = item index
     *) WT_PRUNE_DETAIL="its record cannot be read now"; return 1 ;;
   esac
   return 0
+}
+
+# Re-proved here, not trusted from the discovery: the bootstrap run that moved it aside, or another,
+# may hold the checkout, and the name may have become a symlink since.
+wt_apply_removed_dep_leftover() {  # $1 = item index
+  local leftover=${PRUNE_KEY[$1]} checkout=${PRUNE_OWNER[$1]-} dir=${PRUNE_DEP[$1]-} parent rc
+  if [ -z "$checkout" ] || [ -z "$dir" ] || ! parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") \
+    || [ "${leftover%/*}" != "$parent" ] || ! wt_is_removed_dep_name "${leftover##*/}" "$dir"; then
+    WT_PRUNE_DETAIL="$leftover is no longer beside $dir in $checkout"
+    return 1
+  fi
+  if [ "$checkout" != "$WT_PRUNE_ROOT" ] && { ! wt_prune_list_live || ! wt_prune_is_live "$checkout"; }; then
+    WT_PRUNE_DETAIL="$checkout is no longer a live worktree"
+    return 1
+  fi
+  if command -v flock >/dev/null 2>&1 \
+    && ! wt_lock_acquire "$(wt_state_path "$checkout").lock" 0 "$WT_PRUNE_ALLOCATION_FD"; then
+    WT_PRUNE_DETAIL="a Pitlane run holds the bootstrap lock of $checkout, or it cannot be taken — re-run the report once it is done"
+    return 1
+  fi
+  if [ ! -d "$leftover" ] || ! wt_prune_still_itself "$leftover"; then
+    WT_PRUNE_DETAIL="$leftover is no longer a directory of its own (gone, or a symlink now)"
+    rc=1
+  else
+    wt_prune_remove_dir "$leftover"
+    rc=$?
+    [ "$rc" != 0 ] || WT_PRUNE_DETAIL='deleted'
+  fi
+  wt_lock_release "$WT_PRUNE_ALLOCATION_FD"
+  return "$rc"
 }
 
 wt_apply_ledger_junk() {  # $1 = item index

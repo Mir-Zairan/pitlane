@@ -1,6 +1,6 @@
 ---
 name: pitlane-tidy
-description: Find what this plugin's worktrees left behind — orphaned worktree directories, stale git registrations, runtime allocations (databases, containers) nothing uses any more, app servers /pitlane-serve started in worktrees since removed, broken ledger entries — report it with the disk each item frees, and remove only the items the developer confirms. Use when disk is filling up with old worktrees, after worktrees were deleted by hand, or when a teardown did not finish.
+description: Find what this plugin's worktrees left behind — orphaned worktree directories, stale git registrations, runtime allocations (databases, containers) nothing uses any more, app servers /pitlane-serve started in worktrees since removed, broken ledger entries, dependency copies a fresh install moved aside — report it with the disk each item frees, and remove only the items the developer confirms. Use when disk is filling up with old worktrees, after worktrees were deleted by hand, or when a teardown did not finish.
 argument-hint: "[--dry-run]"
 ---
 
@@ -70,7 +70,11 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `stale-admin` (git's
 registration of a worktree that is gone), `runtime-leftover` (a runtime allocation nothing uses),
 `server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
-as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record), `abandoned` (a subagent worktree — `agent-<hex>` — that is
+as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record),
+`removed-dep-leftover` (a copy of a hardlinked dependency dir — `.vendor.pitlane-removed.<pid>.<n>`
+beside `vendor/` — that a fresh install moved aside and could not finish removing, in the main
+checkout or a live worktree; the next setup of that dependency there removes it too, and applying it
+is refused while a Pitlane run holds that worktree), `abandoned` (a subagent worktree — `agent-<hex>` — that is
 unlocked, holds no work and has gone untouched for an hour; Claude Code leaves these when a
 `WorktreeCreate` hook made them, and applying one runs the teardown hook on it), `held` (a live
 worktree with work in it).

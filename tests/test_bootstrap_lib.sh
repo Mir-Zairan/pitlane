@@ -2805,6 +2805,19 @@ if [ "$(id -u)" != 0 ]; then
   rm -rf "$DREPO/vendor/locked"
 fi
 rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
+
+# The aside name and its one matcher, which the /pitlane-tidy sweep shares: exact shape only.
+eq 'aside name: the dir'"'"'s base, our marker, the pid and a random number' '.node_modules.pitlane-removed.12.345' \
+  "$(wt_removed_dep_name web/node_modules 12 345)"
+eq 'aside name: what it makes is accepted, for that dir' yes \
+  "$(wt_is_removed_dep_name "$(wt_removed_dep_name web/node_modules 12 345)" web/node_modules && echo yes || echo no)"
+for lookalike in .vendor.pitlane-removed.12.345 .node_modules.pitlane-removed.12 \
+  .node_modules.pitlane-removed.12. .node_modules.pitlane-removed..345 .node_modules.pitlane-removed.1x.345 \
+  .node_modules.pitlane-removed.12.34x .node_modules.pitlane-removed.12.3.4 node_modules.pitlane-removed.12.345 \
+  .node_modules.pitlane-removed.1:2.3; do
+  eq "aside name: $lookalike is not ours for web/node_modules" no \
+    "$(wt_is_removed_dep_name "$lookalike" web/node_modules && echo yes || echo no)"
+done
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 donor_rec donor-a "done" 100
 

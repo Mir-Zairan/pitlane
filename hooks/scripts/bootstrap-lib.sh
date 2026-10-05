@@ -2260,6 +2260,27 @@ wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy
     "worktree $(wt_name_from_path "$donor")" || true
 }
 
+# The name wt_clear_linked_dep moves dependency dir $1 aside to, in the dir's own parent:
+# `.<base>.pitlane-removed.<pid>.<random>`. wt_is_removed_dep_name is its only matcher.
+wt_removed_dep_name() {  # $1 = dir, $2 = pid, $3 = a random number
+  printf '.%s.pitlane-removed.%s.%s' "${1##*/}" "$2" "$3"
+}
+
+# True if entry name $1 is exactly what wt_removed_dep_name makes for dependency dir $2. The /pitlane-tidy
+# sweep (prune.sh) matches with this too, so a name only resembling ours is never removed.
+wt_is_removed_dep_name() {  # $1 = entry name, $2 = dir
+  local name=${1-} base=${2##*/} rest pid rand
+  [ -n "$base" ] || return 1
+  case $name in ".$base.pitlane-removed."*) ;; *) return 1 ;; esac
+  rest=${name#".$base.pitlane-removed."}
+  pid=${rest%%.*}
+  rand=${rest#*.}
+  [ "$pid" != "$rest" ] || return 1
+  case $pid in '' | *[!0-9]*) return 1 ;; esac
+  case $rand in '' | *[!0-9]*) return 1 ;; esac
+  return 0
+}
+
 # Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then.
 # Only a real dir under the dep's own plain parent: the names are ours and nothing else makes them.
 wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
@@ -2268,6 +2289,7 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
   parent=$worktree
   case $dir in */*) parent=$worktree/${dir%/*} ;; esac
   for leftover in "$parent/.${dir##*/}.pitlane-removed."*; do
+    wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
     [ -d "$leftover" ] && [ ! -L "$leftover" ] || continue
     if err=$(rm -rf -- "$leftover" 2>&1); then
       wt_log "  $dir: removed ${leftover##*/}, a linked copy an earlier run moved aside"
@@ -2312,7 +2334,7 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
   wt_log "  $dir: $lock changed since it was linked — removing the linked copy and installing fresh"
   # Renamed aside first, within its own parent, then removed: an `rm -rf` that fails part-way at
   # the dir's own path would leave a half tree a later install could run over and record done.
-  aside=${dest%/*}/.${dir##*/}.pitlane-removed.$$.${RANDOM:-0}
+  aside=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
   err="${aside##*/} exists"
   if [ -e "$aside" ] || ! err=$(mv -- "$dest" "$aside" 2>&1); then
     wt_log "  $dir: could not move the linked copy aside to remove it (${err%%"$WT_NL"*}) — not installing over files it shares with another tree; retried next run"

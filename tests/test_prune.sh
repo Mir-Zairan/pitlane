@@ -912,6 +912,97 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Dependency dirs a fresh install moved aside (wt_clear_linked_dep) and could not remove
+# ---------------------------------------------------------------------------
+# Looked for only beside the profile's hardlink dirs, by the exact name bootstrap gives them, in the
+# main checkout and each live worktree; removed only on --apply, re-proved there.
+RL=$TMP/leftovers
+make_repo "$RL"
+WL=$(create "$RL" lefty)
+eq 'removed dep: fixture — the worktree was created' "$RL/.claude/worktrees/lefty" "$WL"
+prune "$RL"
+eq 'removed dep: none listed when there are none' '' "$(grep -F "${TAB}removed-dep-leftover$TAB" "$TMP/out")"
+
+LW=$WL/.vendor.pitlane-removed.4242.17
+mkdir -p "$LW/pkg"
+head -c 20000 /dev/zero >"$LW/pkg/big.bin"
+LM=$RL/.vendor.pitlane-removed.1.2
+mkdir -p "$LM"
+printf 'x\n' >"$LM/f"
+# Shaped like ours, but not beside a hardlink dir, not of that dir, or not quite our name.
+mkdir -p "$WL/sub/.vendor.pitlane-removed.5.6" "$WL/.node_modules.pitlane-removed.5.6" \
+  "$WL/.vendor.pitlane-removed.5" "$WL/.vendor.pitlane-removed.5.x" "$WL/.vendor.pitlane-removed.5.6.7" \
+  "$WL/vendor/.vendor.pitlane-removed.5.6"
+# A symlink with our name, pointing at a tree that must never be touched.
+TGT=$TMP/leftover-target
+mkdir -p "$TGT"
+printf 'keep\n' >"$TGT/precious"
+LS=$WL/.vendor.pitlane-removed.7.7
+ln -s "$TGT" "$LS"
+
+prune "$RL"
+eq 'removed dep: the report exits 0' 0 "$(cat "$TMP/rc")"
+eq 'removed dep: the leftover in the worktree is offered for deletion' delete \
+  "$(field removed-dep-leftover "$LW" 5)"
+eq 'removed dep: with its bytes by du' "$(du_bytes "$LW")" "$(field removed-dep-leftover "$LW" 4)"
+contains 'removed dep: naming the worktree it is in' "in $WL" "$(field removed-dep-leftover "$LW" 6)"
+eq 'removed dep: one in the main checkout is offered too' delete "$(field removed-dep-leftover "$LM" 5)"
+eq 'removed dep: a symlink with the name is refused' refuse "$(field removed-dep-leftover "$LS" 5)"
+contains 'removed dep: saying it is never followed' 'never followed' "$(field removed-dep-leftover "$LS" 6)"
+eq 'removed dep: exactly those three are listed' 3 \
+  "$(grep -c -F "${TAB}removed-dep-leftover$TAB" "$TMP/out" | tr -d ' ')"
+id_lw=$(field removed-dep-leftover "$LW" 1)
+id_lm=$(field removed-dep-leftover "$LM" 1)
+id_ls=$(field removed-dep-leftover "$LS" 1)
+lw_bytes=$(field removed-dep-leftover "$LW" 4)
+
+# The worktree's bootstrap lock held: skipped, with the reason, and kept.
+if command -v flock >/dev/null 2>&1; then
+  LOCKF=$(git -C "$WL" rev-parse --absolute-git-dir)/worktree-bootstrap-state.lock
+  ( exec 7>"$LOCKF"; flock 7; exec sleep 30 ) &
+  holder=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    flock -n "$LOCKF" true 2>/dev/null || break
+    sleep 0.1
+  done
+  prune "$RL" --apply "$id_lw"
+  eq 'removed dep: with the bootstrap lock held, apply exits 1' 1 "$(cat "$TMP/rc")"
+  contains 'removed dep: saying a run holds the lock' 'holds the bootstrap lock' "$(cat "$TMP/out")"
+  eq 'removed dep: and the leftover is kept' yes "$(exists "$LW/pkg/big.bin")"
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+fi
+
+prune "$RL" --apply "$id_lw" "$id_lm" "$id_ls"
+out=$(cat "$TMP/out")
+eq 'removed dep: apply exits 1, the symlink being refused' 1 "$(cat "$TMP/rc")"
+contains 'removed dep: the leftover is applied, freeing what was reported' \
+  "applied$TAB$id_lw${TAB}removed-dep-leftover$TAB$LW$TAB$lw_bytes$TAB" "$out"
+contains 'removed dep: the main checkout'"'"'s too' "applied$TAB$id_lm" "$out"
+contains 'removed dep: the symlink is refused' "refused$TAB$id_ls" "$out"
+eq 'removed dep: both are gone' 'no no' "$(exists "$LW") $(exists "$LM")"
+eq 'removed dep: the symlink is kept' yes "$( [ -L "$LS" ] && echo yes || echo no)"
+eq 'removed dep: and its target untouched' keep "$(cat "$TGT/precious")"
+eq 'removed dep: the look-alikes are untouched' 'yes yes yes yes yes yes' \
+  "$(exists "$WL/sub/.vendor.pitlane-removed.5.6") $(exists "$WL/.node_modules.pitlane-removed.5.6") $(exists "$WL/.vendor.pitlane-removed.5") $(exists "$WL/.vendor.pitlane-removed.5.x") $(exists "$WL/.vendor.pitlane-removed.5.6.7") $(exists "$WL/vendor/.vendor.pitlane-removed.5.6")"
+eq 'removed dep: the dependency dir itself is untouched' yes "$(exists "$WL/vendor/autoload.php")"
+
+# Replaced by a symlink between the report and the apply: refused, the target untouched.
+LR=$WL/.vendor.pitlane-removed.8.8
+mkdir -p "$LR"
+prune "$RL"
+id_lr=$(field removed-dep-leftover "$LR" 1)
+eq 'removed dep: the new leftover is offered' delete "$(field removed-dep-leftover "$LR" 5)"
+rmdir "$LR"
+ln -s "$TGT" "$LR"
+prune "$RL" --apply "$id_lr"
+eq 'removed dep: swapped for a symlink, apply exits 1' 1 "$(cat "$TMP/rc")"
+contains 'removed dep: and refuses it' "refused$TAB$id_lr" "$(cat "$TMP/out")"
+eq 'removed dep: the symlink is kept, its target untouched' 'yes keep' \
+  "$( [ -L "$LR" ] && echo yes || echo no) $(cat "$TGT/precious")"
+rm -f "$LR" "$LS"
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
