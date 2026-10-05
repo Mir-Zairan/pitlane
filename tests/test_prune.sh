@@ -26,6 +26,9 @@ PRUNE=$SCRIPTS/prune.sh
 SCRATCH=$(mktemp -d)
 SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
 TMP=$SCRATCH
+# Each suite allocates from its own band below the ephemeral range, at a per-run offset, so suites
+# running in parallel (or one suite twice) never derive the same ports.
+PORT_BASE=$((15000 + $$ % 25 * 200))
 # Every server a test starts is killed on the way out, by its group, whatever happened.
 SERVED=''
 kill_served() {
@@ -97,7 +100,7 @@ make_repo() {  # $1 = dir, $2 = extra teardown shell
   printf 'LOCK\n' >"$dir/composer.lock"
   printf 'shared\n' >"$dir/vendor/autoload.php"
   printf 'tracked\n' >"$dir/app.txt"
-  cat >"$dir/.claude/worktree-profile.json" <<'JSON'
+  cat >"$dir/.claude/worktree-profile.json" <<JSON
 {
   "schemaVersion": 1,
   "shell": "",
@@ -106,7 +109,7 @@ make_repo() {  # $1 = dir, $2 = extra teardown shell
             "install":"mkdir -p vendor && printf installed > vendor/autoload.php"}],
   "runtime": {
     "slug": "{slug}",
-    "port": { "var": "SERVER_PORT", "base": 4100, "span": 200 },
+    "port": { "var": "SERVER_PORT", "base": $PORT_BASE, "span": 200 },
     "env": { "file": ".env.worktree.local", "vars": { "DATABASE": "demo_{slug}" } },
     "seed": ".claude/worktree-seed.sh",
     "teardown": ".claude/worktree-teardown.sh"

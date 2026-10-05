@@ -27,6 +27,9 @@ REMOVE_HOOK=$SCRIPTS/teardown.sh
 SCRATCH=$(mktemp -d)
 SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
 TMP=$SCRATCH
+# Each suite allocates from its own band below the ephemeral range, at a per-run offset, so suites
+# running in parallel (or one suite twice) never derive the same ports.
+PORT_BASE=$((10000 + $$ % 25 * 200))
 listener_pid=''
 # A test that makes a directory undeletable restores it itself; the chmod here is for one that
 # was interrupted before it could.
@@ -131,7 +134,7 @@ make_repo() {  # $1 = dir, $2 = extra teardown shell, $3 = seedSeconds
             "install":"mkdir -p vendor && printf installed > vendor/autoload.php"}],
   "runtime": {
     "slug": "{slug}",
-    "port": { "var": "SERVER_PORT", "base": 4100, "span": 200 },
+    "port": { "var": "SERVER_PORT", "base": $PORT_BASE, "span": 200 },
     "env": { "file": ".env.worktree.local", "vars": { "DATABASE": "demo_{slug}" } },
     "seed": ".claude/worktree-seed.sh",
     "teardown": ".claude/worktree-teardown.sh"

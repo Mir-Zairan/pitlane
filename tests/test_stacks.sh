@@ -534,7 +534,8 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
   # shellcheck disable=SC2034  # STACK_ARTIFACTS is read by write_profile, in stack_fixtures.sh
   STACK_ARTIFACTS='' STACK_ART_FILE='' STACK_ART_CHANGE='' STACK_ART_EXPECT=''
   STACK_DETECTED_LINKDIRS='' STACK_DETECT_ERRORS='' STACK_COPY='' STACK_INPLACE='' STACK_INPLACE_NET='' STACK_LOCK_CHANGE='' STACK_RELINK_FILE=''
-  STACK_PORT_BASE=$((20000 + $2 * 300))
+  # A band of its own, offset per run, so the other suites running in parallel cannot collide with it.
+  STACK_PORT_BASE=$((20000 + $$ % 3 * 3300 + $2 * 300))
   local dir=$SCRATCH/$BACKEND/$stack
   r=$dir/repo logs=$dir/logs STACK_DB=$dir/databases
   mkdir -p "$r" "$logs" "$STACK_DB"
