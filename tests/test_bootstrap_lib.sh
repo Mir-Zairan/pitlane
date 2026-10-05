@@ -2896,6 +2896,28 @@ if [ "$(id -u)" != 0 ]; then
   eq 'teardown: the worktree is removed, not held for the copy' "0|absent|absent" "$rc|$(present "$TWT")|$(present "$TADMIN")"
   lacks '...and nothing says it holds work' 'holds work' "$(cat "$TMP/trm-err")"
   eq "...the main checkout's tree untouched" 'MAIN|L' "$(cat "$TRM/vendor/pkg/file.txt")|$(cat "$TRM/vendor/locked/f")"
+
+  # The same, with the copy in the git dir still read-only (a Go module cache is): teardown exits 0.
+  TWT2=$TRM/.claude/worktrees/tr2
+  git -C "$TRM" worktree add -q "$TWT2" -b tr2 2>/dev/null
+  wt_bootstrap_deps "$TRM" "$TWT2" "$FAR" >/dev/null 2>&1
+  printf 'LOCKV2\n' > "$TWT2/composer.lock"
+  git -C "$TWT2" commit -qam lock2
+  git -C "$TRM" branch -q tr2-kept tr2
+  chmod 555 "$TWT2/vendor/locked"
+  wt_bootstrap_deps "$TRM" "$TWT2" "$FAR" >/dev/null 2>&1
+  TADMIN2=$(git -C "$TWT2" rev-parse --absolute-git-dir)
+  ne 'teardown, read-only leftover: (fixture) it is in the git dir' '' "$(ls -A "$TADMIN2/pitlane-removed" 2>/dev/null)"
+  rc=0
+  ( cd "$TRM" && printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s","reason":"session_exit","cwd":"%s"}' "$TWT2" "$TRM" \
+    | bash "$HERE/teardown.sh" >/dev/null 2>"$TMP/trm-err2" ) || rc=$?
+  chmod -R u+w "$TADMIN2" 2>/dev/null
+  eq 'teardown, read-only leftover: exits 0' 0 "$rc"
+  eq '...the checkout and its git dir are removed' "absent|absent" "$(present "$TWT2")|$(present "$TADMIN2")"
+  eq '...so git no longer lists it' '' "$(git -C "$TRM" worktree list --porcelain | grep -F "$TWT2")"
+  lacks '...with no failure from git' 'Permission denied' "$(cat "$TMP/trm-err2")"
+  lacks '...and nothing says it holds work' 'holds work' "$(cat "$TMP/trm-err2")"
+  eq "...the main checkout's tree untouched" 'MAIN|L' "$(cat "$TRM/vendor/pkg/file.txt")|$(cat "$TRM/vendor/locked/f")"
 fi
 rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
 
@@ -2922,27 +2944,95 @@ lacks '...without saying it again' 'installs its own copy' "$out"
 PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
 eq '...and nothing is pending' '' "$WT_PENDING"
 
-# Linked before this change: the next run with installs deferred leaves it for the background run,
-# which moves the linked copy into the git dir and installs fresh.
-git -C "$DREPO" config --unset branch.wt-dep1.merge
-relink LOCKV1
+# Linked before this change: the start-up run, installs deferred, moves the linked copy out of the
+# worktree into its git dir at once (an instant rename), and the background run removes it there and
+# installs fresh.
+PADMIN=$(wt_removed_dep_admin_dir "$DWT")
+pr_relink() {  # vendor linked from main while not a pull request, then the branch becomes one
+  git -C "$DREPO" config --unset branch.wt-dep1.merge 2>/dev/null
+  rm -rf "$PADMIN"
+  relink LOCKV1
+  git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+}
+pr_relink
 eq 'pr: (fixture) linked from main while not yet a pull request' main "$(linked_from)"
-git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
 eq 'pr: a linked dir recorded done is pending again' vendor "$WT_PENDING_ATTEMPTABLE"
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains '...at start-up it is left for the background run' 'vendor: to be installed in the background' "$out"
+contains '...at start-up its install is left for the background run' 'vendor: to be installed in the background' "$out"
 contains '...saying why' "vendor: a pull request's worktree installs its own copy" "$out"
-eq '...still linked meanwhile' main "$(linked_from)"
+contains '...and the linked copy is moved out of the worktree at once' \
+  "vendor: it was linked, and a pull request's worktree keeps its own copy — moved the linked copy out of the worktree, into its git dir" "$out"
+eq '...so the session has no tree shared with main' absent "$(present "$DWT/vendor")"
+ne '...it sits in the git dir' '' "$(ls -A "$PADMIN" 2>/dev/null)"
+eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks '...a second start-up has nothing more to move' 'moved the linked copy' "$out"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains '...the run that installs clears the linked copy first' \
-  "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy and installing fresh" "$out"
+contains '...the run that installs removes it from the git dir' "vendor: removed $PADMIN/vendor." "$out"
 eq '...and installs into a fresh dir' "install|absent" "$(linked_from)|$(present "$DWT/vendor/stale.txt")"
 eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
 eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
 eq '...nothing left in the git dir or beside the dir' '|' \
-  "$(ls -A "$(wt_removed_dep_admin_dir "$DWT")" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+  "$(ls -A "$PADMIN" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
 eq '...recorded done' "done" "$(wt_state_status "$DWT" vendor)"
+
+# Not deferred, the run that installs clears the linked copy itself, right before the install.
+pr_relink
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr: a run that installs clears the linked copy first' \
+  "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy and installing fresh" "$out"
+eq '...and installs' "install|" "$(linked_from)|$(find "$DWT/vendor" -type f -links +1)"
+
+# Every step that leaves it uninstalled still moves the linked copy out of use: a PR worktree never
+# keeps a tree shared with main because it could not install.
+PASTDUE=$(( $(date +%s) - 5 ))
+for pr_exit in approval empty-install budget; do
+  pr_relink
+  case $pr_exit in
+    approval) out=$(WT_APPROVAL=no wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); why='not installed — the profile'"'"'s commands are not approved' ;;
+    empty-install)
+      # shellcheck disable=SC2034
+      PROFILE_RAW=$(dep_raw vendor composer.lock hardlink '' '')
+      out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); why='no install command to run' ;;
+    budget) out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$PASTDUE" 2>&1); why='out of time before starting' ;;
+  esac
+  contains "pr, $pr_exit: not installed" "vendor: $why" "$out"
+  contains '...the linked copy is moved out of the worktree all the same' 'moved the linked copy out of the worktree, into its git dir' "$out"
+  eq '...no tree shared with main is left in it' absent "$(present "$DWT/vendor")"
+  eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+done
+
+# The git dir on another device: no instant move, so start-up leaves the linked copy to the run that
+# installs, and says so; a step with no later install (unapproved) removes it outright.
+PFAKESTAT=$TMP/pr-fakestat-bin
+mkdir -p "$PFAKESTAT"
+# shellcheck disable=SC2016  # the fake's own script, expanded when it runs
+printf '#!/bin/sh\nfor a; do p=$a; done\nprintf "%%s\\n" "$p" | cksum | cut -d" " -f1\n' > "$PFAKESTAT/stat"
+chmod +x "$PFAKESTAT/stat"
+pr_relink
+out=$(PATH=$PFAKESTAT:$PATH WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr, git dir on another device: start-up says the linked copy stays for the install' \
+  'vendor: it was linked, and a pull request'"'"'s worktree keeps its own copy — the linked copy stays until the run that installs removes it' "$out"
+eq '...and leaves it, rather than copy the tree across devices' main "$(linked_from)"
+out=$(PATH=$PFAKESTAT:$PATH WT_APPROVAL=no wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...unapproved, nothing will install it, so it is removed outright' 'removing the linked copy and installing fresh' "$out"
+eq '...gone' "absent|$rmain" "$(present "$DWT/vendor")|$(tree_snap "$DREPO/vendor")"
+eq '...nothing left beside it or in the git dir' '|' \
+  "$(ls -A "$PADMIN" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+
+# A PR worktree whose own tree was never linked is not touched by these steps.
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" >/dev/null 2>&1
+printf 'LOCKV7\n' > "$DWT/composer.lock"
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks 'pr: an own install pending again is not moved aside at start-up' 'linked copy' "$out"
+eq '...and stays in place' DINSTALLED "$(cat "$DWT/vendor/m" 2>/dev/null)"
+printf 'LOCKV1\n' > "$DWT/composer.lock"
 git -C "$DREPO" config --unset branch.wt-dep1.merge
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks 'pr: no longer a pull request, it says nothing of its own copy' 'installs its own copy' "$out"

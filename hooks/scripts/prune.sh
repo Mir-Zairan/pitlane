@@ -762,10 +762,16 @@ wt_prune_removed_dep_admin() {  # $1 = checkout
 }
 
 # True when $3 is a name wt_clear_linked_dep makes for dir $2 of checkout $1, where it makes it: in
-# the checkout's admin dir, or beside the dir.
-wt_prune_is_removed_dep() {  # $1 = checkout, $2 = dir, $3 = leftover
+# the checkout's admin dir, or beside the dir. $4 is that admin dir when the caller has it (empty: it
+# has none); without $4 it is looked up, as the apply step does to re-prove it.
+wt_prune_is_removed_dep() {  # $1 = checkout, $2 = dir, $3 = leftover, $4 = admin dir (optional)
   local admin parent
-  if admin=$(wt_prune_removed_dep_admin "$1") && [ "${3%/*}" = "$admin" ]; then
+  if [ "$#" -ge 4 ]; then
+    admin=$4
+  else
+    admin=$(wt_prune_removed_dep_admin "$1") || admin=''
+  fi
+  if [ -n "$admin" ] && [ "${3%/*}" = "$admin" ]; then
     wt_is_removed_dep_admin_name "${3##*/}" "$2"
   else
     parent=$(wt_prune_removed_dep_parent "$1" "$2") && [ "${3%/*}" = "$parent" ] \
@@ -783,7 +789,7 @@ wt_find_removed_dep_leftovers() {
     for dir in ${WT_PRUNE_HARDLINK_DIRS[@]+"${WT_PRUNE_HARDLINK_DIRS[@]}"}; do
       parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") || parent=''
       for leftover in ${admin:+"$admin"/*} ${parent:+"$parent/.${dir##*/}.pitlane-removed."*}; do
-        wt_prune_is_removed_dep "$checkout" "$dir" "$leftover" || continue
+        wt_prune_is_removed_dep "$checkout" "$dir" "$leftover" "$admin" || continue
         wt_prune_find_item "$(wt_prune_item_id removed-dep-leftover "$leftover")" >/dev/null && continue
         n=${#PRUNE_ID[@]}
         if [ -L "$leftover" ]; then

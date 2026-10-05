@@ -164,6 +164,15 @@ if [ "$present" = 1 ]; then
   # shellcheck disable=SC2153  # set by wt_read_allocation, in teardown-lib.sh
   wt_release_env_overrides "$worktree" "$WT_TD_ENVFILE" "$WT_TD_ENVSTATE"
 
+  # What a fresh install moved into the git dir and could not remove (wt_clear_linked_dep) is ours. A
+  # read-only tree there (Go's module cache is one) lets `git worktree remove` delete the checkout and
+  # then fail on the git dir, leaving a registration that `git worktree prune` cannot remove either.
+  if [ -n "$admin" ] && [ -d "$admin/pitlane-removed" ] && [ ! -L "$admin/pitlane-removed" ]; then
+    chmod -R u+w -- "$admin/pitlane-removed" 2>/dev/null
+    rm -rf -- "${admin:?}/pitlane-removed" 2>/dev/null \
+      || wt_log "could not remove $admin/pitlane-removed, dependency copies a fresh install moved aside"
+  fi
+
   # A single --force: it takes the gitignored dependency directories with it. Never -f -f.
   out=$(wt_git "$root" worktree remove --force "$worktree" 2>&1) || {
     [ -n "$out" ] && wt_log "git worktree remove: $out"
