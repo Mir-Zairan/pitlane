@@ -2461,7 +2461,8 @@ WT_APPROVAL=no run_donor 'test -f vendor/pkg/file.txt'
 eq 'donor: with a verify that may not run, no sibling is used' none "$(linked_from)"
 lacks '...and its verify is not tried' 'not running' "$out"
 WT_APPROVAL=no run_donor ''
-eq '...while with no verify a link needs no approval' donor-a "$(linked_from)"
+eq '...nor with no verify: an unapproved worktree takes from no other' none "$(linked_from)"
+contains '...and says so' "composer.lock differs from the main checkout, and a pull request's or unapproved worktree links from no other worktree — installing instead" "$out"
 
 # Copy paths are unshared from the DONOR: an in-place write in this worktree must not reach it.
 mkdir -p "$DONORS/donor-a/vendor/composer"; printf 'DONOR-INSTALLED\n' > "$DONORS/donor-a/vendor/composer/installed.json"
@@ -2512,6 +2513,130 @@ eq 'donor: a sibling whose checkout is gone is not used' install "$(linked_from)
 mv "$TMP/donor-a-moved" "$DONORS/donor-a"
 run_donor
 eq '...and is used once it is back' donor-a "$(linked_from)"
+
+# The main checkout with no lockfile, or with its dir a symlink, cannot give the tree: a donor can.
+mv "$DREPO/composer.lock" "$TMP/main-lock"
+run_donor
+eq 'donor: main has no lockfile, the donor gives it' donor-a "$(linked_from)"
+contains '...and says why' '(the main checkout has no composer.lock)' "$out"
+mv "$TMP/main-lock" "$DREPO/composer.lock"
+mv "$DREPO/vendor" "$TMP/main-vendor"; ln -s "$TMP/main-vendor" "$DREPO/vendor"
+run_donor
+eq "donor: main's dir is a symlink, the donor gives it" donor-a "$(linked_from)"
+contains '...and says why' "(the main checkout's vendor is a symlink)" "$out"
+rm "$DREPO/vendor"; mv "$TMP/main-vendor" "$DREPO/vendor"
+
+# git 2.48's relative paths: the donor's .git names its admin dir relative to the checkout.
+DADMIN=$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)
+cp "$DONORS/donor-a/.git" "$TMP/donor-a.git"
+printf 'gitdir: %s\n' "$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$DADMIN" "$DONORS/donor-a")" \
+  > "$DONORS/donor-a/.git"
+run_donor
+eq 'donor: a .git holding a relative gitdir is still that worktree' donor-a "$(linked_from)"
+cp "$TMP/donor-a.git" "$DONORS/donor-a/.git"
+
+# A name that only starts like a pull request's is an ordinary worktree.
+mk_donor pr-x
+donor_rec pr-x "done" 200
+run_donor
+eq 'donor: a worktree named pr-x is not a pull request' pr-x "$(linked_from)"
+git -C "$DREPO" worktree remove --force "$DONORS/pr-x"
+
+# A detached HEAD cannot be told apart from a pull request's checkout.
+git -C "$DONORS/donor-a" checkout -q --detach
+run_donor
+eq 'donor: a sibling on a detached HEAD is not used' install "$(linked_from)"
+git -C "$DONORS/donor-a" checkout -q wt-donor-a
+
+# A pull request's worktree takes from no other: their trees would share inodes both ways.
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/9/head
+run_donor
+eq "donor: a pull request's worktree links from no sibling" install "$(linked_from)"
+contains '...and says so' "pull request's or unapproved worktree links from no other worktree" "$out"
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+
+# The verify needs time to run: with none left the donor is skipped, not trusted unverified.
+rm -rf "$DWT/vendor"
+hl_rc=0
+wt_hardlink_dep "$DREPO" "$DWT" vendor composer.lock '' "$DLOCK2" "$DICK" 'true' "$(( $(date +%s) - 1 ))" \
+  2>/dev/null || hl_rc=$?
+eq 'donor: with the budget spent, a verify-gated donor is skipped' "1|none" "$hl_rc|$(linked_from)"
+
+# Every path that gives up after a donor was chosen lets go of the donor's lock.
+donor_lock_free() {
+  ( exec 5>"$DADMIN/worktree-bootstrap-state.lock"; flock -n 5 ) && echo free || echo held
+}
+hl_run() {  # $1 = dir, $2 = verify; in this shell, so a lock left held stays held
+  hl_rc=0
+  wt_hardlink_dep "$DREPO" "$DWT" "$1" composer.lock '' "$DLOCK2" "$DICK" "${2-}" "$FAR" 2>"$TMP/hl.log" \
+    || hl_rc=$?
+  hl_log=$(cat "$TMP/hl.log")
+}
+# The dir appears while the donor is being verified: left alone, and the lock released.
+rm -rf "$DWT/vendor"
+hl_run vendor "mkdir -p '$DWT/vendor'"
+eq 'donor: a dir that appears after the donor is chosen is left alone' 2 "$hl_rc"
+contains '...said so' 'already present in the worktree' "$hl_log"
+eq '...and the donor lock is released' free "$(donor_lock_free)"
+rm -rf "$DWT/vendor"
+
+# cp -al failing: a shim that refuses -al, so the fallback install can still run.
+mkdir -p "$TMP/nocp"
+# shellcheck disable=SC2016  # the shim's own "$1" and "$@", expanded when it runs
+printf '#!/bin/sh\n[ "$1" = -al ] && { echo "cp: refused" >&2; exit 1; }\nexec %s "$@"\n' "$(command -v cp)" \
+  > "$TMP/nocp/cp"
+chmod +x "$TMP/nocp/cp"
+PATH=$TMP/nocp:$PATH hl_run vendor
+eq 'donor: a cp -al that fails falls back to an install' 1 "$hl_rc"
+contains '...said so' 'could not hardlink (cp: refused)' "$hl_log"
+eq '...and the donor lock is released' free "$(donor_lock_free)"
+PATH=$TMP/nocp:$PATH run_donor
+eq '...the install runs' install "$(linked_from)"
+
+# A nested dir: its donor record and tree.
+mkdir -p "$DONORS/donor-a/vendor/bundle/pkg"; printf 'B\n' > "$DONORS/donor-a/vendor/bundle/pkg/file.txt"
+wt_state_join dep vendor/bundle hardlink "$DLOCK2" "$DICK" "done" 100
+printf 'wtstate%s%s%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$WT_STATE_REC" "$RS_" \
+  > "$DADMIN/worktree-bootstrap-state"
+# Its parent cannot be made: the worktree's vendor is a file.
+rm -rf "$DWT/vendor"; printf 'x\n' > "$DWT/vendor"
+hl_run vendor/bundle
+eq 'donor: a parent that cannot be made falls back to an install' 1 "$hl_rc"
+contains '...said so' 'could not create its parent directory' "$hl_log"
+eq '...and the donor lock is released' free "$(donor_lock_free)"
+# Its parent is a symlink in this worktree: the link would land wherever that points.
+rm -f "$DWT/vendor"; mkdir -p "$TMP/donor-elsewhere"; ln -s "$TMP/donor-elsewhere" "$DWT/vendor"
+hl_run vendor/bundle
+eq 'donor: a parent symlinked in the worktree falls back to an install' 1 "$hl_rc"
+contains '...said so' 'not a plain path inside the worktree' "$hl_log"
+eq '...nothing landed where it points' '' "$(ls -A "$TMP/donor-elsewhere")"
+eq '...and the donor lock is released' free "$(donor_lock_free)"
+rm -f "$DWT/vendor"; rm -rf "$TMP/donor-elsewhere" "$DONORS/donor-a/vendor/bundle"
+donor_rec donor-a "done" 100
+
+# The repair, when the donor its record names is gone: nothing to compare with, nothing said.
+mkdir -p "$DWT/vendor/composer"; printf 'OWN\n' > "$DWT/vendor/composer/installed.json"
+wt_state_set "$DWT" vendor hardlink "$DLOCK2" "$DICK" "done" '' '' "$DONORS/vanished"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$DINSTALL" '' '["composer"]')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); rc=$?
+eq 'donor repair: a vanished donor fails nothing' 0 "$rc"
+contains '...the dir is up to date' 'already up to date' "$out"
+lacks '...and no repair is claimed' 'shared its files' "$out"
+lacks '...nor a failure' 'could not' "$out"
+# The repair with the main checkout lacking the dir: the donor alone is compared with.
+mv "$DREPO/vendor" "$TMP/main-vendor"
+mkdir -p "$DONORS/donor-a/vendor/composer"; printf 'DONOR-INSTALLED\n' > "$DONORS/donor-a/vendor/composer/installed.json"
+rm -rf "$DWT/vendor"; cp -al "$DONORS/donor-a/vendor" "$DWT/vendor"
+wt_state_set "$DWT" vendor hardlink "$DLOCK2" "$DICK" "done" '' '' "$DONORS/donor-a"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'donor repair: with main lacking the dir, the donor is repaired against' 'composer shared its files with worktree donor-a — made a real copy' "$out"
+ne '...really' "$(ino "$DONORS/donor-a/vendor/composer/installed.json")" "$(ino "$DWT/vendor/composer/installed.json")"
+wt_state_set "$DWT" vendor hardlink "$DLOCK2" "$DICK" "done" '' '' "$DONORS/vanished"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); rc=$?
+eq '...and with the donor gone too, nothing fails' "0|" "$rc|$(printf '%s' "$out" | grep -E 'shared its files|could not')"
+mv "$TMP/main-vendor" "$DREPO/vendor"
+rm -rf "$DONORS/donor-a/vendor/composer" "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 
 git -C "$DREPO" worktree remove --force "$DONORS/donor-a"
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"

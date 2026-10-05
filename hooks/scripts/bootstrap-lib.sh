@@ -1935,13 +1935,15 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy,
   src=$root/$dir
   dest=$worktree/$dir
 
+  # Without our own lockfile there is nothing to compare any source with.
+  if [ -z "$lock" ] || [ ! -f "$worktree/$lock" ]; then
+    wt_log "  $dir: cannot compare $lock between the checkouts — installing instead"
+    return 1
   # `cp -al` copies a symlink as a symlink, so the worktree's dir would BE main's target, and making
   # its copy paths real copies would delete and replace them there.
-  if [ -L "$src" ]; then
-    wt_log "  $dir: the main checkout's $dir is a symlink — installing instead"
-    return 1
-  fi
-  if [ ! -d "$src" ]; then
+  elif [ -L "$src" ]; then
+    why="the main checkout's $dir is a symlink"
+  elif [ ! -d "$src" ]; then
     why="the main checkout has no $dir to link from"
   # An empty source would "succeed" and leave an empty dependency directory that then looks
   # installed to everything downstream.
@@ -1951,16 +1953,24 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy,
   # dependencies its own branch never asked for, which is worse than a slow install because it
   # looks like it worked. `cmp -s` rather than two checksums: it is exact and stops at the first
   # differing byte.
-  elif [ -z "$lock" ] || [ ! -f "$root/$lock" ] || [ ! -f "$worktree/$lock" ]; then
-    wt_log "  $dir: cannot compare $lock between the checkouts — installing instead"
-    return 1
+  elif [ ! -f "$root/$lock" ]; then
+    why="the main checkout has no $lock"
   elif ! cmp -s "$root/$lock" "$worktree/$lock"; then
     why="$lock differs from the main checkout"
   fi
   if [ -n "$why" ]; then
     # Over a dir already there an install is what reconciles it with the lockfile; a link cannot.
-    if [ -e "$dest" ] || [ -L "$dest" ] || [ -z "${6-}" ] \
-       || ! wt_hardlink_donor_find "$root" "$worktree" "$dir" "$lock" "${6-}" "${7-}" "${8-}" "${9-}"; then
+    if [ -e "$dest" ] || [ -L "$dest" ] || [ -z "${6-}" ]; then
+      wt_log "  $dir: $why — installing instead"
+      return 1
+    fi
+    # A donor's tree and ours share every inode outside the copy paths, both ways (ADR-023): a pull
+    # request's worktree, or one whose profile is unapproved, takes no part on either side.
+    if [ "${WT_APPROVAL:-}" = no ] || wt_is_pr_worktree "$worktree"; then
+      wt_log "  $dir: $why, and a pull request's or unapproved worktree links from no other worktree — installing instead"
+      return 1
+    fi
+    if ! wt_hardlink_donor_find "$root" "$worktree" "$dir" "$lock" "${6-}" "${7-}" "${8-}" "${9-}"; then
       wt_log "  $dir: $why — installing instead"
       return 1
     fi
@@ -1968,6 +1978,7 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy,
     src=$WT_DONOR/$dir
   fi
   if [ -e "$dest" ] || [ -L "$dest" ]; then
+    [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
     # A distinct code, not success: the caller must not report a link it did not make.
     wt_log "  $dir: already present in the worktree — leaving it alone"
     return 2
@@ -1993,8 +2004,9 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy,
   # ordinary situations, not errors: fall back rather than dying. Any partial tree is
   # removed first, or the install that follows would run on top of debris. cp's own first line is
   # what gets logged: guessing a cause blamed the filesystem for what was a missing directory.
-  # The donor's lock is held for the copy alone: once linked, its own runs cannot reach our inodes
-  # except through the copy paths, which are made real copies next.
+  # Once linked, every file outside the copy paths is one inode in both trees, so an in-place write
+  # from either side shows in the other (ADR-023 says who may take part). The donor's lock is held for
+  # the copy alone: it keeps the donor's own setup from rewriting its tree mid-copy.
   if ! err=$(cp -al "$src" "$dest" 2>&1); then
     [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
     rm -rf "$dest" 2>/dev/null
@@ -2038,7 +2050,9 @@ wt_admin_worktree() {  # $1 = admin dir, <common>/worktrees/<id>
 
 # True when the worktree checked out at $2, registered at admin dir $1, is a pull request's
 # (ADR-020): named `pr-<digits>`, or on a branch whose upstream is a `refs/pull/*` ref. Any location,
-# not only under the worktrees dir: this decides what may feed another worktree, so it errs wide.
+# not only under the worktrees dir: this decides what may feed another worktree, so it errs wide —
+# a HEAD that is unreadable or not on a branch (detached, as `gh pr checkout --detach` leaves it)
+# cannot be told apart from a PR's, and counts as one.
 # $3 is `git config --get-regexp '^branch\..*\.merge$'`, read once by the caller.
 wt_donor_is_pr() {  # $1 = admin dir, $2 = worktree, $3 = branch merge config
   local admin=${1%/} wt=${2%/} merges=${3-} name head line key branch
@@ -2046,12 +2060,12 @@ wt_donor_is_pr() {  # $1 = admin dir, $2 = worktree, $3 = branch merge config
   case $name in
     pr-*) case ${name#pr-} in '' | *[!0-9]*) ;; *) return 0 ;; esac ;;
   esac
-  [ -n "$merges" ] || return 1
-  IFS= read -r head <"$admin/HEAD" 2>/dev/null || return 1
+  { IFS= read -r head <"$admin/HEAD"; } 2>/dev/null || return 0
   case $head in
     'ref: refs/heads/'*) branch=${head#ref: refs/heads/} ;;
-    *) return 1 ;;
+    *) return 0 ;;
   esac
+  [ -n "$merges" ] || return 1
   while IFS= read -r line; do
     key=${line%% *}
     [ "$key" = "branch.$branch.merge" ] || continue
@@ -2078,7 +2092,7 @@ wt_donor_record_fits() {  # $1 = admin dir, $2 = dir, $3 = lock cksum, $4 = inst
 #   - its record for $3 is `done`, by the same strategy and install command, for the lockfile it has
 #     now, which is byte-identical to ours;
 #   - its $3 is a real, non-empty directory with no symlinked ancestor, and passes $7, our verify,
-#     run there — and with a verify to run, an unapproved profile gets no donor at all;
+#     run there; an unapproved profile gets no donor at all, and without flock nor does anyone;
 #   - its bootstrap lock is free: a worktree being set up, or torn down, is skipped, not waited for.
 # The most recent `done` wins, ties by path. Sets WT_DONOR and returns 0 with that donor's lock HELD
 # on fd 6, for the caller to release once it has copied; 1 when none qualifies.
@@ -2088,7 +2102,15 @@ wt_hardlink_donor_find() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 
   local rest any f verify left
   WT_DONOR=''
   [ -n "$dir" ] && [ -n "$lock" ] && [ -n "$lck" ] && [ -n "$ick" ] && [ -f "$mine/$lock" ] || return 1
-  [ -z "$vtpl" ] || [ "${WT_APPROVAL:-}" != no ] || return 1
+  [ "${WT_APPROVAL:-}" != no ] || return 1
+  # Without flock a donor mid-setup cannot be told from a finished one, so none is used.
+  if ! command -v flock >/dev/null 2>&1; then
+    if [ -z "${WT_DONOR_NO_FLOCK_WARNED:-}" ]; then
+      WT_DONOR_NO_FLOCK_WARNED=1
+      wt_log "flock is not on PATH — dependencies are not hardlinked from other worktrees"
+    fi
+    return 1
+  fi
 
   # wt_prime_paths left the common dir in the lock-dir memo; only an unprimed caller asks git.
   if [ "${WT_LOCKDIR_FOR:-}" = "$root" ] && [ "${WT_LOCKDIR_IS:-}" != "$root/.claude/worktree-locks" ] \
@@ -2108,7 +2130,7 @@ wt_hardlink_donor_find() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 
     [ -n "$wtpath" ] && [ ! "$wtpath" -ef "$mine" ] || continue
     seen=$((seen + 1))
     # A checkout deleted, moved or replaced by hand no longer belongs to this registration.
-    IFS= read -r line <"$wtpath/.git" 2>/dev/null || continue
+    { IFS= read -r line <"$wtpath/.git"; } 2>/dev/null || continue
     gitdir=${line#gitdir: }
     case $gitdir in /*) ;; *) gitdir=$wtpath/$gitdir ;; esac
     [ "$gitdir" -ef "$admin" ] || continue
