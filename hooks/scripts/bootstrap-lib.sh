@@ -3233,10 +3233,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 # One `art` record per dir, in the dep record's fields: `art dir build lck ick status when rc
 # reason`, where lck is the inputs key (wt_art_inputs_key) and ick the build command's checksum; the
 # strategy field is `own-copy` instead of `build` where a pull request's worktree copies (wt_art_strategy). A
-# done record stands while the command is unchanged and the dir is non-empty, NOT while the inputs
-# are: once a worktree has its build, keeping it current as the branch moves is the repo's own dev
-# tooling's job, and rebuilding on every commit would fight a running watcher. The inputs key
-# decides only whether a failed build stands.
+# done record stands while the command is unchanged, the dir is non-empty and the inputs key is the
+# one it was built for. A COMMIT that changes an input makes it out of date: rebuilt (or taken from
+# main again) by a --finish run — the background run or /pitlane-finish — never by a start-up run,
+# which only says so. Committed state only: an uncommitted edit is the developer's own watcher's to
+# build, and is never what a rebuild here is for. The inputs key also decides whether a failed build
+# stands.
 #
 # KNOWN LIMIT: the main checkout's copy is trusted to match its HEAD. A build made from uncommitted
 # edits, or not rebuilt since a pull, is taken as it is; nothing here can tell.
@@ -3245,14 +3247,21 @@ wt_art_state_set() { WT_STATE_KIND=art wt_state_set "$@"; }
 wt_art_state_read() { WT_STATE_KIND=art wt_state_dep_read "$@"; }
 
 # The inputs as they are at the worktree's HEAD: a checksum of their tree entries, so it changes
-# when any file under them changes in a commit, and not for uncommitted edits.
+# when any file under them changes in a commit, and not for uncommitted edits. One git call and one
+# cksum, nothing of the build output read. Empty, returning 1, when git cannot say: an unknown key
+# is never taken for a changed one.
 wt_art_inputs_key() {  # $1 = worktree, $2 = inputs, one per line
   local p out
   local -a paths=()
   while IFS= read -r p; do [ -z "$p" ] || paths+=("$p"); done <<<"${2-}"
   [ "${#paths[@]}" -gt 0 ] || { printf ''; return 0; }
-  out=$(wt_git "$1" ls-tree HEAD -- "${paths[@]}" 2>/dev/null) || out=''
+  out=$(wt_git "$1" ls-tree HEAD -- "${paths[@]}" 2>/dev/null) || { printf ''; return 1; }
   wt_cksum_string "inputs:$out"
+}
+
+# True when a done build recorded for inputs key $1 is out of date at key $2: both known, and not equal.
+wt_art_inputs_changed() {  # $1 = the record's inputs key, $2 = the current one
+  [ -n "${1-}" ] && [ -n "${2-}" ] && [ "$1" != "$2" ]
 }
 
 # True when the inputs are identical at the main checkout's HEAD and the worktree's: the main
@@ -3414,11 +3423,23 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
     wt_art_build_ick "$build"
     ick=$WT_ART_ICK
 
-    # First, and with no git call: the re-entry path of every session.
+    # First, at one git call: the re-entry path of every session.
     wt_art_state_read "$worktree" "$dir" || true
+    ikey=''
     if [ "$WT_DEP_ICK" = "$ick" ] && [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ] && wt_art_has_content "$worktree/$dir"; then
       case $WT_DEP_STATUS in
-        "done" | warn) wt_log "  $dir: already up to date"; continue ;;
+        "done" | warn)
+          ikey=$(wt_art_inputs_key "$worktree" "$list") || ikey=''
+          if ! wt_art_inputs_changed "$WT_DEP_LCK" "$ikey"; then
+            wt_log "  $dir: already up to date"
+            continue
+          fi
+          if [ "${WT_FINISH:-}" != 1 ]; then
+            wt_log "  $dir: its inputs changed in a commit since it was built — left as it is for now, and rebuilt by the background run or /pitlane-finish"
+            continue
+          fi
+          wt_log "  $dir: its inputs changed in a commit since it was built — bringing it up to date"
+          ;;
       esac
     fi
     [ "$WT_ART_STRATEGY" = build ] || wt_log "  $dir: a pull request's worktree takes its own copy — a linked one would share files with the main checkout both ways"
@@ -3427,7 +3448,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
       wt_log "  $dir: not touched — $why, and the plugin replaces only gitignored build output"
       continue
     fi
-    ikey=$(wt_art_inputs_key "$worktree" "$list")
+    [ -n "$ikey" ] || ikey=$(wt_art_inputs_key "$worktree" "$list") || ikey=''
     # A dir already there with no record of ours is the developer's own build: left alone.
     if [ -z "$WT_DEP_STATUS" ] && wt_art_has_content "$worktree/$dir"; then
       wt_log "  $dir: already present in the worktree — leaving it alone"
@@ -3469,7 +3490,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
         ;;
     esac
     if [ "$held" -eq 1 ] && wt_art_state_read "$worktree" "$dir" && [ "$WT_DEP_ICK" = "$ick" ] \
-      && [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ] && wt_art_has_content "$worktree/$dir"; then
+      && [ "$WT_DEP_STRATEGY" = "$WT_ART_STRATEGY" ] && ! wt_art_inputs_changed "$WT_DEP_LCK" "$ikey" \
+      && wt_art_has_content "$worktree/$dir"; then
       case $WT_DEP_STATUS in
         "done" | warn)
           wt_log "  $dir: another run finished it while we waited"
@@ -3622,7 +3644,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
 # failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
 # seed's status) or `warn` (present, installed with warnings; detail its reason), and for build
-# output `artmissing`, `artstanding` and `artwarn` alike, named by dir. Globals, not output, so one
+# output `artmissing`, `artstanding` and `artwarn` alike, named by dir, and `artstale` (present, but
+# a commit changed its inputs since: pending and attemptable, yet not missing). Globals, not output, so one
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
   local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current
@@ -3688,7 +3711,8 @@ wt_bootstrap_pending() {  # $1 = worktree
 }
 
 # wt_bootstrap_pending's half for artifacts[], by wt_bootstrap_artifacts' rules: present when
-# recorded done or warn for this build command and the dir is not empty; a failure that stands is
+# recorded done or warn for this build command and the dir is not empty, and out of date when a
+# commit has changed its inputs since (one git call per such dir); a failure that stands is
 # one for these inputs and this command. A missing one is attemptable only while no dependency's
 # failure stands, since a build needs its dependencies.
 wt_bootstrap_pending_artifacts() {  # $1 = worktree
@@ -3715,6 +3739,12 @@ wt_bootstrap_pending_artifacts() {  # $1 = worktree
       case $WT_DEP_STATUS in
         "done" | warn)
           if wt_art_has_content "$worktree/$dir"; then
+            if wt_art_inputs_changed "$WT_DEP_LCK" "$(wt_art_inputs_key "$worktree" "$list")"; then
+              WT_PENDING+=${WT_PENDING:+$'\n'}$name
+              WT_STATUS_ITEMS+=artstale$WT_US$dir$WT_US$WT_NL
+              [ "$standing" = 1 ] || WT_PENDING_ATTEMPTABLE+=${WT_PENDING_ATTEMPTABLE:+$'\n'}$name
+              continue
+            fi
             if [ "$WT_DEP_STATUS" = warn ]; then
               wt_dep_recorded_reason
               WT_STATUS_ITEMS+=artwarn$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
@@ -3810,6 +3840,14 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
         absent_items+=("build output $name missing ($why)")
         ;;
       artwarn) warned_items+=("build output $name ready with warnings ($detail)") ;;
+      artstale)
+        case $how:$when in
+          background:*) why='its inputs changed in a commit; rebuilding in the background' ;;
+          *:finish) why='its inputs changed in a commit, and it was not rebuilt; stderr says why' ;;
+          *) why='its inputs changed in a commit since it was built' ;;
+        esac
+        absent_items+=("build output $name out of date ($why)")
+        ;;
     esac
   done <<<"${WT_STATUS_ITEMS:-}"
   for summary in ${absent_items[@]+"${absent_items[@]}"} ${warned_items[@]+"${warned_items[@]}"}; do

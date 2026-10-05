@@ -3602,6 +3602,44 @@ art_reset
 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
 eq 'a lockfile named in the inputs changed: built' 'built' "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
 
+# --- a done build whose inputs a later commit changes: rebuilt by a --finish run, never at start-up --
+art_reset
+wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'stale: (fixture) built once' x "$(cat "$ACNT" 2>/dev/null)"
+printf 'v5\n' > "$AWT/src/app.js"
+git -C "$AWT" commit -qam 'a later input change'
+out=$(wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'stale: a start-up run does not rebuild it' x "$(cat "$ACNT")"
+contains '...says its inputs changed' 'public/build: its inputs changed in a commit since it was built — left as it is for now' "$out"
+eq '...and leaves the build there' built "$(cat "$AWT/public/build/app.js" 2>/dev/null)"
+eq '...it is pending, and attemptable, so a background run is started for it' \
+  'build output public/build|build output public/build' "$(PROFILE_PRESENT=1 pending_all "$AWT")|$(PROFILE_PRESENT=1 pending_attemptable "$AWT")"
+eq '...as out of date, not missing' 'artstale|public/build|' "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; printf '%s' "${WT_STATUS_ITEMS//"$US_"/|}")"
+contains '...which the status line says' 'build output public/build out of date (its inputs changed in a commit; rebuilding in the background)' \
+  "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" start background)"
+out=$(WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'stale: a --finish run rebuilds it' xx "$(cat "$ACNT")"
+contains '...saying why' 'public/build: its inputs changed in a commit since it was built — bringing it up to date' "$out"
+eq '...and then nothing is pending' '' "$(PROFILE_PRESENT=1 pending_all "$AWT")"
+out=$(WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
+eq 'stale: no input change since, no rebuild' xx "$(cat "$ACNT")"
+contains '...up to date' 'public/build: already up to date' "$out"
+printf 'more notes\n' >> "$AWT/docs/notes.md"
+git -C "$AWT" commit -qam 'docs only, again'
+WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq 'stale: a commit outside the inputs does not rebuild it' xx "$(cat "$ACNT")"
+printf 'v6-uncommitted\n' > "$AWT/src/app.js"
+WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...nor an uncommitted edit to an input' xx "$(cat "$ACNT")"
+git -C "$AWT" checkout -q -- src/app.js
+# A record whose inputs key git could not give is not taken as changed.
+wt_art_state_set "$AWT" public/build build '' "$(wt_cksum_string "$ABUILD")" "done"
+WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>/dev/null
+eq '...nor a record with no inputs key' xx "$(cat "$ACNT")"
+eq 'inputs key: empty, and 1, when git cannot say' '1|' \
+  "$(k=$(wt_art_inputs_key "$TMP/not-a-repo" src); echo "$?|$k")"
+git -C "$AWT" revert --no-edit HEAD~1 >/dev/null
+
 # --- held back: unapproved, deferred, dependencies missing ---------------------
 art_reset
 out=$(WT_APPROVAL=no wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
