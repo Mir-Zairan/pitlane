@@ -44,9 +44,13 @@
     "worktree root in the HOST shell, so it is a plain file test, never a tool call, and it names a file",
     "only a FINISHED install writes -- checked against a real install of each tool, and against a failed",
     "one. bootstrap trusts it over the install's exit code, so a check that also passes on the tree a",
-    "failed install leaves behind is worse than none: it turns `failed` into `warn`. Where no such file",
-    "exists (bun, mix, poetry, pipenv), the rule says why in `noVerify` instead, detect.sh passes that on",
-    "in a depNote, and setup asks the developer for a check. A rule with `requiresDir` names a directory",
+    "failed install leaves behind is worse than none: it turns `failed` into `warn`. Where no single",
+    "file does, a verify may read the lockfile and require each locked package's own last-written file",
+    "(poetry, pipenv, mix) -- one awk over the lockfile, one test per package. Where nothing does (bun),",
+    "the rule says why in `noVerify` instead, detect.sh passes that on in a depNote, and setup asks the",
+    "developer for a check. When the rule's dir exists in the checkout being calibrated, detect.sh runs",
+    "the verify against it, and withholds a default that fails on that installed tree: it would fail in",
+    "every worktree too. A rule with `requiresDir` names a directory",
     "the tool creates in-project only when configured to; when it is absent, detect.sh withholds the",
     "default (it would fail in every worktree) and setup asks instead. Rules with no `dir` (cargo, go)",
     "keep their dependencies in a machine-wide cache and need neither.",
@@ -153,7 +157,7 @@
       "dir": "node_modules",
       "strategy": "install",
       "install": "bun install --frozen-lockfile",
-      "noVerify": "bun (1.3) writes no marker file into node_modules, and a failed install keeps the tree it extracted -- a postinstall that exits non-zero leaves every package in place -- so no file test separates a finished install from a broken one; ask for a package this repo always installs, e.g. test -f node_modules/<package>/package.json",
+      "noVerify": "measured with bun 1.3: a root postinstall that exits non-zero leaves a node_modules identical to the one a finished install leaves, and bun writes no marker of its own, so no file test can fail there (a killed install links direct dependencies last and .bin after them; an unresolvable transitive package leaves every direct dependency and .bin in place). Ask for a check that reads what the postinstall produces, else a package this repo always installs, e.g. test -f node_modules/<package>/package.json",
       "reason": "bun installs from its own global cache, so a fresh install is cheap and sharing the tree buys nothing. bun.lockb is the pre-1.2 binary lockfile; newer repos use the text bun.lock — one entry covers both, since a repo mid-migration must not get two",
       "hazards": [
         "npm-postinstall"
@@ -177,9 +181,10 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "poetry install",
-      "noVerify": "poetry creates the venv -- its interpreter and a seeded pip with its own .dist-info -- before resolving, so every generic file test on the venv also passes after a failed install; ask for a package this repo always installs, e.g. a glob for its .dist-info under the venv's site-packages",
+      "verify": "ls -d .venv/lib/python*/site-packages/*.dist-info/RECORD 2>/dev/null | awk -F'\"' 'function k(s, v) { s = tolower(s); gsub(/[-_.]+/, \"_\", s); return s \"-\" tolower(v) } FNR == NR { if (/^\\[\\[package\\]\\]/) { if (n != \"\" && !x) w[k(n, v)] = n \" \" v; n = \"\"; x = 0; t = 1 } else if (/^\\[/) t = 0; else if (t && /^name = /) { n = $2; c++ } else if (t && /^version = /) v = $2; else if (t && /^(markers = |optional = true)/) x = 1; next } sub(/\\.dist-info\\/RECORD$/, \"\") { sub(/.*\\//, \"\"); p = $0; sub(/-[^-]*$/, \"\", p); h[k(p, substr($0, length(p) + 2))] = 1 } END { if (n != \"\" && !x) w[k(n, v)] = n \" \" v; e = !c; for (i in w) if (!(i in h)) { print \"not installed: \" w[i] > \"/dev/stderr\"; e = 1 } exit e }' poetry.lock -",
       "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
-      "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and a .venv check would fail in every worktree. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both."
+      "notes": "poetry only creates .venv inside the project when virtualenvs.in-project is set; otherwise the venv lives under poetry's own cache and a .venv check would fail in every worktree. `poetry install --sync` was the older spelling and is deprecated in Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both. The verify requires a .dist-info with a RECORD -- the file an installer writes last -- for every poetry.lock package with no `markers` and not `optional`, so a failed or killed install (poetry creates the venv and seeds pip before resolving) fails it; a lockfile entry plain `poetry install` skips (an optional group, a Poetry 1.x lock with no per-package markers) makes it fail on a finished venv too, which detect.sh catches by running it against this checkout's own .venv first.",
+      "requiresDir": true
     },
     {
       "markers": [
@@ -188,9 +193,10 @@
       "dir": ".venv",
       "strategy": "install",
       "install": "pipenv sync",
-      "noVerify": "pipenv creates the venv -- its interpreter and a seeded pip with its own .dist-info -- before installing, so every generic file test on the venv also passes after a failed install; ask for a package this repo always installs, e.g. a glob for its .dist-info under the venv's site-packages",
+      "verify": "ls -d .venv/lib/python*/site-packages/*.dist-info/RECORD 2>/dev/null | awk -F'\"' 'function k(s, v) { s = tolower(s); gsub(/[-_.]+/, \"_\", s); return s \"-\" tolower(v) } FNR == NR { if (/^    \"/) d = ($2 == \"default\"); else if (d && /^        \"/) { n = $2; x = 0 } else if (d && /^            \"markers\": /) { m = $4; gsub(/python(_full)?_version >= .[0-9.]+.( and )?/, \"\", m); x = (m != \"\") } else if (d && /^            \"version\": \"==/) { c++; if (!x) w[k(n, substr($4, 3))] = n \" \" substr($4, 3) } next } sub(/\\.dist-info\\/RECORD$/, \"\") { sub(/.*\\//, \"\"); p = $0; sub(/-[^-]*$/, \"\", p); h[k(p, substr($0, length(p) + 2))] = 1 } END { e = !c; for (i in w) if (!(i in h)) { print \"not installed: \" w[i] > \"/dev/stderr\"; e = 1 } exit e }' Pipfile.lock -",
       "reason": "a venv is never hardlinked: its scripts, activate files and editable-install mappings hard-code the main checkout's path, so a linked copy installs into and imports from the main checkout",
-      "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so a .venv check would fail in every worktree of a repo that uses the default."
+      "notes": "pipenv's DEFAULT is a venv outside the project, under ~/.local/share/virtualenvs/<project>-<hash>. .venv is used only when PIPENV_VENV_IN_PROJECT is set or a .venv already exists, so a .venv check would fail in every worktree of a repo that uses the default. The verify requires a .dist-info with a RECORD -- the file pip writes last -- for every `default` package in Pipfile.lock whose markers are at most a python_version lower bound (pipenv puts those on nearly every package), so a failed or killed sync fails it; a package whose marker is false here is not required, and one this interpreter is too old for fails it, as it should.",
+      "requiresDir": true
     },
     {
       "markers": [
@@ -217,8 +223,9 @@
       "strategy": "hardlink",
       "copyPaths": [],
       "install": "mix deps.get",
-      "noVerify": "mix deps.get writes one deps/<package>/ per dependency and no marker for the whole fetch, so a fetch that fails part-way leaves a deps/ every generic file test passes; `mix deps.loadpaths --no-compile` does tell (it fails on any missing or out-of-date dependency) but needs elixir, and a verify runs in the host shell -- use it only where elixir is on the host's PATH, else test for a package this repo always fetches",
-      "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching"
+      "verify": "set -- $(awk -F'\"' '/^  \"[^\"]+\": \\{:hex,/ { print \"deps/\" $2 \"/.hex\", $6 } /^  \"[^\"]+\": \\{:git,/ { print \"deps/\" $2 \"/.git/HEAD\", $6 }' mix.lock); test $# -gt 0 || exit 1; while [ $# -gt 1 ]; do grep -qsF -- \"$2\" \"$1\" || exit 1; shift 2; done",
+      "reason": "mix fetches real source per project into deps/, so hardlinking beats refetching",
+      "notes": "the verify requires, for every hex entry in mix.lock, a deps/<name>/.hex holding the entry's checksum -- hex writes .hex only after unpacking -- and for every git entry a deps/<name>/.git/HEAD at the locked revision, so a fetch that fails or is killed part-way, or a deps/ left from an older lockfile, fails it. mix keeps entries for removed dependencies in mix.lock until `mix deps.unlock --unused`, and deps.get never fetches them, so such a lockfile fails it on a finished deps/ too; detect.sh catches that by running it against this checkout's own deps/ first."
     },
     {
       "markers": [

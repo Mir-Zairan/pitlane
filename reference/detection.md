@@ -36,20 +36,26 @@ project, `skip` where the artefacts are build output that a shared cache already
 | `yarn.lock` (no `.yarnrc.yml`) | `node_modules` | hardlink | `yarn install --frozen-lockfile` | `test -f node_modules/.yarn-integrity` | `.yarn-integrity` |
 | `bun.lock` / `bun.lockb` | `node_modules` | install | `bun install --frozen-lockfile` | none² | — |
 | `uv.lock` | `.venv` | install | `uv sync --frozen` | `set -- .venv/lib/python*/site-packages/*.dist-info; test -d "$1"` | — |
-| `poetry.lock` | `.venv` | install | `poetry install` | none² | — |
-| `Pipfile.lock` | `.venv` | install | `pipenv sync` | none² | — |
+| `poetry.lock` | `.venv` | install | `poetry install` | every package in `poetry.lock` installed¹ ⁴ | — |
+| `Pipfile.lock` | `.venv` | install | `pipenv sync` | every package in `Pipfile.lock` installed¹ ⁴ | — |
 | `Gemfile.lock` | `vendor/bundle` | hardlink¹ | `bundle install` | `test -d vendor/bundle/ruby`¹ | none |
-| `mix.lock` | `deps` | hardlink | `mix deps.get` | none² | none (unmeasured) |
+| `mix.lock` | `deps` | hardlink | `mix deps.get` | every package in `mix.lock` fetched⁴ | none (unmeasured) |
 | `Cargo.lock` | — | skip | `cargo fetch` | — | — |
 | `go.sum` | — | skip | `go mod download` | — | — |
 
-¹ `requiresDir: true` — bundler's in-project directory is **opt-in, not the default**. When it does
+¹ `requiresDir: true` — bundler's, poetry's and pipenv's in-project directory is **opt-in, not the
+default**. When it does
 not exist in the main checkout, detection withholds the default `verify` (it would fail in every
 worktree) and says so in a `depNote`, and the `hardlink` falls back to `install`. See the caveats.
 
 ² `noVerify` — no file exists that only a *finished* install writes, so the rule carries the reason
 instead of a check; detection passes it on as a `no default verify:` `depNote` and `/pitlane-setup`
 asks the developer for a check that names something this repo always installs.
+
+⁴ A lockfile-driven check: one awk over the lockfile, one file test per locked package, written out in
+full in `detection.json`. Where the rule's `dir` exists in the checkout being calibrated, detection
+first runs the check against it and **withholds a default that fails there** — a lockfile naming a
+package the install skips would fail it in every worktree — with a `no default verify:` `depNote`.
 
 ³ `copyPaths` — paths inside a hardlinked `dir` that its tool rewrites **in place**, so through the
 shared inode the write would land in the main checkout. Detection emits one `depCopy` record per path,
@@ -64,8 +70,10 @@ leaves behind — a check that passes there turns every broken install into a us
 than having no check. Every rule that manages a directory carries either a `verify` or a `noVerify`
 reason, and `/pitlane-setup` asks the developer when detection has none. A verify runs **from the
 worktree root in the host shell** — the toolchain wrapper can cost tens of seconds — so each default is
-a plain file test, side-effect free, naming a file only a finished install writes. Each was checked
-against a real install, and the venv, bun and mix ones against a failed one too:
+a file test, side-effect free, naming a file only a finished install writes; where no single file is
+written last, it reads the lockfile and tests each locked package's own last-written file. Each was
+checked against a real install, and the venv, bun and mix ones against failed, unresolvable and
+SIGKILLed ones too:
 
 - **pnpm** writes `node_modules/.modules.yaml` on every install with at least one package. A lockfile
   with no dependencies at all writes none, so the check fails there; such a repo needs no entry.
@@ -75,9 +83,11 @@ against a real install, and the venv, bun and mix ones against a failed one too:
 - **Yarn Berry** writes `.yarn/install-state.gz` under both Plug'n'Play and the `node-modules` linker —
   and Berry 4's global cache means `.yarn/cache` itself may never exist, so the check is not on `dir`.
 - **classic yarn** writes `node_modules/.yarn-integrity`.
-- **bun** (1.3, hoisted linker) writes no marker file into `node_modules`, and a failed install keeps
-  what it extracted — a root `postinstall` that exits non-zero leaves every package in place. No file
-  test separates the two, so there is no default; the repo names a package it always installs
+- **bun** (1.3, hoisted linker) writes no marker file into `node_modules`, and a root `postinstall`
+  that exits non-zero leaves a tree identical to a finished one. Measured further: a killed install
+  links direct dependencies last and `.bin` after them, and a lockfile entry that 404s mid-tree leaves
+  every direct dependency and `.bin` in place — but nothing tells the postinstall apart, so there is
+  no default; the repo names what its postinstall produces, else a package it always installs
   (`test -f node_modules/<package>/package.json`).
 - **uv** creates `.venv/bin/python`, `.venv/.lock` and `pyvenv.cfg` *before* resolving, so a sync that
   fails to fetch a package leaves all three — `test -x .venv/bin/python` passed on it. uv's venv is
@@ -87,15 +97,29 @@ against a real install, and the venv, bun and mix ones against a failed one too:
   (`uv sync --frozen --check --offline` is exact, but it is a tool call, and the host shell may not
   have uv.)
 - **poetry, pipenv** create the venv — interpreter and a seeded pip with its own `.dist-info` — before
-  resolving, so a failed install leaves a venv every generic file test passes (measured: Poetry 2.4 and
-  pipenv with an unresolvable package both exit leaving `.venv/bin/python` and `pip-*.dist-info`). No
-  default; the repo names a package it always installs.
+  resolving, so a failed install leaves a venv every generic file test passes, and neither writes a
+  marker when it finishes. So the check reads the lockfile: every package a plain install puts there
+  must have a `<name>-<version>.dist-info/RECORD` in site-packages — RECORD is the file an installer
+  writes last, and a killed install leaves `.dist-info` directories without one. Names are compared
+  normalised (`PyYAML` and `pyyaml`, `charset_normalizer` and `charset-normalizer`), with the version.
+  Not required: poetry packages with `markers` or `optional = true`; pipenv's `develop` section,
+  entries with no `version` (editable, path, VCS), and packages whose markers say more than a
+  `python_version >=` lower bound — pipenv puts that bound on nearly every package. Measured with
+  Poetry 2.4 and pipenv on Python 3.14: a finished install passes; an unresolvable locked version
+  (poetry installs the rest, pipenv nothing) and installs SIGKILLed after 1, 3–4 and 6–8 packages fail.
+  A lockfile from which no package can be read fails it rather than passing.
 - **bundler** with a configured `path` creates `vendor/bundle/ruby/<ruby version>/`; the version
   directory is not named because it changes with the interpreter.
-- **mix** fetches one `deps/<package>/` per dependency and writes no marker for the whole fetch, so a
-  fetch that fails part-way leaves a `deps/` every generic file test passes. No default.
-  `mix deps.loadpaths --no-compile` does tell — it fails on a missing or out-of-date dependency and
-  writes nothing — but it needs elixir, so it suits only a repo whose host shell has it.
+- **mix** fetches one `deps/<package>/` per dependency, in turn, and writes no marker for the whole
+  fetch — but hex writes `deps/<name>/.hex`, holding the package's checksum, only after unpacking it,
+  and a git dependency is checked out at its locked revision. So the check requires, for every `:hex`
+  entry in `mix.lock`, a `.hex` containing that entry's checksum, and for every `:git` entry a
+  `.git/HEAD` at its revision. Measured with mix 1.18: a finished fetch passes; a fetch that fails on
+  its third package, one SIGKILLed after 1, 4 and 8 of 9, and a git revision that cannot be checked out
+  fail. mix keeps a removed dependency in `mix.lock` until `mix deps.unlock --unused`, and `deps.get`
+  never fetches it, so such a lockfile fails the check on a finished tree — which is what the
+  this-checkout run (⁴) catches. `mix deps.loadpaths --no-compile` is exact but needs elixir on the
+  host shell.
 - **cargo and go** keep dependencies in a machine-wide cache (`CARGO_HOME`, `GOMODCACHE`); there is no
   per-project directory to check, and their entries are `skip`.
 
@@ -134,8 +158,9 @@ into an array. Ordering plus a guard expresses the same thing with no nesting.
   or make the entry `install`. Bundler's `vendor/bundle` measured safe; mix is unmeasured.
 - **`Pipfile.lock`'s `.venv` is the exception, not the rule.** pipenv's *default* is a venv **outside**
   the project, under `~/.local/share/virtualenvs/<project>-<hash>`. `.venv` is used only when
-  `PIPENV_VENV_IN_PROJECT` is set or a `.venv` already exists — so a check the developer writes must
-  read wherever this repo's venv actually lives.
+  `PIPENV_VENV_IN_PROJECT` is set or a `.venv` already exists — so with no `.venv` in the main
+  checkout the default verify is withheld, and a check the developer writes must read wherever this
+  repo's venv actually lives.
 - **`poetry.lock` assumes an in-project venv too.** `poetry install` only creates `.venv` in the
   project when `virtualenvs.in-project` is set. Also note `poetry install --sync` is deprecated in
   Poetry 2.0 in favour of `poetry sync`; plain `poetry install` is correct on both, which is why the

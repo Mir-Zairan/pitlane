@@ -117,9 +117,11 @@ rhetorical.
 
 **Every dependency gets a `verify`** — every one whose strategy is not `skip`. bootstrap believes it
 over the install's exit code, so without one a failed install and a usable tree look the same. Use the
-one detection proposed. When its `verify` field is empty (a `no default verify:` `depNote` says why —
-a tool that writes no file only a finished install writes, or whose in-project directory is opt-in and
-absent), **ask the developer** for a check rather than writing none: a plain file test, run from the
+one detection proposed; poetry's, pipenv's and mix's read the lockfile and require each locked
+package's last-written file — show them as "every package in `<lock>` installed" rather than pasting
+the awk. When its `verify` field is empty (a `no default verify:` `depNote` says why — a tool that
+writes no file only a finished install writes, an in-project directory that is opt-in and absent, or
+a default that failed on this checkout's own installed tree), **ask the developer** for a check rather than writing none: a plain file test, run from the
 worktree root in the host shell, that names a file the install writes and that cannot pass on an
 empty or missing tree, nor on what a failed install leaves — usually a package this repo always
 installs (`test -f node_modules/<package>/package.json`). Do not use a tool command (`composer

@@ -489,6 +489,7 @@ claimed() {  # $1 = list, $2 = needle
 # is: same strategy, same hazards, same escalations.
 detect_deps_in() {  # $1 = directory prefix
   local pre=${1-} d_markers d_dir d_strategy d_install d_verify d_reason d_hazards d_when d_requires
+  local -a bound
   local d_fallback d_notes d_noverify d_copy marker m strategy fallback install verify hid h_manifest h_probes h_action
   local cpaths cpath
   local h_flag h_why x_id x_manifest x_probes x_action x_flag x_why hit probed pkey
@@ -560,11 +561,10 @@ detect_deps_in() {  # $1 = directory prefix
   
     strategy=$d_strategy
     verify=$d_verify
-    # For bundler an in-project directory is OPT-IN rather than the default (poetry and pipenv
-    # too, but their rules carry no verify to withhold). Absent here, a hardlink would name a
-    # directory that is not there, and the default verify would test a path the tool never writes —
-    # failing in every worktree, which bootstrap believes over the install's exit code. So the
-    # verify is withheld and setup asks for one.
+    # For bundler, poetry and pipenv an in-project directory is OPT-IN rather than the default.
+    # Absent here, a hardlink would name a directory that is not there, and the default verify would
+    # test a path the tool never writes — failing in every worktree, which bootstrap believes over
+    # the install's exit code. So the verify is withheld and setup asks for one.
     if [ "$d_requires" = true ] && [ -n "$d_dir" ] && [ ! -d "$ROOT/$pre$d_dir" ]; then
       if [ "$d_strategy" = hardlink ]; then
         fallback=${d_fallback:-install}
@@ -573,9 +573,22 @@ detect_deps_in() {  # $1 = directory prefix
         strategy=$fallback
       fi
       if [ -n "$verify" ]; then
-        emit depNote "$N" "no default verify: \`$verify\` only holds when $d_dir is created in-project, and it is not here — ask the developer for a check that reads wherever this tool installs"
+        emit depNote "$N" "no default verify: the table's check reads $d_dir, which this tool creates in-project only when configured to, and it is not here — ask the developer for a check that reads wherever this tool installs"
         verify=''
       fi
+    fi
+    # A verify that reads the lockfile requires every package in it, and a lockfile can name one the
+    # install never puts there: mix keeps removed dependencies in mix.lock, poetry lists optional
+    # groups. On a finished tree that check fails in every worktree, so where this checkout has the
+    # dir installed, the default must pass on it first. Every default is a side-effect-free file
+    # test by the table's contract, so running one here writes nothing. With no coreutils `timeout`
+    # it runs unbounded, as bootstrap runs it.
+    bound=()
+    command -v timeout >/dev/null 2>&1 && bound=(timeout 20)
+    if [ -n "$verify" ] && [ -n "$d_dir" ] && [ -d "$ROOT/$pre$d_dir" ] \
+      && ! (cd "$ROOT/$pre." && ${bound[@]+"${bound[@]}"} bash -c "$verify") </dev/null >/dev/null 2>&1; then
+      emit depNote "$N" "no default verify: the table's check fails on this checkout's own $pre$d_dir — either it is not fully installed, or its lockfile names a package the install skips; ask the developer for a check that passes here"
+      verify=''
     fi
   
     CLAIMED_MARKERS="$CLAIMED_MARKERS$pre$marker "
