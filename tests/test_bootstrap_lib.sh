@@ -3198,8 +3198,8 @@ rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 
 
 # --- a pull request's copy of main's tree: its symlinks, its failures, its cost ------------------
-# The copy is made in a temp, its symlinks checked, then renamed into place: a symlink main's tree
-# holds into main itself would still lead the PR's writes there, so that tree is installed instead.
+# The copy is made in a temp and its symlinks checked there, before it is renamed into place: a
+# link leaving the folder would still lead the PR's writes out of it, so that tree is installed instead.
 git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
@@ -3214,135 +3214,124 @@ pc_leftovers() {
     "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* .vendor.pitlane-copying.* 2>/dev/null)"
 }
 
-# A relative symlink inside the tree is kept as it is, and so resolves inside the worktree.
+# Package-manager links inside the tree (a bin entry into its package, one through another link that
+# stays in, one dangling in place) are kept as they are, and so resolve inside the worktree's copy.
 mkdir -p "$DREPO/vendor/bin"
 ln -s ../pkg/file.txt "$DREPO/vendor/bin/tool"
-# One that leaves the dir but stays in the worktree: allowed, it is the worktree's own file.
-ln -s ../composer.lock "$DREPO/vendor/lockref"
-# An absolute one to somewhere that is neither: a system path, as main's own tree uses it.
-mkdir -p "$TMP/elsewhere"; printf 'X\n' > "$TMP/elsewhere/x"
-ln -s "$TMP/elsewhere/x" "$DREPO/vendor/sys"
+ln -s pkg "$DREPO/vendor/lib"
+ln -s ../lib/file.txt "$DREPO/vendor/bin/via"
+ln -s ../pkg/missing/x "$DREPO/vendor/bin/gone"
 pc_reset
 rmain=$(tree_snap "$DREPO/vendor")
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-eq 'pr copy: relative and outside symlinks do not stop the copy' copy "$(linked_from)"
-eq '...the relative symlink is kept as a link, with its own target' 'link|../pkg/file.txt' \
+eq 'pr copy: links that stay inside the folder do not stop the copy' copy "$(linked_from)"
+eq '...the bin link is kept as a link, with its own target' 'link|../pkg/file.txt' \
   "$([ -L "$DWT/vendor/bin/tool" ] && echo link)|$(readlink "$DWT/vendor/bin/tool")"
 eq "...and resolves to the worktree's own file, not main's" 'mine|' \
   "$([ "$DWT/vendor/bin/tool" -ef "$DWT/vendor/pkg/file.txt" ] && echo mine)|$([ "$DWT/vendor/bin/tool" -ef "$DREPO/vendor/pkg/file.txt" ] && echo main)"
-eq "...one leaving the dir lands on the worktree's lockfile" yes \
-  "$([ "$DWT/vendor/lockref" -ef "$DWT/composer.lock" ] && echo yes)"
-eq '...an absolute one elsewhere is kept as it is' "$TMP/elsewhere/x" "$(readlink "$DWT/vendor/sys")"
+eq '...one through a link inside resolves to the copy too' mine \
+  "$([ "$DWT/vendor/bin/via" -ef "$DWT/vendor/pkg/file.txt" ] && echo mine)"
+eq '...a dangling one inside is kept' '../pkg/missing/x' "$(readlink "$DWT/vendor/bin/gone")"
 eq "...main's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
-rm -f "$DREPO/vendor/lockref" "$DREPO/vendor/sys"
+rm -f "$DREPO/vendor/lib" "$DREPO/vendor/bin/via" "$DREPO/vendor/bin/gone"
 
-# An absolute symlink into the main checkout: installed instead, and the temp copy is gone.
-ln -s "$DREPO/composer.lock" "$DREPO/vendor/bin/back"
-pc_reset
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains 'pr copy: an absolute symlink into main is refused, and says which' \
-  "vendor: the main checkout's copy has a symlink pointing back into it (bin/back -> $DREPO/composer.lock) — installing instead" "$out"
-eq '...installed instead' install "$(linked_from)"
-eq '...no temp copy left' '|' "$(pc_leftovers)"
+# Every link leaving the folder is refused, wherever it leads: the tree is installed instead, the
+# temp is gone, and the dir never held the copy.
+mkdir -p "$TMP/elsewhere"; printf 'X\n' > "$TMP/elsewhere/x"
+pc_refused() {  # $1 = label, $2 = link in main's vendor, $3 = its target, $4 = the example the log gives
+  ln -s "$3" "$DREPO/vendor/$2"
+  pc_reset
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains "pr copy: $1 is refused, and says which" "vendor: the main checkout's copy has a link leaving the folder ($4" "$out"
+  eq '...installed instead, nothing left behind, the link not in the worktree' "install||absent" \
+    "$(linked_from)|$(pc_leftovers | tr -d '|')|$( [ -L "$DWT/vendor/$2" ] && echo present || echo absent)"
+  rm -f "$DREPO/vendor/$2"
+}
+pc_refused 'an absolute link elsewhere' bin/sys "$TMP/elsewhere/x" "bin/sys -> $TMP/elsewhere/x) — installing instead"
 wt_state_dep_read "$DWT" vendor
 eq '...recorded as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
-rm -f "$DREPO/vendor/bin/back"
-# The same through main's physical path, when the path it was given goes through a symlink.
-ln -s "$DREPO" "$TMP/drepo-alias"
+pc_refused "an absolute link into main" bin/back "$DREPO/composer.lock" "bin/back -> $DREPO/composer.lock"
+pc_refused "a relative link to the worktree's own lockfile" lockref ../composer.lock 'lockref -> ../composer.lock'
+pc_refused 'a target ending in ..' bin/up ../.. 'bin/up -> ../..'
+mkdir -p "$DREPO/vendor/a/b"
+ln -s .. "$DREPO/vendor/a/b/up"
+pc_refused 'a link whose text stays in but climbs through another' u2 a/b/up/../.. 'u2 -> a/b/up/../..'
+rm -f "$DREPO/vendor/a/b/up"
+ln -s loop2 "$DREPO/vendor/loop1"
+pc_refused 'a loop' loop2 loop1 'loop'
+rm -f "$DREPO/vendor/loop1"
+rm -rf "$DREPO/vendor/a"
+
+# The check runs on the temp, before the dir exists; the dir appears only once it has passed.
+eval "pc_orig_$(declare -f wt_copy_link_leaves)"
+pc_checked() {  # runs the rest with the check recording what it was given and whether the dir was there
+  # shellcheck disable=SC2329  # stands in for the check inside the copy
+  wt_copy_link_leaves() { printf '%s|%s\n' "$1" "$(present "$DWT/vendor")" > "$TMP/pc-checked"; pc_orig_wt_copy_link_leaves "$@"; }
+  "$@"
+}
+pc_reset; rm -f "$TMP/pc-checked"
+out=$(pc_checked wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+pc_seen=$(cat "$TMP/pc-checked" 2>/dev/null)
+eq 'pr copy: the links are checked in the temp, the dir not yet there' "$PCCOPYING/|absent" \
+  "$(case ${pc_seen%|*} in "$PCCOPYING"/*) printf '%s/' "$PCCOPYING" ;; *) printf '%s' "${pc_seen%|*}" ;; esac)|${pc_seen##*|}"
+eq '...then moved into place' copy "$(linked_from)"
 ln -s "$DREPO/composer.lock" "$DREPO/vendor/bin/back"
-pc_reset
-out=$(wt_bootstrap_deps "$TMP/drepo-alias" "$DWT" "$FAR" 2>&1)
-contains 'pr copy: main named through a symlink, a link to its physical path is refused too' \
-  'pointing back into it (bin/back -> ' "$out"
-rm -f "$DREPO/vendor/bin/back" "$TMP/drepo-alias"
+pc_reset; rm -f "$TMP/pc-checked"
+out=$(pc_checked wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+pc_seen=$(cat "$TMP/pc-checked" 2>/dev/null)
+eq 'pr copy: refused, the dir was not there when it was judged' absent "${pc_seen##*|}"
+eq '...and never took the copy: what is there is the install' 'install|absent' \
+  "$(linked_from)|$([ -L "$DWT/vendor/bin/back" ] && echo present || echo absent)"
+rm -f "$DREPO/vendor/bin/back" "$TMP/pc-checked"
 
-# A relative symlink that climbs out of the worktree into the main checkout (the worktree lives
-# inside it): resolved from where it will sit, and refused the same way.
-ln -s ../../../../composer.lock "$DREPO/vendor/bin/climb"
-pc_reset
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains 'pr copy: a relative symlink escaping into main is refused' \
-  "vendor: the main checkout's copy has a symlink pointing back into it (bin/climb -> ../../../../composer.lock) — installing instead" "$out"
-eq '...installed instead, nothing left behind' "install|" "$(linked_from)|$(pc_leftovers | tr -d '|')"
-rm -f "$DREPO/vendor/bin/climb"
-# A trailing `..` is a climb too.
-ln -s ../../../../.. "$DREPO/vendor/bin/up"
-pc_reset
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains 'pr copy: a target ending in .. that lands in main is refused' 'pointing back into it (bin/up -> ../../../../..)' "$out"
-rm -f "$DREPO/vendor/bin/up"
-
-# Resolved on disk, not by text: a `..` after a symlink climbs from where that symlink points. Here
-# u1 is the worktree itself, so u1/vendor/u1/../../.. is main, while its text collapses to vendor.
-ln -s .. "$DREPO/vendor/u1"
-ln -s u1/vendor/u1/../../.. "$DREPO/vendor/u2"
-pc_reset
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains 'pr copy: a chain of two links that climbs into main is refused' \
-  "vendor: the main checkout's copy has a symlink pointing back into it (u2 -> u1/vendor/u1/../../..) — installing instead" "$out"
-eq '...installed instead, nothing left behind' "install|" "$(linked_from)|$(pc_leftovers | tr -d '|')"
-rm -f "$DREPO/vendor/u1" "$DREPO/vendor/u2"
-# Through a symlink the worktree itself holds (a tracked one, in a pull request): followed, too.
-ln -s "$DREPO" "$DWT/shared"
-ln -s ../shared/composer.lock "$DREPO/vendor/thru"
-pc_reset
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains "pr copy: a link through the worktree's own symlink into main is refused" \
-  'pointing back into it (thru -> ../shared/composer.lock)' "$out"
-eq '...installed instead' install "$(linked_from)"
-rm -f "$DREPO/vendor/thru" "$DWT/shared"
-
-# The scan's arms, on its own, over a dir in place in the worktree: what counts, and a listing that
+# The check's arms, on its own, over a scratch tree: what stays in, what leaves, and a listing that
 # fails is a refusal.
-PCS=$DWT/scanned
-mkdir -p "$PCS/a"
-pc_scan() { wt_copy_symlink_escape "$PCS" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE"; }
+PCS=$TMP/pc-scan/tree
+mkdir -p "$PCS/a/b"
+pc_scan() { wt_copy_link_leaves "$PCS"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE"; }
+pc_scan_one() {  # $1 = link in the tree, $2 = target; the scan with only it
+  ln -s "$2" "$PCS/$1"; pc_scan; rm -f "$PCS/$1"
+}
 eq 'scan: no symlinks, nothing found' '1:' "$(pc_scan)"
-ln -s "$DWT/composer.lock" "$PCS/a/own"
-eq "scan: an absolute link into the worktree itself is its own" '1:' "$(pc_scan)"
-ln -s ../../composer.lock "$PCS/a/rel"
-eq "scan: a relative one that stays in the worktree is kept" '1:' "$(pc_scan)"
-ln -s "$DREPO/.git" "$PCS/a/git"
-eq "scan: one into main's git dir is main's" "0:a/git -> $DREPO/.git" "$(pc_scan)"
-rm -f "$PCS/a/git"
-ln -s "$DWT/../other/vendor" "$PCS/a/sib"
-eq "scan: one into another worktree under main counts as main's" "0:a/sib -> $DWT/../other/vendor" "$(pc_scan)"
-rm -f "$PCS/a/sib"
-ln -s ..lookalike "$PCS/a/dots"
-eq 'scan: a name starting with dots is not a climb' '1:' "$(pc_scan)"
-ln -s ../nowhere/x "$PCS/a/dangling"
-eq 'scan: a dangling link inside the worktree is kept' '1:' "$(pc_scan)"
-ln -s "$DREPO/nowhere/x" "$PCS/a/dangling-main"
-eq 'scan: a dangling link into main resolves as far as it exists: main' "0:a/dangling-main -> $DREPO/nowhere/x" "$(pc_scan)"
-rm -f "$PCS/a/dangling-main"
-ln -s ./loop2 "$PCS/a/loop1"
-ln -s ./loop1 "$PCS/a/loop2"
-eq 'scan: a loop stops at the hop limit, and stays in the tree' '1:' "$(pc_scan)"
-ln -s "$DREPO" "$DWT/shared"
-ln -s "$DWT/shared/composer.lock" "$PCS/a/through"
-eq "scan: an absolute link through the worktree's own symlink into main is main's" \
-  "0:a/through -> $DWT/shared/composer.lock" "$(pc_scan)"
-rm -f "$PCS/a/through" "$DWT/shared"
+eq 'scan: a bin link into its package stays in' '1:' "$(pc_scan_one a/x ../b/x)"
+eq 'scan: a link to the top of the tree stays in' '1:' "$(pc_scan_one a/top ..)"
+eq 'scan: a name starting with dots is not a climb' '1:' "$(pc_scan_one a/dots ..lookalike)"
+eq 'scan: a dangling link inside is kept' '1:' "$(pc_scan_one a/d missing/../../a/b/x)"
+eq 'scan: a dangling link whose text leaves is refused' '0:a/d -> missing/../../../x' "$(pc_scan_one a/d missing/../../../x)"
+eq 'scan: an absolute link into the tree itself is refused' "0:a/abs -> $PCS/a/b" "$(pc_scan_one a/abs "$PCS/a/b")"
+eq 'scan: a relative climb out is refused' '0:a/out -> ../../x' "$(pc_scan_one a/out ../../x)"
+ln -s ../a/b "$PCS/a/lib"
+eq 'scan: through a link that stays in, it stays in' '1:' "$(pc_scan_one a/via lib/../b/x)"
+rm -f "$PCS/a/lib"
 ln -s .. "$PCS/u1"
-ln -s u1/scanned/u1/../../.. "$PCS/u2"
-eq 'scan: two links whose text stays in the tree, on disk in main' "0:u2 -> u1/scanned/u1/../../.." "$(pc_scan)"
-rm -f "$PCS/u1" "$PCS/u2"
+eq 'scan: u1 -> .. alone leaves' '0:u1 -> ..' "$(pc_scan)"
+rm -f "$PCS/u1"
+# Judged one link at a time, the chain's second link is caught on its own walk too.
+ln -s .. "$PCS/a/b/up"
+eq 'scan, one link: .. after a link climbs from its target' 1 \
+  "$(wt_link_target_is_contained "$PCS" u2 a/b/up/../..; echo $?)"
+eq '...the same text without the link stays in' 0 \
+  "$(wt_link_target_is_contained "$PCS" u2 a/b/../..; echo $?)"
+rm -f "$PCS/a/b/up"
+ln -s "$TMP" "$PCS/a/abs"
+eq 'scan, one link: through an absolute link is a leaving' 1 \
+  "$(wt_link_target_is_contained "$PCS" via a/abs/x; echo $?)"
+rm -f "$PCS/a/abs"
+ln -s l2 "$PCS/l1"
+ln -s l1 "$PCS/l2"
+eq 'scan: a loop is a leaving at the hop limit' 0 "$(wt_copy_link_leaves "$PCS"; echo $?)"
+rm -f "$PCS/l1" "$PCS/l2"
+eq 'scan: control characters in the example are replaced' "0:a/n?l -> /x" "$(pc_scan_one "a/n${WT_NL}l" /x)"
 # shellcheck disable=SC2329  # stands in for find inside the scan
 eq 'scan: a find that fails is a refusal' '2:' "$(find() { return 1; }; pc_scan)"
 eq 'scan: a dir that is not there is a refusal' '2:' \
-  "$(wt_copy_symlink_escape "$DWT/not-there" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE")"
+  "$(wt_copy_link_leaves "$TMP/pc-scan/not-there"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE")"
 # Without GNU find's -printf: one readlink per link, the same answer.
-ln -s ../../../../../composer.lock "$PCS/a/climb"
+ln -s ../../x "$PCS/a/climb"
 # shellcheck disable=SC2329  # stands in for find inside the scan
-eq 'scan, plain find: a climb into main is found' "0:a/climb -> ../../../../../composer.lock" \
+eq 'scan, plain find: a climb out is found' "0:a/climb -> ../../x" \
   "$(find() { case " $* " in *' -printf '*) return 1 ;; esac; command find "$@"; }; pc_scan)"
-rm -rf "$PCS"
-# The resolution on its own: a link mid-path is followed before the `..` after it.
-mkdir -p "$TMP/rp/real/deep"
-ln -s real/deep "$TMP/rp/ln"
-wt_resolve_physical "$TMP/rp/ln/../x/y"
-eq 'resolve: .. after a link climbs from its target, a missing rest kept as text' "$(cd -P "$TMP/rp" && pwd -P)/real/x/y" "$WT_RESOLVED"
-rm -rf "$TMP/rp"
+rm -rf "$TMP/pc-scan"
 
 # cp stood in for: one that fails part-way, one that hangs, one without --reflink, one that logs.
 REALCP=$(command -v cp)
