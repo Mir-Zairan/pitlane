@@ -209,6 +209,21 @@ pipfile_lock() {  # $1 = project dir
 EOF
 }
 
+# A Pipfile.lock whose `default` holds pkg0, pkg1, ... version 1.0, one per marker in $2...
+pipfile_markers() {  # $1 = project dir, rest = markers
+  local dir=$1 i=0 m
+  shift
+  {
+    printf '{\n    "default": {\n'
+    for m in "$@"; do
+      [ "$i" -gt 0 ] && printf ',\n'
+      printf '        "pkg%s": {\n            "markers": "%s",\n            "version": "==1.0"\n        }' "$i" "$m"
+      i=$((i + 1))
+    done
+    printf '\n    },\n    "develop": {}\n}\n'
+  } >"$dir/Pipfile.lock"
+}
+
 # A site-packages as an installer leaves it: a .dist-info per package, its RECORD written last.
 venv_has() {  # $1 = project dir, rest = <name>-<version> as the .dist-info spells it
   local d=$1/.venv/lib/python3.12/site-packages s
@@ -348,6 +363,21 @@ run_suite() {
   d=$(mkrepo pv_emptylock pyproject.toml poetry.lock)
   venv_has "$d" PyYAML-6.0.2
   nok 'poetry verify: a lockfile it cannot read a package from fails' "$d" "$v"
+  # Every package excluded leaves nothing to require, which must not read as "all installed".
+  d=$(mkrepo pv_allexcluded pyproject.toml)
+  printf '[[package]]\nname = "colorama"\nversion = "0.4.6"\nmarkers = "sys_platform == \\"win32\\""\n\n[[package]]\nname = "pysocks"\nversion = "1.7.1"\noptional = true\n' >"$d/poetry.lock"
+  mkdir -p "$d/.venv/lib/python3.12/site-packages"
+  nok 'poetry verify: a lockfile whose every package is excluded fails' "$d" "$v"
+  d=$(mkrepo pv_nosite pyproject.toml .venv/pyvenv.cfg)
+  poetry_lock "$d"
+  nok 'poetry verify: a .venv with no site-packages fails' "$d" "$v"
+  # A venv rebuilt for another Python keeps the old interpreter's site-packages, complete RECORDs and
+  # all: two python* dirs cannot say which one the venv runs, so the check refuses to guess.
+  d=$(mkrepo pv_twopythons pyproject.toml)
+  poetry_lock "$d"
+  venv_has "$d" charset_normalizer-3.5.2 PyYAML-6.0.2
+  mkdir -p "$d/.venv/lib/python3.13/site-packages"
+  nok 'poetry verify: site-packages for two interpreters fails' "$d" "$v"
 
   v=$(tverify Pipfile.lock)
   d=$(mkrepo pp_ok Pipfile)
@@ -366,6 +396,28 @@ run_suite() {
   d=$(mkrepo pp_emptylock Pipfile Pipfile.lock)
   venv_has "$d" certifi-2026.7.22
   nok 'pipenv verify: a lockfile it cannot read a package from fails' "$d" "$v"
+  # Only clauses that are python lower bounds make a package required; a compound marker with any
+  # other clause may be false here and is not, so a lockfile of nothing else requires nothing — and fails.
+  d=$(mkrepo pp_allexcluded Pipfile)
+  pipfile_markers "$d" "python_version >= '3.8' and python_version < '4'" "implementation_name == 'cpython'"
+  mkdir -p "$d/.venv/lib/python3.12/site-packages"
+  nok 'pipenv verify: a lockfile whose every default package has a compound marker fails' "$d" "$v"
+  d=$(mkrepo pp_compound Pipfile)
+  pipfile_markers "$d" "python_full_version >= '3.8.1'" "python_version >= '3.8' and sys_platform == 'win32'" "sys_platform == 'linux' and python_version >= '3.8'"
+  venv_has "$d" pkg0-1.0
+  ok 'pipenv verify: a python_full_version bound is required, a lower bound and another clause is not' "$d" "$v"
+  d=$(mkrepo pp_fullbound Pipfile)
+  pipfile_markers "$d" "python_full_version >= '3.8.1'" "python_version >= '3.8' and sys_platform == 'win32'"
+  venv_has "$d" pkg1-1.0
+  nok 'pipenv verify: a package under a python_full_version bound not installed fails' "$d" "$v"
+  d=$(mkrepo pp_novenv Pipfile)
+  pipfile_lock "$d"
+  nok 'pipenv verify: no venv fails' "$d" "$v"
+  d=$(mkrepo pp_twopythons Pipfile)
+  pipfile_lock "$d"
+  venv_has "$d" certifi-2026.7.22 zope_interface-7.0
+  mkdir -p "$d/.venv/lib/python3.11/site-packages"
+  nok 'pipenv verify: site-packages for two interpreters fails' "$d" "$v"
 
   v=$(tverify mix.lock)
   d=$(mkrepo mv_ok mix.exs)
@@ -392,6 +444,18 @@ run_suite() {
   nok 'mix verify: a lockfile it cannot read a package from fails' "$d" "$v"
   d=$(mkrepo mv_nolock mix.exs)
   nok 'mix verify: no lockfile fails' "$d" "$v"
+  # A lock entry the verify cannot read as a name and a hex checksum fails rather than shifting every
+  # later name/checksum pair out of step: a glob, a space or an empty checksum.
+  d=$(mkrepo mv_glob mix.exs)
+  mix_lock "$d"
+  mix_fetched "$d"
+  printf '%%{\n  "*": {:hex, :x, "1.0", "b9226785", [:mix], [], "hexpm", "b9226785"},\n}\n' >"$d/mix.lock"
+  nok 'mix verify: a package name that is not an atom fails' "$d" "$v"
+  d=$(mkrepo mv_nochecksum mix.exs)
+  mix_lock "$d"
+  mix_fetched "$d"
+  printf '%%{\n  "jason": {:hex, :jason, "1.4.4", "", [:mix], [], "hexpm", ""},\n}\n' >"$d/mix.lock"
+  nok 'mix verify: an entry with no checksum fails' "$d" "$v"
 
   # The whole table, one row per rule as dir|strategy|verify|noVerify. The row count is asserted
   # first: an empty read would pass every "no row matches" check below.

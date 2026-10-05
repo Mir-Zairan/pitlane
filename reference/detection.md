@@ -104,17 +104,22 @@ SIGKILLed ones too:
   normalised (`PyYAML` and `pyyaml`, `charset_normalizer` and `charset-normalizer`), with the version.
   Not required: poetry packages with `markers` or `optional = true`; pipenv's `develop` section,
   entries with no `version` (editable, path, VCS), and packages whose markers say more than a
-  `python_version >=` lower bound — pipenv puts that bound on nearly every package. Measured with
+  `python_version >=` or `python_full_version >=` lower bound — pipenv puts that bound on nearly every
+  package. A compound marker with any other clause (`python_version >= '3.8' and python_version < '4'`,
+  `implementation_name == 'cpython'`) may be false here, so it is not required. Measured with
   Poetry 2.4 and pipenv on Python 3.14: a finished install passes; an unresolvable locked version
   (poetry installs the rest, pipenv nothing) and installs SIGKILLed after 1, 3–4 and 6–8 packages fail.
-  A lockfile from which no package can be read fails it rather than passing.
+  A lockfile that leaves nothing required — none readable, or every package excluded — fails it
+  rather than passing, as does a `.venv` with no site-packages or with more than one
+  `lib/python*/` (a venv rebuilt for another Python keeps the old interpreter's complete one).
 - **bundler** with a configured `path` creates `vendor/bundle/ruby/<ruby version>/`; the version
   directory is not named because it changes with the interpreter.
 - **mix** fetches one `deps/<package>/` per dependency, in turn, and writes no marker for the whole
   fetch — but hex writes `deps/<name>/.hex`, holding the package's checksum, only after unpacking it,
   and a git dependency is checked out at its locked revision. So the check requires, for every `:hex`
   entry in `mix.lock`, a `.hex` containing that entry's checksum, and for every `:git` entry a
-  `.git/HEAD` at its revision. Measured with mix 1.18: a finished fetch passes; a fetch that fails on
+  `.git/HEAD` at its revision; an entry whose name is not an atom or whose checksum is not hex fails
+  it, rather than shifting every later name/checksum pair out of step. Measured with mix 1.18: a finished fetch passes; a fetch that fails on
   its third package, one SIGKILLed after 1, 4 and 8 of 9, and a git revision that cannot be checked out
   fail. mix keeps a removed dependency in `mix.lock` until `mix deps.unlock --unused`, and `deps.get`
   never fetches it, so such a lockfile fails the check on a finished tree — which is what the
