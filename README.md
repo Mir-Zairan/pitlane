@@ -32,7 +32,7 @@ comes ready to use and gets its own database and its own address, so each sessio
 | **Settings** | Copies `.env` and other ignored config into each copy, then points it at that copy's own database and port |
 | **Packages** | Linked from your main copy when unchanged, so it's instant and uses no extra disk. A branch that changed its lockfile links from another finished copy with the same lockfile instead (never from a pull request's copy), and installs only when there is none. Files a package manager rewrites in place (Composer's autoloader, npm's `.package-lock.json`) are real copies, so a command run in one copy never reaches the main one |
 | **Honest status** | A check you approve decides whether packages are installed, not the installer's exit code. Each is reported as ready, ready with warnings, or missing with the reason, and any tracked file an install changed is named and never put back without your word |
-| **Database & port** | Each copy gets its own, so sessions never clash. Claude's own shell gets `WORKTREE_PORT` and `WORKTREE_URL` too |
+| **Database & port** | Each copy gets its own, so sessions never clash. Claude's own shell gets `WORKTREE_PORT` and `WORKTREE_URL` too, and a subagent in a worktree of its own is told that worktree's |
 | **Build output** | Ignored build output (a front-end bundle, say) is copied from your main copy when its sources match, or built in the background when they don't |
 | **Your app, on request** | `/pitlane-serve` starts the app on that copy's own port and tells Claude the address |
 | **Pull requests** | `claude -w "#1234"` opens a PR in its own copy. You approve its setup before anything runs, and again after each new push |

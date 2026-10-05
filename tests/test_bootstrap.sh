@@ -1860,6 +1860,78 @@ contains '...while its env block still carries WORKTREE_URL' 'http://made.localh
   "$(envval "$SV/.claude/worktrees/made" WORKTREE_URL)"
 eq 'serve: nothing was started on any path' no "$([ -e "$TMP/served" ] || [ -e "$TMP/stopped" ] && echo yes || echo no)"
 
+# ---------------------------------------------------------------------------
+# SubagentStart: a subagent is told its own worktree's port and URL, not the parent's it inherited
+# ---------------------------------------------------------------------------
+SA_HOOK=${HOOK%/*}/subagent-start.sh
+# Driven as Claude Code drives it (measured, ADR-024): the payload's cwd is the subagent's directory,
+# and CLAUDE_PROJECT_DIR the directory the parent session started in. stdout is the hook's answer.
+subagent_hook() {  # $1 = the subagent's directory, $2 = the parent session's start directory
+  local rc=0
+  ( cd "$1" && printf '{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-purpose","cwd":"%s"}' "$1" \
+    | CLAUDE_PROJECT_DIR=$2 bash "$SA_HOOK" 2>"$TMP/err" ) || rc=$?
+  printf '%s' "$rc" >"$TMP/sa-rc"
+}
+sa_context() {  # stdin = the hook's stdout; prints its additionalContext, or why it is not valid JSON
+  python3 -c 'import json,sys
+t = sys.stdin.read()
+if not t: sys.exit(0)
+d = json.loads(t)
+assert d["hookSpecificOutput"]["hookEventName"] == "SubagentStart", d
+print(d["hookSpecificOutput"]["additionalContext"], end="")' 2>&1
+}
+# shellcheck disable=SC2016  # the literal command hooks.json carries
+eq 'subagent: hooks.json registers the SubagentStart hook' \
+  'bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/subagent-start.sh"' \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks"]["SubagentStart"][0]["hooks"][0]["command"])' "${HOOK%/scripts/*}/hooks.json")"
+MADE=$SV/.claude/worktrees/made
+MADEPORT=$(envval "$MADE" SERVER_PORT)
+ne 'subagent: (fixture) its worktree has a port other than the parent session'"'"'s' "$SVPORT" "$MADEPORT"
+out=$(subagent_hook "$MADE" "$WSV")
+eq 'subagent: in its own worktree, told that worktree'"'"'s port, URL and /pitlane-serve' \
+  "Pitlane: this worktree is made; its app port is $MADEPORT and URL http://made.localhost:$MADEPORT/ — use these, not any inherited WORKTREE_PORT/WORKTREE_URL; start it with /pitlane-serve" \
+  "$(printf '%s' "$out" | sa_context)"
+eq '...as one line of JSON on stdout' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+eq '...and exits 0' 0 "$(cat "$TMP/sa-rc")"
+# No serve and no URL in the profile: the port alone.
+out=$(subagent_hook "$WA" "")
+eq 'subagent: no runtime.url or serve, the port alone' \
+  "Pitlane: this worktree is alice; its app port is $(envval "$WA" SERVER_PORT) — use these, not any inherited WORKTREE_PORT/WORKTREE_URL" \
+  "$(printf '%s' "$out" | sa_context)"
+# The main checkout, under a parent session that started in a worktree with a port.
+out=$(subagent_hook "$SV" "$WSV")
+eq 'subagent: in the main checkout, the parent'"'"'s inherited values are said not to apply' \
+  'Pitlane: this directory is not a Pitlane worktree — the WORKTREE_PORT/WORKTREE_URL this subagent inherited belong to worktree serve-me and do not apply here' \
+  "$(printf '%s' "$out" | sa_context)"
+out=$(WORKTREE_PORT=4999 subagent_hook "$SV" "$SV")
+eq '...and so they are when the hook itself sees them' \
+  'Pitlane: this directory is not a Pitlane worktree — the WORKTREE_PORT/WORKTREE_URL this subagent inherited do not apply here' \
+  "$(printf '%s' "$out" | sa_context)"
+eq 'subagent: in the main checkout of a session started there, nothing is said' '' "$(subagent_hook "$SV" "$SV")"
+# A Pitlane worktree with no port of its own, and a name JSON must escape.
+SNR=$TMP/sanr
+make_repo "$SNR" ''
+SNRW=$SNR/.claude/worktrees/say\"hi
+git -C "$SNR" worktree add -q "$SNRW" -b say-hi 2>/dev/null
+out=$(subagent_hook "$SNRW" "$WSV")
+eq 'subagent: a worktree with no port of its own says the inherited ones do not apply, escaped as JSON' \
+  'Pitlane: this worktree, say"hi, has no app port of its own — the WORKTREE_PORT/WORKTREE_URL this subagent inherited belong to worktree serve-me and do not apply here' \
+  "$(printf '%s' "$out" | sa_context)"
+eq '...and nothing at all under a parent with no port' '' "$(subagent_hook "$SNRW" "$SNR")"
+# Never fails the subagent: outside any repository, and on a payload that is not JSON.
+out=$(subagent_hook "$TMP" "")
+eq 'subagent: outside any repository, nothing on stdout' '' "$out"
+eq '...and exit 0' 0 "$(cat "$TMP/sa-rc")"
+contains '...or, under a parent with a port, that its values do not apply' 'this directory is not a Pitlane worktree' \
+  "$(subagent_hook "$TMP" "$WSV" | sa_context)"
+out=$(cd "$MADE" && printf 'not json' | bash "$SA_HOOK" 2>/dev/null); rc=$?
+eq 'subagent: an unreadable payload falls back to the cwd, and exits 0' "0|$MADEPORT" \
+  "$rc|$(printf '%s' "$out" | sa_context | sed -n 's/.*app port is \([0-9]*\).*/\1/p')"
+# /pitlane-serve finds the worktree from its cwd, never from an inherited WORKTREE_*.
+out=$(cd "$MADE" && WORKTREE_PORT=$SVPORT WORKTREE_URL="http://serve_me.localhost:$SVPORT/" bash "$HOOK" --serve-stop 2>/dev/null)
+eq 'subagent: --serve-stop in its worktree speaks for that worktree, whatever it inherited' \
+  'Pitlane: no server started by Pitlane is recorded for this worktree — nothing stopped.' "$out"
+
 # serve and stop are commands: a profile naming only them needs approval, and an edit to serve
 # needs approving again — the fingerprint is of the profile's bytes (ADR-020).
 SVA=$TMP/sva
