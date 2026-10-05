@@ -1258,10 +1258,11 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
 # entries, and a partial write is the one thing a reader must never see. WT_STATE_KIND=art writes
 # a build-output record instead, in the same fields (wt_art_state_set).
-# $9, the worktree a hardlinked dir was linked from (wt_hardlink_donor_find), is appended only when
-# set, so every other record keeps the shape older readers know.
-wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line, $9 = donor worktree
-  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} donor=${9-} when rec
+# $9, the worktree a hardlinked dir was linked from (wt_hardlink_donor_find), and ${10}, the lockfile's
+# checksum before an install that rewrote it ($4 being the one it left), are appended only when set, so
+# every other record keeps the shape older readers know.
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line, $9 = donor worktree, $10 = lock cksum before the install
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} donor=${9-} before=${10-} when rec
 
   # Recorded but never compared: it answers "when did this last happen" for a developer looking at
   # a worktree that seems stale, and gives prune something to age entries by. It is deliberately
@@ -1269,7 +1270,9 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
 
-  if [ -n "$donor" ]; then
+  if [ -n "$before" ]; then
+    wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor" "$before"
+  elif [ -n "$donor" ]; then
     wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor"
   else
     wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason"
@@ -1285,11 +1288,12 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
 #
 # The lock checksum compared is the WORKTREE's own lockfile, not the main checkout's and not the
 # profile's calibration-time value: they answer different questions, and a worktree on its own
-# branch can legitimately differ from both. The install command is fingerprinted too, so editing
-# it in the profile re-runs the dependency rather than trusting a tree built by the old one.
+# branch can legitimately differ from both. It matches as the install left it or, for an install that
+# rewrote it, as it was before (wt_dep_lock_matches). The install command is fingerprinted too, so
+# editing it in the profile re-runs the dependency rather than trusting a tree built by the old one.
 wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy
   local wt=${1%/} dir=${2-} lck=${3-} ick=${4-} want=${5-}
-  local file rec kind rest ver rdir rstrategy rlck rick rstatus rwhen seen=0
+  local file rec kind rest ver rdir rstrategy rlck rick rstatus rwhen rrc rreason rdonor rbefore rmore seen=0
 
   file=$(wt_state_path "$wt")
   [ -r "$file" ] || return 1
@@ -1305,14 +1309,14 @@ wt_state_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install c
         seen=1
         ;;
       dep)
-        # SC2034: rstrategy and rwhen are read POSITIONALLY to consume their fields; dropping
-        # either would shift every field after it.
+        # SC2034: the fields up to rbefore are read POSITIONALLY to consume them; dropping one
+        # would shift every field after it.
         # shellcheck disable=SC2034
-        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen <<<"$rest" || true
+        IFS=$WT_US read -r rdir rstrategy rlck rick rstatus rwhen rrc rreason rdonor rbefore rmore <<<"$rest" || true
         [ "$rdir" = "$dir" ] || continue
         # Quoted: bare `done` is the loop keyword to the parser. `doing` means killed mid-write.
         case $rstatus in "done" | warn) ;; *) return 1 ;; esac
-        [ "$rlck" = "$lck" ] || return 1
+        wt_dep_lock_matches "$lck" "$rlck" "$rbefore" || return 1
         [ "$rick" = "$ick" ] || return 1
         # The recorded STRATEGY is compared too, not merely stored. Flipping a dependency from
         # hardlink to install in the profile changes neither the lockfile nor the install command,
@@ -1727,7 +1731,8 @@ wt_cksum_file() {  # $1 = path
 }
 
 # Read one dependency's record into WT_DEP_STRATEGY, WT_DEP_LCK, WT_DEP_ICK, WT_DEP_STATUS,
-# WT_DEP_WHEN, WT_DEP_RC, WT_DEP_REASON and WT_DEP_DONOR. Returns 1, with them all empty, when there
+# WT_DEP_WHEN, WT_DEP_RC, WT_DEP_REASON, WT_DEP_DONOR and WT_DEP_LCK_BEFORE (empty in a record from
+# before it existed, and wherever the install left its lockfile as it was). Returns 1, with them all empty, when there
 # is no usable record. Globals rather than output so a caller in its own shell gets every field from
 # one read. WT_STATE_KIND=art reads a build-output record instead (wt_art_state_read).
 wt_state_dep_read() {  # $1 = worktree, $2 = dir
@@ -1736,9 +1741,9 @@ wt_state_dep_read() {  # $1 = worktree, $2 = dir
 
 # wt_state_dep_read on a state file named directly: another worktree's, read without a git call.
 wt_state_dep_read_file() {  # $1 = state file, $2 = dir
-  local file=${1-} dir=${2-} rec kind rest rdir seen=0
+  local file=${1-} dir=${2-} rec kind rest rdir rmore seen=0
   WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_WHEN='' WT_DEP_RC=''
-  WT_DEP_REASON='' WT_DEP_DONOR=''
+  WT_DEP_REASON='' WT_DEP_DONOR='' WT_DEP_LCK_BEFORE=''
   [ -n "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
@@ -1751,15 +1756,23 @@ wt_state_dep_read_file() {  # $1 = state file, $2 = dir
       "${WT_STATE_KIND:-dep}")
         [ "$seen" = 1 ] || return 1
         [ "${rest%%"$WT_US"*}" = "$dir" ] || continue
-        # SC2034: rdir is read POSITIONALLY to consume its field.
+        # SC2034: rdir and rmore are read POSITIONALLY: its field, and whatever a later format appends.
         # shellcheck disable=SC2034
         IFS=$WT_US read -r rdir WT_DEP_STRATEGY WT_DEP_LCK WT_DEP_ICK WT_DEP_STATUS WT_DEP_WHEN \
-          WT_DEP_RC WT_DEP_REASON WT_DEP_DONOR <<<"$rest" || true
+          WT_DEP_RC WT_DEP_REASON WT_DEP_DONOR WT_DEP_LCK_BEFORE rmore <<<"$rest" || true
         return 0
         ;;
     esac
   done <"$file"
   return 1
+}
+
+# True when lockfile checksum $1 is one a dependency's record was made for: $2, as the install left it,
+# or $3, as it was before an install that rewrote it. The second is what a developer
+# gets by restoring a lockfile the install rewrote (`git checkout -- package-lock.json`); counting it
+# stale would reinstall, and rewrite it again. Both are the same packages, by the install's own say.
+wt_dep_lock_matches() {  # $1 = lock cksum, $2 = the record's, $3 = the record's from before the install
+  [ "${2-}" = "${1-}" ] || { [ -n "${3-}" ] && [ "$3" = "${1-}" ]; }
 }
 
 # Read back the recorded status for one dependency: `done`, `warn`, `failed`, `doing`, `dirty`, or
@@ -2080,7 +2093,7 @@ wt_donor_is_pr() {  # $1 = admin dir, $2 = worktree, $3 = branch merge config
 wt_donor_record_fits() {  # $1 = admin dir, $2 = dir, $3 = lock cksum, $4 = install cksum
   wt_state_dep_read_file "${1%/}/worktree-bootstrap-state" "${2-}" || return 1
   [ "$WT_DEP_STATUS" = "done" ] && [ "$WT_DEP_STRATEGY" = hardlink ] \
-    && [ "$WT_DEP_LCK" = "${3-}" ] && [ "$WT_DEP_ICK" = "${4-}" ]
+    && wt_dep_lock_matches "${3-}" "$WT_DEP_LCK" "$WT_DEP_LCK_BEFORE" && [ "$WT_DEP_ICK" = "${4-}" ]
 }
 
 # Find another linked worktree to hardlink dependency dir $3 from, when the main checkout cannot give
@@ -2822,7 +2835,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
-  local verify_tpl linked_from lock_rc own_copy clear_why own_linked
+  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before
   WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
@@ -3183,14 +3196,23 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
 
     # AN INSTALL MAY REWRITE ITS OWN LOCKFILE (npm updating package-lock.json, a tool normalising
     # one). The checksum taken before it would then never match again: pending forever, reinstalled
-    # every run. So a finished install records the lockfile as it left it. A tracked one it rewrote
-    # is in the `changed` record (wt_install_note_changes), so the user is still told.
+    # every run. So a finished install records the lockfile as it left it, AND as it was before, and
+    # either counts as current (wt_dep_lock_matches): the developer may restore it. A tracked one it
+    # rewrote is in the `changed` record (wt_install_note_changes), so the user is still told.
+    lck_before=''
     if [ "$effective" = install ]; then
-      case $outcome in "done" | warn) lckhash=$(wt_cksum_file "$worktree/$lock") ;; esac
+      case $outcome in
+        "done" | warn)
+          lck_before=$lckhash
+          lckhash=$(wt_cksum_file "$worktree/$lock")
+          [ "$lck_before" != "$lckhash" ] || lck_before=''
+          ;;
+      esac
     fi
     case $outcome in
-      warn | failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
-      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" '' '' "$linked_from" || true ;;
+      warn) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" '' "$lck_before" || true ;;
+      failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
+      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" '' '' "$linked_from" "$lck_before" || true ;;
     esac
 
     [ "$held" -eq 1 ] && wt_lock_release 9
@@ -3628,7 +3650,7 @@ wt_bootstrap_pending() {  # $1 = worktree
     # wt_state_is_done and wt_state_failure_stands: the record is for this lockfile, command and
     # strategy (never empty here), and then its status says which.
     current=0
-    if wt_state_dep_read "$worktree" "$dir" && [ "$WT_DEP_LCK" = "$lckhash" ] \
+    if wt_state_dep_read "$worktree" "$dir" && wt_dep_lock_matches "$lckhash" "$WT_DEP_LCK" "$WT_DEP_LCK_BEFORE" \
       && [ "$WT_DEP_ICK" = "$ickhash" ] && [ "$WT_DEP_STRATEGY" = "$strategy" ]; then
       current=1
     fi

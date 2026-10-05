@@ -2069,6 +2069,34 @@ eq '...so it is not pending' '' "$(pending_all "$DWT")"
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq '...and not re-run' x "$(cat "$CNT")"
 eq '...the lockfile listed as a tracked file the install changed' composer.lock "$(wt_install_changed_paths "$DWT")"
+eq '...and recorded as it was before, too' "$(git -C "$DWT" show HEAD:composer.lock | cksum)" \
+  "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_LCK_BEFORE")"
+# The developer restores the lockfile the install rewrote: still done, not reinstalled (which would
+# rewrite it again).
+git -C "$DWT" checkout -q -- composer.lock
+eq 'lockfile restored after its install rewrote it: still done' '' "$(pending_all "$DWT")"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...up to date' 'vendor: already up to date' "$out"
+eq '...not re-run' x "$(cat "$CNT")"
+eq '...and the lockfile stays as restored' LOCKV1 "$(cat "$DWT/composer.lock")"
+# A genuinely different lockfile is neither: reinstalled.
+printf 'LOCKV9\n' > "$DWT/composer.lock"
+eq 'a lockfile neither as committed nor as the install left it: pending' vendor "$(pending_all "$DWT")"
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq '...and reinstalled' xx "$(cat "$CNT")"
+# A record from before the field existed (nine fields) still reads, and matches only as it says.
+wt_state_set "$DWT" vendor install "$(wt_cksum_file "$DWT/composer.lock")" "$(wt_cksum_string "$RWCMD")" "done"
+eq 'a record without the before field: done for its own lockfile' '' "$(pending_all "$DWT")"
+eq '...read with that field empty' '' "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_LCK_BEFORE")"
+git -C "$DWT" checkout -q -- composer.lock
+eq '...and pending for another' vendor "$(pending_all "$DWT")"
+# A donor's field is kept apart from it: both in one record.
+wt_state_set "$DWT" vendor hardlink LCKAFTER ICK "done" '' '' /elsewhere/donor-a LCKBEFORE
+wt_state_dep_read "$DWT" vendor
+eq 'a record with a donor and a before field reads both' "/elsewhere/donor-a|LCKAFTER|LCKBEFORE" \
+  "$WT_DEP_DONOR|$WT_DEP_LCK|$WT_DEP_LCK_BEFORE"
+eq '...and is done for either lockfile' "0|0|1" \
+  "$(wt_state_is_done "$DWT" vendor LCKAFTER ICK hardlink; echo $?)|$(wt_state_is_done "$DWT" vendor LCKBEFORE ICK hardlink; echo $?)|$(wt_state_is_done "$DWT" vendor OTHER ICK hardlink; echo $?)"
 # Installed with warnings: the same.
 git -C "$DWT" checkout -q -- composer.lock; rm -rf "$DWT/vendor"; rm -f "$CNT" "$(wt_state_path "$DWT")"
 # shellcheck disable=SC2034
