@@ -2342,8 +2342,9 @@ wt_same_device() {  # $1, $2 = existing paths
   [ -n "$a" ] && [ "$a" = "$b" ]
 }
 
-# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then,
-# in the worktree's admin dir and beside the dir. Only real dirs with names only we make.
+# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then, and
+# what an interrupted wt_own_copy_from_main left in the same places, in the worktree's admin dir and
+# beside the dir. Only real dirs with names only we make.
 wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
   local worktree=${1%/} dir=${2-} parent admin leftover err
   wt_is_safe_relpath "$dir" && ! wt_has_symlinked_parent "$worktree" "$dir" || return 0
@@ -2358,9 +2359,9 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
     fi
     [ -d "$leftover" ] && [ ! -L "$leftover" ] || continue
     if err=$(rm -rf -- "$leftover" 2>&1); then
-      wt_log "  $dir: removed $leftover, a linked copy an earlier run moved aside"
+      wt_log "  $dir: removed $leftover, a tree an earlier run left aside"
     else
-      wt_log "  $dir: could not remove $leftover, a linked copy an earlier run moved aside (${err%%"$WT_NL"*}) — retried next run"
+      wt_log "  $dir: could not remove $leftover, a tree an earlier run left aside (${err%%"$WT_NL"*}) — retried next run"
     fi
   done
 }
@@ -2373,8 +2374,8 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
 # With $7 `aside` it only moves the dir into the admin dir, an instant rename, leaving the removal to
 # the sweep of the run that installs: 0 when moved (or nothing is linked), 3 when the admin dir cannot
 # take it, 1, silently, when the lock or the path forbids it. With $7 `remove` it removes the dir as
-# a step that installs nothing, and says so.
-wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock, $6 = why it is cleared, for the log, $7 = `aside`, `remove` or empty
+# a step that installs nothing, and says so; with $7 `copy`, as a step that copies the main checkout's.
+wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock, $6 = why it is cleared, for the log, $7 = `aside`, `remove`, `copy` or empty
   local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} mode=${7-} dest probe aside admin err why
   dest=$worktree/$dir
   [ -n "$dir" ] && [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
@@ -2406,6 +2407,7 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
   case $mode in
     aside) ;;
     remove) wt_log "  $dir: $why — removing the linked copy; nothing installs it here" ;;
+    copy) wt_log "  $dir: $why — removing the linked copy and copying the main checkout's" ;;
     *) wt_log "  $dir: $why — removing the linked copy and installing fresh" ;;
   esac
   # Renamed aside first, then removed: an `rm -rf` that fails part-way at the dir's own path would
@@ -2832,6 +2834,156 @@ wt_own_copy_unlink() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = lo
   [ "$had" = 1 ] && [ ! -e "${2%/}/$3" ]
 }
 
+# True when the main checkout can give pull request worktree $2 its dependency dir $3 as a copy: the
+# two lockfiles are byte-identical and main's dir is one wt_hardlink_dep would link (a real, non-empty
+# directory, not a symlink). A copy shares no inode with main and runs none of the PR's code; it
+# costs disk where a link costs none. Says nothing: the caller logs what it does instead.
+wt_own_copy_source_fits() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-}
+  [ -n "$dir" ] && [ -n "$lock" ] && [ -f "$worktree/$lock" ] && [ -f "$root/$lock" ] || return 1
+  [ ! "$worktree" -ef "$root" ] && wt_art_has_content "$root/$dir" || return 1
+  cmp -s "$root/$lock" "$worktree/$lock"
+}
+
+# WT_CP_REFLINK: yes when this `cp` takes `--reflink=auto` (GNU coreutils), no when it does not (BSD,
+# busybox), '' until asked. Tried once per process on an empty file in dir $1, not assumed from the
+# platform. On a copy-on-write filesystem (btrfs, XFS, bcachefs) a reflinked copy shares blocks until
+# either side writes, so a large tree copies in moments; elsewhere GNU cp copies as plain `cp -a` does.
+WT_CP_REFLINK=''
+wt_cp_reflink_judge() {  # $1 = a writable directory
+  local probe=${1%/}/.pitlane-reflink-probe.$$
+  [ -z "$WT_CP_REFLINK" ] || return 0
+  WT_CP_REFLINK=no
+  if : >"$probe.a" 2>/dev/null && cp --reflink=auto -- "$probe.a" "$probe.b" >/dev/null 2>&1; then
+    WT_CP_REFLINK=yes
+  fi
+  rm -f -- "$probe.a" "$probe.b" 2>/dev/null
+  return 0
+}
+
+# Whether copy $1, to be renamed to $2, holds a symlink that would point into main checkout $3 rather
+# than into worktree $4: 0 with the first as `<path in the dir> -> <target>` in WT_COPY_ESCAPE, 1 when
+# none, 2 when the copy cannot be listed (the caller fails closed). A relative target is resolved,
+# by text, from where the link will sit; one with no `..` component stays below the link's own dir
+# and is not looked at. Absolute targets elsewhere (a system toolchain, a store path) are what main's
+# tree points at too: only main's own files are a write the copy exists to keep away from.
+# One `find` for the whole tree; on GNU find it also prints the targets, else one readlink per link.
+wt_copy_symlink_escape() {  # $1 = copy, $2 = its final path, $3 = main checkout, $4 = worktree
+  local copy=${1%/} final=${2%/} root=${3%/} worktree=${4%/} rootp worktreep link target at gnu=0 listed=0
+  WT_COPY_ESCAPE=''
+  rootp=$(cd -P -- "$root" 2>/dev/null && pwd -P) || rootp=$root
+  worktreep=$(cd -P -- "$worktree" 2>/dev/null && pwd -P) || worktreep=$worktree
+  ! find "$copy" -maxdepth 0 -printf '' >/dev/null 2>&1 || gnu=1
+  # The empty name after find's own output marks a listing that finished: a find that failed part-way
+  # (an unreadable subdir) never prints it.
+  while IFS= read -r -d '' link; do
+    if [ -z "$link" ]; then
+      listed=1
+      break
+    fi
+    if [ "$gnu" = 1 ]; then
+      IFS= read -r -d '' target || break
+    elif ! target=$(readlink -- "$link" 2>/dev/null); then
+      break
+    fi
+    case $target in
+      /*) at=$target ;;
+      .. | ../* | */.. | */../*) at=${link#"$copy"} at=$final${at%/*}/$target ;;
+      *) continue ;;
+    esac
+    wt_collapse_dotdot_into "$at/"
+    case ${WT_COLLAPSED%/}/ in
+      "$worktree"/* | "$worktreep"/*) ;;
+      "$root"/* | "$rootp"/*)
+        WT_COPY_ESCAPE="${link#"$copy"/} -> $target"
+        return 0
+        ;;
+    esac
+  done < <(
+    if [ "$gnu" = 1 ]; then
+      find "$copy" -type l -printf '%p\0%l\0' 2>/dev/null && printf '\0\0'
+    else
+      find "$copy" -type l -print0 2>/dev/null && printf '\0'
+    fi
+  )
+  [ "$listed" = 1 ] || return 2
+  return 1
+}
+
+# Give pull request worktree $2 its own copy of the main checkout's dependency dir $3, which
+# wt_own_copy_source_fits has approved and the caller has cleared: `cp -a` (`--reflink=auto` where
+# cp takes it) into a temp named and placed as wt_clear_linked_dep's removals are — the admin dir on
+# the dir's device, else beside the dir — so an interrupted copy is swept like one, and teardown and
+# /pitlane-tidy know it. Its symlinks are checked there, then it is renamed into place: the dir is
+# never a half copy. The copy is stopped after $4 seconds. Its size is logged: a copy costs disk.
+#   0 = in place, 1 = install instead (said why), 2 = ran out of time (nothing left; the next run tries again).
+wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
+  local root=${1%/} worktree=${2%/} dir=${3-} secs=${4-} dest tmp admin err rc=0 started elapsed size note=''
+  local -a flags=(-a) bound=()
+  dest=$worktree/$dir
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    wt_log "  $dir: already present in the worktree, sharing no file with another tree — installing over it rather than copying the main checkout's"
+    return 1
+  fi
+  if [ "${dir%/*}" != "$dir" ] && ! err=$(mkdir -p -- "${dest%/*}" 2>&1); then
+    wt_log "  $dir: could not create its parent directory (${err:-mkdir failed}) — installing instead"
+    return 1
+  fi
+  if admin=$(wt_removed_dep_admin_dir "$worktree") && mkdir -p -- "$admin" 2>/dev/null && [ ! -L "$admin" ] \
+    && wt_same_device "${dest%/*}" "$admin"; then
+    tmp=$admin/$(wt_removed_dep_admin_name "$dir" "$$" "${RANDOM:-0}")
+  else
+    tmp=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
+  fi
+  if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+    wt_log "  $dir: could not copy it from the main checkout (${tmp##*/} exists) — installing instead"
+    return 1
+  fi
+  wt_cp_reflink_judge "${tmp%/*}"
+  [ "$WT_CP_REFLINK" = no ] || flags+=(--reflink=auto) note=', copy-on-write where the filesystem allows'
+  command -v timeout >/dev/null 2>&1 && wt_is_seconds "$secs" && bound=(timeout "$secs")
+  started=$(date +%s 2>/dev/null) || started=''
+  err=$(${bound[@]+"${bound[@]}"} cp "${flags[@]}" -- "$root/$dir" "$tmp" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -rf -- "$tmp" 2>/dev/null
+    if [ "$rc" -eq 124 ] && [ "${#bound[@]}" -gt 0 ]; then
+      wt_log "  $dir: copying it from the main checkout ran past the ${secs}s left in the budget — left for the next run"
+      return 2
+    fi
+    wt_log "  $dir: could not copy it from the main checkout (${err%%"$WT_NL"*}) — installing instead"
+    return 1
+  fi
+  # A symlink main's tree holds into main itself would, copied, still lead the PR's writes there.
+  wt_copy_symlink_escape "$tmp" "$dest" "$root" "$worktree"
+  case $? in
+    0) rm -rf -- "$tmp" 2>/dev/null
+       wt_log "  $dir: the main checkout's copy has a symlink pointing back into it ($WT_COPY_ESCAPE) — installing instead"
+       return 1 ;;
+    2) rm -rf -- "$tmp" 2>/dev/null
+       wt_log "  $dir: could not list the symlinks in the main checkout's copy — installing instead"
+       return 1 ;;
+  esac
+  # Re-tested: were it there now, `mv` would put the copy inside it.
+  err="$dir appeared in the worktree meanwhile"
+  if [ -e "$dest" ] || [ -L "$dest" ] || ! err=$(mv -- "$tmp" "$dest" 2>&1); then
+    rm -rf -- "$tmp" 2>/dev/null
+    wt_log "  $dir: could not move the copy into place (${err%%"$WT_NL"*}) — installing instead"
+    return 1
+  fi
+  elapsed=''
+  [ -z "$started" ] || elapsed=$(( $(date +%s) - started ))
+  size=$(du -sh -- "$dest" 2>/dev/null) && size=${size%%[[:space:]]*} || size=''
+  wt_log "  $dir: copied from the main checkout${elapsed:+ in ${elapsed}s}${size:+ ($size$note)}"
+  return 0
+}
+
+# wt_state_is_done for dependency $2, where a pull request's own copy ($6 = 1) recorded `copy` counts
+# as current for its `install` too: either made a private tree for this lockfile and command.
+wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy
+  wt_state_is_done "$1" "$2" "$3" "$4" "$5" && return 0
+  [ "${6-}" = 1 ] && wt_state_is_done "$1" "$2" "$3" "$4" copy
+}
+
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
 #
 # TWO PASSES, cheapest first: hardlinked entries (a second or so each, and no toolchain needed), then
@@ -2842,7 +2994,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
-  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before
+  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits
   WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
@@ -2858,8 +3010,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     n=$((n + 1))
     body=${rec#*"$WT_US"}
     IFS=$WT_US read -r dir lock strategy install verify _cksum dcopy <<<"$body" || true
-    # Installed as its own copy, and recorded `install`: a record from before this, `hardlink`, then
-    # no longer matches, so a dir linked then is cleared and installed by the next deferred run.
+    # Its own copy, installed (recorded `install`) or copied from main (`copy`, wt_dep_is_done): a
+    # record from before this, `hardlink`, then no longer matches, so a dir linked then is cleared and
+    # replaced by the next deferred run.
     own_copy=0
     if [ "$strategy" = hardlink ]; then
       [ -n "$WT_OWN_COPY" ] || wt_own_copy_judge "$worktree"
@@ -2933,7 +3086,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
 
-    if wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+    if wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy"; then
       wt_log "  $dir: already up to date"
       if [ "$strategy" = hardlink ]; then
         wt_state_dep_read "$worktree" "$dir" || true
@@ -2941,7 +3094,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
       continue
     fi
-    [ "$own_copy" = 0 ] || wt_log "  $dir: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways"
+    own_fits=0
+    if [ "$own_copy" = 1 ] && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
+      own_fits=1
+      wt_log "  $dir: a pull request's worktree copies the main checkout's rather than link it — a linked one would share files with the main checkout both ways"
+    elif [ "$own_copy" = 1 ]; then
+      wt_log "  $dir: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways"
+    fi
     # Read before `doing` replaces the record: a dir it says was linked is moved out of use at each
     # step below that leaves it uninstalled (wt_own_copy_unlink). Gated on the record so a tree that
     # was never linked is not walked on every start-up. Once moved, the record is rewritten `dirty`:
@@ -2970,9 +3129,14 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       continue
     fi
 
-    # Deferred: an install is the slow part, and the background run that follows does it.
+    # Deferred: an install is the slow part, and the background run that follows does it. So is a
+    # copy: unlike `cp -al` it writes every byte.
     if [ "${WT_DEFER:-0}" = 1 ] && [ "$strategy" = install ]; then
-      wt_log "  $dir: to be installed in the background"
+      if [ "$own_fits" = 1 ]; then
+        wt_log "  $dir: to be copied from the main checkout in the background"
+      else
+        wt_log "  $dir: to be installed in the background"
+      fi
       if [ "$own_linked" = 1 ] && wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" '' 0; then
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
       fi
@@ -3002,7 +3166,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # outside it; without this the second waits out the lock and then repeats an install the
     # first just finished. Checking the marker outside the lock and acting on it inside is the
     # source conversation's bug 1 in a different costume.
-    if [ "$held" -eq 1 ] && wt_state_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy"; then
+    if [ "$held" -eq 1 ] && wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy"; then
       wt_log "  $dir: another session finished it while we waited"
       wt_lock_release 9
       continue
@@ -3083,6 +3247,33 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
     else
       linked_from=''
+    fi
+
+    # A pull request's worktree copies what main has for the same lockfile, after the clearing an
+    # install gets and within the same budget. Re-judged here, under the lock. Not deferred past
+    # this point: a deferred copy waited above, like an install.
+    if [ "$own_copy" = 1 ] && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
+      left=$(wt_budget_left "$deadline")
+      if [ "$left" -le 0 ]; then
+        wt_log "  $dir: the budget ran out before the copy could start — leaving it for the next session"
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$own_linked" = 0 ] || wt_own_copy_unlink "$root" "$worktree" "$dir" "$lock" "$lock_rc" 0 || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      if ! wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc" \
+        "it was linked, and a pull request's worktree keeps its own copy" copy; then
+        wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+        [ "$held" -eq 1 ] && wt_lock_release 9
+        continue
+      fi
+      wt_own_copy_from_main "$root" "$worktree" "$dir" "$left"
+      case $? in
+        0) effective=copy ;;
+        2) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
+           [ "$held" -eq 1 ] && wt_lock_release 9
+           continue ;;
+      esac
     fi
 
     rc=0 reason=''
@@ -3215,6 +3406,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # either counts as current (wt_dep_lock_matches): the developer may restore it. A tracked one it
     # rewrote is in the `changed` record (wt_install_note_changes), so the user is still told.
     lck_before=''
+    # Recorded as what it is: a later run takes `copy` for current (wt_dep_is_done), and nothing that
+    # mends or moves a LINKED tree (wt_own_copy_unlink, wt_repair_shared_copy_paths) reads it as one.
+    [ "$effective" != copy ] || strategy=copy
     if [ "$effective" = install ]; then
       case $outcome in
         "done" | warn)
@@ -3663,7 +3857,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # a commit changed its inputs since: pending and attemptable, yet not missing). Globals, not output, so one
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
-  local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current own
   WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS='' WT_OWN_COPY=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -3677,9 +3871,10 @@ wt_bootstrap_pending() {  # $1 = worktree
     { [ -n "$dir" ] && wt_is_safe_relpath "$dir"; } || continue
     [ "$strategy" = store ] && strategy=install
     # As wt_bootstrap_deps records it.
+    own=0
     if [ "$strategy" = hardlink ]; then
       [ -n "$WT_OWN_COPY" ] || wt_own_copy_judge "$worktree"
-      [ "$WT_OWN_COPY" = 0 ] || strategy=install
+      [ "$WT_OWN_COPY" = 0 ] || own=1 strategy=install
     fi
     install=$(wt_expand "$install")
     lckhash=$(wt_cksum_file "$worktree/$lock")
@@ -3689,7 +3884,8 @@ wt_bootstrap_pending() {  # $1 = worktree
     # strategy (never empty here), and then its status says which.
     current=0
     if wt_state_dep_read "$worktree" "$dir" && wt_dep_lock_matches "$lckhash" "$WT_DEP_LCK" "$WT_DEP_LCK_BEFORE" \
-      && [ "$WT_DEP_ICK" = "$ickhash" ] && [ "$WT_DEP_STRATEGY" = "$strategy" ]; then
+      && [ "$WT_DEP_ICK" = "$ickhash" ] \
+      && { [ "$WT_DEP_STRATEGY" = "$strategy" ] || { [ "$own" = 1 ] && [ "$WT_DEP_STRATEGY" = copy ]; }; }; then
       current=1
     fi
     if [ "$current" = 1 ]; then
@@ -5155,10 +5351,17 @@ wt_rule_is_recorded() {  # $1 = the rule's markers as compact JSON, $2 = the rul
 # not exist. `pwd -P` would also resolve symlinks and costs a subshell per sibling; this is a
 # textual normalisation, which is what a comparison between two paths git itself produced needs.
 wt_collapse_dotdot() {  # $1 = path
+  wt_collapse_dotdot_into "${1-}"
+  printf '%s' "$WT_COLLAPSED"
+}
+
+# wt_collapse_dotdot into WT_COLLAPSED, for a caller that asks once per entry of a long list: no
+# subshell per call.
+wt_collapse_dotdot_into() {  # $1 = path
   local p=${1-} out='' seg rest
   case $p in
     */../*) ;;
-    *) printf '%s' "$p"; return 0 ;;      # nothing to do, and no cost for the common case
+    *) WT_COLLAPSED=$p; return 0 ;;      # nothing to do, and no cost for the common case
   esac
   rest=$p
   case $rest in /*) out='' ;; esac
@@ -5171,7 +5374,7 @@ wt_collapse_dotdot() {  # $1 = path
       *) out="$out/$seg" ;;
     esac
   done
-  printf '%s' "${out:-/}"
+  WT_COLLAPSED=${out:-/}
 }
 
 # Collect every LIVE sibling worktree of $1 that has a runtime allocation. Sets WT_SIBLINGS to the

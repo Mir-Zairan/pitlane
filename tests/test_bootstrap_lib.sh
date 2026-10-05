@@ -2856,7 +2856,7 @@ if [ "$(id -u)" != 0 ]; then
   eq '...and it is not done, so the next run installs' dirty "$(wt_state_status "$DWT" vendor)"
   chmod 755 "$ADMIN/$leftover/locked"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  contains '...which removes the leftover' "vendor: removed $ADMIN/$leftover, a linked copy an earlier run moved aside" "$out"
+  contains '...which removes the leftover' "vendor: removed $ADMIN/$leftover, a tree an earlier run left aside" "$out"
   eq '...and installs into a fresh dir' "done|DINSTALLED|absent|absent" \
     "$(wt_state_status "$DWT" vendor)|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/locked")|$(present "$ADMIN/$leftover")"
   eq "...main's tree still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
@@ -2875,7 +2875,7 @@ if [ "$(id -u)" != 0 ]; then
   ne '...the leftover sits beside the dir' '' "$leftover"
   chmod 755 "$DWT/$leftover/locked"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  contains '...and the next run removes it there' "vendor: removed $DWT/$leftover, a linked copy" "$out"
+  contains '...and the next run removes it there' "vendor: removed $DWT/$leftover, a tree an earlier run left aside" "$out"
   eq '...and installs' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/$leftover")"
 
   # A git dir on another device: never `mv`ed into, which would copy the whole tree.
@@ -2967,28 +2967,51 @@ if [ "$(id -u)" != 0 ]; then
 fi
 rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
 
-# --- a pull request's worktree installs its hardlink deps, from the main checkout too -----------
+# --- a pull request's worktree never links its hardlink deps: it copies main's, or installs -------
 # A linked tree shares inodes with main both ways: the PR's own scripts would write into main's files.
+# With main's lockfile it takes a real copy of main's tree; with another, it installs.
 relink LOCKV1
 eq 'pr: (fixture) an ordinary worktree with main'"'"'s lockfile still links from main' main "$(linked_from)"
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 rmain=$(tree_snap "$DREPO/vendor")
 git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-eq "pr: with main's lockfile, a pull request's worktree installs" install "$(linked_from)"
+eq "pr: with main's lockfile, a pull request's worktree copies main's tree" copy "$(linked_from)"
 contains '...and says why, once' \
-  "vendor: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways" "$out"
-eq '...once' 1 "$(printf '%s\n' "$out" | grep -c "installs its own copy")"
+  "vendor: a pull request's worktree copies the main checkout's rather than link it — a linked one would share files with the main checkout both ways" "$out"
+eq '...once' 1 "$(printf '%s\n' "$out" | grep -c "rather than link it")"
+contains '...and what it cost' 'vendor: copied from the main checkout in ' "$out"
 lacks '...not linked from main' 'hardlinked from' "$out"
+lacks '...nor installed' 'installing' "$out"
+eq '...the install never ran' absent "$(present "$DWT/vendor/m")"
 eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
+eq "...every byte of main's" "$(cd "$DREPO/vendor" && find . -type f -exec cksum {} + | LC_ALL=C sort)" \
+  "$(cd "$DWT/vendor" && find . -type f -exec cksum {} + | LC_ALL=C sort)"
 eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+eq '...no temp left in the git dir or beside the dir' '|' \
+  "$(ls -A "$(wt_removed_dep_admin_dir "$DWT")" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
 wt_state_dep_read "$DWT" vendor
-eq '...recorded done as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+eq '...recorded done as a copy' "done|copy" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains '...which the next run finds up to date' 'vendor: already up to date' "$out"
-lacks '...without saying it again' 'installs its own copy' "$out"
+lacks '...without saying it again' 'rather than link it' "$out"
 PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
 eq '...and nothing is pending' '' "$WT_PENDING"
+# A write in the PR's copy goes nowhere else.
+printf 'PR EDIT' >> "$DWT/vendor/pkg/file.txt"
+eq "...an in-place write in the PR's copy leaves main's file as it was" "$rmain" "$(tree_snap "$DREPO/vendor")"
+# With a lockfile of its own it installs, as before.
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+printf 'LOCKV5\n' > "$DWT/composer.lock"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq "pr: with a lockfile of its own, a pull request's worktree installs" install "$(linked_from)"
+contains '...and says why' \
+  "vendor: a pull request's worktree installs its own copy — a linked one would share files with the main checkout both ways" "$out"
+lacks '...nothing copied' 'copied from the main checkout' "$out"
+wt_state_dep_read "$DWT" vendor
+eq '...recorded done as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+printf 'LOCKV1\n' > "$DWT/composer.lock"
 
 # Linked before this change: the start-up run, installs deferred, moves the linked copy out of the
 # worktree into its git dir at once (an instant rename), and the background run removes it there and
@@ -3005,8 +3028,9 @@ eq 'pr: (fixture) linked from main while not yet a pull request' main "$(linked_
 PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
 eq 'pr: a linked dir recorded done is pending again' vendor "$WT_PENDING_ATTEMPTABLE"
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains '...at start-up its install is left for the background run' 'vendor: to be installed in the background' "$out"
-contains '...saying why' "vendor: a pull request's worktree installs its own copy" "$out"
+contains '...at start-up its copy is left for the background run' 'vendor: to be copied from the main checkout in the background' "$out"
+lacks '...no copy made at start-up' 'vendor: copied from' "$out"
+contains '...saying why' "vendor: a pull request's worktree copies the main checkout's rather than link it" "$out"
 contains '...and the linked copy is moved out of the worktree at once' \
   "vendor: it was linked, and a pull request's worktree keeps its own copy — moved the linked copy out of the worktree, into its git dir" "$out"
 eq '...so the session has no tree shared with main' absent "$(present "$DWT/vendor")"
@@ -3015,16 +3039,24 @@ eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks '...a second start-up has nothing more to move' 'moved the linked copy' "$out"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains '...the run that installs removes it from the git dir' "vendor: removed $PADMIN/vendor." "$out"
-eq '...and installs into a fresh dir' "install|absent" "$(linked_from)|$(present "$DWT/vendor/stale.txt")"
+contains '...the run that copies removes it from the git dir' "vendor: removed $PADMIN/vendor." "$out"
+eq "...and copies main's tree into a fresh dir" "copy|absent" "$(linked_from)|$(present "$DWT/vendor/stale.txt")"
 eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
 eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
 eq '...nothing left in the git dir or beside the dir' '|' \
   "$(ls -A "$PADMIN" 2>/dev/null)|$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
 eq '...recorded done' "done" "$(wt_state_status "$DWT" vendor)"
 
-# Not deferred, the run that installs clears the linked copy itself, right before the install.
+# Not deferred, the run that copies clears the linked copy itself, right before the copy; with a
+# lockfile of its own, before the install.
 pr_relink
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr: a run that copies clears the linked copy first' \
+  "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy and copying the main checkout's" "$out"
+eq '...and copies' "copy|" "$(linked_from)|$(find "$DWT/vendor" -type f -links +1)"
+eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
+pr_relink
+printf 'LOCKV9\n' > "$DWT/composer.lock"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'pr: a run that installs clears the linked copy first' \
   "vendor: it was linked, and a pull request's worktree keeps its own copy — removing the linked copy and installing fresh" "$out"
@@ -3038,6 +3070,8 @@ for pr_exit in approval empty-install budget; do
   case $pr_exit in
     approval) out=$(WT_APPROVAL=no wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); why='not installed — the profile'"'"'s commands are not approved' ;;
     empty-install)
+      # A lockfile of its own, or main's tree would be copied before the install is looked at.
+      printf 'LOCKV9\n' > "$DWT/composer.lock"
       # shellcheck disable=SC2034
       PROFILE_RAW=$(dep_raw vendor composer.lock hardlink '' '')
       out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1); why='no install command to run' ;;
@@ -3061,7 +3095,8 @@ git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 
 # The steps past the dep's lock. wt_budget_left is stood in for, counting its calls in a file, so the
 # budget runs out at exactly the check under test: the first passes the step before the lock, the
-# second the one after the wait, the third the one before the install.
+# second the one after the wait, the third the one before the copy or, with a lockfile of its own,
+# the install.
 PBUDGET=$TMP/pr-budget-calls
 budget_out_after() {  # $1 = how many budget checks pass; sets out
   local passes=$1
@@ -3077,10 +3112,13 @@ budget_out_after() {  # $1 = how many budget checks pass; sets out
     wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1
   )
 }
-for pr_exit in waiting before-install toolchain; do
+for pr_exit in waiting before-copy before-install toolchain; do
   pr_relink
+  # Past the copy, a lockfile of its own: main's would be copied first.
+  case $pr_exit in before-install | toolchain) printf 'LOCKV9\n' > "$DWT/composer.lock" ;; esac
   case $pr_exit in
     waiting) budget_out_after 1; why='the budget ran out while waiting' ;;
+    before-copy) budget_out_after 2; why='the budget ran out before the copy could start' ;;
     before-install) budget_out_after 2; why='the budget ran out before the install could start' ;;
     toolchain) out=$(PROFILE_SHELL=fake-shell WT_TOOLCHAIN=broken wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
       why='needs the toolchain, which is not ready' ;;
@@ -3133,6 +3171,7 @@ eq '...nothing left beside it or in the git dir' '|' \
 
 # The toolchain step, with the git dir on another device, only leaves it: no outright removal there.
 pr_relink
+printf 'LOCKV9\n' > "$DWT/composer.lock"
 out=$(PATH=$PFAKESTAT:$PATH PROFILE_SHELL=fake-shell WT_TOOLCHAIN=broken wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'pr, toolchain, git dir on another device: the linked copy stays for the install' \
   'the linked copy stays until the run that installs removes it' "$out"
@@ -3145,6 +3184,7 @@ rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
+printf 'LOCKV5\n' > "$DWT/composer.lock"
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" >/dev/null 2>&1
 printf 'LOCKV7\n' > "$DWT/composer.lock"
 out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
@@ -3156,6 +3196,205 @@ out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 lacks 'pr: no longer a pull request, it says nothing of its own copy' 'installs its own copy' "$out"
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 
+
+# --- a pull request's copy of main's tree: its symlinks, its failures, its cost ------------------
+# The copy is made in a temp, its symlinks checked, then renamed into place: a symlink main's tree
+# holds into main itself would still lead the PR's writes there, so that tree is installed instead.
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
+PCADMIN=$(wt_removed_dep_admin_dir "$DWT")
+pc_reset() {  # no vendor, no record, no leftovers, main's lockfile
+  rm -rf "$DWT/vendor" "$PCADMIN"; rm -f "$(wt_state_path "$DWT")"
+  printf 'LOCKV1\n' > "$DWT/composer.lock"
+}
+pc_leftovers() { printf '%s|%s' "$(ls -A "$PCADMIN" 2>/dev/null)" "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"; }
+
+# A relative symlink inside the tree is kept as it is, and so resolves inside the worktree.
+mkdir -p "$DREPO/vendor/bin"
+ln -s ../pkg/file.txt "$DREPO/vendor/bin/tool"
+# One that leaves the dir but stays in the worktree: allowed, it is the worktree's own file.
+ln -s ../composer.lock "$DREPO/vendor/lockref"
+# An absolute one to somewhere that is neither: a system path, as main's own tree uses it.
+mkdir -p "$TMP/elsewhere"; printf 'X\n' > "$TMP/elsewhere/x"
+ln -s "$TMP/elsewhere/x" "$DREPO/vendor/sys"
+pc_reset
+rmain=$(tree_snap "$DREPO/vendor")
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'pr copy: relative and outside symlinks do not stop the copy' copy "$(linked_from)"
+eq '...the relative symlink is kept as a link, with its own target' 'link|../pkg/file.txt' \
+  "$([ -L "$DWT/vendor/bin/tool" ] && echo link)|$(readlink "$DWT/vendor/bin/tool")"
+eq "...and resolves to the worktree's own file, not main's" 'mine|' \
+  "$([ "$DWT/vendor/bin/tool" -ef "$DWT/vendor/pkg/file.txt" ] && echo mine)|$([ "$DWT/vendor/bin/tool" -ef "$DREPO/vendor/pkg/file.txt" ] && echo main)"
+eq "...one leaving the dir lands on the worktree's lockfile" yes \
+  "$([ "$DWT/vendor/lockref" -ef "$DWT/composer.lock" ] && echo yes)"
+eq '...an absolute one elsewhere is kept as it is' "$TMP/elsewhere/x" "$(readlink "$DWT/vendor/sys")"
+eq "...main's tree untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+rm -f "$DREPO/vendor/lockref" "$DREPO/vendor/sys"
+
+# An absolute symlink into the main checkout: installed instead, and the temp copy is gone.
+ln -s "$DREPO/composer.lock" "$DREPO/vendor/bin/back"
+pc_reset
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: an absolute symlink into main is refused, and says which' \
+  "vendor: the main checkout's copy has a symlink pointing back into it (bin/back -> $DREPO/composer.lock) — installing instead" "$out"
+eq '...installed instead' install "$(linked_from)"
+eq '...no temp copy left' '|' "$(pc_leftovers)"
+wt_state_dep_read "$DWT" vendor
+eq '...recorded as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
+rm -f "$DREPO/vendor/bin/back"
+# The same through main's physical path, when the path it was given goes through a symlink.
+ln -s "$DREPO" "$TMP/drepo-alias"
+ln -s "$DREPO/composer.lock" "$DREPO/vendor/bin/back"
+pc_reset
+out=$(wt_bootstrap_deps "$TMP/drepo-alias" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: main named through a symlink, a link to its physical path is refused too' \
+  'pointing back into it (bin/back -> ' "$out"
+rm -f "$DREPO/vendor/bin/back" "$TMP/drepo-alias"
+
+# A relative symlink that climbs out of the worktree into the main checkout (the worktree lives
+# inside it): resolved from where it will sit, and refused the same way.
+ln -s ../../../../composer.lock "$DREPO/vendor/bin/climb"
+pc_reset
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a relative symlink escaping into main is refused' \
+  "vendor: the main checkout's copy has a symlink pointing back into it (bin/climb -> ../../../../composer.lock) — installing instead" "$out"
+eq '...installed instead, nothing left behind' "install|" "$(linked_from)|$(pc_leftovers | tr -d '|')"
+rm -f "$DREPO/vendor/bin/climb"
+# A trailing `..` is a climb too.
+ln -s ../../../../.. "$DREPO/vendor/bin/up"
+pc_reset
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a target ending in .. that lands in main is refused' 'pointing back into it (bin/up -> ../../../../..)' "$out"
+rm -f "$DREPO/vendor/bin/up"
+
+# The scan's arms, on its own: what counts, and a listing that fails is a refusal.
+mkdir -p "$TMP/scan/copy/a"
+pc_scan() { wt_copy_symlink_escape "$TMP/scan/copy" "$DWT/vendor" "$DREPO" "$DWT"; printf '%s:%s' "$?" "$WT_COPY_ESCAPE"; }
+eq 'scan: no symlinks, nothing found' '1:' "$(pc_scan)"
+ln -s "$DWT/composer.lock" "$TMP/scan/copy/a/own"
+eq "scan: an absolute link into the worktree itself is its own" '1:' "$(pc_scan)"
+ln -s "$DREPO/.git" "$TMP/scan/copy/a/git"
+eq "scan: one into main's git dir is main's" "0:a/git -> $DREPO/.git" "$(pc_scan)"
+rm -f "$TMP/scan/copy/a/git"
+ln -s "$DWT/../other/vendor" "$TMP/scan/copy/a/sib"
+eq "scan: one into another worktree under main counts as main's" "0:a/sib -> $DWT/../other/vendor" "$(pc_scan)"
+rm -f "$TMP/scan/copy/a/sib"
+ln -s ..lookalike "$TMP/scan/copy/a/dots"
+eq 'scan: a name starting with dots is not a climb' '1:' "$(pc_scan)"
+# shellcheck disable=SC2329  # stands in for find inside the scan
+eq 'scan: a find that fails is a refusal' '2:' "$(find() { return 1; }; pc_scan)"
+# Without GNU find's -printf: one readlink per link, the same answer.
+ln -s ../../../../../composer.lock "$TMP/scan/copy/a/climb"
+# shellcheck disable=SC2329  # stands in for find inside the scan
+eq 'scan, plain find: a climb into main is found' "0:a/climb -> ../../../../../composer.lock" \
+  "$(find() { case " $* " in *' -printf '*) return 1 ;; esac; command find "$@"; }; pc_scan)"
+rm -rf "$TMP/scan"
+
+# cp stood in for: one that fails part-way, one that hangs, one without --reflink, one that logs.
+REALCP=$(command -v cp)
+PCBIN=$TMP/pc-bin
+mkdir -p "$PCBIN"
+# shellcheck disable=SC2016  # the stand-ins' own scripts, expanded when they run
+{
+  printf '#!/bin/sh\ncase "$*" in *pitlane-reflink-probe*) exec %s "$@" ;; esac\n' "$REALCP"
+  printf 'for a; do last=$a; done\nmkdir -p "$last" && : > "$last/partial"\n'
+  printf 'printf "cp: error writing: No space left on device\\n" >&2\nexit 1\n'
+} > "$PCBIN/cp-fails"
+# shellcheck disable=SC2016
+{
+  printf '#!/bin/sh\ncase "$*" in *pitlane-reflink-probe*) exec %s "$@" ;; esac\n' "$REALCP"
+  printf 'for a; do last=$a; done\nmkdir -p "$last" && : > "$last/partial"\nexec sleep 30\n'
+} > "$PCBIN/cp-hangs"
+# shellcheck disable=SC2016
+{
+  printf '#!/bin/sh\nfor a; do case $a in --reflink*) echo "cp: unrecognized option $a" >&2; exit 1 ;; esac; done\n'
+  printf 'exec %s "$@"\n' "$REALCP"
+} > "$PCBIN/cp-noreflink"
+# shellcheck disable=SC2016
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexec %s "$@"\n' "$TMP/pc-cp-args" "$REALCP" > "$PCBIN/cp-logs"
+chmod +x "$PCBIN"/cp-*
+pc_with_cp() {  # $1 = stand-in; runs the rest with it as `cp`
+  local which=$1; shift
+  mkdir -p "$PCBIN/$which.d"
+  ln -sf "$PCBIN/$which" "$PCBIN/$which.d/cp"
+  PATH=$PCBIN/$which.d:$PATH "$@"
+}
+
+pc_reset
+out=$(pc_with_cp cp-fails wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a copy that fails says what cp said' \
+  'vendor: could not copy it from the main checkout (cp: error writing: No space left on device) — installing instead' "$out"
+eq '...its partial temp is removed' '|' "$(pc_leftovers)"
+eq '...and it installs instead' install "$(linked_from)"
+
+pc_reset
+NEAR=$(( $(date +%s) + 2 ))
+out=$(pc_with_cp cp-hangs wt_bootstrap_deps "$DREPO" "$DWT" "$NEAR" 2>&1)
+contains 'pr copy: a copy that outlasts the budget is stopped' \
+  'vendor: copying it from the main checkout ran past the' "$out"
+eq '...its partial temp is removed, and the dir never appears' '||absent' "$(pc_leftovers)|$(present "$DWT/vendor")"
+lacks '...nothing installed in its place' 'installing' "$out"
+eq '...recorded not done' dirty "$(wt_state_status "$DWT" vendor)"
+PROFILE_PRESENT=1 wt_bootstrap_pending "$DWT"
+eq '...so it is pending, and attemptable' vendor "$WT_PENDING_ATTEMPTABLE"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq '...and the next run copies it' copy "$(linked_from)"
+
+# --reflink=auto where cp takes it; plain cp -a where it does not.
+pc_reset
+rm -f "$TMP/pc-cp-args"
+out=$(pc_with_cp cp-logs wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a cp that takes --reflink=auto is given it' "-a --reflink=auto -- $DREPO/vendor " "$(cat "$TMP/pc-cp-args")"
+contains '...and the log says the copy may share blocks' 'copy-on-write where the filesystem allows)' "$out"
+pc_reset
+out=$(pc_with_cp cp-noreflink wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'pr copy: a cp without --reflink still copies, with plain cp -a' copy "$(linked_from)"
+lacks '...without the copy failing' 'could not copy' "$out"
+lacks '...nor claiming copy-on-write' 'copy-on-write' "$out"
+eq '...no probe file left' '' "$(compgen -G "$PCADMIN/.pitlane-reflink-probe.*")"
+
+# Deferred at start-up: nothing is copied then, and nothing is left half-made.
+pc_reset
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: at start-up the copy is left for the background run' \
+  'vendor: to be copied from the main checkout in the background' "$out"
+eq '...nothing copied' 'absent||' "$(present "$DWT/vendor")|$(pc_leftovers)"
+eq '...not recorded done' 1 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+# Unapproved: neither copied nor installed.
+out=$(WT_APPROVAL=no wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq 'pr copy: unapproved, nothing is copied' absent "$(present "$DWT/vendor")"
+
+# Already present and sharing nothing (the session installed it by hand): installed over, not copied.
+pc_reset
+mkdir -p "$DWT/vendor"; printf 'HAND\n' > "$DWT/vendor/hand"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'pr copy: a dir already there is installed over rather than replaced' \
+  "vendor: already present in the worktree, sharing no file with another tree — installing over it rather than copying the main checkout's" "$out"
+eq '...its own files kept' HAND "$(cat "$DWT/vendor/hand" 2>/dev/null)"
+
+# A copy recorded done is current for a PR's worktree only: it is not a link for the donor search or
+# the repairs, and the done check takes it for this lockfile and command alone.
+pc_reset
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" >/dev/null 2>&1
+eq 'pr copy: (fixture) copied' copy "$(linked_from)"
+eq '...current for its own copy' 0 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+eq '...not for a worktree that installs as such' 1 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(wt_cksum_string "$RINSTALL")" install 0; echo $?)"
+eq '...nor for another lockfile' 1 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_string other)" \
+  "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+printf 'LOCKV8\n' > "$DWT/composer.lock"
+out=$(WT_DEFER=1 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks '...its lockfile changed: the copy is not moved aside as a link at start-up' 'linked copy' "$out"
+eq '...and stays' copy "$(linked_from)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq '...then installed into' install "$(linked_from)"
+
+rm -rf "$DREPO/vendor/bin"
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+pc_reset
 # The aside name and its one matcher, which the /pitlane-tidy sweep shares: exact shape only.
 eq 'aside name: the dir'"'"'s base, our marker, the pid and a random number' '.node_modules.pitlane-removed.12.345' \
   "$(wt_removed_dep_name web/node_modules 12 345)"

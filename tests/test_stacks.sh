@@ -499,6 +499,55 @@ relink_check() {  # $1 = repo, $2 = scratch dir for logs
   git -C "$r" branch -qD relink-kept
 }
 
+# A pull request's worktree (`pr-<digits>`, as `claude -w "#N"` names it) on main's lockfile: each
+# hardlinked dir is a real copy of main's, sharing no inode, the stack's runtime loads it from the
+# worktree, and an in-place edit there leaves main's trees keeping every byte and inode.
+pr_copy_check() {  # $1 = repo, $2 = scratch dir for logs
+  local r=$1 logs=$2 w f first out port expect shared main_before main_after
+  [ -n "$STACK_LINKDIRS" ] || return 0
+  w=$r/.claude/worktrees/pr-77
+  git -C "$r" worktree add -q "$w" -b worktree-pr-77 2>/dev/null
+  # A pull request's approval covers its commit, so it is approved in the worktree itself.
+  approve "$w"
+  session_start "$w" "$logs/pr.start" >/dev/null
+  out=$(cd "$w" && bash "$HOOK" --finish 2>"$logs/pr.finish")
+  eq 'pr-77: --finish reports the worktree fully set up' 'Pitlane: this worktree is fully set up.' "$out"
+  out=$(cat "$logs/pr.start" "$logs/pr.finish")
+  for f in $STACK_LINKDIRS; do
+    contains "pr-77: $f is copied from the main checkout, not linked or installed" "$f: copied from the main checkout in " "$out"
+    printf 'NOTE [%s/%s] pr-77 %s\n' "$BACKEND" "$STACK" "$(printf '%s\n' "$out" | grep -m1 "$f: copied from" | sed 's/^worktree: *//')" >&2
+    shared=$(LC_ALL=C comm -12 <(inodes_of "$r/$f") <(inodes_of "$w/$f") | head -n 1)
+    eq "pr-77: ...no file of its $f shares an inode with main's" '' "$shared"
+    eq "pr-77: ...with main's names, bytes and symlink targets" "$(dir_digest "$r/$f")" "$(dir_digest "$w/$f")"
+  done
+  # SC2086: each entry is a glob, expanded on purpose, relative to the worktree.
+  # shellcheck disable=SC2086
+  for f in $STACK_OWNFILES; do
+    first=$(cd "$w" && for g in $f; do [ -e "$g" ] && { (cd -P "$(dirname "$g")" && pwd -P); break; }; done)
+    eq "pr-77: the worktree's own tree holds $f" yes "$(case $first/ in "$w"/*) echo yes ;; esac)"
+  done
+  port=$(envval "$w" "$STACK_ENVFILE" APP_PORT)
+  expect=${STACK_EXPECT//\{slug\}/pr-77}
+  expect=${expect//\{port\}/$port}
+  out=$(tc "$w" "unset NODE_PATH PYTHONPATH RUBYLIB; export PROBE_ROOT=$(printf '%q' "$w"); $STACK_PROBE" \
+    2>"$logs/pr.probe")
+  eq "pr-77: the stack's own runtime loads the copied dependencies ($STACK_PROBE)" "$expect" "$out"
+  [ "$out" = "$expect" ] || show_log "$logs/pr.probe"
+  main_before=''
+  for f in $STACK_LINKDIRS; do main_before+=$(inode_snapshot "$r/$f"); done
+  for f in $STACK_LINKDIRS; do
+    first=$(cd "$w" && find "$f" -type f | LC_ALL=C sort | head -n 1)
+    printf '\n' >> "$w/$first"
+  done
+  main_after=''
+  for f in $STACK_LINKDIRS; do main_after+=$(inode_snapshot "$r/$f"); done
+  eq "pr-77: an in-place edit in its $STACK_LINKDIRS leaves main's keeping every byte and inode" "$main_before" "$main_after"
+  remove_worktree "$r" pr-77 "$logs"
+}
+
+# Every regular file's inode under $1, one per line, sorted for comm.
+inodes_of() { (cd "$1" && find . -type f -exec ls -i {} + | awk '{ print $1 }' | LC_ALL=C sort -u); }
+
 remove_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   local r=$1 name=$2 w
   w=$r/.claude/worktrees/$name
@@ -573,6 +622,7 @@ run_stack() {  # $1 = stack, $2 = index (for its port base)
     ne 'two worktrees get distinct ports' "$p_alpha" "$p_beta"
     donor_check "$r" "$logs"
     relink_check "$r" "$logs"
+    pr_copy_check "$r" "$logs"
     if [ -n "$STACK_SERVE" ]; then
       # Both apps at once, each on its own port: the case a hardcoded start command cannot serve.
       contains "alpha's app still answers beside beta's" "${STACK_SERVE_EXPECT//\{port\}/$p_alpha}" \

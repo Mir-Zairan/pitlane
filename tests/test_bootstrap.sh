@@ -1366,6 +1366,27 @@ eq '...and installed by the background run' installed "$(cat "$WBG/vendor/autolo
 eq "...leaving the main checkout's copy alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
 git -C "$WBG" checkout -q composer.lock
 
+# A pull request's worktree with main's lockfile gets a real copy of main's tree, never a link — and
+# a copy writes every byte, so it is made by the background run, not before the session starts.
+WPR=$BG/.claude/worktrees/pr-41
+git -C "$BG" worktree add -q "$WPR" -b worktree-pr-41 2>/dev/null
+GDPR=$(git -C "$WPR" rev-parse --absolute-git-dir)
+outB=$(PITLANE_BACKGROUND=on start_hook "$WPR"); errB=$(cat "$TMP/err")
+contains 'pr: its copy of the main checkout is left for the background run' \
+  'vendor: to be copied from the main checkout in the background' "$errB"
+lacks '...not linked at start-up' 'vendor: hardlinked from' "$errB"
+contains '...and named in the notice' 'vendor missing (still installing)' "$outB"
+( cd "$WPR" && bash "$HOOK" --finish >/dev/null 2>&1 )
+eq "...then holds main's tree, copied, not installed" MAIN "$(cat "$WPR/vendor/autoload.php" 2>/dev/null)"
+eq '...sharing no inode with it' no "$([ "$WPR/vendor/autoload.php" -ef "$BG/vendor/autoload.php" ] && echo yes || echo no)"
+contains '...and the log says what the copy cost' 'vendor: copied from the main checkout in ' \
+  "$(cat "$GDPR/worktree-bootstrap.log" 2>/dev/null)"
+printf 'PR\n' >> "$WPR/vendor/autoload.php"
+eq "...a write in it leaves main's file alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
+outB=$(PITLANE_BACKGROUND=on start_hook "$WPR")
+eq '...and the next session finds it set up' '' "$outB"
+git -C "$BG" worktree remove --force "$WPR"
+
 # ---------------------------------------------------------------------------
 # Verify decides, not the install's exit code; a failure that would repeat is not retried
 # ---------------------------------------------------------------------------
