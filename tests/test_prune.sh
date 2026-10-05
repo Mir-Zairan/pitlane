@@ -1005,6 +1005,30 @@ eq 'removed dep: the symlink is kept, its target untouched' 'yes keep' \
   "$( [ -L "$LR" ] && echo yes || echo no) $(cat "$TGT/precious")"
 rm -f "$LR" "$LS"
 
+# --- Moved aside into the worktree's git admin dir (wt_removed_dep_admin_dir), where bootstrap
+# puts them first: listed and removed the same way, by the exact name, never by a walk.
+WLA=$(git -C "$WL" rev-parse --absolute-git-dir)/pitlane-removed
+LA=$WLA/vendor.4343.18
+mkdir -p "$LA/pkg"
+head -c 20000 /dev/zero >"$LA/pkg/big.bin"
+mkdir -p "$WLA/node_modules.4.5" "$WLA/vendor.4" "$WLA/vendor.4.x" "$WLA/.vendor.pitlane-removed.4.5"
+LAS=$WLA/vendor.9.9
+ln -s "$TGT" "$LAS"
+prune "$RL"
+eq 'removed dep (admin dir): the leftover is offered for deletion' delete "$(field removed-dep-leftover "$LA" 5)"
+eq 'removed dep (admin dir): with its bytes by du' "$(du_bytes "$LA")" "$(field removed-dep-leftover "$LA" 4)"
+contains 'removed dep (admin dir): naming the worktree it belongs to' "in $WL" "$(field removed-dep-leftover "$LA" 6)"
+eq 'removed dep (admin dir): a symlink with the name is refused' refuse "$(field removed-dep-leftover "$LAS" 5)"
+eq 'removed dep (admin dir): exactly those two are listed' 2 \
+  "$(grep -c -F "${TAB}removed-dep-leftover$TAB" "$TMP/out" | tr -d ' ')"
+id_la=$(field removed-dep-leftover "$LA" 1)
+prune "$RL" --apply "$id_la"
+eq 'removed dep (admin dir): apply exits 0' 0 "$(cat "$TMP/rc")"
+contains 'removed dep (admin dir): and reports it applied' "applied$TAB$id_la" "$(cat "$TMP/out")"
+eq 'removed dep (admin dir): it is gone, the symlink and the look-alikes kept' 'no yes yes yes yes yes keep' \
+  "$(exists "$LA") $( [ -L "$LAS" ] && echo yes || echo no) $(exists "$WLA/node_modules.4.5") $(exists "$WLA/vendor.4") $(exists "$WLA/vendor.4.x") $(exists "$WLA/.vendor.pitlane-removed.4.5") $(cat "$TGT/precious")"
+rm -rf "$WLA"
+
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------

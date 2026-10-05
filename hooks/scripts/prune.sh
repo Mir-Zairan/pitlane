@@ -61,7 +61,8 @@
 #     made for each. Applying one runs teardown.sh on it, so the guard is the teardown hook's own.
 #     Inside a live worktree, or the main checkout, only a `removed-dep-leftover` is ever removed: a
 #     hardlinked dependency dir a fresh install renamed aside (wt_clear_linked_dep) and could not
-#     finish removing, matched by its exact name beside the profile's dir and never searched for.
+#     finish removing, matched by its exact name in the checkout's git admin dir or beside the
+#     profile's dir, and never searched for.
 #   * no process is killed but a server-leftover's, and that only on --apply: the one server
 #     /pitlane-serve recorded starting in a worktree now gone, found through its serve mirror
 #     (bootstrap-lib.sh), signalled only while its recorded start identity matches. Never a process
@@ -752,16 +753,37 @@ wt_prune_removed_dep_parent() {  # $1 = checkout, $2 = dir
   printf '%s' "$parent"
 }
 
-# Only the parents of the profile's hardlink dirs, in the main checkout and each live worktree, and
-# only names wt_is_removed_dep_name accepts: never a walk of the tree. A symlink of that name is
-# listed to say it is not followed.
+# The admin dir wt_clear_linked_dep moves checkout $1's dependency dirs into, on stdout; returns 1
+# when it has none, or it is not a plain directory.
+wt_prune_removed_dep_admin() {  # $1 = checkout
+  local admin
+  admin=$(wt_removed_dep_admin_dir "$1") && [ -d "$admin" ] && wt_prune_still_itself "$admin" || return 1
+  printf '%s' "$admin"
+}
+
+# True when $3 is a name wt_clear_linked_dep makes for dir $2 of checkout $1, where it makes it: in
+# the checkout's admin dir, or beside the dir.
+wt_prune_is_removed_dep() {  # $1 = checkout, $2 = dir, $3 = leftover
+  local admin parent
+  if admin=$(wt_prune_removed_dep_admin "$1") && [ "${3%/*}" = "$admin" ]; then
+    wt_is_removed_dep_admin_name "${3##*/}" "$2"
+  else
+    parent=$(wt_prune_removed_dep_parent "$1" "$2") && [ "${3%/*}" = "$parent" ] \
+      && wt_is_removed_dep_name "${3##*/}" "$2"
+  fi
+}
+
+# Only the checkout's admin dir and the parents of the profile's hardlink dirs, in the main checkout
+# and each live worktree, and only names wt_clear_linked_dep makes: never a walk of the tree. A
+# symlink of that name is listed to say it is not followed.
 wt_find_removed_dep_leftovers() {
-  local checkout dir parent leftover n
+  local checkout dir parent admin leftover n
   for checkout in "$WT_PRUNE_ROOT" ${WT_PRUNE_LIVE[@]+"${WT_PRUNE_LIVE[@]}"}; do
+    admin=$(wt_prune_removed_dep_admin "$checkout") || admin=''
     for dir in ${WT_PRUNE_HARDLINK_DIRS[@]+"${WT_PRUNE_HARDLINK_DIRS[@]}"}; do
-      parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") || continue
-      for leftover in "$parent/.${dir##*/}.pitlane-removed."*; do
-        wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
+      parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") || parent=''
+      for leftover in ${admin:+"$admin"/*} ${parent:+"$parent/.${dir##*/}.pitlane-removed."*}; do
+        wt_prune_is_removed_dep "$checkout" "$dir" "$leftover" || continue
         wt_prune_find_item "$(wt_prune_item_id removed-dep-leftover "$leftover")" >/dev/null && continue
         n=${#PRUNE_ID[@]}
         if [ -L "$leftover" ]; then
@@ -1087,10 +1109,9 @@ wt_apply_server_leftover() {  # $1 = item index
 # Re-proved here, not trusted from the discovery: the bootstrap run that moved it aside, or another,
 # may hold the checkout, and the name may have become a symlink since.
 wt_apply_removed_dep_leftover() {  # $1 = item index
-  local leftover=${PRUNE_KEY[$1]} checkout=${PRUNE_OWNER[$1]-} dir=${PRUNE_DEP[$1]-} parent rc
-  if [ -z "$checkout" ] || [ -z "$dir" ] || ! parent=$(wt_prune_removed_dep_parent "$checkout" "$dir") \
-    || [ "${leftover%/*}" != "$parent" ] || ! wt_is_removed_dep_name "${leftover##*/}" "$dir"; then
-    WT_PRUNE_DETAIL="$leftover is no longer beside $dir in $checkout"
+  local leftover=${PRUNE_KEY[$1]} checkout=${PRUNE_OWNER[$1]-} dir=${PRUNE_DEP[$1]-} rc
+  if [ -z "$checkout" ] || [ -z "$dir" ] || ! wt_prune_is_removed_dep "$checkout" "$dir" "$leftover"; then
+    WT_PRUNE_DETAIL="$leftover is no longer where a copy of $dir in $checkout is moved aside to"
     return 1
   fi
   if [ "$checkout" != "$WT_PRUNE_ROOT" ] && { ! wt_prune_list_live || ! wt_prune_is_live "$checkout"; }; then

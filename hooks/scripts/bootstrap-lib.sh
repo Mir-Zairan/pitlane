@@ -2260,8 +2260,8 @@ wt_repair_shared_copy_paths() {  # $1 = root, $2 = worktree, $3 = dir, $4 = copy
     "worktree $(wt_name_from_path "$donor")" || true
 }
 
-# The name wt_clear_linked_dep moves dependency dir $1 aside to, in the dir's own parent:
-# `.<base>.pitlane-removed.<pid>.<random>`. wt_is_removed_dep_name is its only matcher.
+# The name wt_clear_linked_dep moves dependency dir $1 aside to in the dir's own parent, when the
+# admin dir cannot take it: `.<base>.pitlane-removed.<pid>.<random>`. wt_is_removed_dep_name is its only matcher.
 wt_removed_dep_name() {  # $1 = dir, $2 = pid, $3 = a random number
   printf '.%s.pitlane-removed.%s.%s' "${1##*/}" "$2" "$3"
 }
@@ -2281,20 +2281,73 @@ wt_is_removed_dep_name() {  # $1 = entry name, $2 = dir
   return 0
 }
 
-# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then.
-# Only a real dir under the dep's own plain parent: the names are ours and nothing else makes them.
+# Where wt_clear_linked_dep moves a dependency dir first: `pitlane-removed/` in worktree $1's own git
+# admin dir, beside its state file. Git lists nothing there, so a copy that outlives its removal is
+# not an untracked file that makes teardown keep the worktree, and it goes when the worktree does.
+# Returns 1, printing nothing, when the state is in the working-tree fallback.
+wt_removed_dep_admin_dir() {  # $1 = worktree
+  local state
+  state=$(wt_state_path "$1")
+  [ "$state" != "${1%/}/$WT_STATE_FALLBACK_REL" ] || return 1
+  printf '%s/pitlane-removed' "${state%/*}"
+}
+
+# The name of dependency dir $1 moved into the admin dir: `<dir>.<pid>.<random>`, with `%` and `/`
+# percent-encoded so two dirs never share a slug. wt_is_removed_dep_admin_name is its only matcher.
+wt_removed_dep_admin_name() {  # $1 = dir, $2 = pid, $3 = a random number
+  wt_removed_dep_slug "$1"
+  printf '%s.%s.%s' "$WT_REMOVED_DEP_SLUG" "$2" "$3"
+}
+
+wt_removed_dep_slug() {  # $1 = dir; sets WT_REMOVED_DEP_SLUG
+  WT_REMOVED_DEP_SLUG=${1%/}
+  WT_REMOVED_DEP_SLUG=${WT_REMOVED_DEP_SLUG//\%/%25}
+  WT_REMOVED_DEP_SLUG=${WT_REMOVED_DEP_SLUG//\//%2F}
+}
+
+wt_is_removed_dep_admin_name() {  # $1 = entry name, $2 = dir
+  local name=${1-} slug rest pid rand
+  wt_removed_dep_slug "${2-}"
+  slug=$WT_REMOVED_DEP_SLUG
+  [ -n "$slug" ] || return 1
+  case $name in "$slug."*) ;; *) return 1 ;; esac
+  rest=${name#"$slug."}
+  pid=${rest%%.*}
+  rand=${rest#*.}
+  [ "$pid" != "$rest" ] || return 1
+  case $pid in '' | *[!0-9]*) return 1 ;; esac
+  case $rand in '' | *[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+# True when paths $1 and $2 are on one device. A plain `mv` between two devices copies the whole tree
+# and then deletes it, which is the wrong trade for a move meant to be instant; 1 when either is unknown.
+wt_same_device() {  # $1, $2 = existing paths
+  local a b
+  a=$(stat -c %d -- "$1" 2>/dev/null || stat -f %d -- "$1" 2>/dev/null) || return 1
+  b=$(stat -c %d -- "$2" 2>/dev/null || stat -f %d -- "$2" 2>/dev/null) || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+# Remove what wt_clear_linked_dep moved aside for dir $2 in worktree $1 and could not remove then,
+# in the worktree's admin dir and beside the dir. Only real dirs with names only we make.
 wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
-  local worktree=${1%/} dir=${2-} parent leftover err
+  local worktree=${1%/} dir=${2-} parent admin leftover err
   wt_is_safe_relpath "$dir" && ! wt_has_symlinked_parent "$worktree" "$dir" || return 0
   parent=$worktree
   case $dir in */*) parent=$worktree/${dir%/*} ;; esac
-  for leftover in "$parent/.${dir##*/}.pitlane-removed."*; do
-    wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
+  admin=$(wt_removed_dep_admin_dir "$worktree") && [ -d "$admin" ] && [ ! -L "$admin" ] || admin=''
+  for leftover in ${admin:+"$admin"/*} "$parent/.${dir##*/}.pitlane-removed."*; do
+    if [ "${leftover%/*}" = "$admin" ]; then
+      wt_is_removed_dep_admin_name "${leftover##*/}" "$dir" || continue
+    else
+      wt_is_removed_dep_name "${leftover##*/}" "$dir" || continue
+    fi
     [ -d "$leftover" ] && [ ! -L "$leftover" ] || continue
     if err=$(rm -rf -- "$leftover" 2>&1); then
-      wt_log "  $dir: removed ${leftover##*/}, a linked copy an earlier run moved aside"
+      wt_log "  $dir: removed $leftover, a linked copy an earlier run moved aside"
     else
-      wt_log "  $dir: could not remove ${leftover##*/}, a linked copy an earlier run moved aside (${err%%"$WT_NL"*}) — retried next run"
+      wt_log "  $dir: could not remove $leftover, a linked copy an earlier run moved aside (${err%%"$WT_NL"*}) — retried next run"
     fi
   done
 }
@@ -2305,7 +2358,7 @@ wt_sweep_removed_dep() {  # $1 = worktree, $2 = dir
 # writes through a shared inode into the tree it was linked from. Removing our links never touches
 # that tree's files. Returns 1, having said why, when the install must not run over the dir.
 wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = wt_lock_acquire's status for the dep's lock
-  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} dest probe aside err
+  local root=${1%/} worktree=${2%/} dir=${3-} lock=${4-} dest probe aside admin err
   dest=$worktree/$dir
   [ -n "$dir" ] && [ -d "$dest" ] && [ ! -L "$dest" ] || return 0
   # The main checkout's own dir is the tree every link points back to: never ours to remove.
@@ -2332,16 +2385,27 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
     return 1
   fi
   wt_log "  $dir: $lock changed since it was linked — removing the linked copy and installing fresh"
-  # Renamed aside first, within its own parent, then removed: an `rm -rf` that fails part-way at
-  # the dir's own path would leave a half tree a later install could run over and record done.
-  aside=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
-  err="${aside##*/} exists"
-  if [ -e "$aside" ] || ! err=$(mv -- "$dest" "$aside" 2>&1); then
-    wt_log "  $dir: could not move the linked copy aside to remove it (${err%%"$WT_NL"*}) — not installing over files it shares with another tree; retried next run"
-    return 1
+  # Renamed aside first, then removed: an `rm -rf` that fails part-way at the dir's own path would
+  # leave a half tree a later install could run over and record done. Into the admin dir when it is
+  # on the same device (wt_removed_dep_admin_dir says why); else within the dir's own parent.
+  aside=''
+  if admin=$(wt_removed_dep_admin_dir "$worktree") && mkdir -p -- "$admin" 2>/dev/null && [ ! -L "$admin" ] \
+    && wt_same_device "${dest%/*}" "$admin"; then
+    aside=$admin/$(wt_removed_dep_admin_name "$dir" "$$" "${RANDOM:-0}")
+    if [ -e "$aside" ] || ! mv -- "$dest" "$aside" 2>/dev/null; then
+      aside=''
+    fi
+  fi
+  if [ -z "$aside" ]; then
+    aside=${dest%/*}/$(wt_removed_dep_name "$dir" "$$" "${RANDOM:-0}")
+    err="${aside##*/} exists"
+    if [ -e "$aside" ] || ! err=$(mv -- "$dest" "$aside" 2>&1); then
+      wt_log "  $dir: could not move the linked copy aside to remove it (${err%%"$WT_NL"*}) — not installing over files it shares with another tree; retried next run"
+      return 1
+    fi
   fi
   if ! err=$(rm -rf -- "$aside" 2>&1); then
-    wt_log "  $dir: could not remove the linked copy moved aside to ${aside##*/} (${err%%"$WT_NL"*}) — installed fresh next run, which removes it"
+    wt_log "  $dir: could not remove the linked copy moved aside to $aside (${err%%"$WT_NL"*}) — installed fresh next run, which removes it"
     return 1
   fi
   return 0

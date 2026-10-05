@@ -2768,21 +2768,26 @@ if [ "$(id -u)" != 0 ]; then
   out=$(wt_clear_linked_dep "$DREPO" "$DWT" vendor composer.lock 1 2>&1); rc=$?
   eq '...while the same dir, readable and sharing nothing, is left for the install' "0|" "$rc|$out"
 
-  # The rename aside fails (the worktree's root is read-only): the tree and the record stay whole.
+  # The rename aside fails, into the git dir and beside the dir (both read-only): the tree and the
+  # record stay whole.
+  ADMIN=$(wt_removed_dep_admin_dir "$DWT")
   relink LOCKV1
   printf 'LOCKV3\n' > "$DWT/composer.lock"
   rwt=$(tree_snap "$DWT/vendor")
-  chmod 555 "$DWT"
+  mkdir -p "$ADMIN"
+  chmod 555 "$DWT" "$ADMIN"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  chmod 755 "$DWT"
+  chmod 755 "$DWT" "$ADMIN"
   contains 'relink: a linked dir that cannot be moved aside says so' 'vendor: could not move the linked copy aside to remove it (' "$out"
   eq '...every file of it is still there, unchanged' "$rwt" "$(tree_snap "$DWT/vendor")"
   eq '...the install does not run' absent "$(present "$DWT/vendor/m")"
   eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
   eq '...and it is not done, so the next run retries' dirty "$(wt_state_status "$DWT" vendor)"
   eq '...nothing was left beside it' '' "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+  eq '...nor in the git dir' '' "$(ls -A "$ADMIN")"
 
-  # The removal of the moved-aside copy fails part-way: no half tree is left at vendor itself.
+  # The removal of the moved-aside copy fails part-way: no half tree is left at vendor itself, and
+  # what is left sits in the worktree's git dir, where git does not list it.
   mkdir -p "$DREPO/vendor/locked"; printf 'L\n' > "$DREPO/vendor/locked/f"
   relink LOCKV1
   chmod 555 "$DWT/vendor/locked"
@@ -2790,19 +2795,102 @@ if [ "$(id -u)" != 0 ]; then
   printf 'LOCKV3\n' > "$DWT/composer.lock"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
   contains 'relink: a moved-aside copy that cannot be removed says so' \
-    'vendor: could not remove the linked copy moved aside to .vendor.pitlane-removed.' "$out"
+    "vendor: could not remove the linked copy moved aside to $ADMIN/vendor." "$out"
   eq '...the dir itself is gone, not half there' absent "$(present "$DWT/vendor")"
-  leftover=$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)
-  ne '...the leftover sits beside it' '' "$leftover"
+  leftover=$(cd "$ADMIN" && ls -Ad vendor.* 2>/dev/null)
+  ne "...the leftover sits in the worktree's git dir" '' "$leftover"
+  eq '...not beside the dir' '' "$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)"
+  eq '...so git lists nothing of it' '' "$(git -C "$DWT" status --porcelain --untracked-files=all -- . ':!composer.lock')"
   eq "...the main checkout's tree kept every byte and inode" "$rmain" "$(tree_snap "$DREPO/vendor")"
   eq '...and it is not done, so the next run installs' dirty "$(wt_state_status "$DWT" vendor)"
+  chmod 755 "$ADMIN/$leftover/locked"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains '...which removes the leftover' "vendor: removed $ADMIN/$leftover, a linked copy an earlier run moved aside" "$out"
+  eq '...and installs into a fresh dir' "done|DINSTALLED|absent|absent" \
+    "$(wt_state_status "$DWT" vendor)|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/locked")|$(present "$ADMIN/$leftover")"
+  eq "...main's tree still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+
+  # The git dir cannot take it (read-only here; on another device below): moved aside beside the
+  # dir instead, as before, and the next run's sweep finds it there.
+  relink LOCKV1
+  chmod 555 "$DWT/vendor/locked" "$ADMIN"
+  printf 'LOCKV3\n' > "$DWT/composer.lock"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  chmod 755 "$ADMIN"
+  contains 'relink: with the git dir read-only the copy is moved aside beside the dir' \
+    "vendor: could not remove the linked copy moved aside to $DWT/.vendor.pitlane-removed." "$out"
+  eq '...nothing went into the git dir' '' "$(ls -A "$ADMIN")"
+  leftover=$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)
+  ne '...the leftover sits beside the dir' '' "$leftover"
   chmod 755 "$DWT/$leftover/locked"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-  contains '...which removes the leftover' "vendor: removed $leftover, a linked copy an earlier run moved aside" "$out"
-  eq '...and installs into a fresh dir' "done|DINSTALLED|absent|absent" \
-    "$(wt_state_status "$DWT" vendor)|$(cat "$DWT/vendor/m")|$(present "$DWT/vendor/locked")|$(present "$DWT/$leftover")"
-  eq "...main's tree still untouched" "$rmain" "$(tree_snap "$DREPO/vendor")"
+  contains '...and the next run removes it there' "vendor: removed $DWT/$leftover, a linked copy" "$out"
+  eq '...and installs' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/$leftover")"
+
+  # A git dir on another device: never `mv`ed into, which would copy the whole tree.
+  FAKESTAT=$TMP/fakestat-bin
+  mkdir -p "$FAKESTAT"
+  # shellcheck disable=SC2016  # the fake's own script, expanded when it runs
+  printf '#!/bin/sh\nfor a; do p=$a; done\nprintf "%%s\\n" "$p" | cksum | cut -d" " -f1\n' > "$FAKESTAT/stat"
+  chmod +x "$FAKESTAT/stat"
+  eq 'relink: (fixture) the fake stat gives two paths two devices' 1 \
+    "$(PATH=$FAKESTAT:$PATH wt_same_device "$DWT" "$ADMIN"; echo $?)"
+  eq '...while the real one gives the worktree and its git dir one' 0 "$(wt_same_device "$DWT" "$ADMIN"; echo $?)"
+  relink LOCKV1
+  chmod 555 "$DWT/vendor/locked"
+  printf 'LOCKV3\n' > "$DWT/composer.lock"
+  out=$(PATH=$FAKESTAT:$PATH wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains 'relink: with the git dir on another device the copy is moved aside beside the dir' \
+    "vendor: could not remove the linked copy moved aside to $DWT/.vendor.pitlane-removed." "$out"
+  eq '...nothing went into the git dir' '' "$(ls -A "$ADMIN")"
+  leftover=$(cd "$DWT" && ls -Ad .vendor.pitlane-removed.* 2>/dev/null)
+  chmod 755 "$DWT/$leftover/locked"
+
+  # The sweep looks in both places, and takes only names it makes for this dir.
+  mkdir -p "$ADMIN/vendor.77.1/pkg" "$ADMIN/node_modules.77.1" "$ADMIN/vendor.77.x"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains 'relink: the sweep removes a leftover beside the dir' "vendor: removed $DWT/$leftover," "$out"
+  contains '...and one in the git dir' "vendor: removed $ADMIN/vendor.77.1," "$out"
+  eq "...leaving what is not this dir's" "absent|absent|present|present" \
+    "$(present "$DWT/$leftover")|$(present "$ADMIN/vendor.77.1")|$(present "$ADMIN/node_modules.77.1")|$(present "$ADMIN/vendor.77.x")"
+  rm -rf "$ADMIN/node_modules.77.1" "$ADMIN/vendor.77.x"
   rm -rf "$DREPO/vendor/locked"
+
+  # A copy left in the git dir is no work of the developer's: teardown removes the worktree, and the
+  # copy goes with its git dir.
+  TRM=$TMP/trm
+  git init -q "$TRM"
+  git -C "$TRM" config user.email t@example.com
+  git -C "$TRM" config user.name t
+  printf 'vendor/\n' > "$TRM/.gitignore"
+  printf 'LOCKV1\n' > "$TRM/composer.lock"
+  git -C "$TRM" add .gitignore composer.lock
+  git -C "$TRM" commit -qm init
+  mkdir -p "$TRM/vendor/pkg" "$TRM/vendor/locked"
+  printf 'MAIN\n' > "$TRM/vendor/pkg/file.txt"; printf 'L\n' > "$TRM/vendor/locked/f"
+  TWT=$TRM/.claude/worktrees/tr1
+  git -C "$TRM" worktree add -q "$TWT" -b tr1 2>/dev/null
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "$RINSTALL" '')
+  wt_bootstrap_deps "$TRM" "$TWT" "$FAR" >/dev/null 2>&1
+  eq 'teardown: (fixture) vendor is linked from the main checkout' yes \
+    "$([ "$TWT/vendor/pkg/file.txt" -ef "$TRM/vendor/pkg/file.txt" ] && echo yes || echo no)"
+  printf 'LOCKV2\n' > "$TWT/composer.lock"
+  git -C "$TWT" commit -qam lock2
+  git -C "$TRM" branch -q tr1-kept tr1
+  chmod 555 "$TWT/vendor/locked"
+  out=$(wt_bootstrap_deps "$TRM" "$TWT" "$FAR" 2>&1)
+  TADMIN=$(git -C "$TWT" rev-parse --absolute-git-dir)
+  contains 'teardown: (fixture) the moved-aside copy could not be removed' 'could not remove the linked copy moved aside' "$out"
+  ne '...and is left in the git dir' '' "$(ls -A "$TADMIN/pitlane-removed" 2>/dev/null)"
+  chmod -R u+w "$TADMIN/pitlane-removed"
+  eq '...where git status lists nothing' '' "$(git -C "$TWT" status --porcelain --untracked-files=all)"
+  rc=0
+  ( cd "$TRM" && printf '{"hook_event_name":"WorktreeRemove","worktree_path":"%s","reason":"session_exit","cwd":"%s"}' "$TWT" "$TRM" \
+    | bash "$HERE/teardown.sh" >/dev/null 2>"$TMP/trm-err" ) || rc=$?
+  eq 'teardown: the worktree is removed, not held for the copy' "0|absent|absent" "$rc|$(present "$TWT")|$(present "$TADMIN")"
+  lacks '...and nothing says it holds work' 'holds work' "$(cat "$TMP/trm-err")"
+  eq "...the main checkout's tree untouched" 'MAIN|L' "$(cat "$TRM/vendor/pkg/file.txt")|$(cat "$TRM/vendor/locked/f")"
 fi
 rm -f "$DREPO/vendor/stale.txt" "$DONORS/donor-a/vendor/stale.txt"
 
@@ -2817,6 +2905,18 @@ for lookalike in .vendor.pitlane-removed.12.345 .node_modules.pitlane-removed.12
   .node_modules.pitlane-removed.1:2.3; do
   eq "aside name: $lookalike is not ours for web/node_modules" no \
     "$(wt_is_removed_dep_name "$lookalike" web/node_modules && echo yes || echo no)"
+done
+# The name in the git dir: the dir's whole path, with `%` and `/` encoded, so no two dirs share one.
+eq 'admin name: the encoded dir, the pid and a random number' 'web%2Fnode_modules.12.345' \
+  "$(wt_removed_dep_admin_name web/node_modules 12 345)"
+ne "admin name: a dir whose name holds an encoded slash is not the dir with that slash" \
+  "$(wt_removed_dep_admin_name a/b 1 2)" "$(wt_removed_dep_admin_name a%2Fb 1 2)"
+eq 'admin name: what it makes is accepted, for that dir' yes \
+  "$(wt_is_removed_dep_admin_name "$(wt_removed_dep_admin_name web/node_modules 12 345)" web/node_modules && echo yes || echo no)"
+for lookalike in node_modules.12.345 web%2Fnode_modules.12 web%2Fnode_modules.12. web%2Fnode_modules..345 \
+  web%2Fnode_modules.1x.345 web%2Fnode_modules.12.3.4 .node_modules.pitlane-removed.12.345 web/node_modules.12.345; do
+  eq "admin name: $lookalike is not ours for web/node_modules" no \
+    "$(wt_is_removed_dep_admin_name "$lookalike" web/node_modules && echo yes || echo no)"
 done
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 donor_rec donor-a "done" 100
