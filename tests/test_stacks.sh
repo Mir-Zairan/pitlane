@@ -298,11 +298,12 @@ exercise_worktree() {  # $1 = repo, $2 = name, $3 = scratch dir for logs
   git -C "$r" worktree add -q "$w" -b "worktree-$name" 2>/dev/null
   [ "$name" != beta ] || [ -z "$STACK_ART_CHANGE" ] || (cd "$w" && bash -c "$STACK_ART_CHANGE")
   out=$(session_start "$w" "$logs/$name.start")
-  # Fully set up: stdout is empty, or, with a serve profile, the one line naming /pitlane-serve (ADR-021).
-  expect=''
-  [ -z "$STACK_SERVE" ] || expect="Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://localhost:$(envval "$w" "$STACK_ENVFILE" APP_PORT)/), not the repo's own start command."
-  eq "$name: SessionStart reports the worktree fully set up" "$expect" "$out"
-  [ "$out" = "$expect" ] || show_log "$logs/$name.start"
+  # Fully set up: one line saying so, which names the dependency dirs in place and, with a serve
+  # profile, carries the /pitlane-serve clause (ADR-021). Which dirs it names is the unit suites' job.
+  expect='Pitlane: this worktree is fully set up — '
+  [ -z "$STACK_SERVE" ] || expect="To run the app, use /pitlane-serve (it serves at http://localhost:$(envval "$w" "$STACK_ENVFILE" APP_PORT)/), not the repo's own start command."
+  contains "$name: SessionStart reports the worktree fully set up" "$expect" "$out"
+  case $out in "Pitlane: this worktree is fully set up — "*) ;; *) show_log "$logs/$name.start" ;; esac
   out=$(cd "$w" && bash "$HOOK" --finish 2>"$logs/$name.finish")
   eq "$name: --finish reports the worktree fully set up" 'Pitlane: this worktree is fully set up.' "$out"
   local d first f own
