@@ -97,7 +97,11 @@ Read the existing profile first if there is one.
   `activate` files and editable-install mappings name the main checkout, so every worktree installs
   into main's venv and imports main's source. Propose the `install` command detection gives now, and
   a `verify` as step 3 says. Keep-theirs still applies — but if they keep `hardlink`, say in the agent
-  note that they chose it knowing this.
+  note (*The agent note*, step 5) that they chose it knowing this.
+- **A worktree section an earlier setup wrote into the repo's `CLAUDE.md`, `AGENTS.md` or
+  `CLAUDE.local.md`**: the note now lives in the profile's `agentNote`. Offer to carry what is still
+  true into `agentNote`, by the rules in *The agent note*, and to remove the old section — both only on
+  the developer's yes. A section they keep stays theirs; never edit it on your own.
 - **A hardlinked entry with no `copy` while detection emits `depCopy` for it** (bootstrap warns about
   exactly this every session): raise it as an explicit addition, saying why — the package manager
   rewrites those files in place, so a command in a worktree (`composer dump-autoload`,
@@ -284,7 +288,8 @@ one** get one of two answers:
 
 - **isolated** — its env file goes in `runtime.env.file`, and the seed must create every store the
   app derives from the selector in that environment (a test env that appends `_test` to a database
-  name needs that database cloned too). Confirm which files that environment's loader actually reads;
+  name needs that database cloned too — and see *Names derived from `{slug}`* below). Confirm which
+  files that environment's loader actually reads;
   an e2e runner that starts its own server may read none of them, in which case it is a pin (below);
 - **deliberately shared** — say plainly what that costs (two sessions running it at once collide on
   its database or port) and put it in the agent note, so a session knows not to run it in parallel.
@@ -292,6 +297,28 @@ one** get one of two answers:
 "Only development" is a fine answer — but it has to be an answer for each environment, not an
 omission you made for the developer. An environment left out of both lists is a setup that is not
 finished.
+
+### Names derived from `{slug}`
+
+A name you put in `runtime.env.vars` is often not the only name the app uses. Many frameworks derive
+more from it by appending a suffix — a test database named `<name>_test`, a per-process
+`<name>_test<N>` for parallel test workers — and some skip the suffix when the name already ends with
+it. Read the framework's own rule (its test bootstrap, its database config) before choosing a template,
+because **a name that ends in `{slug}` collides**:
+
+- one worktree's derived name can equal another worktree's base name — with `app_{slug}`, the worktree
+  slugged `fix` gets the test database `app_fix_test`, which is exactly the base database of the
+  worktree slugged `fix_test`; a test run in one recreates the other's development data;
+- with a framework that skips an existing suffix, a worktree slugged `fix_test` gets a test database
+  equal to its own base name, so its test run recreates its own development database.
+
+Slugs come from branch names, so both shapes will turn up. Put a fixed token **after** `{slug}` —
+`app_wt_{slug}_dev`, not `app_wt_{slug}` — so a base name never ends in a suffix the framework appends,
+and no derived name can equal any worktree's base name. Then check the derived names for every slug
+shape, and show the developer the result: an ordinary slug (`alice_fix_99`), one that ends in the
+suffix (`fix_test`), one that is the suffix (`test`), the `wt_<checksum>` fallback for a name with no
+usable characters, and the longest slug (40 characters) with every suffix appended, against the
+database's identifier limit. The seed and teardown scripts must use the same names.
 
 ### Inline pins stop setup
 
@@ -356,7 +383,8 @@ never a command assembled from repo text they have not seen.
 - **Write no `runtime` block the developer did not explicitly confirm.** Omitting it is valid and
   means *touch nothing*.
 - Confirm each answer back in concrete terms — "a worktree named `alice/fix-99` would get database
-  `app_alice_fix_99` on port 3214, with overrides written to `.env.development.local` and `.env.test.local`" — because that is
+  `app_wt_alice_fix_99_dev` (and `app_wt_alice_fix_99_dev_test` for its tests) on port 3214, with
+  overrides written to `.env.development.local` and `.env.test.local`" — because that is
   the sentence in which a wrong guess becomes obvious.
 - **Never author a command that drops, truncates, resets, recreates or dumps a database.** Not in
   `seed`, and above all not in `teardown`. Teardown is by nature "destroy the state we made", so it is
@@ -375,6 +403,46 @@ never a command assembled from repo text they have not seen.
 - **No secrets in the profile, ever**. A password for
   the seed step is read from the environment or from the copied `.env` at run time. If a hint looks
   like a credential, do not put it in the file — not even as an example.
+
+### The agent note
+
+Some of what this setup found is true only in a worktree, and a session there would otherwise walk
+straight into it. Write it into the profile's **`agentNote`** — not into the repo's `CLAUDE.md`,
+`AGENTS.md` or `CLAUDE.local.md`, which every session in the main checkout would pay for too. Once the
+developer approves the profile, Pitlane shows the note to every session in a worktree — at start-up
+and resume, again after `/clear` and a compaction — and to every subagent working in one; never in the
+main checkout. Write it only with the developer's yes to its exact lines; no note at all is a valid
+answer.
+
+**Only this repo's own hazards.** Fill it from the profile you are writing and what steps 2–5
+found:
+
+- documented commands and scripts that reach the main checkout's files, databases or fixed ports from
+  a worktree — every inline pin the developer accepted a worktree-safe invocation for (*Inline pins
+  stop setup*), naming the command and what to run instead;
+- environments deliberately shared (*Every environment*), and so not to be run from two worktrees at
+  once;
+- servers that stay on their fixed ports (*How the app starts*) and collide with the main checkout's
+  while both run; and, only when the profile has no `runtime.serve` and the port is taken by a flag,
+  how to start the dev server on `$WORKTREE_PORT`;
+- for a hardlinked dependency dir, the commands of this repo's ecosystem that rewrite files in it in
+  place — re-running package install scripts (`npm rebuild`, `yarn install --force`, composer
+  scripts) — and so write into the main checkout's copy; and a hardlinked venv kept knowingly (step 2);
+- anything else the developer names that is true only in a worktree of this repo.
+
+**Not what Pitlane already tells the session**: that setup is still running or finished,
+`/pitlane-finish`, `/pitlane-serve` and the worktree's URL arrive in Pitlane's own status line. Nor
+anything true in the main checkout as well — that belongs in the repo's own instructions.
+
+**Each line one self-contained instruction**, readable without the others and without this
+conversation: `Run the e2e suite with pnpm e2e, never scripts/e2e.sh, which pins the main checkout's
+database.` Neutral wording, nothing about this plugin's internals. The validator holds it to **at most
+40 lines of at most 400 characters**, one string per line, and refuses a line holding a newline, tab,
+escape or any other control character, or a bidirectional, zero-width or tag character.
+
+The note is part of what the developer approves: `--review` lists each line as `agent note: …`, a
+profile carrying a note needs approval even when it runs no commands, and editing a line needs
+approving again before any session is shown it.
 
 ## 6 — Write it, validate it, and say what will happen
 
@@ -402,6 +470,8 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
   guard fires.
+- `agentNote` — the lines from step 5's *The agent note*, exactly as the developer accepted them; leave
+  it out when there are none.
 - No `_comment` keys in the file you write. Those are the template's annotations, not schema.
 
 Then **validate, and treat failure as fatal here** — unlike the hooks, which warn and fall back to
@@ -421,14 +491,16 @@ noise.
 
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
 get hardlinked and which get installed, which build output is copied or built, what shell that runs inside, roughly how long the first
-bootstrap will take, and what — if anything — will be isolated. Then ask **who it is for**:
+bootstrap will take, what — if anything — will be isolated, and what the agent note tells a worktree
+session. Then ask **who it is for**:
 
 - **the team** — commit the profile, `.worktreeinclude` and the scripts; a teammate who installs the
-  plugin gets a working setup with no calibration run of their own;
+  plugin gets a working setup with no calibration run of their own. The agent note goes with the
+  profile, and each teammate approves it, with the commands, before their sessions are shown it;
 - **only this developer** — commit nothing. Leave the files untracked in the main checkout and list them
   in `.git/info/exclude` (never committed, shared by every worktree); put the seed and teardown scripts
-  in the profile's `copy[]` so each worktree gets them; and write the agent note to `CLAUDE.local.md`,
-  listed in `.worktreeinclude`, instead of the repo's shared instructions.
+  in the profile's `copy[]` so each worktree gets them. The agent note needs nothing more: it is in the
+  profile, which worktrees read from the main checkout.
 
 ### Approve what you wrote
 
@@ -441,55 +513,12 @@ checkout:
 bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --review
 ```
 
-Show the developer what it lists, and on their confirmation run the `--approve <fingerprint>` command it
-printed. Tell them that any later edit to the profile or to those scripts — theirs, a teammate's, a pull
+Show the developer what it lists — the agent note's lines among it, as `agent note: …` — and on their
+confirmation run the `--approve <fingerprint>` command it printed. Until then no session is shown the
+note. Tell them that any later edit to the profile, its note or those scripts — theirs, a teammate's, a pull
 request's — needs approving again, which `/pitlane-finish` walks them through; and that the approval
 covers the commands Pitlane starts, not what an approved install runs from the branch's own manifests
 (package lifecycle scripts) or toolchain files.
-
-### Propose a note for the repo's agent instructions
-
-A session cannot tell a bootstrapped worktree from a bare one — the hooks print nothing into its
-context by design — so without being told it reinstalls dependencies, re-clones the database and
-hunts for a port out of habit. Offer a short section for the repo's `CLAUDE.md` (or `AGENTS.md`, if
-`CLAUDE.md` only imports it), **filled from the profile you just wrote**, and write it only if the
-developer confirms. Neutral wording; nothing about this plugin's internals. It says:
-
-- worktrees under `.claude/worktrees/` arrive bootstrapped: name the dependency directories that are
-  provided, and say not to reinstall them or re-seed;
-- the env files named in `runtime.env.file` already point this worktree at its own database and
-  port — and, from every `assign` record, which documented commands pin a variable inline and must
-  be run **without** that prefix inside a worktree;
-- which environments are deliberately shared, so must not be run from two worktrees at once;
-- only when the profile has no `runtime.serve`: how to start the dev server on the worktree's port,
-  when the port is taken by a flag (with a `serve`, the bullet below replaces this one);
-- which additional servers stay on their fixed ports, and so collide with the main checkout's while
-  both run;
-- when the profile has `runtime.serve`: start the app with `/pitlane-serve`, never the repo's own
-  start command (which does not know this worktree's port), and find it at `$WORKTREE_URL` — set in
-  the session's environment and in the env files named above — rather than at the main checkout's
-  usual address;
-- only when a dependency dir is hardlinked: its files are shared with the main checkout's, so a
-  command that rewrites them in place writes into the main checkout too. Ordinary installs are safe
-  (the profile's `copy` paths are the worktree's own), but anything that re-runs package install
-  scripts — `npm rebuild`, `yarn install --force`, composer scripts — can write anywhere in the
-  package's directory. Run those only after the dir was installed for this worktree instead, or
-  re-run `/pitlane-setup` and make that dir `install`;
-- a worktree lives inside the main checkout, and dependency resolution can reach back into it: Node
-  walks up the directory tree to the main checkout's `node_modules`, and a Python command can pick up
-  the main checkout's virtualenv (an activated one, or one a tool finds above the worktree). When the
-  worktree's own `node_modules` or virtualenv is missing or incomplete, an import can silently load
-  the **main checkout's** packages. So a test or build that "works" in a
-  worktree may be running against main's dependencies — check that `/pitlane-finish` says the
-  worktree is ready before trusting it;
-- to make another worktree, use `EnterWorktree` or a subagent with `isolation: "worktree"` — not a
-  raw `git worktree add` from inside a session, which no hook sees. The exception is checking out an
-  *existing* branch, which neither can do: `git worktree add .claude/worktrees/<name> <branch>`, then
-  start a new session inside it. It must be under `.claude/worktrees/` — a worktree anywhere else is
-  never bootstrapped.
-
-If there is no `runtime` block, leave out the database and port lines rather than writing them as
-"not isolated" — say that in the confirmation instead.
 
 ## What you must not do
 

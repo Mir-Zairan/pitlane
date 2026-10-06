@@ -52,6 +52,8 @@ That's it. When you want the app running, type `/pitlane-serve`.
 - **Build output** (such as a front-end bundle) copied from your main checkout, or built if its
   sources changed.
 - **The app on request.** `/pitlane-serve` starts it on the worktree's own port.
+- **Notes for Claude.** Setup can save a few lines of advice about your project's worktrees. Claude
+  sees them only in a worktree, and only after you approve them.
 - **An honest status.** Each step is reported as ready, ready with warnings, or missing, with the
   reason.
 - **No waiting.** Your first prompt starts at once. Setup runs at low priority, so your machine stays
