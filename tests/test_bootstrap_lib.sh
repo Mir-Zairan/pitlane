@@ -1474,6 +1474,30 @@ out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'idempotence: a second run reports it is already up to date' 'already up to date' "$out"
 eq 'idempotence: and does not re-run the install' 'TOUCHED' "$(cat "$DWT/vendor/marker")"
 
+# A record says what a run made, not what is there now: a dir removed since (`rm -rf`, `git clean
+# -fdX`) or emptied is set up again, and said so, rather than called up to date.
+rm -rf "$DWT/vendor"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'gone: a done dependency whose dir was removed is set up again' 'vendor: recorded as set up, but the directory is gone or empty' "$out"
+lacks '...not called up to date' 'already up to date' "$out"
+eq '...and is back' 'ok' "$(cat "$DWT/vendor/marker" 2>/dev/null)"
+rm -rf "$DWT/vendor"; mkdir "$DWT/vendor"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'gone: one emptied is set up again too' 'directory is gone or empty' "$out"
+eq '...and is back' 'ok' "$(cat "$DWT/vendor/marker" 2>/dev/null)"
+eq 'gone: a dir holding only a dotfile is not empty' 0 \
+  "$(rm -rf "$DWT/vendor"/*; : > "$DWT/vendor/.keep"; wt_dep_has_content "$DWT/vendor"; echo $?)"
+# An install that leaves its dir empty is not recorded done, which the next run would undo every
+# session: it is a failure, standing until the lockfile or the install command changes.
+rm -rf "$DWT/vendor"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'true # leaves nothing' '')
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains 'empty: an install that leaves its dir empty says so' 'vendor: it left vendor empty or missing' "$out"
+eq '...and is recorded failed, not done' failed "$(wt_state_status "$DWT" vendor)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+lacks '...so the next run does not install it again' 'installing' "$out"
+
 # Changing the install command invalidates it, even though the lockfile is untouched.
 # shellcheck disable=SC2034
 PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf v2 > vendor/marker' '')
@@ -1613,7 +1637,7 @@ eq '...a name is branch text, shown printable' \
   "$(WT_READY_DEPS="ven"$'\033'"dor"$'\n' PROFILE_HAS_RUNTIME=0 ready_line)"
 rt_ready() {  # $@ = ready_line's args; the runtime facts of a seeded, ported, URL'd profile
   PROFILE_HAS_RUNTIME=1 PROFILE_RT_SEED=${RL_SEED-.claude/seed.sh} WT_RUNTIME_PORT=${RL_PORT-4123} \
-    WT_RUNTIME_URL=${RL_URL-http://localhost:4123} ready_line "$@"
+    WT_RUNTIME_URL=${RL_URL-http://localhost:4123} WT_RUNTIME_ISOLATED=${RL_ISO-1} ready_line "$@"
 }
 eq 'ready: with runtime, its own databases and port, and the URL' \
   'Pitlane: this worktree is fully set up — vendor and node_modules are in place and it has its own databases and port (http://localhost:4123); do not reinstall dependencies or re-create its databases.' \
@@ -1628,10 +1652,15 @@ eq '...a URL alone' 'Pitlane: this worktree is fully set up — it has its own U
   "$(RL_SEED='' RL_PORT='' rt_ready)"
 eq '...env overrides alone' 'Pitlane: this worktree is fully set up — it has its own env settings.' \
   "$(PROFILE_RT_ENVFILES=.env.local RL_SEED='' RL_PORT='' RL_URL='' rt_ready)"
-mkdir -p "$TMP/norun/.claude"; : > "$TMP/norun/.claude/worktree-no-runtime"
-eq "...but not for a worktree whose runtime is switched off: it has none of its own" \
+eq '...a runtime with nothing to name, and nothing else: silent' '' \
+  "$(RL_SEED='' RL_PORT='' RL_URL='' rt_ready)"
+# The runtime's facts only when this run's hand-off left the worktree pointed at its own state
+# (WT_RUNTIME_ISOLATED, set by wt_runtime_handoff and tested with it): a seed recorded done or a
+# port claimed says nothing of an env file the developer took over or the plugin could not write.
+eq "...but not when this run did not isolate it: it has none of its own to name" \
   'Pitlane: this worktree is fully set up — vendor is in place; do not reinstall dependencies.' \
-  "$(WT_READY_DEPS=$'vendor\n' RL_WT=$TMP/norun rt_ready)"
+  "$(WT_READY_DEPS=$'vendor\n' RL_ISO='' rt_ready)"
+eq '...nor env settings alone' '' "$(PROFILE_RT_ENVFILES=.env.local RL_SEED='' RL_PORT='' RL_URL='' RL_ISO='' rt_ready)"
 eq 'ready: with runtime.serve, ONE line carrying both, the URL said once' \
   "Pitlane: this worktree is fully set up — vendor is in place and it has its own databases and port; do not reinstall dependencies or re-create its databases. To run the app, use /pitlane-serve (it serves at http://localhost:4123), not the repo's own start command." \
   "$(WT_READY_DEPS=$'vendor\n' PROFILE_RT_SERVE='bin/server' rt_ready)"
@@ -1710,10 +1739,22 @@ eq 'walk: done, but for another install command, is pending' 'missing|vendor|don
 wt_state_set "$DWT" vendor install other-lck "$SWI" warn 1 why
 eq 'walk: a warning for another lockfile is pending' 'missing|vendor|warn' "$(status_items "$DWT")"
 wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done"
+mkdir -p "$DWT/vendor"; : > "$DWT/vendor/autoload"
 eq 'walk: done for this lockfile, command and strategy is no item' '' "$(status_items "$DWT")"
 eq '...and not pending' '' "$(pending_all "$DWT")"
 eq '...but in place, for the "fully set up" line' vendor "$(wt_bootstrap_pending "$DWT"; printf '%s' "${WT_READY_DEPS%$'\n'}")"
+# Done, and the dir removed since: missing, and attempted, since a run sets it up again
+# (wt_dep_is_done) — never named in place, which would tell the session not to reinstall it.
+rm -rf "$DWT/vendor"
+eq 'walk: done, but its dir since removed, is missing' 'missing|vendor|done' "$(status_items "$DWT")"
+eq '...attempted' vendor "$(pending_attemptable "$DWT")"
+eq '...and not named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
+mkdir "$DWT/vendor"
+eq 'walk: done, but its dir emptied, is missing too' 'missing|vendor|done' "$(status_items "$DWT")"
+eq '...and not named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
 wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 why
+eq 'walk: a warning over an emptied dir is missing, not "ready with warnings"' 'missing|vendor|warn' "$(status_items "$DWT")"
+: > "$DWT/vendor/autoload"
 eq 'walk: a warning is not counted in place, which would make the line read as clean' '' \
   "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
 wt_state_set "$DWT" vendor install "$SWL" "$SWI" failed 1 boom
@@ -2185,7 +2226,7 @@ eq 'no git: wt_tracked_changes says it cannot tell' 1 "$(set +o pipefail; wt_tra
 eq '...the state falls back into the working tree' "$NOGIT/.claude/worktree-bootstrap-state" "$(wt_state_path "$NOGIT")"
 eq '...so there is no capture path' '1:' "$(p=$(wt_install_capture_path "$NOGIT" vendor); echo "$?:$p")"
 # shellcheck disable=SC2034
-PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && echo nogit-progress" '')
+PROFILE_RAW=$(dep_raw vendor composer.lock install "mkdir -p vendor && : > vendor/x && echo nogit-progress" '')
 out=$(wt_bootstrap_deps "$NOGIT" "$NOGIT" "$FAR" 2>&1)
 eq '...the install still runs' "done" "$(wt_state_status "$NOGIT" vendor)"
 contains '...its output still on stderr' 'nogit-progress' "$out"
@@ -5881,6 +5922,40 @@ wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
 eq 'hand-off: no runtime block clears a url left from an earlier run' '' "$WT_RUNTIME_URL"
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_RT_URL=''
+
+# WT_RUNTIME_ISOLATED: 1 only when this run left the worktree pointed at its own state, which is
+# what lets the "fully set up" line name its own databases, port and env settings. Env files taken
+# over or unwritable are driven through the entrypoint (tests/test_bootstrap.sh).
+WT_RUNTIME_ISOLATED=stale
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'isolated: no runtime block, nothing isolated' '' "$WT_RUNTIME_ISOLATED"
+PROFILE_HAS_RUNTIME=1
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'isolated: a runtime with no env file to take over is' 1 "$WT_RUNTIME_ISOLATED"
+ISO_SLUG=$WT_SLUG
+mkdir -p "$DWT/.claude"; : > "$DWT/$WT_NO_RUNTIME_MARKER"
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'isolated: not with the opt-out marker' '' "$WT_RUNTIME_ISOLATED"
+eq '...so the ready line names none of its runtime' \
+  'Pitlane: this worktree is fully set up — vendor is in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_RT_SEED=.claude/seed.sh WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE='' \
+     PROFILE_PRESENT=1 wt_bootstrap_status_line "$DWT" start '')"
+rm -f "$DWT/$WT_NO_RUNTIME_MARKER"
+# No slug: wt_slugify falls back to a checksum, so only a failing one (no cksum) reaches the skip.
+noslug_isolated() (  # a subshell, so the failing wt_slugify stays in it
+  # shellcheck disable=SC2329  # called by wt_runtime_handoff
+  wt_slugify() { return 1; }
+  WT_SLUG=''
+  wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+  printf '%s' "${WT_RUNTIME_ISOLATED:-}"
+)
+eq 'isolated: not when no slug could be derived, which skips the runtime' '' "$(noslug_isolated)"
+WT_SIBLINGS="$ISO_SLUG${US_}4999${RS_}" wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq 'isolated: not when another live worktree has its slug, and so its databases' '' "$WT_RUNTIME_ISOLATED"
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq '...and again once it has not' 1 "$WT_RUNTIME_ISOLATED"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_HAS_RUNTIME=0
 
 # --- the session's own environment (CLAUDE_ENV_FILE) ---------------------------------------------
 CEF=$TMP/claude-env/sessionstart-hook-0.sh

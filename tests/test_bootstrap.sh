@@ -825,8 +825,11 @@ eq "the override file is invisible to git status" '' \
 # ACCEPTANCE: a developer can redirect a worktree without touching the profile, and the plugin
 # respects it on EVERY later session — warning once, not every time.
 printf 'DATABASE_NAME=the_shared_one\n' > "$WA/.env.worktree.local"
-start_hook "$WA" >/dev/null; first=$(cat "$TMP/err")
+outTheirs=$(start_hook "$WA"); first=$(cat "$TMP/err")
 start_hook "$WA" >/dev/null; second=$(cat "$TMP/err")
+# Its port is still claimed, but the app no longer reads it from a file the plugin wrote: the ready
+# line names none of the runtime's own, which would send the session at a shared database.
+eq 'a taken-over env file: the ready line claims no port or env settings of its own' "$READY_VENDOR" "$outTheirs"
 eq 'a hand-edited override file survives a re-bootstrap byte for byte' \
   'DATABASE_NAME=the_shared_one' "$(cat "$WA/.env.worktree.local")"
 contains 'and the developer is told once that it is now theirs' 'it will be left alone' "$first"
@@ -835,11 +838,20 @@ rm -f "$WA/.env.worktree.local"
 start_hook "$WA" >/dev/null
 eq 'deleting it hands ownership back' "$pA" "$(envval "$WA" SERVER_PORT)"
 
+# A dependency recorded done whose dir was removed since (`rm -rf vendor`, `git clean -fdX`) is set
+# up again, never named in place over nothing.
+rm -rf "$WA/vendor"
+outGone=$(start_hook "$WA"); errGone=$(cat "$TMP/err")
+contains 'a removed dependency dir is set up again at the next start' 'vendor: recorded as set up, but the directory is gone or empty' "$errGone"
+eq '...and is back' 'ok' "$(cat "$WA/vendor/marker" 2>/dev/null)"
+eq '...before the ready line names it, its own port with it again' "$outA" "$outGone"
+
 # ACCEPTANCE: the opt-out marker skips layer 3 entirely and leaves dependencies working.
 rm -f "$WB/.env.worktree.local"
 mkdir -p "$WB/.claude"
 : > "$WB/.claude/worktree-no-runtime"
-start_hook "$WB" >/dev/null; errB=$(cat "$TMP/err")
+outMarker=$(start_hook "$WB"); errB=$(cat "$TMP/err")
+eq 'with the opt-out marker the ready line claims nothing of the runtime' "$READY_VENDOR" "$outMarker"
 eq 'the opt-out marker writes no override file' 0 \
   "$([ -e "$WB/.env.worktree.local" ] && echo 1 || echo 0)"
 contains 'and says so once' 'leaving this worktree' "$errB"
@@ -976,6 +988,7 @@ start_hook "$WRF" >/dev/null; errRF=$(cat "$TMP/err")
 contains 'a non-gitignored override path is refused' 'not gitignored' "$errRF"
 lacks 'and the summary does not claim it wrote one' 'env=tracked.env' "$errRF"
 contains 'while still reporting the slug it settled on' 'runtime: slug=rf' "$errRF"
+eq 'and the ready line claims no port or env settings it did not write' "$READY_VENDOR" "$(start_hook "$WRF")"
 eq 'and no such file was created' 0 "$([ -e "$WRF/tracked.env" ] && echo 1 || echo 0)"
 
 # AN UNWRITABLE OVERRIDE FILE MUST ALSO STOP THE SEED. The seed's first refusal is "the app is not
@@ -2263,7 +2276,8 @@ set_agent_note "$ND" "$NL1" "$NL2"
 WND=$ND/.claude/worktrees/noted
 git -C "$ND" worktree add -q "$WND" -b worktree-noted 2>/dev/null
 
-# Approved (the suite trusts its fixtures): the note alone, since a complete worktree has no status line.
+# Approved (the suite trusts its fixtures): the note alone, since a profile that installs nothing and has
+# no runtime gives the "fully set up" line nothing to name, and that line is then not printed.
 out=$(start_hook "$WND")
 eq 'note: start-up prints the header and each line, literally' "$NOTE_BLOCK" "$out"
 eq '...and nothing in it was run' no "$([ -e "$TMP/note-ran" ] && echo yes || echo no)"
@@ -2296,7 +2310,9 @@ WNR=$NR/.claude/worktrees/ready-noted
 git -C "$NR" worktree add -q "$WNR" -b worktree-ready-noted 2>/dev/null
 eq 'note: after the ready line, at start-up' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(start_hook "$WNR")"
 eq '...and at resume' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" resume)"
-eq '...and a compaction gives the note alone' "$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" compact)"
+for src in clear compact; do
+  eq "...and $src gives the note alone, without the ready line" "$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" "$src")"
+done
 
 # Not approved: never printed. Start-up says the note is held and where approval happens, without
 # its text; /clear and a compaction print nothing at all; --finish is not "fully set up".

@@ -3175,10 +3175,33 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
 # wt_state_is_done for dependency $2, where a pull request's own copy ($6 = 1) recorded `own-copy`
 # counts as current for its `install` too: either made a private tree for this lockfile and command.
 # `copy` is the spelling the first version of this wrote, read the same.
+#
+# AND THE DIR IS STILL THERE, as for build output (wt_bootstrap_pending_artifacts): a record says
+# what an earlier run made, and an `rm -rf vendor` or `git clean -fdX` since leaves it saying done
+# over nothing — the session then told the dependencies are in place and not to reinstall them.
+# WT_DEP_GONE is 1 when that is why it is not done, for the log.
+WT_DEP_GONE=0
 wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy
-  wt_state_is_done "$1" "$2" "$3" "$4" "$5" && return 0
-  [ "${6-}" = 1 ] || return 1
-  wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy
+  WT_DEP_GONE=0
+  if ! wt_state_is_done "$1" "$2" "$3" "$4" "$5"; then
+    [ "${6-}" = 1 ] || return 1
+    wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy || return 1
+  fi
+  wt_dep_has_content "${1%/}/$2" && return 0
+  WT_DEP_GONE=1
+  return 1
+}
+
+# True when dependency dir $1 is a directory with at least one entry. Unlike wt_art_has_content it
+# follows a symlink: a dir the install made a link is the install's business, and the plugin only
+# reads it here.
+wt_dep_has_content() {  # $1 = directory
+  local entry
+  [ -d "${1-}" ] || return 1
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [ -e "$entry" ] || [ -L "$entry" ]; then return 0; fi
+  done
+  return 1
 }
 
 # Bootstrap every entry in deps[]. $3 is the epoch second the whole bootstrap must be finished by.
@@ -3291,6 +3314,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
       continue
     fi
+    [ "$WT_DEP_GONE" = 0 ] || wt_log "  $dir: recorded as set up, but the directory is gone or empty — setting it up again"
     own_fits=0
     if [ "$own_copy" = 1 ] && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
       own_fits=1
@@ -3597,6 +3621,18 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         fi
       fi
     fi
+    # A dependency counts as done only while its dir has content (wt_dep_is_done), so one left
+    # without any is not recorded done: the next run would set it up again on every session, and
+    # the session be told it is missing each time. As for build output, it is a failure, which
+    # stands until the lockfile or the install command changes.
+    case $outcome in
+      "done" | warn)
+        if ! wt_dep_has_content "$worktree/$dir"; then
+          outcome=failed reason="it left $dir empty or missing"
+          wt_log "  $dir: $reason"
+        fi
+        ;;
+    esac
 
     # AN INSTALL MAY REWRITE ITS OWN LOCKFILE (npm updating package-lock.json, a tool normalising
     # one). The checksum taken before it would then never match again: pending forever, reinstalled
@@ -4043,13 +4079,15 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 }
 
 # What this worktree's bootstrap has NOT finished, one item per line, in WT_PENDING: each dependency
-# directory not recorded done (or warn) for its current lockfile and install command, then
+# directory not recorded done (or warn) for its current lockfile and install command, or since
+# emptied, then
 # `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty means the
 # worktree is complete. It is what the session is told, so it reads the state the steps recorded
 # rather than guessing. WT_PENDING_ATTEMPTABLE is the same list less each dependency whose failure
 # stands: what a run would actually try, which decides whether one is worth starting.
-# WT_READY_DEPS and WT_READY_ARTS are the dependency and build-output dirs recorded done, one per
-# line, which the "fully set up" line names (wt_ready_clause).
+# WT_READY_DEPS and WT_READY_ARTS are the dependency and build-output dirs recorded done and still
+# holding something, one per line, which the "fully set up" line names (wt_ready_clause). One recorded
+# done whose dir is gone or empty is missing, not in place: a run sets it up again (wt_dep_is_done).
 # WT_STATUS_ITEMS is every imperfect item with what the state says about it, for
 # wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
 # failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
@@ -4089,6 +4127,11 @@ wt_bootstrap_pending() {  # $1 = worktree
       && { [ "$WT_DEP_STRATEGY" = "$strategy" ] \
         || { [ "$own" = 1 ] && { [ "$WT_DEP_STRATEGY" = own-copy ] || [ "$WT_DEP_STRATEGY" = copy ]; }; }; }; then
       current=1
+    fi
+    # Done or warn over a dir since emptied is missing, as wt_dep_is_done has a run set it up again.
+    if [ "$current" = 1 ] && { [ "$WT_DEP_STATUS" = "done" ] || [ "$WT_DEP_STATUS" = warn ]; } \
+      && ! wt_dep_has_content "$worktree/$dir"; then
+      current=0
     fi
     if [ "$current" = 1 ]; then
       case $WT_DEP_STATUS in
@@ -4342,15 +4385,17 @@ wt_join_words() {  # $1 = and | or, $2 = items, one per line
 # What a worktree with nothing pending has in place, as the rest of the "fully set up" sentence,
 # into WT_READY_CLAUSE: ` — <dirs> are in place and it has its own databases and port (<url>); do
 # not reinstall dependencies or re-create its databases`, or empty when there is nothing to name.
-# Only facts this run already holds: the dirs wt_bootstrap_pending found done, a seed (done, since
-# nothing is pending) and the port and URL wt_runtime_handoff published — never for a worktree whose
-# runtime is switched off. It exists so a session can tell a worktree set up from a bare one, and does
-# not reinstall or re-seed out of habit. Never for a profile the approval holds: that is not a
+# Only facts this run already holds: the dirs wt_bootstrap_pending found done and present, and the
+# runtime's only when wt_runtime_handoff left the worktree pointed at its own state this run
+# (WT_RUNTIME_ISOLATED) — a seed (done, since nothing is pending), the port and URL it published, the
+# env files it wrote. Never for a worktree whose runtime is switched off or skipped, nor one whose
+# env file the developer took over or the plugin could not write. It exists so a session can tell a
+# worktree set up from a bare one, and does not reinstall or re-seed out of habit. Never for a profile the approval holds: that is not a
 # worktree "fully set up", and the line stays as it was. $2 = 1 leaves the URL out, for a line whose
 # /pitlane-serve clause names it already. The dirs are branch text, so they go through wt_visible.
 WT_READY_CLAUSE=''
-wt_ready_clause() {  # $1 = worktree, $2 = 1 when the line names the URL elsewhere
-  local worktree=${1%/} url_named=${2-} placed='' own='' dont=''
+wt_ready_clause() {  # $1 = worktree (unread: the facts are this run's globals), $2 = 1 when the line names the URL elsewhere
+  local url_named=${2-} placed='' own='' dont=''
   WT_READY_CLAUSE=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${WT_APPROVAL:-}" != no ] || return 0
   wt_join_words and "${WT_READY_DEPS:-}${WT_READY_ARTS:-}"
@@ -4360,7 +4405,7 @@ wt_ready_clause() {  # $1 = worktree, $2 = 1 when the line names the URL elsewhe
   fi
   [ -z "${WT_READY_DEPS:-}" ] || dont+="reinstall dependencies$WT_NL"
   [ -z "${WT_READY_ARTS:-}" ] || dont+="rebuild its build output$WT_NL"
-  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ "${WT_RUNTIME_ISOLATED:-}" = 1 ]; then
     if [ -n "${PROFILE_RT_SEED:-}" ]; then
       own=databases
       dont+="re-create its databases$WT_NL"
@@ -4383,9 +4428,10 @@ wt_ready_clause() {  # $1 = worktree, $2 = 1 when the line names the URL elsewhe
 # `<name> ready with warnings (<why>)`, and the count of tracked files an install changed — a count,
 # not the names, which are branch content; /pitlane-finish shows them. Still one line (ADR-017). At
 # start-up a complete, clean worktree gets `Pitlane: this worktree is fully set up — ` and what is in
-# place (wt_ready_clause), so the session does not redo it; it prints NOTHING only when the profile
-# gave it nothing to name (no dependency, build output or runtime) and has no runtime.serve, when the
-# approval holds the profile, or when there is no usable profile: stdout there is model context. With runtime.serve the line ends naming
+# place (wt_ready_clause), so the session does not redo it; it prints NOTHING only when there is
+# nothing to name (no dependency or build output in place, no runtime this start isolated) and no
+# runtime.serve, when the approval holds the profile, or when there is no usable profile: stdout
+# there is model context. With runtime.serve the line ends naming
 # /pitlane-serve and the URL (ADR-021), a clause every other start-up line carries too. --finish says
 # the same head and stops: `Pitlane: this worktree is fully set up.` A worktree whose only gaps are
 # failures that stand is not sent to /pitlane-finish as if that would fix them: it would not retry
@@ -6672,13 +6718,20 @@ wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, 
 # Layer 3 for one worktree: slug, port, env blocks, seed. Publishes WT_RUNTIME_PORT (the claimed
 # port, when runtime.port.var names a variable to carry it) and WT_RUNTIME_URL (runtime.url expanded,
 # when it is safe), for the session's environment and status line; both empty when nothing was set.
+# And WT_RUNTIME_ISOLATED, 1 only when THIS run left the worktree pointed at its own state: runtime not
+# skipped (the opt-out marker, no slug), every env file holding the plugin's block as written now —
+# none the developer's, none that could not be written — and no other live worktree on the slug. The
+# "fully set up" line names the worktree's own env settings, databases and port only then
+# (wt_ready_clause): a seed recorded done, or a port claimed, says nothing of where the app now points.
+WT_RUNTIME_ISOLATED=''
 wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport
-  local rest f prior fstate shown nfiles url
+  local rest f prior fstate shown nfiles url shared=0
 
   WT_RUNTIME_PORT=''
   WT_RUNTIME_URL=''
+  WT_RUNTIME_ISOLATED=''
   [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] || return 0
 
   if [ -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
@@ -6840,6 +6893,7 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
     while IFS=$WT_US read -r -d "$WT_RS" sslug sport; do
       if [ "$sslug" = "$slug" ]; then
         wt_log "runtime: another live worktree already uses the name \"$slug\", so both would point at the same database. Rename this worktree, or give runtime.slug a template that distinguishes them."
+        shared=1
         break
       fi
     done <<EOF
@@ -6867,6 +6921,10 @@ EOF
   # non-gitignored path and a failed write, and naming such a file would report isolation that did
   # not happen.
   wt_log "runtime: slug=$slug${port:+ port=$port}${url:+ url=$url}${shown:+ env=$shown}"
+  # `ours` only when every file was written this run (envstate starts there and only worsens).
+  if [ "$shared" = 0 ] && { [ -z "$envfiles" ] || [ "$envstate" = ours ]; }; then
+    WT_RUNTIME_ISOLATED=1
+  fi
   return 0
 }
 
