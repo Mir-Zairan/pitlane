@@ -286,9 +286,11 @@ wt_status_after_reset() {  # $1 = the session's directory
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   wt_state_path "$worktree" >/dev/null
   wt_runtime_outcome_read "$worktree"
-  # The slug the hand-off settled on, which a dependency's install command may name: its checksum is
-  # what the dependency's record was written against.
-  [ -z "$WT_RTRUN_SLUG" ] || WT_SLUG=$WT_RTRUN_SLUG
+  # The slug the last start-up's hand-off settled on, which the status line's install checksums are
+  # taken with, as at start-up's own pending check. Only while an rtrun record says that hand-off
+  # established something: an `rt` record left from an older runtime block must not replace the
+  # slugified name start-up used.
+  [ -z "$WT_RTRUN_REC" ] || [ -z "$WT_RTRUN_SLUG" ] || WT_SLUG=$WT_RTRUN_SLUG
   export WT_NAME WT_SLUG WT_PATH WT_ROOT
   wt_approval_check "$worktree"
   wt_bootstrap_pending "$worktree"
