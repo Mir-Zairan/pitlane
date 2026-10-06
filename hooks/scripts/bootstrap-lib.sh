@@ -1371,11 +1371,13 @@ wt_state_rewrite() {  # $1 = worktree, $2 = kind to replace, $3 = its first fiel
 # Record the outcome for one dependency. Rewrites the whole file atomically: it holds a handful of
 # entries, and a partial write is the one thing a reader must never see. WT_STATE_KIND=art writes
 # a build-output record instead, in the same fields (wt_art_state_set).
-# $9, the worktree a hardlinked dir was linked from (wt_hardlink_donor_find), and ${10}, the lockfile's
-# checksum before an install that rewrote it ($4 being the one it left), are appended only when set, so
-# every other record keeps the shape older readers know.
-wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line, $9 = donor worktree, $10 = lock cksum before the install
-  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} donor=${9-} before=${10-} when rec
+# $9, the worktree a hardlinked dir was linked from (wt_hardlink_donor_find), ${10}, the lockfile's
+# checksum before an install that rewrote it ($4 being the one it left), and ${11}, whether the dir
+# held anything when a `done` or `warn` was recorded (1 or 0, wt_dep_is_done), are appended only when
+# set — the fields before a set one written empty — so every other record keeps the shape older
+# readers know.
+wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 = install cksum, $6 = status, $7 = install exit code, $8 = its error line, $9 = donor worktree, $10 = lock cksum before the install, $11 = 1 or 0, the dir had content
+  local wt=${1%/} dir=${2-} strategy=${3-} lck=${4-} ick=${5-} status=${6-} rc=${7-} reason=${8-} donor=${9-} before=${10-} content=${11-} when rec
 
   # Recorded but never compared: it answers "when did this last happen" for a developer looking at
   # a worktree that seems stale, and gives prune something to age entries by. It is deliberately
@@ -1383,7 +1385,9 @@ wt_state_set() {  # $1 = worktree, $2 = dir, $3 = strategy, $4 = lock cksum, $5 
   # comparing one would make re-entry depend on the clock.
   when=$(date +%s 2>/dev/null) || when=0
 
-  if [ -n "$before" ]; then
+  if [ -n "$content" ]; then
+    wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor" "$before" "$content"
+  elif [ -n "$before" ]; then
     wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor" "$before"
   elif [ -n "$donor" ]; then
     wt_state_join "${WT_STATE_KIND:-dep}" "$dir" "$strategy" "$lck" "$ick" "$status" "$when" "$rc" "$reason" "$donor"
@@ -1844,8 +1848,10 @@ wt_cksum_file() {  # $1 = path
 }
 
 # Read one dependency's record into WT_DEP_STRATEGY, WT_DEP_LCK, WT_DEP_ICK, WT_DEP_STATUS,
-# WT_DEP_WHEN, WT_DEP_RC, WT_DEP_REASON, WT_DEP_DONOR and WT_DEP_LCK_BEFORE (empty in a record from
-# before it existed, and wherever the install left its lockfile as it was). Returns 1, with them all empty, when there
+# WT_DEP_WHEN, WT_DEP_RC, WT_DEP_REASON, WT_DEP_DONOR, WT_DEP_LCK_BEFORE (empty in a record from
+# before it existed, and wherever the install left its lockfile as it was) and WT_DEP_CONTENT (1 or 0,
+# whether the dir held anything when it was recorded done or warn; empty in a record from before it
+# existed, and for any other status). Returns 1, with them all empty, when there
 # is no usable record. Globals rather than output so a caller in its own shell gets every field from
 # one read. WT_STATE_KIND=art reads a build-output record instead (wt_art_state_read).
 wt_state_dep_read() {  # $1 = worktree, $2 = dir
@@ -1856,7 +1862,7 @@ wt_state_dep_read() {  # $1 = worktree, $2 = dir
 wt_state_dep_read_file() {  # $1 = state file, $2 = dir
   local file=${1-} dir=${2-} rec kind rest rdir rmore seen=0
   WT_DEP_STRATEGY='' WT_DEP_LCK='' WT_DEP_ICK='' WT_DEP_STATUS='' WT_DEP_WHEN='' WT_DEP_RC=''
-  WT_DEP_REASON='' WT_DEP_DONOR='' WT_DEP_LCK_BEFORE=''
+  WT_DEP_REASON='' WT_DEP_DONOR='' WT_DEP_LCK_BEFORE='' WT_DEP_CONTENT=''
   [ -n "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
@@ -1872,7 +1878,7 @@ wt_state_dep_read_file() {  # $1 = state file, $2 = dir
         # SC2034: rdir and rmore are read POSITIONALLY: its field, and whatever a later format appends.
         # shellcheck disable=SC2034
         IFS=$WT_US read -r rdir WT_DEP_STRATEGY WT_DEP_LCK WT_DEP_ICK WT_DEP_STATUS WT_DEP_WHEN \
-          WT_DEP_RC WT_DEP_REASON WT_DEP_DONOR WT_DEP_LCK_BEFORE rmore <<<"$rest" || true
+          WT_DEP_RC WT_DEP_REASON WT_DEP_DONOR WT_DEP_LCK_BEFORE WT_DEP_CONTENT rmore <<<"$rest" || true
         return 0
         ;;
     esac
@@ -3176,10 +3182,14 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
 # counts as current for its `install` too: either made a private tree for this lockfile and command.
 # `copy` is the spelling the first version of this wrote, read the same.
 #
-# AND THE DIR IS STILL THERE, as for build output (wt_bootstrap_pending_artifacts): a record says
-# what an earlier run made, and an `rm -rf vendor` or `git clean -fdX` since leaves it saying done
-# over nothing — the session then told the dependencies are in place and not to reinstall them.
-# WT_DEP_GONE is 1 when that is why it is not done, for the log.
+# AND THE DIR HAS NOT BEEN EMPTIED SINCE: a record says what an earlier run made, and an `rm -rf
+# vendor` or `git clean -fdX` since leaves it saying done over nothing — the session then told the
+# dependencies are in place and not to reinstall them. So a record notes whether the dir held
+# anything when it was written (WT_DEP_CONTENT), and one that did is done only while it still does.
+# A dir that never held anything is done as recorded: an install that exits 0 and passes its verify
+# may rightly leave none (a project or workspace member with no dependencies), and treating that as
+# missing would set it up again on every session. A record from before the flag is done as recorded,
+# as it was then. WT_DEP_GONE is 1 when an emptied dir is why it is not done, for the log.
 WT_DEP_GONE=0
 wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy
   WT_DEP_GONE=0
@@ -3188,17 +3198,22 @@ wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cks
     wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy || return 1
   fi
   wt_dep_has_content "${1%/}/$2" && return 0
+  # Only an empty dir pays the second read.
+  wt_state_dep_read "$1" "$2" || return 0
+  [ "$WT_DEP_CONTENT" = 1 ] || return 0
   WT_DEP_GONE=1
   return 1
 }
 
-# True when dependency dir $1 is a directory with at least one entry. Unlike wt_art_has_content it
-# follows a symlink: a dir the install made a link is the install's business, and the plugin only
-# reads it here.
+# True when dependency dir $1 is a directory with at least one entry other than a .gitkeep or a
+# .gitignore: a dir committed with only those keeps them through `git clean -fdX`, and is as empty
+# as one removed. Unlike wt_art_has_content it follows a symlink: a dir the install made a link is
+# the install's business, and the plugin only reads it here.
 wt_dep_has_content() {  # $1 = directory
   local entry
   [ -d "${1-}" ] || return 1
   for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    case ${entry##*/} in .gitkeep | .gitignore) continue ;; esac
     if [ -e "$entry" ] || [ -L "$entry" ]; then return 0; fi
   done
   return 1
@@ -3214,7 +3229,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
-  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits
+  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits content
   WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
@@ -3621,16 +3636,13 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         fi
       fi
     fi
-    # A dependency counts as done only while its dir has content (wt_dep_is_done), so one left
-    # without any is not recorded done: the next run would set it up again on every session, and
-    # the session be told it is missing each time. As for build output, it is a failure, which
-    # stands until the lockfile or the install command changes.
+    # Whether the dir holds anything as it is recorded done or warn: one that does is done only while
+    # it still does (wt_dep_is_done), one that does not — no dependencies to install — stays done.
+    content=''
     case $outcome in
       "done" | warn)
-        if ! wt_dep_has_content "$worktree/$dir"; then
-          outcome=failed reason="it left $dir empty or missing"
-          wt_log "  $dir: $reason"
-        fi
+        content=0
+        ! wt_dep_has_content "$worktree/$dir" || content=1
         ;;
     esac
 
@@ -3654,9 +3666,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       esac
     fi
     case $outcome in
-      warn) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" '' "$lck_before" || true ;;
+      warn) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" '' "$lck_before" "$content" || true ;;
       failed) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" "$rc" "$reason" || true ;;
-      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" '' '' "$linked_from" "$lck_before" || true ;;
+      *) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" "$outcome" '' '' "$linked_from" "$lck_before" "$content" || true ;;
     esac
 
     [ "$held" -eq 1 ] && wt_lock_release 9
@@ -4079,15 +4091,16 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 }
 
 # What this worktree's bootstrap has NOT finished, one item per line, in WT_PENDING: each dependency
-# directory not recorded done (or warn) for its current lockfile and install command, or since
-# emptied, then
+# directory not recorded done (or warn) for its current lockfile and install command, or emptied
+# since it was, then
 # `databases (seed: <status>)` when the profile has a seed that has not run to done. Empty means the
 # worktree is complete. It is what the session is told, so it reads the state the steps recorded
 # rather than guessing. WT_PENDING_ATTEMPTABLE is the same list less each dependency whose failure
 # stands: what a run would actually try, which decides whether one is worth starting.
-# WT_READY_DEPS and WT_READY_ARTS are the dependency and build-output dirs recorded done and still
-# holding something, one per line, which the "fully set up" line names (wt_ready_clause). One recorded
-# done whose dir is gone or empty is missing, not in place: a run sets it up again (wt_dep_is_done).
+# WT_READY_DEPS and WT_READY_ARTS are the dependency and build-output dirs recorded done and holding
+# something now, one per line, which the "fully set up" line names (wt_ready_clause). One recorded
+# done over content since removed is missing, not in place: a run sets it up again (wt_dep_is_done);
+# one that never held anything is done, and not named.
 # WT_STATUS_ITEMS is every imperfect item with what the state says about it, for
 # wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
 # failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
@@ -4096,7 +4109,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # a commit changed its inputs since: pending and attemptable, yet not missing). Globals, not output, so one
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
-  local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current own
+  local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current own present
   WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS='' WT_OWN_COPY='' WT_READY_DEPS='' WT_READY_ARTS=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
@@ -4128,15 +4141,17 @@ wt_bootstrap_pending() {  # $1 = worktree
         || { [ "$own" = 1 ] && { [ "$WT_DEP_STRATEGY" = own-copy ] || [ "$WT_DEP_STRATEGY" = copy ]; }; }; }; then
       current=1
     fi
-    # Done or warn over a dir since emptied is missing, as wt_dep_is_done has a run set it up again.
-    if [ "$current" = 1 ] && { [ "$WT_DEP_STATUS" = "done" ] || [ "$WT_DEP_STATUS" = warn ]; } \
-      && ! wt_dep_has_content "$worktree/$dir"; then
-      current=0
+    # Done or warn over a dir that held something then and nothing now is missing, as wt_dep_is_done
+    # has a run set it up again. Named in place only while it holds something.
+    present=0
+    if [ "$current" = 1 ] && { [ "$WT_DEP_STATUS" = "done" ] || [ "$WT_DEP_STATUS" = warn ]; }; then
+      wt_dep_has_content "$worktree/$dir" && present=1
+      [ "$present" = 1 ] || [ "$WT_DEP_CONTENT" != 1 ] || current=0
     fi
     if [ "$current" = 1 ]; then
       case $WT_DEP_STATUS in
         "done")
-          WT_READY_DEPS+=$dir$WT_NL
+          [ "$present" = 0 ] || WT_READY_DEPS+=$dir$WT_NL
           continue
           ;;
         warn)
@@ -6720,7 +6735,8 @@ wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, 
 # when it is safe), for the session's environment and status line; both empty when nothing was set.
 # And WT_RUNTIME_ISOLATED, 1 only when THIS run left the worktree pointed at its own state: runtime not
 # skipped (the opt-out marker, no slug), every env file holding the plugin's block as written now —
-# none the developer's, none that could not be written — and no other live worktree on the slug. The
+# none the developer's, none that could not be written — and no other live worktree on the slug, by a
+# sibling scan that could see them all. The
 # "fully set up" line names the worktree's own env settings, databases and port only then
 # (wt_ready_clause): a seed recorded done, or a port claimed, says nothing of where the app now points.
 WT_RUNTIME_ISOLATED=''
@@ -6889,6 +6905,12 @@ wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline 
   # same `demo_{slug}`, and stepping the port forward does not fix that. The seed refuses outright,
   # but a profile with `env.vars` and no seed has nothing to refuse, so the warning belongs here
   # where every profile shape reaches it.
+  # THE SCAN IS RUN HERE, as the seed runs its own: the port claim scans only when it allocates a
+  # port, so from a worktree's second session on (its port recorded), or with no runtime.port at
+  # all, WT_SIBLINGS is stale or empty and a sibling on this slug would go unseen. One rev-parse.
+  # A scan that could not see every sibling cannot show the slug is this worktree's alone.
+  wt_runtime_siblings "$root" "$worktree"
+  [ "${WT_SIBLINGS_OK:-0}" = 1 ] || shared=1
   if [ -n "${WT_SIBLINGS-}" ]; then
     while IFS=$WT_US read -r -d "$WT_RS" sslug sport; do
       if [ "$sslug" = "$slug" ]; then

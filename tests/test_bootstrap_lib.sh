@@ -1476,6 +1476,8 @@ eq 'idempotence: and does not re-run the install' 'TOUCHED' "$(cat "$DWT/vendor/
 
 # A record says what a run made, not what is there now: a dir removed since (`rm -rf`, `git clean
 # -fdX`) or emptied is set up again, and said so, rather than called up to date.
+ready_deps() { PROFILE_PRESENT=1 wt_bootstrap_pending "$1"; printf '%s' "${WT_READY_DEPS%$'\n'}"; }
+pending_deps() { PROFILE_PRESENT=1 wt_bootstrap_pending "$1"; printf '%s' "$WT_PENDING"; }
 rm -rf "$DWT/vendor"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'gone: a done dependency whose dir was removed is set up again' 'vendor: recorded as set up, but the directory is gone or empty' "$out"
@@ -1485,18 +1487,72 @@ rm -rf "$DWT/vendor"; mkdir "$DWT/vendor"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
 contains 'gone: one emptied is set up again too' 'directory is gone or empty' "$out"
 eq '...and is back' 'ok' "$(cat "$DWT/vendor/marker" 2>/dev/null)"
-eq 'gone: a dir holding only a dotfile is not empty' 0 \
+eq '...and named in place again once it is' vendor "$(ready_deps "$DWT")"
+eq 'content: a dir holding only a dotfile is not empty' 0 \
   "$(rm -rf "$DWT/vendor"/*; : > "$DWT/vendor/.keep"; wt_dep_has_content "$DWT/vendor"; echo $?)"
-# An install that leaves its dir empty is not recorded done, which the next run would undo every
-# session: it is a failure, standing until the lockfile or the install command changes.
-rm -rf "$DWT/vendor"
+# A committed .gitkeep or .gitignore survives `git clean -fdX`: a dir holding only those is empty.
+eq 'content: a dir holding only .gitkeep and .gitignore is empty' 1 \
+  "$(rm -f "$DWT/vendor/.keep"; : > "$DWT/vendor/.gitkeep"; : > "$DWT/vendor/.gitignore"; wt_dep_has_content "$DWT/vendor"; echo $?)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+contains '...so a done dependency left with only those is set up again' 'directory is gone or empty' "$out"
+eq '...and is back' 'ok' "$(cat "$DWT/vendor/marker" 2>/dev/null)"
+# A dir the install made a symlink is read through the link.
+mkdir -p "$TMP/linked-full" "$TMP/linked-empty"; : > "$TMP/linked-full/pkg"
+ln -s "$TMP/linked-full" "$TMP/link-full"; ln -s "$TMP/linked-empty" "$TMP/link-empty"
+ln -s "$TMP/linked-nowhere" "$TMP/link-dangling"
+eq 'content: a symlink to a populated dir has content' 0 "$(wt_dep_has_content "$TMP/link-full"; echo $?)"
+eq 'content: a symlink to an empty dir has none' 1 "$(wt_dep_has_content "$TMP/link-empty"; echo $?)"
+eq 'content: a dangling symlink has none' 1 "$(wt_dep_has_content "$TMP/link-dangling"; echo $?)"
+
+# AN INSTALL THAT EXITS 0 AND LEAVES NOTHING is a project with no dependencies, not a failure: done,
+# recorded as never having had content, so it is neither set up again every session nor named.
+for zero in absent empty; do
+  rm -rf "$DWT/vendor"; rm -f "$TMP/zero-runs" "$(wt_state_path "$DWT")"
+  if [ "$zero" = absent ]; then zcmd="printf x >> '$TMP/zero-runs'"; else zcmd="mkdir -p vendor && : > vendor/.gitkeep && printf x >> '$TMP/zero-runs'"; fi
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock install "$zcmd" 'true')
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  eq "zero deps ($zero): recorded done" "done" "$(wt_state_status "$DWT" vendor)"
+  lacks '...with no failure said' 'failed' "$out"
+  eq '...and recorded as never having had content' 0 "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_CONTENT")"
+  eq '...complete' '' "$(pending_deps "$DWT")"
+  eq '...and not named in place' '' "$(ready_deps "$DWT")"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains '...the next run calls it up to date' 'already up to date' "$out"
+  eq '...and does not install it again' x "$(cat "$TMP/zero-runs")"
+done
+# A hardlink of a main checkout's dir holding nothing but a .gitkeep, and a fallback install over an
+# empty one, are alike: done, never failed, and neither linked nor installed again next session.
+for zero in gitkeep empty; do
+  rm -rf "$DWT/vendor" "$DREPO/vendor"; rm -f "$TMP/zero-runs" "$(wt_state_path "$DWT")"; mkdir -p "$DREPO/vendor"
+  [ "$zero" = empty ] || : > "$DREPO/vendor/.gitkeep"
+  # shellcheck disable=SC2034
+  PROFILE_RAW=$(dep_raw vendor composer.lock hardlink "printf x >> '$TMP/zero-runs'" '')
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  eq "zero deps, hardlink ($zero): recorded done" "done" "$(wt_state_status "$DWT" vendor)"
+  lacks '...with no failure said' 'failed' "$out"
+  eq '...and not named in place' '' "$(ready_deps "$DWT")"
+  out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+  contains '...the next run calls it up to date' 'already up to date' "$out"
+  lacks '...without linking it again' 'hardlinked' "$out"
+  lacks '...or installing it' 'installing' "$out"
+done
+eq '...the empty one was installed once, by the fallback' x "$(cat "$TMP/zero-runs")"
+rm -rf "$DWT/vendor" "$DREPO/vendor"
+
+# Once it does install something, it is recorded as such, and a removal is then set up again.
 # shellcheck disable=SC2034
-PROFILE_RAW=$(dep_raw vendor composer.lock install 'true # leaves nothing' '')
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf ok > vendor/marker' '')
+wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+eq 'content: an install that fills its dir records so' 1 "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_CONTENT")"
+# A record written before the flag existed reads as it did then: done is done, dir or no dir.
+OLDL=$(wt_cksum_file "$DWT/composer.lock"); OLDI=$(wt_cksum_string 'mkdir -p vendor && printf ok > vendor/marker')
+wt_state_set "$DWT" vendor install "$OLDL" "$OLDI" "done"
+rm -rf "$DWT/vendor"
+eq 'old record: no content flag' '' "$(wt_state_dep_read "$DWT" vendor; printf '%s' "$WT_DEP_CONTENT")"
 out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-contains 'empty: an install that leaves its dir empty says so' 'vendor: it left vendor empty or missing' "$out"
-eq '...and is recorded failed, not done' failed "$(wt_state_status "$DWT" vendor)"
-out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
-lacks '...so the next run does not install it again' 'installing' "$out"
+contains '...done as recorded, dir or no dir' 'already up to date' "$out"
+eq '...not named in place over nothing' '' "$(ready_deps "$DWT")"
 
 # Changing the install command invalidates it, even though the lockfile is untouched.
 # shellcheck disable=SC2034
@@ -1738,12 +1794,12 @@ wt_state_set "$DWT" vendor install "$SWL" other-ick "done"
 eq 'walk: done, but for another install command, is pending' 'missing|vendor|done' "$(status_items "$DWT")"
 wt_state_set "$DWT" vendor install other-lck "$SWI" warn 1 why
 eq 'walk: a warning for another lockfile is pending' 'missing|vendor|warn' "$(status_items "$DWT")"
-wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done" '' '' '' '' 1
 mkdir -p "$DWT/vendor"; : > "$DWT/vendor/autoload"
 eq 'walk: done for this lockfile, command and strategy is no item' '' "$(status_items "$DWT")"
 eq '...and not pending' '' "$(pending_all "$DWT")"
 eq '...but in place, for the "fully set up" line' vendor "$(wt_bootstrap_pending "$DWT"; printf '%s' "${WT_READY_DEPS%$'\n'}")"
-# Done, and the dir removed since: missing, and attempted, since a run sets it up again
+# Done with content, and the dir removed since: missing, and attempted, since a run sets it up again
 # (wt_dep_is_done) — never named in place, which would tell the session not to reinstall it.
 rm -rf "$DWT/vendor"
 eq 'walk: done, but its dir since removed, is missing' 'missing|vendor|done' "$(status_items "$DWT")"
@@ -1752,8 +1808,23 @@ eq '...and not named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$
 mkdir "$DWT/vendor"
 eq 'walk: done, but its dir emptied, is missing too' 'missing|vendor|done' "$(status_items "$DWT")"
 eq '...and not named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
-wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 why
+# Done over a dir that never had anything (a project with no dependencies): complete, not missing,
+# and not named in place either — there is nothing there to tell the session about.
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done" '' '' '' '' 0
+eq 'walk: done, its dir never filled, is no item' '' "$(status_items "$DWT")"
+eq '...and not pending' '' "$(pending_all "$DWT")"
+eq '...nor named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
+# A record from before the flag: done as recorded, as it was before; named only over content.
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done"
+eq 'walk: an old done record over an empty dir is no item' '' "$(status_items "$DWT")"
+eq '...nor named in place' '' "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
+: > "$DWT/vendor/autoload"
+eq '...and named once it holds something' vendor "$(wt_bootstrap_pending "$DWT"; printf '%s' "${WT_READY_DEPS%$'\n'}")"
+rm -f "$DWT/vendor/autoload"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 why '' '' 1
 eq 'walk: a warning over an emptied dir is missing, not "ready with warnings"' 'missing|vendor|warn' "$(status_items "$DWT")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 why '' '' 0
+eq 'walk: a warning over a dir never filled stands as a warning' 'warn|vendor|why' "$(status_items "$DWT")"
 : > "$DWT/vendor/autoload"
 eq 'walk: a warning is not counted in place, which would make the line read as clean' '' \
   "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
@@ -1784,7 +1855,7 @@ LONGCMD="mkdir -p vendor && touch vendor/autoload.php; printf 'error %0400d\\n' 
 PROFILE_RAW=$(dep_raw vendor composer.lock install "$LONGCMD" 'test -r vendor/autoload.php')
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 rec=$(dep_line vendor)
-reason=${rec##*|}
+reason=$(printf '%s' "$rec" | cut -d'|' -f9)
 eq 'the recorded reason is length-capped' 160 "${#reason}"
 contains '...with the exit code beside it' '|3|error 000' "$rec"
 # The record's own separators, inside the part of the line that is kept.
@@ -1794,9 +1865,10 @@ PROFILE_RAW=$(dep_raw vendor composer.lock install \
   "mkdir -p vendor && touch vendor/autoload.php; printf 'error \\037ab\\036c\\n' >&2; exit 3" 'test -r vendor/autoload.php')
 wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 rec=$(dep_line vendor)
-eq 'separators in the error line are stripped, so the record still has its nine fields' 8 \
+eq 'separators in the error line are stripped, so the record still has its twelve fields' 11 \
   "$(printf '%s' "$rec" | tr '|' '\n' | wc -l | tr -d ' ')"
-eq '...leaving the text around them' 'error abc' "${rec##*|}"
+eq '...leaving the text around them' 'error abc' "$(printf '%s' "$rec" | cut -d'|' -f9)"
+eq '...and the content flag last' 1 "${rec##*|}"
 
 # The error line is the LAST one that looks like an error...
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
@@ -5950,10 +6022,36 @@ noslug_isolated() (  # a subshell, so the failing wt_slugify stays in it
   printf '%s' "${WT_RUNTIME_ISOLATED:-}"
 )
 eq 'isolated: not when no slug could be derived, which skips the runtime' '' "$(noslug_isolated)"
-WT_SIBLINGS="$ISO_SLUG${US_}4999${RS_}" wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
-eq 'isolated: not when another live worktree has its slug, and so its databases' '' "$WT_RUNTIME_ISOLATED"
+# Another live worktree on the slug, found by the hand-off's own scan: the port claim scans only
+# when it allocates, so from the second session on (a port already recorded) it would see nothing.
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_RT_PORTBASE=4600 PROFILE_RT_PORTSPAN=50
 wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
-eq '...and again once it has not' 1 "$WT_RUNTIME_ISOLATED"
+eq 'isolated: with a port, and no sibling on the slug' 1 "$WT_RUNTIME_ISOLATED"
+ISO_PORT=$(wt_runtime_state_get "$DWT" port)
+eq '...whose port is recorded' 0 "$(wt_is_posint "$ISO_PORT"; echo $?)"
+ISO_SIB=$DREPO/.claude/worktrees/iso-sibling
+git -C "$DREPO" worktree add -q "$ISO_SIB" -b wt-iso-sibling 2>/dev/null
+wt_runtime_state_set "$ISO_SIB" "$ISO_SLUG" 4999 derived '' '' none '' 2>/dev/null
+for n in 1 2; do
+  WT_SIBLINGS='' wt_runtime_handoff "$DREPO" "$DWT" '' 2>"$TMP/iso-err"
+  eq "isolated: not when another live worktree has its slug, and so its databases (hand-off $n)" '' "$WT_RUNTIME_ISOLATED"
+  contains '...and says so' "another live worktree already uses the name \"$ISO_SLUG\"" "$(cat "$TMP/iso-err")"
+  eq '...its own port kept' "$ISO_PORT" "$(wt_runtime_state_get "$DWT" port)"
+done
+# A scan that cannot be trusted cannot show the slug is this worktree's alone.
+blind_isolated() (  # a subshell, so the blind scan stays in it
+  # shellcheck disable=SC2329  # called by wt_runtime_handoff
+  wt_runtime_siblings() { WT_SIBLINGS='' WT_SIBLINGS_OK=0; }
+  wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+  printf '%s' "${WT_RUNTIME_ISOLATED:-}"
+)
+git -C "$DREPO" worktree remove --force "$ISO_SIB" 2>/dev/null
+eq 'isolated: not when the other worktrees could not be enumerated' '' "$(blind_isolated)"
+wt_runtime_handoff "$DREPO" "$DWT" '' 2>/dev/null
+eq '...and again once the sibling is gone' 1 "$WT_RUNTIME_ISOLATED"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_RT_PORTBASE='' PROFILE_RT_PORTSPAN=''
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_HAS_RUNTIME=0
 
