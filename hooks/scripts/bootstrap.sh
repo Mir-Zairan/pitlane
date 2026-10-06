@@ -260,21 +260,17 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
 # start-up hook printed, while CLAUDE.md is read again — so the agent note, which says what CLAUDE.md
 # cannot for a worktree, would be gone for the rest of the session. This prints it again, approved,
 # and does nothing else: the bootstrap ran at start-up, and a compaction fires mid-session, where its
-# cost would land on the user's next prompt. One profile load and the approval check, no state
-# written; the caller silences stderr, which would otherwise repeat on every compaction what start-up
-# already said once.
+# cost would land on the user's next prompt. No state written; the caller silences stderr, which
+# would otherwise repeat on every compaction what start-up already said once. Cheapest first: a
+# session outside .claude/worktrees/ spawns nothing, and a worktree whose profile cannot carry a note
+# (wt_profile_may_carry_agent_note) costs the git calls that find it and no interpreter. Only a
+# profile that may carry one is loaded and put to the approval check.
 wt_agent_note_after_reset() {  # $1 = the session's directory
-  local here=$1 worktree root
-  case "$here/" in
-    *"$WT_SUBPATH"*) ;;
-    *) return 0 ;;
-  esac
-  worktree=$(wt_repo_root "$here") || return 0
-  root=$(wt_main_root "$here") || return 0
-  wt_is_worktree_of "$worktree" "$root" || return 0
-  wt_load_profile_for "$worktree" "$root"
+  wt_linked_worktree_at "${1-}" || return 0
+  wt_profile_may_carry_agent_note "$WT_LINKED_WORKTREE" "$WT_LINKED_ROOT" || return 0
+  wt_load_profile_for "$WT_LINKED_WORKTREE" "$WT_LINKED_ROOT"
   wt_profile_has_agent_note || return 0
-  wt_approval_check "$worktree"
+  wt_approval_check "$WT_LINKED_WORKTREE"
   if wt_agent_note_is_approved; then
     wt_agent_note_block
   fi

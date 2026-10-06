@@ -25,39 +25,31 @@ set -uo pipefail
 
 # The Pitlane worktree directory $1 is in, its main checkout and its recorded port, into
 # WT_SA_WORKTREE, WT_SA_ROOT and WT_SA_PORT. Returns 1 when $1 is not inside a linked worktree under
-# <root>/.claude/worktrees/ — the same rule /pitlane-serve applies.
+# <root>/.claude/worktrees/ (wt_linked_worktree_at) — the same rule /pitlane-serve applies.
 wt_subagent_worktree() {  # $1 = directory
-  local here=${1-}
   WT_SA_WORKTREE='' WT_SA_ROOT='' WT_SA_PORT=''
-  [ -n "$here" ] && [ -d "$here" ] || return 1
-  case "$here/" in *"$WT_SUBPATH"*) ;; *) return 1 ;; esac
-  WT_SA_WORKTREE=$(wt_repo_root "$here") || return 1
-  WT_SA_ROOT=$(wt_main_root "$here" 2>/dev/null) || return 1
-  case "$WT_SA_WORKTREE/" in
-    "$WT_SA_ROOT$WT_SUBPATH"?*) ;;
-    *) return 1 ;;
-  esac
+  wt_linked_worktree_at "${1-}" || return 1
+  WT_SA_WORKTREE=$WT_LINKED_WORKTREE WT_SA_ROOT=$WT_LINKED_ROOT
   WT_SA_PORT=$(wt_runtime_state_get "$WT_SA_WORKTREE" port) || WT_SA_PORT=''
   wt_is_posint "$WT_SA_PORT" || WT_SA_PORT=''
   return 0
 }
 
-# A JSON string body: backslash and quote escaped, control characters dropped.
-wt_subagent_json_escape() {  # $1 = text
-  local t
-  t=$(printf '%s' "${1-}" | LC_ALL=C tr -d '\000-\037')
-  t=${t//\\/\\\\}
-  printf '%s' "${t//\"/\\\"}"
-}
-
-# The same for a block of lines: each LF becomes the escape `\n` instead of being dropped, so the
-# lines reach the subagent as lines. Every other control character is still dropped.
-wt_subagent_json_escape_lines() {  # $1 = text
-  local t
-  t=$(printf '%s' "${1-}" | LC_ALL=C tr -d '\000-\011\013-\037')
+# A JSON string body: backslash and quote escaped, control characters dropped — but with $2 = lines,
+# a line feed becomes the escape `\n` instead, so a block of lines reaches the subagent as lines. One
+# function for both, so the two cannot drift. In-process: LC_ALL=C so the ranges match bytes, and
+# every other byte is kept.
+wt_subagent_json_escape() {  # $1 = text, $2 = lines or empty
+  local LC_ALL=C t=${1-}
+  if [ "${2-}" = lines ]; then
+    t=${t//[$'\x01'-$'\x09'$'\x0b'-$'\x1f']/}
+  else
+    t=${t//[$'\x01'-$'\x1f']/}
+  fi
   t=${t//\\/\\\\}
   t=${t//\"/\\\"}
-  printf '%s' "${t//$'\n'/\\n}"
+  [ "${2-}" != lines ] || t=${t//$'\n'/\\n}
+  printf '%s' "$t"
 }
 
 # The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told; and
@@ -77,14 +69,18 @@ wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the pa
 
   if wt_subagent_worktree "$here"; then
     name=$(wt_name_from_path "$WT_SA_WORKTREE")
-    # Loaded with or without a port: the agent note does not depend on one. Its approval is decided
-    # for this worktree, as the start-up hook decides it — what the parent session was shown says
-    # nothing about the files here.
-    wt_load_profile_for "$WT_SA_WORKTREE" "$WT_SA_ROOT" 2>/dev/null
-    if wt_profile_has_agent_note; then
-      wt_approval_check "$WT_SA_WORKTREE" 2>/dev/null
-      if wt_agent_note_is_approved; then
-        WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block)
+    # One load, shared by the port line and the agent note: with a port, as it always was; without
+    # one, only when the profile may carry a note at all (wt_profile_may_carry_agent_note), so the
+    # common worktree, with neither, starts no interpreter. The note's approval is decided for this
+    # worktree, as the start-up hook decides it — what the parent session was shown says nothing
+    # about the files here.
+    if [ -n "$WT_SA_PORT" ] || wt_profile_may_carry_agent_note "$WT_SA_WORKTREE" "$WT_SA_ROOT"; then
+      wt_load_profile_for "$WT_SA_WORKTREE" "$WT_SA_ROOT" 2>/dev/null
+      if wt_profile_has_agent_note; then
+        wt_approval_check "$WT_SA_WORKTREE" 2>/dev/null
+        if wt_agent_note_is_approved; then
+          WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block)
+        fi
       fi
     fi
     if [ -n "$WT_SA_PORT" ]; then
@@ -118,7 +114,7 @@ main() {
   # The Pitlane line first, then the note on lines of its own, as at start-up.
   context=$(wt_subagent_json_escape "$WT_SUBAGENT_NOTE")
   if [ -n "$WT_SUBAGENT_AGENT_NOTE" ]; then
-    context+=${context:+\\n}$(wt_subagent_json_escape_lines "$WT_SUBAGENT_AGENT_NOTE")
+    context+=${context:+\\n}$(wt_subagent_json_escape "$WT_SUBAGENT_AGENT_NOTE" lines)
   fi
   printf '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"%s"}}\n' "$context"
 }
