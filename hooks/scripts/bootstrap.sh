@@ -520,17 +520,38 @@ case $event in
       # from the default branch silently lacks it, a pull request under review most of all. So the
       # new branch starts from the commit that worktree has checked out; its uncommitted changes
       # cannot come along, and the log says so.
-      base=refs/remotes/origin/HEAD
+      #
+      # A pull request's commit stays a pull request's: the new worktree is marked as one before
+      # its path is printed (wt_pr_origin_mark), or it is not based there at all.
+      default_base=refs/remotes/origin/HEAD
+      if ! wt_git "$root" rev-parse --verify --quiet "$default_base" >/dev/null 2>&1; then
+        default_base=HEAD
+      fi
+      base=$default_base parent_name='' parent_is_pr=0
       if wt_parent_worktree "$root" "$payload_cwd"; then
         base=$WT_PARENT_COMMIT
+        parent_name=$(wt_name_from_path "$WT_PARENT_WORKTREE")
+        wt_parent_is_pr "$root" && parent_is_pr=1
         base_short=$(wt_git "$root" rev-parse --short "$base" 2>/dev/null) || base_short=$base
-        wt_log "basing $branch on $(wt_name_from_path "$WT_PARENT_WORKTREE")'s current commit ($base_short) — the session that started it works there; uncommitted changes are not included"
-      elif ! wt_git "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
-        base=HEAD
+        wt_log "basing $branch on $parent_name's current commit ($base_short) — the session that started it works there; uncommitted changes are not included"
+        [ "$parent_is_pr" = 0 ] \
+          || wt_log "$parent_name is, or may be, a pull request's worktree — so $branch is treated as one too"
+      elif [ "$default_base" = HEAD ]; then
         wt_log "no origin/HEAD in this repository — basing $branch on local HEAD"
       fi
       out=$(wt_git "$root" worktree add -b "$branch" "$worktree" "$base" 2>&1) || true
       [ -n "$out" ] && wt_log "$out"
+      if [ "$parent_is_pr" = 1 ] && [ -d "$worktree" ] \
+         && ! wt_pr_origin_mark "$worktree" "$parent_name" "$base"; then
+        wt_log "could not mark $worktree as started from a pull request's worktree — basing $branch on $default_base instead"
+        if ! wt_git "$root" worktree remove --force "$worktree" >/dev/null 2>&1; then
+          wt_log "could not remove the unmarked $worktree — leaving worktree creation to Claude Code"
+          exit 0
+        fi
+        wt_git "$root" branch -D "$branch" >/dev/null 2>&1 || true
+        out=$(wt_git "$root" worktree add -b "$branch" "$worktree" "$default_base" 2>&1) || true
+        [ -n "$out" ] && wt_log "$out"
+      fi
     fi
 
     # Never print a path that isn't there. Claude Code would fail the session on a path it

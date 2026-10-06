@@ -1811,6 +1811,94 @@ outP=$(gated_hook "$WGH")
 eq "approval: a gh-checked-out fork PR does not inherit the developer's approval" no "$([ -e "$WGH/vendor/marker" ] && echo yes || echo no)"
 contains 'review: it is flagged as a pull request' 'pull-request worktree' "$(gated_cli "$WGH" --review)"
 
+# A SUBAGENT STARTED FROM A PULL REQUEST'S WORKTREE is on that PR's commit, named agent-<id> on a branch
+# with no upstream. It is marked as a PR's in its git admin dir, so it gets no approval its parent's
+# commit does not have. Every parent below is at content the developer approved for their own work.
+sub_create() {  # $1 = name, $2 = parent session's directory; sets outS, errS
+  outS=$( ( unset PITLANE_TRUST_PROFILES; cd "$AP" \
+    && printf '%s' "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"$1\",\"cwd\":\"$2\"}" \
+    | bash "$HOOK" 2>"$TMP/err" ) )
+  errS=$(cat "$TMP/err")
+}
+pr_mark_of() { cat "$(git -C "$1" rev-parse --absolute-git-dir)/pitlane-pr-origin" 2>/dev/null || echo none; }
+
+git -C "$AP" checkout -q -b pr-src-6 "$APBASE"
+printf 'pr six\n' > "$AP/README"; git -C "$AP" add README
+pr_worktree 6
+WP6=$AP/.claude/worktrees/pr-6
+WP6_HEAD=$(git -C "$WP6" rev-parse HEAD)
+gated_cli "$WP6" --approve "$(gated_cli "$WP6" --review | fp_of)" >/dev/null
+sub_create agent-p6 "$WP6"
+WS6=$AP/.claude/worktrees/agent-p6
+eq 'pr subagent: stdout is exactly the new path' "$WS6" "$outS"
+eq "...based on the PR worktree's commit" "$WP6_HEAD" "$(git -C "$WS6" rev-parse HEAD 2>/dev/null)"
+eq '...marked in its git admin dir with that commit and the parent' "$WP6_HEAD pr-6" "$(pr_mark_of "$WS6")"
+contains '...and the log says it is treated as a pull request'"'"'s' 'treated as one too' "$errS"
+contains '...review flags it as a pull request' 'pull-request worktree: approving covers this commit only' \
+  "$(gated_cli "$WS6" --review)"
+eq "...its fingerprint is its parent's: same commit, same content" "$(gated_cli "$WP6" --review | fp_of)" \
+  "$(gated_cli "$WS6" --review | fp_of)"
+gated_hook "$WS6" >/dev/null
+eq "...so the approval the parent's commit has covers it, and it is set up" ok "$(cat "$WS6/vendor/marker" 2>/dev/null)"
+
+git -C "$AP" checkout -q -b pr-src-7 "$APBASE"
+printf 'pr seven\n' > "$AP/README"; git -C "$AP" add README
+pr_worktree 7
+WP7=$AP/.claude/worktrees/pr-7
+sub_create agent-p7 "$WP7"
+WS7=$AP/.claude/worktrees/agent-p7
+eq 'pr subagent, parent unapproved: based on its commit' "$(git -C "$WP7" rev-parse HEAD)" "$(git -C "$WS7" rev-parse HEAD 2>/dev/null)"
+eq '...and marked' "$(git -C "$WP7" rev-parse HEAD) pr-7" "$(pr_mark_of "$WS7")"
+outP=$(gated_hook "$WS7")
+eq "...its install is held back, though its content is the developer's approved own" no \
+  "$([ -e "$WS7/vendor/marker" ] && echo yes || echo no)"
+contains '...and the session is told' 'setup commands were NOT run' "$outP"
+
+sub_create agent-gh "$WGH"
+WSG=$AP/.claude/worktrees/agent-gh
+eq 'pr subagent of a refs/pull upstream: based on its commit' "$(git -C "$WGH" rev-parse HEAD)" "$(git -C "$WSG" rev-parse HEAD 2>/dev/null)"
+eq '...and marked' "$(git -C "$WGH" rev-parse HEAD) review" "$(pr_mark_of "$WSG")"
+gated_hook "$WSG" >/dev/null
+eq '...and held back' no "$([ -e "$WSG/vendor/marker" ] && echo yes || echo no)"
+
+WDET=$AP/.claude/worktrees/loose
+git -C "$AP" worktree add -q --detach "$WDET" "$APBASE" 2>/dev/null
+sub_create agent-det "$WDET"
+WSD=$AP/.claude/worktrees/agent-det
+eq 'subagent of a detached HEAD: based on its commit' "$APBASE" "$(git -C "$WSD" rev-parse HEAD 2>/dev/null)"
+eq '...and marked, since a detached HEAD may be a PR checkout' "$APBASE loose" "$(pr_mark_of "$WSD")"
+gated_hook "$WSD" >/dev/null
+eq '...and held back' no "$([ -e "$WSD/vendor/marker" ] && echo yes || echo no)"
+
+sub_create agent-own "$WAP"
+WSO=$AP/.claude/worktrees/agent-own
+eq "subagent of the developer's own worktree: based on its commit" "$(git -C "$WAP" rev-parse HEAD)" \
+  "$(git -C "$WSO" rev-parse HEAD 2>/dev/null)"
+eq '...not marked' none "$(pr_mark_of "$WSO")"
+lacks '...and not called a pull request'"'"'s' 'treated as one too' "$errS"
+gated_hook "$WSO" >/dev/null
+eq "...and set up under the developer's approval" ok "$(cat "$WSO/vendor/marker" 2>/dev/null)"
+
+# The marker cannot be written (here: a post-checkout hook puts a directory where it goes, once). The
+# worktree is not handed out on the PR's commit unmarked: it is made again from the default base.
+AP_HOOKS=$(git -C "$AP" rev-parse --git-common-dir)/hooks
+case $AP_HOOKS in /*) ;; *) AP_HOOKS=$AP/$AP_HOOKS ;; esac
+mkdir -p "$AP_HOOKS"
+touch "$TMP/break-mark-once"
+# shellcheck disable=SC2016  # the hook expands its own git dir.
+printf '#!/usr/bin/env bash\n[ -e %s ] || exit 0\nrm -f %s\nmkdir "$(git rev-parse --absolute-git-dir)/pitlane-pr-origin"\n' \
+  "$TMP/break-mark-once" "$TMP/break-mark-once" > "$AP_HOOKS/post-checkout"
+chmod +x "$AP_HOOKS/post-checkout"
+sub_create agent-fail "$WP7"
+rm -f "$AP_HOOKS/post-checkout"
+WSF=$AP/.claude/worktrees/agent-fail
+eq 'mark failure: (fixture) the hook broke the marker' no "$([ -e "$TMP/break-mark-once" ] && echo yes || echo no)"
+eq '...stdout is still exactly the path' "$WSF" "$outS"
+eq "...based on the default base, not the PR's commit" "$(git -C "$AP" rev-parse HEAD)" "$(git -C "$WSF" rev-parse HEAD 2>/dev/null)"
+ne '...(which differ)' "$(git -C "$AP" rev-parse HEAD)" "$(git -C "$WP7" rev-parse HEAD)"
+eq '...unmarked' none "$(pr_mark_of "$WSF")"
+contains '...and the log says why' 'could not mark' "$errS"
+
 # The developer's re-approved edit does run.
 python3 - "$WAP2/.claude/worktree-profile.json" <<'EOF2'
 import json, sys

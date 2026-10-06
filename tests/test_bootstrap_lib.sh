@@ -2450,6 +2450,16 @@ donor_rec pr-123 "done" 200
 run_donor
 eq 'donor: a pull-request worktree is not used, though it is the most recent' donor-a "$(linked_from)"
 git -C "$DREPO" worktree remove --force "$DONORS/pr-123"
+# A sibling started from a pull request's worktree (wt_pr_origin_mark) is one, whatever its name and
+# branch: it is on that PR's commit, and its install ran that PR's package scripts.
+DMARK=$(git -C "$DONORS/donor-a" rev-parse --absolute-git-dir)/pitlane-pr-origin
+wt_pr_origin_mark "$DONORS/donor-a" pr-7 "$(git -C "$DONORS/donor-a" rev-parse HEAD)"
+eq 'donor: (fixture) the marker is written' yes "$([ -f "$DMARK" ] && echo yes || echo no)"
+run_donor
+eq "donor: a sibling started from a pull request's worktree is not used" install "$(linked_from)"
+rm -f "$DMARK"
+run_donor
+eq '...and without the marker it is again' donor-a "$(linked_from)"
 
 mv "$DONORS/donor-a/vendor" "$TMP/donor-real"; ln -s "$TMP/donor-real" "$DONORS/donor-a/vendor"
 run_donor
@@ -3012,6 +3022,24 @@ wt_state_dep_read "$DWT" vendor
 eq '...recorded done as an install' "done|install" "$WT_DEP_STATUS|$WT_DEP_STRATEGY"
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 printf 'LOCKV1\n' > "$DWT/composer.lock"
+
+# Started from a pull request's worktree, on a plain branch with no upstream: the marker alone makes
+# it a pull request's, so it takes a copy of main's tree rather than a link.
+git -C "$DREPO" config --unset branch.wt-dep1.merge
+PMARK=$(git -C "$DWT" rev-parse --absolute-git-dir)/pitlane-pr-origin
+eq 'pr-origin: (fixture) an unmarked worktree on its own branch is not a pull request'"'"'s' 1 \
+  "$(wt_is_pr_worktree "$DWT"; echo $?)"
+wt_pr_origin_mark "$DWT" pr-7 "$(git -C "$DWT" rev-parse HEAD)"
+eq 'pr-origin: the marker names the commit and the parent' "$(git -C "$DWT" rev-parse HEAD) pr-7" "$(cat "$PMARK" 2>/dev/null)"
+eq "pr-origin: a marked worktree is a pull request's" 0 "$(wt_is_pr_worktree "$DWT"; echo $?)"
+out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
+eq "pr-origin: it copies main's tree rather than link it" copy "$(linked_from)"
+contains '...saying why' "vendor: a pull request's worktree copies the main checkout's rather than link it" "$out"
+eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
+rm -f "$PMARK"
+eq 'pr-origin: without the marker it is not' 1 "$(wt_is_pr_worktree "$DWT"; echo $?)"
+rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
+git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 
 # Linked before this change: the start-up run, installs deferred, moves the linked copy out of the
 # worktree into its git dir at once (an instant rename), and the background run removes it there and

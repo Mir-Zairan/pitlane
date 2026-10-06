@@ -103,6 +103,52 @@ wt_parent_worktree() {  # $1 = main checkout, $2 = the parent session's director
   WT_PARENT_COMMIT=$commit
 }
 
+# A worktree started from a pull request's worktree is a pull request's own (ADR-020): it is on that
+# PR's commit, yet named `agent-<id>` on a branch with no upstream, so nothing else would say so. The
+# marker lives in its git admin dir, which no commit can write, and every PR test honours it.
+WT_PR_ORIGIN_FILENAME=pitlane-pr-origin
+
+# The git admin dir (<common>/worktrees/<id>) of linked worktree $1, into WT_WORKTREE_ADMIN, read from
+# its `.git` file without a fork; returns 1 when $1 has no such file.
+WT_WORKTREE_ADMIN=''
+wt_worktree_admin() {  # $1 = worktree
+  local wt=${1%/} line admin
+  WT_WORKTREE_ADMIN=''
+  { IFS= read -r line <"$wt/.git"; } 2>/dev/null || return 1
+  case $line in
+    'gitdir: '?*) admin=${line#gitdir: } ;;
+    *) return 1 ;;
+  esac
+  case $admin in /*) ;; *) admin=$wt/$admin ;; esac
+  WT_WORKTREE_ADMIN=${admin%/}
+}
+
+# True when linked worktree $1 carries the marker wt_pr_origin_mark writes.
+wt_pr_origin_marked() {  # $1 = worktree
+  wt_worktree_admin "$1" || return 1
+  [ -e "$WT_WORKTREE_ADMIN/$WT_PR_ORIGIN_FILENAME" ]
+}
+
+# True when the parent WorktreeCreate found (wt_parent_worktree) is, or may be, a pull request's. The
+# wide test wt_donor_is_pr applies — a detached or unreadable HEAD counts — since a wrong "no" hands
+# a stranger's commit the developer's own approval, and a wrong "yes" costs one more approval.
+wt_parent_is_pr() {  # $1 = main checkout
+  local merges
+  [ -n "$WT_PARENT_WORKTREE" ] || return 0
+  wt_worktree_admin "$WT_PARENT_WORKTREE" || return 0
+  merges=$(wt_git "$1" config --get-regexp '^branch\..*\.merge$' 2>/dev/null) || merges=''
+  wt_donor_is_pr "$WT_WORKTREE_ADMIN" "$WT_PARENT_WORKTREE" "$merges"
+}
+
+# Mark new worktree $1 as started from pull request worktree $2 at commit $3. Returns 1 when the
+# marker is not there afterwards: the caller must then not hand out a worktree on that commit.
+wt_pr_origin_mark() {  # $1 = new worktree, $2 = parent's name, $3 = commit
+  wt_worktree_admin "$1" && [ -d "$WT_WORKTREE_ADMIN" ] || return 1
+  printf '%s %s\n' "${3-}" "$(wt_visible "${2-}")" >"$WT_WORKTREE_ADMIN/$WT_PR_ORIGIN_FILENAME" 2>/dev/null \
+    || return 1
+  [ -f "$WT_WORKTREE_ADMIN/$WT_PR_ORIGIN_FILENAME" ]
+}
+
 # The profile is committed, so a branch that adds a dependency also updates it.
 # The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
 # a worktree gets bootstrapped from whatever main happens to have, while bootstrap reads its
@@ -205,7 +251,8 @@ wt_visible() {  # $1 = text
 
 # True when $1 is a pull-request worktree: named `pr-<digits>`, the kind `claude -w "#1234"` makes, or
 # on a branch whose upstream is a pull-request ref — what `gh pr checkout` records for a fork's PR, in
-# the shared git config no branch can write. For those, the approval is bound to the commit as well as
+# the shared git config no branch can write — or started from such a worktree (wt_pr_origin_marked).
+# For those, the approval is bound to the commit as well as
 # the content. An approved install runs
 # the branch's own manifests (package lifecycle scripts) and an approved `shell` evaluates its
 # toolchain files, so a stranger's PR that leaves the profile alone would otherwise inherit the
@@ -227,6 +274,7 @@ wt_is_pr_worktree() {  # $1 = run directory
       esac
       ;;
   esac
+  wt_pr_origin_marked "$1" && return 0
   branch=$(wt_git "$1" symbolic-ref -q --short HEAD 2>/dev/null) || return 1
   [ -n "$branch" ] || return 1
   merge=$(wt_git "$1" config --get "branch.$branch.merge" 2>/dev/null) || return 1
@@ -2096,7 +2144,8 @@ wt_admin_worktree() {  # $1 = admin dir, <common>/worktrees/<id>
 }
 
 # True when the worktree checked out at $2, registered at admin dir $1, is a pull request's
-# (ADR-020): named `pr-<digits>`, or on a branch whose upstream is a `refs/pull/*` ref. Any location,
+# (ADR-020): named `pr-<digits>`, marked as started from one (wt_pr_origin_mark), or on a branch whose
+# upstream is a `refs/pull/*` ref. Any location,
 # not only under the worktrees dir: this decides what may feed another worktree, so it errs wide —
 # a HEAD that is unreadable or not on a branch (detached, as `gh pr checkout --detach` leaves it)
 # cannot be told apart from a PR's, and counts as one.
@@ -2107,6 +2156,7 @@ wt_donor_is_pr() {  # $1 = admin dir, $2 = worktree, $3 = branch merge config
   case $name in
     pr-*) case ${name#pr-} in '' | *[!0-9]*) ;; *) return 0 ;; esac ;;
   esac
+  [ ! -e "$admin/$WT_PR_ORIGIN_FILENAME" ] || return 0
   { IFS= read -r head <"$admin/HEAD"; } 2>/dev/null || return 0
   case $head in
     'ref: refs/heads/'*) branch=${head#ref: refs/heads/} ;;
