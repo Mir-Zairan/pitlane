@@ -69,6 +69,40 @@ wt_name_from_path() {  # $1 = worktree path
   printf '%s' "$name"
 }
 
+# The linked worktree of the repository at $1 that directory $2 lies in, physical, and the commit it
+# has checked out, into WT_PARENT_WORKTREE and WT_PARENT_COMMIT; returns 1 for anything else.
+#
+# $2 is WorktreeCreate's `cwd` — the PARENT session's directory — and so payload text: it counts
+# only once git's own list registers its working tree as a linked worktree of $1, because a copied
+# worktree directory carries a working .git file and passes every other check. The main checkout,
+# git's first entry, never counts. The commit is a sha, not the parent's branch, so the new branch
+# is its own.
+WT_PARENT_WORKTREE='' WT_PARENT_COMMIT=''
+# shellcheck disable=SC2034  # both are read by bootstrap.sh's WorktreeCreate branch.
+wt_parent_worktree() {  # $1 = main checkout, $2 = the parent session's directory
+  local top listed line listed_wt n=0 found=0 commit
+  WT_PARENT_WORKTREE='' WT_PARENT_COMMIT=''
+  [ -n "${2-}" ] && [ -d "$2" ] || return 1
+  top=$(wt_repo_root "$2") || return 1
+  top=$(cd -P "$top" 2>/dev/null && pwd -P) || return 1
+  listed=$(wt_git "$1" worktree list --porcelain 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    case $line in 'worktree '*) ;; *) continue ;; esac
+    n=$((n + 1))
+    [ "$n" -gt 1 ] || continue
+    listed_wt=$(cd -P "${line#worktree }" 2>/dev/null && pwd -P) || continue
+    if [ "$listed_wt" = "$top" ]; then
+      found=1
+      break
+    fi
+  done <<<"$listed"
+  [ "$found" = 1 ] || return 1
+  commit=$(wt_git "$top" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) || return 1
+  [ -n "$commit" ] || return 1
+  WT_PARENT_WORKTREE=$top
+  WT_PARENT_COMMIT=$commit
+}
+
 # The profile is committed, so a branch that adds a dependency also updates it.
 # The worktree's own checked-out copy therefore wins over the main checkout's — otherwise
 # a worktree gets bootstrapped from whatever main happens to have, while bootstrap reads its

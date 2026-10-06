@@ -332,6 +332,75 @@ out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"cwd\":\"$R11\"}" "$R11
 eq 'a WorktreeCreate with no name at all prints no path' '' "$out"
 contains '...and says the name was missing' 'no name' "$(cat "$TMP/err")"
 
+# THE BASE OF A NEW BRANCH follows the parent session's linked worktree. origin/HEAD is the init
+# commit, the main checkout is one commit past it, and the parent worktree a different commit past
+# it — so each of the three possible bases is distinguishable from the other two.
+RB=$TMP/rb
+make_repo "$RB" ''
+git -C "$RB" update-ref refs/remotes/origin/main HEAD
+git -C "$RB" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+RB_ORIGIN=$(git -C "$RB" rev-parse HEAD)
+printf 'main\n' > "$RB/main-only.txt"
+git -C "$RB" add main-only.txt && git -C "$RB" commit -qm 'main only'
+RB_PARENT=$RB/.claude/worktrees/parent
+git -C "$RB" worktree add -q -b parent-work "$RB_PARENT" "$RB_ORIGIN" 2>/dev/null
+mkdir -p "$RB_PARENT/src/deep"
+printf 'committed\n' > "$RB_PARENT/src/parent.txt"
+git -C "$RB_PARENT" add src/parent.txt && git -C "$RB_PARENT" commit -qm 'parent work'
+RB_PARENT_HEAD=$(git -C "$RB_PARENT" rev-parse HEAD)
+printf 'uncommitted\n' > "$RB_PARENT/src/parent.txt"
+printf 'untracked\n' > "$RB_PARENT/src/scratch.txt"
+
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a1\",\"cwd\":\"$RB_PARENT\"}" "$RB")
+err=$(cat "$TMP/err")
+eq 'parent base: stdout is exactly the new worktree path' "$RB/.claude/worktrees/agent-a1" "$out"
+eq "...whose HEAD is the parent worktree's commit" "$RB_PARENT_HEAD" \
+  "$(git -C "$RB/.claude/worktrees/agent-a1" rev-parse HEAD 2>/dev/null)"
+eq '...so it has that commit'"'"'s file, as committed' 'committed' \
+  "$(cat "$RB/.claude/worktrees/agent-a1/src/parent.txt" 2>/dev/null)"
+eq '...and not the untracked file' absent \
+  "$([ -e "$RB/.claude/worktrees/agent-a1/src/scratch.txt" ] && echo present || echo absent)"
+eq "...on a branch of its own, not the parent's" worktree-agent-a1 \
+  "$(git -C "$RB/.claude/worktrees/agent-a1" symbolic-ref --short HEAD 2>/dev/null)"
+contains '...and the log names the parent, the commit and what is left behind' \
+  "basing worktree-agent-a1 on parent's current commit ($(git -C "$RB" rev-parse --short "$RB_PARENT_HEAD"))" "$err"
+contains '...including that uncommitted changes stay behind' 'uncommitted changes are not included' "$err"
+eq "the parent's own work is untouched" 'uncommitted' "$(cat "$RB_PARENT/src/parent.txt")"
+
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a2\",\"cwd\":\"$RB_PARENT/src/deep\"}" "$RB")
+eq 'parent base from a subdirectory: stdout is exactly the path' "$RB/.claude/worktrees/agent-a2" "$out"
+eq "...and still the parent worktree's commit" "$RB_PARENT_HEAD" \
+  "$(git -C "$RB/.claude/worktrees/agent-a2" rev-parse HEAD 2>/dev/null)"
+
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a3\",\"cwd\":\"$RB\"}" "$RB")
+eq 'from the main checkout: stdout is exactly the path' "$RB/.claude/worktrees/agent-a3" "$out"
+eq '...and the base is origin/HEAD, not the main checkout'"'"'s own HEAD' "$RB_ORIGIN" \
+  "$(git -C "$RB/.claude/worktrees/agent-a3" rev-parse HEAD 2>/dev/null)"
+lacks '...and no parent base is claimed' 'current commit' "$(cat "$TMP/err")"
+
+# A copy of the parent worktree, outside the repository: its .git file still works, but git does
+# not list it, so it is not trusted as a parent.
+cp -a "$RB_PARENT" "$TMP/rb-copied-parent"
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a4\",\"cwd\":\"$TMP/rb-copied-parent\"}" "$RB")
+eq 'from an unregistered copy of a worktree: stdout is exactly the path' "$RB/.claude/worktrees/agent-a4" "$out"
+eq '...and the base is origin/HEAD' "$RB_ORIGIN" \
+  "$(git -C "$RB/.claude/worktrees/agent-a4" rev-parse HEAD 2>/dev/null)"
+lacks '...and no parent base is claimed' 'current commit' "$(cat "$TMP/err")"
+
+# Another repository's worktree decides nothing about this one: the repository comes from `cwd`.
+RB2=$TMP/rb2
+make_repo "$RB2" ''
+git -C "$RB2" worktree add -q -b other-work "$RB2/.claude/worktrees/other" 2>/dev/null
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a5\",\"cwd\":\"$RB2/.claude/worktrees/other\"}" "$RB")
+eq "another repository's worktree: the new one is made in that repository" "$RB2/.claude/worktrees/agent-a5" "$out"
+eq '...and nothing is registered in this one' 0 \
+  "$(git -C "$RB" worktree list --porcelain | grep -c 'agent-a5')"
+
+mkdir -p "$TMP/not-a-repo"
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"agent-a6\",\"cwd\":\"$TMP/not-a-repo\"}" "$RB")
+eq 'a cwd outside any repository prints no path' '' "$out"
+eq '...and registers nothing' 0 "$(git -C "$RB" worktree list --porcelain | grep -c 'agent-a6')"
+
 # ---------------------------------------------------------------------------
 # Concurrency: two worktrees bootstrapping at once from cold
 # ---------------------------------------------------------------------------

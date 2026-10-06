@@ -514,8 +514,18 @@ case $event in
       # So: match the default. What is NOT matched is a user who has configured
       # `worktree.baseRef: head`; reading their settings is out of this hook's scope and the gap
       # is acknowledged rather than guessed at.
+      #
+      # EXCEPT WHEN THE PARENT SESSION WORKS IN A LINKED WORKTREE. `cwd` is that session's directory
+      # (measured), and a subagent it starts almost always assists with its work — a worktree cut
+      # from the default branch silently lacks it, a pull request under review most of all. So the
+      # new branch starts from the commit that worktree has checked out; its uncommitted changes
+      # cannot come along, and the log says so.
       base=refs/remotes/origin/HEAD
-      if ! wt_git "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
+      if wt_parent_worktree "$root" "$payload_cwd"; then
+        base=$WT_PARENT_COMMIT
+        base_short=$(wt_git "$root" rev-parse --short "$base" 2>/dev/null) || base_short=$base
+        wt_log "basing $branch on $(wt_name_from_path "$WT_PARENT_WORKTREE")'s current commit ($base_short) — the session that started it works there; uncommitted changes are not included"
+      elif ! wt_git "$root" rev-parse --verify --quiet "$base" >/dev/null 2>&1; then
         base=HEAD
         wt_log "no origin/HEAD in this repository — basing $branch on local HEAD"
       fi
