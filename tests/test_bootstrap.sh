@@ -2007,6 +2007,15 @@ ne 'approval: editing one note line changes the fingerprint' "$FPN" "$FPN2"
 eq '...so the edited note is held again' no "$(approval_of "$AN")"
 contains '...and the old fingerprint does not approve it' 'is not the current fingerprint' "$(gated_cli "$AN" --approve "$FPN")"
 
+# A profile that runs a command AND carries a note is held once, and the one message names both.
+ANC=$TMP/anc
+make_repo "$ANC" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"true"}' '' \
+  '"agentNote": ["Run make test, not the root test script."],'
+eq 'approval: a profile with commands and an agent note is held until approved' no "$(approval_of "$ANC")"
+errANC=$(cat "$TMP/err")
+contains '...and stderr says its commands will not run' 'not approved in this form — none of them will run' "$errANC"
+contains '...and that its agent note will not be shown' 'and its agent note will not be shown' "$errANC"
+
 # Approving from the main checkout covers a worktree carrying the same content.
 MC=$TMP/mc
 make_repo "$MC" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'

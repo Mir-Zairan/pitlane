@@ -1803,7 +1803,47 @@ JSON
   vw '{"schemaVersion":1,"agentNote":['"$lines"']}'
   eq 'validate: 40 lines are allowed' '' "$(vv)"
   vw '{"schemaVersion":1,"agentNote":['"$lines"',"one more"]}'
-  eq 'validate: 41 lines are refused' 'agentNote: has 41 lines, more than the 40 allowed' "$(vv)"
+  eq 'validate: 41 lines are refused' 'agentNote: has more than the 40 lines allowed' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":5}'
+  eq 'validate: an agentNote that is a number is refused' 'agentNote: must be an array of strings' "$(vv)"
+  # null is no note, as it is for copy and the other optional arrays: both render it as nothing.
+  vw '{"schemaVersion":1,"agentNote":null}'
+  eq 'validate: an agentNote of null is no note' '' "$(vv)"
+  # The note is validated at session start, before approval, so its cost must not grow with what a
+  # branch puts in it. Both bounds are timed: the byte cap (50000 one-character lines, 200 KB) and,
+  # under the cap, the line count (40000 empty lines, 120 KB).
+  huge=$(printf '"a",%.0s' $(seq 50000))
+  vw '{"schemaVersion":1,"agentNote":['"${huge%,}"']}'
+  t0=${EPOCHREALTIME/./}
+  out=$(vv)
+  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  eq 'validate: an agentNote of 200 KB is refused by its size' \
+    'agentNote: is too long — more than 40 lines of 400 characters can hold' "$out"
+  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  huge=$(printf '"",%.0s' $(seq 40000))
+  vw '{"schemaVersion":1,"agentNote":['"${huge%,}"']}'
+  t0=${EPOCHREALTIME/./}
+  out=$(vv)
+  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  eq 'validate: 40000 empty lines under the byte cap are refused by their count' \
+    'agentNote: has more than the 40 lines allowed' "$out"
+  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  # And one line of 190 KB, under the cap, which cutting the literals out one quote at a time took
+  # 37s over.
+  huge=$(printf 'a%.0s' $(seq 190000))
+  vw '{"schemaVersion":1,"agentNote":["'"$huge"'"]}'
+  t0=${EPOCHREALTIME/./}
+  out=$(vv)
+  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  eq 'validate: one line of 190 KB is refused by its length' 'agentNote[0]: is longer than 400 characters' "$out"
+  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  # The cap refuses nothing the bounds allow: 40 lines of 400 four-byte characters are within them.
+  long4=$(printf '\360\237\230\200%.0s' $(seq 400))
+  lines=''
+  n=0
+  while [ "$n" -lt 40 ]; do lines="$lines${lines:+,}\"$long4\""; n=$((n + 1)); done
+  vw '{"schemaVersion":1,"agentNote":['"$lines"']}'
+  eq 'validate: 40 lines of 400 four-byte characters are allowed' '' "$(vv)"
   # Characters, not bytes: 400 two-byte characters are 800 bytes and still allowed.
   long=$(printf 'é%.0s' $(seq 400))
   vw '{"schemaVersion":1,"agentNote":["short","'"$long"'"]}'
@@ -1813,13 +1853,70 @@ JSON
   for ctl in '\n' '\r' '\t' '\u001b' '\u0000' '\u007f' '\u0085'; do
     vw '{"schemaVersion":1,"agentNote":["fine","a'"$ctl"'b"]}'
     eq "validate: an agentNote line holding $ctl is refused" \
-      'agentNote[1]: contains a control character (a newline, a tab, an escape) — each line must be plain text' "$(vv)"
+      'agentNote[1]: contains a character that does not print as itself (a newline, a tab, an escape, a bidirectional or zero-width mark) — each line must be plain text' "$(vv)"
   done
   # Raw DEL and C1 are legal unescaped in a JSON string; python3 passes them through as they are.
   vw '{"schemaVersion":1,"agentNote":["a'$'\x7f''b"]}'
-  contains 'validate: a raw DEL is refused' 'agentNote[0]: contains a control character' "$(vv)"
+  contains 'validate: a raw DEL is refused' 'agentNote[0]: contains a character that does not print' "$(vv)"
   vw '{"schemaVersion":1,"agentNote":["a'$'\xc2\x9b''b"]}'
-  contains 'validate: a raw C1 control is refused' 'agentNote[0]: contains a control character' "$(vv)"
+  contains 'validate: a raw C1 control is refused' 'agentNote[0]: contains a character that does not print' "$(vv)"
+  # Characters that make a line look other than it is: line separators, bidirectional controls,
+  # zero-width and tag characters. Written escaped and raw in the file; both backends render them
+  # raw, and the escaped forms a backend could render instead are asserted on the predicate below.
+  # The first and last of every refused range, so a range cut short or run long fails.
+  invisible='\u061c \u200b \u200d \u200e \u200f \u2028 \u2029 \u202a \u202e \u2060 \u2064 \u2066 \u2069 \u206f \ufeff \udb40\udc00 \udb40\udc01 \udb40\udc7f'
+  for cp in $invisible; do
+    vw '{"schemaVersion":1,"agentNote":["fine","a'"$cp"'b"]}'
+    contains "validate: an agentNote line holding $cp (escaped in the file) is refused" \
+      'agentNote[1]: contains a character that does not print' "$(vv)"
+    vw '{"schemaVersion":1,"agentNote":["fine","a'"$(printf '"%s"' "$cp" | python3 -c 'import json,sys;sys.stdout.write(json.loads(sys.stdin.read()))')"'b"]}'
+    contains "validate: an agentNote line holding $cp (raw in the file) is refused" \
+      'agentNote[1]: contains a character that does not print' "$(vv)"
+  done
+  # Their neighbours print, and stay allowed: U+2010 hyphen, U+2027, U+202F, U+205F, U+2070, U+FEFE
+  # and a tag-adjacent U+E0080.
+  for cp in '\u2010' '\u2027' '\u202f' '\u205f' '\u2070' '\ufefe' '\udb40\udc80' '\u061b'; do
+    vw '{"schemaVersion":1,"agentNote":["a'"$cp"'b"]}'
+    eq "validate: an agentNote line holding $cp is allowed" '' "$(vv)"
+  done
+  for cp in 'u061C' 'u200B' 'u200b' 'u2028' 'u202E' 'u2066' 'u206F' 'uFEFF' 'ufeff' 'uDB40\uDC01' 'udb40\udc7f'; do
+    wt_json_has_nonprinting "a\\${cp}b"
+    rc_is "has_nonprinting: the escaped form \\$cp is refused" 0 $?
+  done
+  for cp in 'u2010' 'u202F' 'u2070' 'uDB40\uDC80' 'u00e9'; do
+    wt_json_has_nonprinting "a\\${cp}b"
+    rc_is "has_nonprinting: the escaped form \\$cp prints" 1 $?
+  done
+  wt_json_has_nonprinting 'a\\u202eb'
+  rc_is 'has_nonprinting: an escaped backslash before u202e is text' 1 $?
+  # The byte-level checks under a UTF-8 locale, where `${#s}` counts characters and a byte range in
+  # a pattern collates characters instead: each helper's own LC_ALL=C must make the locale not matter.
+  utf8_locale=$(locale -a 2>/dev/null | grep -i -x -m1 -e 'en_US.UTF-8' -e 'en_US.utf8' -e 'C.UTF-8' -e 'C.utf8')
+  if [ -n "$utf8_locale" ]; then
+    vw '{"schemaVersion":1,"agentNote":["a'$'\x7f''b"]}'
+    contains "validate: a raw DEL is refused under $utf8_locale" 'agentNote[0]: contains a character that does not print' \
+      "$(LC_ALL=$utf8_locale vv)"
+    vw '{"schemaVersion":1,"agentNote":["a'$'\xc2\x9b''b"]}'
+    contains "validate: a raw C1 control is refused under $utf8_locale" 'agentNote[0]: contains a character that does not print' \
+      "$(LC_ALL=$utf8_locale vv)"
+    for cp in $invisible; do
+      vw '{"schemaVersion":1,"agentNote":["a'"$cp"'b"]}'
+      contains "validate: an agentNote line holding $cp is refused under $utf8_locale" \
+        'agentNote[0]: contains a character that does not print' "$(LC_ALL=$utf8_locale vv)"
+    done
+    vw '{"schemaVersion":1,"agentNote":["short","'"$long"'"]}'
+    eq "validate: a line of 400 two-byte characters is allowed under $utf8_locale" '' "$(LC_ALL=$utf8_locale vv)"
+    vw '{"schemaVersion":1,"agentNote":["short","'"${long}x"'"]}'
+    eq "validate: a line of 401 characters is refused under $utf8_locale" \
+      'agentNote[1]: is longer than 400 characters' "$(LC_ALL=$utf8_locale vv)"
+    # 200 three-byte characters are 600 bytes but 200 characters: a byte count would refuse them.
+    vw '{"schemaVersion":1,"agentNote":["'"$(printf '\342\234\223%.0s' $(seq 200))"'"]}'
+    eq "validate: 200 three-byte characters are allowed under $utf8_locale" '' "$(LC_ALL=$utf8_locale vv)"
+    eq "is_longer_in_bytes_than: counts bytes under $utf8_locale" 0 \
+      "$(LC_ALL=$utf8_locale wt_is_longer_in_bytes_than 3 'éé'; echo $?)"
+  else
+    printf 'SKIP: no UTF-8 locale; the agentNote locale cases did not run\n' >&2
+  fi
   # An escaped backslash followed by n is text, not a newline.
   vw '{"schemaVersion":1,"agentNote":["C:\\new"]}'
   eq 'validate: an escaped backslash before n is not a control character' '' "$(vv)"

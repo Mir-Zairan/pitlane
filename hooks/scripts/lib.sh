@@ -1074,7 +1074,9 @@ wt_profile_scan() {  # $1 = profile path
 # shellcheck disable=SC2034
 wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   local raw=${1-} rec body
-  rec=${raw%%"$WT_RS"*}
+  # The first record is read, not cut with ${raw%%"$WT_RS"*}: bash tries that pattern at every
+  # offset, which is quadratic in a stream whose length the branch decides (5s for a 200 KB note).
+  IFS= read -r -d "$WT_RS" rec <<<"$raw" || true
   body=${rec#*"$WT_US"}
   IFS=$WT_US read -r \
     WT_PS_VERSION WT_PS_SHELL WT_PS_SHELLARGS WT_PS_DEPS WT_PS_RUNTIME \
@@ -1199,21 +1201,48 @@ WT_HOOK_TIMEOUT=600
 # real guidance and no more.
 WT_AGENT_NOTE_MAX_LINES=40
 WT_AGENT_NOTE_MAX_CHARS=400
+# The most bytes a note within both bounds can take as compact JSON, so the validator can refuse a
+# bigger one before reading it literal by literal. Counted at the worst escaping a character can get:
+# one outside the BMP written as a surrogate pair, `\uXXXX\uXXXX`, is 12 bytes; each line adds its two
+# quotes and a comma, the array its brackets. Neither backend escapes that much today, so the cap
+# only ever refuses a note the bounds refuse anyway.
+WT_AGENT_NOTE_MAX_BYTES=$((WT_AGENT_NOTE_MAX_LINES * (WT_AGENT_NOTE_MAX_CHARS * 12 + 3) + 2))
 
-# True when $1, JSON text as either backend renders it (wt_json_backend), holds a control character.
-# C0 must be escaped inside a JSON string, so it arrives as `\n`, `\t`, `\u001b` and so on; DEL is
-# escaped by jq and raw from python3; C1 is raw from both, as UTF-8. The rendered JSON is the only
-# place to look: the record readers fold CR and LF into a space and strip US and RS, so a record
-# cannot show them. `\\` pairs are dropped first so an escaped backslash before an `n` is not one —
-# the same order wt_resolve_removal_target uses. LC_ALL=C so the byte ranges below are bytes.
-wt_json_has_control() {  # $1 = rendered JSON
+# True when $1, JSON text as either backend renders it (wt_json_backend), holds a character that
+# does not print as itself, so a line holding it can look like other text than it is — to the human
+# approving it in --review and to the model it is then shown to:
+#   - C0, DEL and C1 controls. C0 must be escaped inside a JSON string, so it arrives as `\n`, `\t`,
+#     `\u001b` and so on; DEL is escaped by jq and raw from python3; C1 is raw from both, as UTF-8.
+#   - U+2028/U+2029, which some readers break a line at.
+#   - The bidirectional marks, embeddings, overrides and isolates (U+061C, U+200E-200F,
+#     U+202A-202E, U+2066-2069), which reorder the text shown around them.
+#   - The zero-width and invisible characters (U+200B-200D, U+2060-206F, U+FEFF), and the tag
+#     characters (U+E0000-E007F), which show nothing and can carry a hidden message.
+# Both backends render all but the C0 controls and DEL as raw UTF-8 today; the escaped forms are
+# matched too, in either case of hex, so a backend that escapes them does not let them through.
+# The rendered JSON is the only place to look: the record readers fold CR and LF into a space and
+# strip US and RS, so a record cannot show them. `\\` pairs are dropped first so an escaped
+# backslash before an `n` is not one — the same order wt_resolve_removal_target uses. LC_ALL=C so
+# the byte ranges below are bytes.
+wt_json_has_nonprinting() {  # $1 = rendered JSON
   local LC_ALL=C escaped_backslash="\\\\" s=${1-}
   s=${s//"$escaped_backslash"/}
   case $s in
     *'\n'* | *'\r'* | *'\t'* | *'\b'* | *'\f'* | *'\u00'[01]* | *'\u007'[fF]* | *'\u00'[89]*) return 0 ;;
     *$'\x7f'* | *$'\xc2'[$'\x80'-$'\x9f']*) return 0 ;;
+    *'\u061'[cC]* | *'\u200'[bBcCdDeEfF]* | *'\u202'[89aAbBcCdDeE]* | *'\u206'[0-9a-fA-F]*) return 0 ;;
+    *'\u'[fF][eE][fF][fF]*) return 0 ;;
+    *'\u'[dD][bB]'40\u'[dD][cC][0-7]*) return 0 ;;
+    *$'\xe2\x80'[$'\x8b'-$'\x8f']* | *$'\xe2\x80'[$'\xa8'-$'\xae']* | *$'\xe2\x81'[$'\xa0'-$'\xaf']*) return 0 ;;
+    *$'\xd8\x9c'* | *$'\xef\xbb\xbf'* | *$'\xf3\xa0'[$'\x80'$'\x81']*) return 0 ;;
   esac
   return 1
+}
+
+# True when $2 is longer than $1 bytes, whatever the locale: ${#s} counts characters in a UTF-8 one.
+wt_is_longer_in_bytes_than() {  # $1 = limit, $2 = text
+  local LC_ALL=C
+  [ "${#2}" -gt "$1" ]
 }
 
 # True when $2 is longer than $1 characters, counted as UTF-8 whatever the locale: every byte that is
@@ -1307,8 +1336,8 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local ef efrest efseen efrebuilt efn
   local serve stopcmd urltpl urlwhy
   local artifacts adir ainputs abuild averify alink nart=0 depdirs=' ' artdirs=' '
-  local agentnote rest shape want lit nlit nline=0 escaped_backslash="\\\\"
-  local -a lits=()
+  local agentnote rest shape want lit nlit nline=0 toomany escaped_backslash="\\\\"
+  local -a lits=() pieces=()
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1605,51 +1634,65 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   # --- agentNote[] ----------------------------------------------------------
   # Lines of guidance for the model working in a worktree, which is text from anyone's branch put in
   # front of a model — so it is held to plain, bounded lines. A newline would let one entry pose as
-  # several, and an escape sequence can make a terminal show other text than the line holds. No
-  # message below repeats the value: it may be 16000 characters, or carry the very bytes refused.
-  # The types, the count and the control characters are read from the rendered JSON (wt_profile_scan
-  # says why the records cannot answer); the length from the records, which are the lines unescaped.
+  # several, and an escape sequence or a bidirectional or invisible mark can make a line show other
+  # text than it holds. No message below repeats the value: it may be 16000 characters, or carry the
+  # very bytes refused. `null` is no note, as it is for copy and the other optional arrays. The
+  # types, the count and the characters are read from the rendered JSON (wt_profile_scan says why
+  # the records cannot answer); the length from the records, which are the lines unescaped.
   if [ -n "$agentnote" ]; then
     case $agentnote in
       '['*']') ;;
       *) printf 'agentNote: must be an array of strings\n'; bad=1; agentnote='' ;;
     esac
   fi
+  # Refused by its size before anything reads it literal by literal: this runs at session start,
+  # before the profile is approved, on whatever the branch holds.
+  if [ -n "$agentnote" ] && wt_is_longer_in_bytes_than "$WT_AGENT_NOTE_MAX_BYTES" "$agentnote"; then
+    printf 'agentNote: is too long — more than %d lines of %d characters can hold\n' \
+      "$WT_AGENT_NOTE_MAX_LINES" "$WT_AGENT_NOTE_MAX_CHARS"
+    bad=1
+    agentnote=''
+  fi
   if [ -n "$agentnote" ] && [ "$agentnote" != '[]' ]; then
     # Take every string literal out and keep what is between them. Only an array of strings leaves
     # `[` and `]` with a comma between each pair; a number, an object or a nested array leaves more.
     # Neither backend puts a space in compact JSON, and with `\\` and `\"` gone first, every
-    # remaining quote opens or closes a literal.
+    # remaining quote opens or closes a literal, so splitting at the quotes leaves the literals at the
+    # odd places. Split by `read`, which is linear: cutting at each quote with ${rest%%'"'*} is
+    # quadratic in bash, and took 37s on one line of 190 KB. The loop stops at the first literal past
+    # the line limit rather than collecting thousands of short ones.
     rest=${agentnote//"$escaped_backslash"/}
     rest=${rest//\\\"/}
-    shape=''
-    while :; do
-      case $rest in
-        *'"'*'"'*) ;;
-        *) break ;;
-      esac
-      shape+=${rest%%'"'*}
-      rest=${rest#*'"'}
-      lits+=("${rest%%'"'*}")
-      rest=${rest#*'"'}
+    IFS='"' read -r -a pieces <<<"$rest" || true
+    shape=${pieces[0]-}
+    toomany=0
+    n=1
+    while [ "$n" -lt "${#pieces[@]}" ]; do
+      if [ "${#lits[@]}" -eq "$WT_AGENT_NOTE_MAX_LINES" ]; then
+        toomany=1
+        break
+      fi
+      lits+=("${pieces[n]}")
+      shape+=${pieces[n + 1]-}
+      n=$((n + 2))
     done
-    shape+=$rest
     nlit=${#lits[@]}
     want='['
     n=1
     while [ "$n" -lt "$nlit" ]; do want+=','; n=$((n + 1)); done
     want+=']'
-    if [ "$nlit" -eq 0 ] || [ "$shape" != "$want" ]; then
-      printf 'agentNote: every element must be a string\n'
+    # Past the limit, the count is all that is known: the rest was never read.
+    if [ "$toomany" = 1 ]; then
+      printf 'agentNote: has more than the %d lines allowed\n' "$WT_AGENT_NOTE_MAX_LINES"
       bad=1
-    elif [ "$nlit" -gt "$WT_AGENT_NOTE_MAX_LINES" ]; then
-      printf 'agentNote: has %d lines, more than the %d allowed\n' "$nlit" "$WT_AGENT_NOTE_MAX_LINES"
+    elif [ "$nlit" -eq 0 ] || [ "$shape" != "$want" ]; then
+      printf 'agentNote: every element must be a string\n'
       bad=1
     else
       n=0
       for lit in "${lits[@]}"; do
-        if wt_json_has_control "$lit"; then
-          printf 'agentNote[%d]: contains a control character (a newline, a tab, an escape) — each line must be plain text\n' "$n"
+        if wt_json_has_nonprinting "$lit"; then
+          printf 'agentNote[%d]: contains a character that does not print as itself (a newline, a tab, an escape, a bidirectional or zero-width mark) — each line must be plain text\n' "$n"
           bad=1
         fi
         n=$((n + 1))

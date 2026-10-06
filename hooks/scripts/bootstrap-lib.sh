@@ -365,7 +365,11 @@ wt_profile_runs_commands() {
 # profile holding only a note and have it read in the reviewer's session unapproved. Editing the note
 # edits the profile, so the fingerprint, which hashes the whole file, asks again.
 wt_profile_needs_approval() {
-  wt_profile_runs_commands && return 0
+  wt_profile_runs_commands || wt_profile_has_agent_note
+}
+
+# True when the loaded profile carries a non-empty agentNote.
+wt_profile_has_agent_note() {
   [ "${PROFILE_PRESENT:-0}" = 1 ] && [ -n "${PROFILE_AGENT_NOTE:-}" ]
 }
 
@@ -388,10 +392,15 @@ wt_approval_known() {  # $1 = fingerprint, $2 = record file
 # after the config copy, which is what brings a personal profile's scripts into a worktree. Says why
 # on stderr when the answer is no; never fails.
 wt_approval_check() {  # $1 = directory the profile's commands run in
-  local dir=${1%/} store
+  local dir=${1%/} store runs_commands=no
   WT_APPROVAL=yes
   WT_APPROVAL_FP=''
-  wt_profile_needs_approval || return 0
+  # wt_profile_needs_approval, unrolled: whether it runs commands also chooses the message below.
+  if wt_profile_runs_commands; then
+    runs_commands=yes
+  elif ! wt_profile_has_agent_note; then
+    return 0
+  fi
   case ${PITLANE_TRUST_PROFILES:-} in
     1 | yes | on | true) return 0 ;;
   esac
@@ -405,7 +414,7 @@ wt_approval_check() {  # $1 = directory the profile's commands run in
     return 0
   fi
   WT_APPROVAL=no
-  if wt_profile_runs_commands; then
+  if [ "$runs_commands" = yes ]; then
     wt_log "approval: the commands in $PROFILE_PATH (and the seed and teardown scripts it names) are not approved in this form — none of them will run${PROFILE_AGENT_NOTE:+, and its agent note will not be shown}. To see what they are, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
   else
     wt_log "approval: the agent note in $PROFILE_PATH is not approved in this form — it will not be shown. To see it, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
