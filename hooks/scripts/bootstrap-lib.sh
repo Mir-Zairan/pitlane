@@ -3198,8 +3198,11 @@ wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cks
     wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy || return 1
   fi
   wt_dep_has_content "${1%/}/$2" && return 0
-  # Only an empty dir pays the second read.
-  wt_state_dep_read "$1" "$2" || return 0
+  # Only an empty dir pays the second read. Another session may have rewritten the record between the
+  # two reads (to doing while it sets the dir up again), so this one's status is checked too, and a
+  # record gone since is not done.
+  wt_state_dep_read "$1" "$2" || return 1
+  case $WT_DEP_STATUS in done | warn) ;; *) return 1 ;; esac
   [ "$WT_DEP_CONTENT" = 1 ] || return 0
   WT_DEP_GONE=1
   return 1
