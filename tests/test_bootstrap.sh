@@ -45,6 +45,10 @@ export HOME
 
 pass=0 fail=0
 
+# What SessionStart prints for a worktree complete and clean whose profile installs vendor/ and has no
+# runtime: the one line saying it is set up, so the session does not redo it.
+READY_VENDOR='Pitlane: this worktree is fully set up — vendor is in place; do not reinstall dependencies.'
+
 eq() {  # $1 = label, $2 = expected, $3 = actual
   if [ "$2" = "$3" ]; then
     pass=$((pass + 1))
@@ -127,8 +131,9 @@ out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"c
 err=$(cat "$TMP/err")
 
 # THE PROTOCOL. On SessionStart stdout is injected into the model's context, so a single stray
-# byte there is a bug — including anything an install command prints.
-eq 'SessionStart writes NOTHING to stdout' '' "$out"
+# byte there is a bug — including anything an install command prints. A complete worktree gets the
+# one line saying so, and nothing else.
+eq 'SessionStart writes ONLY the ready line to stdout' "$READY_VENDOR" "$out"
 eq 'the dependency was installed' 'ok' "$(cat "$W1/vendor/marker" 2>/dev/null)"
 contains 'and progress went to stderr' 'installing' "$err"
 contains 'with a total time at the end' 'bootstrap finished in' "$err"
@@ -150,7 +155,7 @@ start=$(date +%s)
 out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$W1\"}" "$W1")
 took=$(( $(date +%s) - start ))
 err=$(cat "$TMP/err")
-eq 're-entry still writes nothing to stdout' '' "$out"
+eq 're-entry writes the same ready line, and nothing else' "$READY_VENDOR" "$out"
 eq 're-entry does not redo the install' 'TOUCHED' "$(cat "$W1/vendor/marker")"
 contains 're-entry says it is already up to date' 'already up to date' "$err"
 # Second-resolution timing straddles boundaries, so this is a generous ceiling: it exists to
@@ -177,10 +182,11 @@ inject() {  # $1 = label, $2 = repo, $3 = worktree
   out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$3\"}" "$3")
   rc=$?
   eq "$1: the hook still exits 0" 0 "$rc"
-  # stdout is model context: nothing, or the one-line "not fully set up" notice — never a stray byte.
+  # stdout is model context: nothing, the one-line "not fully set up" notice, or the one line saying
+  # it is set up (a fallback that worked) — never a stray byte.
   case $out in
-    '' | 'Pitlane: this worktree is not fully set up'*) pass=$((pass + 1)) ;;
-    *) fail=$((fail + 1)); printf 'FAIL %s: stdout is neither empty nor the notice\n      actual: %q\n' "$1" "$out" >&2 ;;
+    '' | 'Pitlane: this worktree is not fully set up'* | 'Pitlane: this worktree is fully set up — '*) pass=$((pass + 1)) ;;
+    *) fail=$((fail + 1)); printf 'FAIL %s: stdout is neither empty nor a status line\n      actual: %q\n' "$1" "$out" >&2 ;;
   esac
   eq "$1: and stdout is at most one line" 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
   INJECT_OUT=$out
@@ -481,7 +487,8 @@ JSON
 
     out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WP\"}" "$WP")
     err=$(cat "$TMP/err")
-    eq 'pnpm: the session start writes nothing to stdout' '' "$out"
+    eq 'pnpm: the session start writes only the ready line to stdout' \
+      'Pitlane: this worktree is fully set up — node_modules is in place; do not reinstall dependencies.' "$out"
     eq 'pnpm: node_modules really is installed by a real pnpm' yes \
       "$([ -d "$WP/node_modules" ] && echo yes)"
     # pnpm has its own content-addressable store, so it must be installed, never shared.
@@ -540,7 +547,7 @@ err=$(cat "$TMP/err")
 eq 'composer-shaped: vendor/ is present in the worktree' 'REALBYTES' \
   "$(cat "$WC/vendor/autoload.php" 2>/dev/null)"
 contains 'composer-shaped: and it was hardlinked rather than installed' 'hardlinked' "$err"
-eq 'composer-shaped: the session start writes nothing to stdout' '' "$out"
+eq 'composer-shaped: the session start writes only the ready line to stdout' "$READY_VENDOR" "$out"
 src_ino=$(stat -c '%i' "$RC/vendor/pkg/big.php" 2>/dev/null || stat -f '%i' "$RC/vendor/pkg/big.php" 2>/dev/null)
 # Guard against the comparison passing because BOTH sides are empty on a host with neither stat.
 eq 'composer-shaped: the source inode is readable, so the next assertion means something' yes \
@@ -567,7 +574,7 @@ contains 'donor: the first worktree installs, its lockfile differing from main' 
 mkdir -p "$WD1/vendor/composer"; printf 'FIRST\n' > "$WD1/vendor/composer/installed.php"
 out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WD2\"}" "$WD2")
 contains 'donor: the second links from the first' 'vendor: hardlinked from worktree first (composer.lock differs from the main checkout)' "$(cat "$TMP/err")"
-eq '...printing nothing to stdout' '' "$out"
+eq '...printing only the ready line to stdout' "$READY_VENDOR" "$out"
 eq '...sharing its inodes' yes "$([ "$WD2/vendor/pkg/big.php" -ef "$WD1/vendor/pkg/big.php" ] && echo yes)"
 eq "...not the main checkout's" MAIN "$(cat "$RD2/vendor/pkg/big.php")"
 eq '...its copy paths its own' no "$([ "$WD2/vendor/composer/installed.php" -ef "$WD1/vendor/composer/installed.php" ] && echo yes || echo no)"
@@ -606,7 +613,7 @@ chmod +x "$TMP/stub/cp"
 out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WX\"}" \
        | PATH="$TMP/stub:$PATH" bash "$HOOK" 2>"$TMP/err" )
 err=$(cat "$TMP/err")
-eq 'a hardlink that cannot be made does not fail the session' '' "$out"
+eq 'a hardlink that cannot be made does not fail the session' "$READY_VENDOR" "$out"
 contains '...it says the link was not possible' 'could not hardlink' "$err"
 eq '...and installs instead, so the worktree still works' 'fellback' "$(cat "$WX/vendor/m" 2>/dev/null)"
 eq '...having first cleared the debris the failed copy left' '' \
@@ -783,7 +790,10 @@ git -C "$RT" worktree add -q "$WB" -b worktree-bob 2>/dev/null
 outA=$(start_hook "$WA"); errA=$(cat "$TMP/err")
 outB=$(start_hook "$WB"); errB=$(cat "$TMP/err")
 
-eq 'runtime work still writes NOTHING to stdout on SessionStart' '' "$outA$outB"
+# Each its own port, named as such, and nothing else on stdout.
+eq 'runtime work writes only the ready line on SessionStart, naming its own port' \
+  'Pitlane: this worktree is fully set up — vendor is in place and it has its own port; do not reinstall dependencies.' "$outA"
+eq '...in the other worktree too' "$outA" "$outB"
 eq 'both worktrees still get their dependencies' 'okok' \
   "$(cat "$WA/vendor/marker" 2>/dev/null)$(cat "$WB/vendor/marker" 2>/dev/null)"
 
@@ -1259,10 +1269,11 @@ PYJ
   eq '--finish ran the install the hook had to skip' ok "$(cat "$WF/node_modules/m" 2>/dev/null)"
   contains '--finish warmed the toolchain first' 'toolchain: ready' "$errF"
 
-  # A complete worktree: silent, and the toolchain is not even started.
+  # A complete worktree: the ready line, and the toolchain is not even started.
   : > "$TMP/shell.log"
   outF=$(start_hook "$WF")
-  eq 'a complete worktree gets no notice on stdout' '' "$outF"
+  eq 'a complete worktree gets the ready line on stdout' \
+    'Pitlane: this worktree is fully set up — node_modules and vendor are in place; do not reinstall dependencies.' "$outF"
   eq 'and a complete re-entry never starts the toolchain' '' "$(cat "$TMP/shell.log")"
 
   outF=$( (cd "$FT" && bash "$HOOK" --finish </dev/null 2>/dev/null) )
@@ -1328,7 +1339,8 @@ contains 'low memory: the session is told what is missing' '— node_modules mis
 
 outL=$(WT_MEMINFO=$TMP/meminfo.ok start_hook "$WLM")
 eq 'with memory back, the next session completes it' ok "$(cat "$WLM/node_modules/m" 2>/dev/null)"
-eq '...and is silent again' '' "$outL"
+eq '...and says it is set up again' \
+  'Pitlane: this worktree is fully set up — node_modules and vendor are in place; do not reinstall dependencies.' "$outL"
 
 # ---------------------------------------------------------------------------
 # The background hand-off: the session starts after the cheap steps, the rest finishes behind it
@@ -1399,7 +1411,8 @@ contains 'background: its log has the progress' 'node_modules: installed' "$(cat
 lacks 'background: nothing lands in the checkout' 'worktree-bootstrap' "$(git -C "$WBG" status --porcelain)"
 
 outB=$(PITLANE_BACKGROUND=on start_hook "$WBG")
-eq 'background: a complete worktree starts silent' '' "$outB"
+READY_BG='Pitlane: this worktree is fully set up — vendor and node_modules are in place and it has its own databases and port; do not reinstall dependencies or re-create its databases.'
+eq 'background: a complete worktree starts with the ready line, naming its databases and port' "$READY_BG" "$outB"
 eq '...and starts no run' no "$([ -e "$GDBG/worktree-bootstrap.pid" ] && echo yes || echo no)"
 
 # A session starting mid-run asks the running one to go round again: it may need work the run has
@@ -1453,7 +1466,7 @@ contains '...and the log says what the copy cost' 'vendor: copied from the main 
 printf 'PR\n' >> "$WPR/vendor/autoload.php"
 eq "...a write in it leaves main's file alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
 outB=$(PITLANE_BACKGROUND=on start_hook "$WPR")
-eq '...and the next session finds it set up' '' "$outB"
+eq '...and the next session finds it set up' "$READY_BG" "$outB"
 git -C "$BG" worktree remove --force "$WPR"
 
 # ---------------------------------------------------------------------------
@@ -1558,7 +1571,7 @@ eq 'changed, complete: --finish does not call it fully set up' \
 git -C "$WTC" checkout -q -- .gitignore
 contains '...and counts only what is still changed' 'an install changed 1 tracked file (' "$(start_hook "$WTC")"
 git -C "$WTC" checkout -q -- .worktreeinclude
-eq '...and once restored, a clean complete worktree starts silent' '' "$(start_hook "$WTC")"
+eq '...and once restored, a clean complete worktree starts with the ready line' "$READY_VENDOR" "$(start_hook "$WTC")"
 eq '...and its changed record is gone, so the next start asks git nothing' 0 \
   "$(tr '\036' '\n' <"$(git -C "$WTC" rev-parse --absolute-git-dir)/worktree-bootstrap-state" | grep -c '^changed' || true)"
 eq '...and --finish says fully set up' 'Pitlane: this worktree is fully set up.' \
@@ -1701,7 +1714,8 @@ eq '...and the seed' own "$(cat "$WAP/seeded.txt" 2>/dev/null)"
 WAP2=$AP/.claude/worktrees/own2
 git -C "$AP" worktree add -q "$WAP2" -b worktree-own2 2>/dev/null
 outA=$(gated_hook "$WAP2")
-eq 'approval: another worktree with the same content runs at once, silently' '' "$outA"
+eq 'approval: another worktree with the same content runs at once, and says it is set up' \
+  'Pitlane: this worktree is fully set up — vendor is in place and it has its own databases and port; do not reinstall dependencies or re-create its databases.' "$outA"
 eq '...its install ran' ok "$(cat "$WAP2/vendor/marker" 2>/dev/null)"
 
 # The developer's own edit to the profile needs approving again, like any other change.
@@ -2023,7 +2037,7 @@ FPM=$(gated_cli "$MC" --review | fp_of)
 gated_cli "$MC" --approve "$FPM" >/dev/null
 WMC=$MC/.claude/worktrees/mc
 git -C "$MC" worktree add -q "$WMC" -b worktree-mc 2>/dev/null
-eq 'approval: approved from the main checkout, a worktree starts silent' '' "$(gated_hook "$WMC")"
+eq 'approval: approved from the main checkout, a worktree starts set up' "$READY_VENDOR" "$(gated_hook "$WMC")"
 eq '...and its install ran' ok "$(cat "$WMC/vendor/marker" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
@@ -2043,8 +2057,8 @@ outS=$(CLAUDE_ENV_FILE="$CEF" start_hook "$WSV")
 SVPORT=$(envval "$WSV" SERVER_PORT)
 ne 'serve: the worktree has a port' '' "$SVPORT"
 eq 'serve: WORKTREE_URL is in the env block, expanded' "http://serve_me.localhost:$SVPORT/" "$(envval "$WSV" WORKTREE_URL)"
-eq 'serve: a complete worktree with a serve profile prints ONE line, naming /pitlane-serve and the URL' \
-  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/), not the repo's own start command." \
+eq 'serve: a complete worktree with a serve profile prints ONE line, what is in place, then /pitlane-serve and the URL' \
+  "Pitlane: this worktree is fully set up — vendor is in place and it has its own port; do not reinstall dependencies. To run the app, use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/), not the repo's own start command." \
   "$outS"
 eq 'serve: CLAUDE_ENV_FILE gets WORKTREE_PORT and WORKTREE_URL, never the profile'"'"'s port var' \
   "export WORKTREE_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF" 2>/dev/null)"
@@ -2274,6 +2288,16 @@ done
 eq '...and writes no state, starts no background run, and copies nothing' "$before" \
   "$(ls -A "$GDND2"; git -C "$WND2" status --porcelain --ignored)"
 
+# A complete worktree whose profile installs something: the ready line first, then the note.
+NR=$TMP/nr
+make_repo "$NR" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor && printf ok > vendor/marker"}'
+set_agent_note "$NR" "$NL1"
+WNR=$NR/.claude/worktrees/ready-noted
+git -C "$NR" worktree add -q "$WNR" -b worktree-ready-noted 2>/dev/null
+eq 'note: after the ready line, at start-up' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(start_hook "$WNR")"
+eq '...and at resume' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" resume)"
+eq '...and a compaction gives the note alone' "$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" compact)"
+
 # Not approved: never printed. Start-up says the note is held and where approval happens, without
 # its text; /clear and a compaction print nothing at all; --finish is not "fully set up".
 NU=$TMP/nu
@@ -2314,8 +2338,16 @@ lacks 'note: an invalid profile prints no note at start-up' "$NL1" "$out"
 contains '...and stderr says the profile is not valid' 'is not valid' "$(cat "$TMP/err")"
 eq '...nor after a compaction' '' "$(reset_hook "$WNV" compact)"
 
-# A profile with no note: resume is as silent as start-up has always been.
-eq 'no note: resume of a complete worktree prints nothing' '' "$(reset_hook "$W1" resume)"
+# A profile with no note: resume says what start-up says.
+eq 'no note: resume of a complete worktree prints the ready line, like start-up' "$READY_VENDOR" "$(reset_hook "$W1" resume)"
+# A profile that gives a worktree nothing to name — no dependency, build output or runtime — and no
+# note: start-up and resume stay silent.
+NN=$TMP/nn
+make_repo "$NN" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+WNN=$NN/.claude/worktrees/bare
+git -C "$NN" worktree add -q "$WNN" -b worktree-bare 2>/dev/null
+eq 'nothing to name: start-up prints nothing' '' "$(start_hook "$WNN")"
+eq '...nor does resume' '' "$(reset_hook "$WNN" resume)"
 
 # WorktreeCreate: stdout is the path and nothing else, note or not.
 out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"made-noted\",\"cwd\":\"$ND\"}" "$ND")

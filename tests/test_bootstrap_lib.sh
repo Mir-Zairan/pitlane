@@ -1587,8 +1587,68 @@ eq 'status, complete with a warning: not a bare "fully set up"' \
   "$(status_line 'warn|c|peer warning' '' '' finish)"
 contains '...and at start-up it is said, not swallowed' 'set up, with warnings — c ready with warnings' \
   "$(status_line 'warn|c|peer warning' '' '' start)"
-eq 'status, complete and clean: silent at start-up' '' "$(status_line '' '' '' start)"
+eq 'status, complete and clean, a profile with nothing to name: silent at start-up' '' \
+  "$(PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=0 status_line '' '' '' start)"
 eq '...and "fully set up" from --finish' 'Pitlane: this worktree is fully set up.' "$(status_line '' '' '' finish)"
+# Complete with something to name: start-up says so in one line, naming what is in place, so the
+# session can tell it from a bare worktree and does not reinstall or re-seed out of habit.
+ready_line() {  # $1 = when (default start); the facts arrive as environment prefixes
+  WT_STATUS_ITEMS='' WT_PENDING='' WT_PENDING_ATTEMPTABLE='' PROFILE_PRESENT=${PROFILE_PRESENT:-1} \
+    wt_bootstrap_status_line "${RL_WT:-$SLW}" "${1:-start}" ''
+}
+eq 'ready: dependencies only, named, and not to be reinstalled' \
+  'Pitlane: this worktree is fully set up — vendor and node_modules are in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'vendor\nnode_modules\n' PROFILE_HAS_RUNTIME=0 ready_line)"
+eq '...one of them reads "is"' \
+  'Pitlane: this worktree is fully set up — vendor is in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_HAS_RUNTIME=0 ready_line)"
+eq '...many are capped like the status items' \
+  'Pitlane: this worktree is fully set up — a, b, c and 2 more are in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'a\nb\nc\nd\ne\n' PROFILE_HAS_RUNTIME=0 ready_line)"
+eq '...build output too, with its own "do not"' \
+  'Pitlane: this worktree is fully set up — vendor and public/build are in place; do not reinstall dependencies or rebuild its build output.' \
+  "$(WT_READY_DEPS=$'vendor\n' WT_READY_ARTS=$'public/build\n' PROFILE_HAS_RUNTIME=0 ready_line)"
+eq '...a name is branch text, shown printable' \
+  'Pitlane: this worktree is fully set up — ven?dor is in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS="ven"$'\033'"dor"$'\n' PROFILE_HAS_RUNTIME=0 ready_line)"
+rt_ready() {  # $@ = ready_line's args; the runtime facts of a seeded, ported, URL'd profile
+  PROFILE_HAS_RUNTIME=1 PROFILE_RT_SEED=${RL_SEED-.claude/seed.sh} WT_RUNTIME_PORT=${RL_PORT-4123} \
+    WT_RUNTIME_URL=${RL_URL-http://localhost:4123} ready_line "$@"
+}
+eq 'ready: with runtime, its own databases and port, and the URL' \
+  'Pitlane: this worktree is fully set up — vendor and node_modules are in place and it has its own databases and port (http://localhost:4123); do not reinstall dependencies or re-create its databases.' \
+  "$(WT_READY_DEPS=$'vendor\nnode_modules\n' rt_ready)"
+eq '...runtime alone, no dependencies' \
+  'Pitlane: this worktree is fully set up — it has its own databases and port (http://localhost:4123); do not re-create its databases.' \
+  "$(rt_ready)"
+eq '...a port and no seed: no databases' \
+  'Pitlane: this worktree is fully set up — vendor is in place and it has its own port (http://localhost:4123); do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'vendor\n' RL_SEED='' rt_ready)"
+eq '...a URL alone' 'Pitlane: this worktree is fully set up — it has its own URL (http://localhost:4123).' \
+  "$(RL_SEED='' RL_PORT='' rt_ready)"
+eq '...env overrides alone' 'Pitlane: this worktree is fully set up — it has its own env settings.' \
+  "$(PROFILE_RT_ENVFILES=.env.local RL_SEED='' RL_PORT='' RL_URL='' rt_ready)"
+mkdir -p "$TMP/norun/.claude"; : > "$TMP/norun/.claude/worktree-no-runtime"
+eq "...but not for a worktree whose runtime is switched off: it has none of its own" \
+  'Pitlane: this worktree is fully set up — vendor is in place; do not reinstall dependencies.' \
+  "$(WT_READY_DEPS=$'vendor\n' RL_WT=$TMP/norun rt_ready)"
+eq 'ready: with runtime.serve, ONE line carrying both, the URL said once' \
+  "Pitlane: this worktree is fully set up — vendor is in place and it has its own databases and port; do not reinstall dependencies or re-create its databases. To run the app, use /pitlane-serve (it serves at http://localhost:4123), not the repo's own start command." \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_RT_SERVE='bin/server' rt_ready)"
+eq '...with runtime.serve and no URL, the port still named' \
+  "Pitlane: this worktree is fully set up — it has its own databases and port; do not re-create its databases. To run the app, use /pitlane-serve, not the repo's own start command." \
+  "$(PROFILE_RT_SERVE='bin/server' RL_URL='' rt_ready)"
+eq 'ready: --finish keeps its plain line' 'Pitlane: this worktree is fully set up.' \
+  "$(WT_READY_DEPS=$'vendor\n' rt_ready finish)"
+eq 'ready: no usable profile says nothing, whatever is left over' '' \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_PRESENT=0 rt_ready)"
+eq 'ready: a held profile says nothing, as before' '' "$(WT_READY_DEPS=$'vendor\n' WT_APPROVAL=no rt_ready)"
+eq 'ready: a warning keeps its own line' \
+  'Pitlane: this worktree is set up, with warnings — c ready with warnings (peer warning). It is usable; tell the user if it matters for the task.' \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_PRESENT=1 PROFILE_HAS_RUNTIME=0 status_line 'warn|c|peer warning' '' '' start)"
+eq 'ready: a pending line is unchanged by what else is in place' \
+  "$(PROFILE_HAS_RUNTIME=0 status_line 'missing|b|dirty' b b start)" \
+  "$(WT_READY_DEPS=$'vendor\n' PROFILE_HAS_RUNTIME=0 status_line 'missing|b|dirty' b b start)"
 # A profile with runtime.serve names /pitlane-serve and the URL, so the session never reaches for
 # the repo's own start command: the ONE line a complete worktree then prints, and a clause on the
 # others — except the held-back line, where /pitlane-serve would refuse too.
@@ -1597,10 +1657,10 @@ serve_line() {  # $1 = items, $2 = pending, $3 = attemptable, $4 = how, $5 = url
     status_line "$1" "$2" "$3" start "${4-}"
 }
 eq 'status, complete with a serve profile: one line naming /pitlane-serve and the URL' \
-  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve (it serves at http://localhost:4123), not the repo's own start command." \
+  "Pitlane: this worktree is fully set up. To run the app, use /pitlane-serve (it serves at http://localhost:4123), not the repo's own start command." \
   "$(serve_line '' '' '' '' http://localhost:4123)"
 eq '...without a URL, the command alone' \
-  "Pitlane: this worktree is set up. To run the app, use /pitlane-serve, not the repo's own start command." \
+  "Pitlane: this worktree is fully set up. To run the app, use /pitlane-serve, not the repo's own start command." \
   "$(serve_line '' '' '' '' '')"
 contains '...appended to a not-finished line' \
   "Run /pitlane-finish to complete it now (it has no time limit), or start a new session here. Until then, do not install dependencies or create databases by hand; those steps belong to the setup. To run the app, use /pitlane-serve (it serves at http://localhost:4123)" \
@@ -1652,6 +1712,10 @@ eq 'walk: a warning for another lockfile is pending' 'missing|vendor|warn' "$(st
 wt_state_set "$DWT" vendor install "$SWL" "$SWI" "done"
 eq 'walk: done for this lockfile, command and strategy is no item' '' "$(status_items "$DWT")"
 eq '...and not pending' '' "$(pending_all "$DWT")"
+eq '...but in place, for the "fully set up" line' vendor "$(wt_bootstrap_pending "$DWT"; printf '%s' "${WT_READY_DEPS%$'\n'}")"
+wt_state_set "$DWT" vendor install "$SWL" "$SWI" warn 1 why
+eq 'walk: a warning is not counted in place, which would make the line read as clean' '' \
+  "$(wt_bootstrap_pending "$DWT"; printf '%s' "$WT_READY_DEPS")"
 wt_state_set "$DWT" vendor install "$SWL" "$SWI" failed 1 boom
 eq 'walk: a failure for this lockfile, command and strategy stands' 'standing|vendor|boom' "$(status_items "$DWT")"
 eq '...pending' vendor "$(pending_all "$DWT")"
@@ -4115,6 +4179,8 @@ out=$(WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
 eq 'stale: a --finish run rebuilds it' xx "$(cat "$ACNT")"
 contains '...saying why' 'public/build: its inputs changed in a commit since it was built — bringing it up to date' "$out"
 eq '...and then nothing is pending' '' "$(PROFILE_PRESENT=1 pending_all "$AWT")"
+eq '...and it is in place, for the "fully set up" line' public/build \
+  "$(PROFILE_PRESENT=1 wt_bootstrap_pending "$AWT"; printf '%s' "${WT_READY_ARTS%$'\n'}")"
 out=$(WT_FINISH=1 wt_bootstrap_artifacts "$AREPO" "$AWT" "$FAR" 2>&1)
 eq 'stale: no input change since, no rebuild' xx "$(cat "$ACNT")"
 contains '...up to date' 'public/build: already up to date' "$out"
@@ -4177,6 +4243,7 @@ eq 'build fails, verify passes: warn' warn "$(art_status)"
 contains '...and says so' 'built with warnings' "$out"
 eq '...a status item with its reason' 'artwarn|public/build|error: one chunk too big' "$(art_items)"
 eq '...and not pending' '' "$(pending_all "$AWT")"
+eq '...nor in place for the "fully set up" line' '' "$(wt_bootstrap_pending "$AWT"; printf '%s' "$WT_READY_ARTS")"
 contains 'status: a warned build reads "ready with warnings"' 'build output public/build ready with warnings (error: one chunk too big)' \
   "$(wt_bootstrap_pending "$AWT"; wt_bootstrap_status_line "$SLW" finish '')"
 art_reset

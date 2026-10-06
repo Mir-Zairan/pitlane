@@ -4048,6 +4048,8 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # worktree is complete. It is what the session is told, so it reads the state the steps recorded
 # rather than guessing. WT_PENDING_ATTEMPTABLE is the same list less each dependency whose failure
 # stands: what a run would actually try, which decides whether one is worth starting.
+# WT_READY_DEPS and WT_READY_ARTS are the dependency and build-output dirs recorded done, one per
+# line, which the "fully set up" line names (wt_ready_clause).
 # WT_STATUS_ITEMS is every imperfect item with what the state says about it, for
 # wt_bootstrap_status_line: one `<kind> US <name> US <detail>` per line, kind being `standing` (a
 # failure that stands; detail its reason), `missing` (detail the recorded status), `seed` (detail the
@@ -4057,7 +4059,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
 # walk answers all three: each item costs an expand and two checksums.
 wt_bootstrap_pending() {  # $1 = worktree
   local worktree=${1%/} rec body dir lock strategy install verify _cksum _copy lckhash ickhash seed current own
-  WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS='' WT_OWN_COPY=''
+  WT_PENDING='' WT_PENDING_ATTEMPTABLE='' WT_STATUS_ITEMS='' WT_OWN_COPY='' WT_READY_DEPS='' WT_READY_ARTS=''
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
@@ -4090,7 +4092,10 @@ wt_bootstrap_pending() {  # $1 = worktree
     fi
     if [ "$current" = 1 ]; then
       case $WT_DEP_STATUS in
-        "done") continue ;;
+        "done")
+          WT_READY_DEPS+=$dir$WT_NL
+          continue
+          ;;
         warn)
           wt_dep_recorded_reason
           WT_STATUS_ITEMS+=warn$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
@@ -4159,6 +4164,8 @@ wt_bootstrap_pending_artifacts() {  # $1 = worktree
             if [ "$WT_DEP_STATUS" = warn ]; then
               wt_dep_recorded_reason
               WT_STATUS_ITEMS+=artwarn$WT_US$dir$WT_US$WT_DEP_SHOWN_REASON$WT_NL
+            else
+              WT_READY_ARTS+=$dir$WT_NL
             fi
             continue
           fi
@@ -4312,14 +4319,75 @@ wt_agent_note_held_line() {  # $1 = start | finish, $2 = summary of warnings or 
 # How many imperfect items the status line names before it says "and N more".
 WT_STATUS_SHOWN=3
 
+# `a`, `a and b`, `a, b and c`: the lines of $2 joined for a sentence, at most WT_STATUS_SHOWN of
+# them before `and N more`, into WT_JOINED, with WT_JOINED_N the count. $1 is the last conjunction.
+WT_JOINED='' WT_JOINED_N=0
+wt_join_words() {  # $1 = and | or, $2 = items, one per line
+  local item last=''
+  WT_JOINED='' WT_JOINED_N=0
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    WT_JOINED_N=$((WT_JOINED_N + 1))
+    [ "$WT_JOINED_N" -le "$WT_STATUS_SHOWN" ] || continue
+    [ -z "$last" ] || WT_JOINED+=${WT_JOINED:+, }$last
+    last=$item
+  done <<<"${2-}"
+  if [ "$WT_JOINED_N" -gt "$WT_STATUS_SHOWN" ]; then
+    WT_JOINED+=${WT_JOINED:+, }$last" $1 $((WT_JOINED_N - WT_STATUS_SHOWN)) more"
+  else
+    WT_JOINED+=${WT_JOINED:+ $1 }$last
+  fi
+}
+
+# What a worktree with nothing pending has in place, as the rest of the "fully set up" sentence,
+# into WT_READY_CLAUSE: ` — <dirs> are in place and it has its own databases and port (<url>); do
+# not reinstall dependencies or re-create its databases`, or empty when there is nothing to name.
+# Only facts this run already holds: the dirs wt_bootstrap_pending found done, a seed (done, since
+# nothing is pending) and the port and URL wt_runtime_handoff published — never for a worktree whose
+# runtime is switched off. It exists so a session can tell a worktree set up from a bare one, and does
+# not reinstall or re-seed out of habit. Never for a profile the approval holds: that is not a
+# worktree "fully set up", and the line stays as it was. $2 = 1 leaves the URL out, for a line whose
+# /pitlane-serve clause names it already. The dirs are branch text, so they go through wt_visible.
+WT_READY_CLAUSE=''
+wt_ready_clause() {  # $1 = worktree, $2 = 1 when the line names the URL elsewhere
+  local worktree=${1%/} url_named=${2-} placed='' own='' dont=''
+  WT_READY_CLAUSE=''
+  [ "${PROFILE_PRESENT:-0}" = 1 ] && [ "${WT_APPROVAL:-}" != no ] || return 0
+  wt_join_words and "${WT_READY_DEPS:-}${WT_READY_ARTS:-}"
+  if [ "$WT_JOINED_N" -gt 0 ]; then
+    placed="$(wt_visible "$WT_JOINED") are in place"
+    [ "$WT_JOINED_N" -ne 1 ] || placed="${placed% are in place} is in place"
+  fi
+  [ -z "${WT_READY_DEPS:-}" ] || dont+="reinstall dependencies$WT_NL"
+  [ -z "${WT_READY_ARTS:-}" ] || dont+="rebuild its build output$WT_NL"
+  if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ ! -e "$worktree/$WT_NO_RUNTIME_MARKER" ]; then
+    if [ -n "${PROFILE_RT_SEED:-}" ]; then
+      own=databases
+      dont+="re-create its databases$WT_NL"
+    fi
+    [ -z "${WT_RUNTIME_PORT:-}" ] || own+=${own:+ and }port
+    [ -n "$own" ] || [ -z "${PROFILE_RT_ENVFILES:-}" ] || own='env settings'
+    if [ -n "${WT_RUNTIME_URL:-}" ] && [ "$url_named" != 1 ]; then
+      own=${own:-URL}" ($WT_RUNTIME_URL)"
+    fi
+  fi
+  [ -n "$placed$own" ] || return 0
+  WT_READY_CLAUSE=" — $placed${placed:+${own:+ and }}${own:+it has its own $own}"
+  wt_join_words or "$dont"
+  [ -z "$WT_JOINED" ] || WT_READY_CLAUSE+="; do not $WT_JOINED"
+}
+
 # THE ONE LINE on stdout that tells the session (SessionStart) or /pitlane-finish (--finish) the
 # worktree's state, from the globals wt_bootstrap_pending has just set. Every ending goes through
 # here so that all of them name states alike: each imperfect item as `<name> missing (<why>)` or
 # `<name> ready with warnings (<why>)`, and the count of tracked files an install changed — a count,
-# not the names, which are branch content; /pitlane-finish shows them. Still one line (ADR-017), and
-# at start-up a complete worktree with nothing to report prints NOTHING: stdout there is model
-# context — unless the profile has runtime.serve, when it prints one line naming /pitlane-serve and
-# the URL (ADR-021), a clause every other start-up line carries too. A worktree whose only gaps are
+# not the names, which are branch content; /pitlane-finish shows them. Still one line (ADR-017). At
+# start-up a complete, clean worktree gets `Pitlane: this worktree is fully set up — ` and what is in
+# place (wt_ready_clause), so the session does not redo it; it prints NOTHING only when the profile
+# gave it nothing to name (no dependency, build output or runtime) and has no runtime.serve, when the
+# approval holds the profile, or when there is no usable profile: stdout there is model context. With runtime.serve the line ends naming
+# /pitlane-serve and the URL (ADR-021), a clause every other start-up line carries too. --finish says
+# the same head and stops: `Pitlane: this worktree is fully set up.` A worktree whose only gaps are
 # failures that stand is not sent to /pitlane-finish as if that would fix them: it would not retry
 # them, and retrying is the user's call. A worktree set up but for an agent note held back by the
 # approval gets a line of its own (wt_agent_note_held_line); the approved note itself is not part of
@@ -4431,7 +4499,9 @@ wt_bootstrap_status_line() {  # $1 = worktree, $2 = start | finish, $3 = backgro
     app=" To run the app, use /pitlane-serve${WT_RUNTIME_URL:+ (it serves at $WT_RUNTIME_URL)}, not the repo's own start command."
   fi
   if [ -z "$summary" ]; then
-    [ -z "$app" ] || printf 'Pitlane: this worktree is set up.%s\n' "$app"
+    # The URL once: in the /pitlane-serve clause when there is one.
+    wt_ready_clause "$worktree" "${app:+${WT_RUNTIME_URL:+1}}"
+    [ -z "$WT_READY_CLAUSE$app" ] || printf 'Pitlane: this worktree is fully set up%s.%s\n' "$WT_READY_CLAUSE" "$app"
     return 0
   fi
   if [ -z "${WT_PENDING:-}" ]; then

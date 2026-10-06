@@ -691,10 +691,11 @@ case $event in
       done
     fi
 
-    # stdout is the model's context here, so it stays EMPTY when the worktree is complete and clean —
-    # and gets one short notice when it is not, because a session that mistakes a half-set-up worktree for a
-    # ready one goes on to install and clone by hand (measured: it is what sessions did before this
-    # plugin existed). /pitlane-finish reads the same list as a plain status line.
+    # stdout is the model's context here, so it gets ONE short line: what is missing when the worktree
+    # is not complete, because a session that mistakes a half-set-up worktree for a ready one goes on to
+    # install and clone by hand (measured: it is what sessions did before this plugin existed); and
+    # what is in place when it is, so a session does not redo it out of habit. EMPTY only when the
+    # profile gives it nothing to name. /pitlane-finish reads the same list as a plain status line.
     wt_bootstrap_pending "$worktree"
     pending=$WT_PENDING
     if [ "${WT_FINISH:-}" = 1 ]; then
