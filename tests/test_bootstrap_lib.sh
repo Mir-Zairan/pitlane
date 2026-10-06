@@ -3038,6 +3038,22 @@ contains '...saying why' "vendor: a pull request's worktree copies the main chec
 eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
 rm -f "$PMARK"
 eq 'pr-origin: without the marker it is not' 1 "$(wt_is_pr_worktree "$DWT"; echo $?)"
+# Moved out of the worktrees dir, the marker still decides, and the two tests agree.
+MOVED=$(mktemp -d)/moved-wt
+git -C "$DREPO" worktree add -q -b wt-moved "$DREPO${WT_SUBPATH}moved-wt" HEAD
+git -C "$DREPO" worktree move "$DREPO${WT_SUBPATH}moved-wt" "$MOVED"
+moved_donor_is_pr() {
+  wt_worktree_admin "$MOVED"
+  wt_donor_is_pr "$WT_WORKTREE_ADMIN" "$MOVED" "$(git -C "$DREPO" config --get-regexp '^branch\..*\.merge$')"
+  echo $?
+}
+eq 'pr-origin: an unmarked worktree moved out is not a pull request'"'"'s' 1 "$(wt_is_pr_worktree "$MOVED"; echo $?)"
+eq '...nor a donor pull request'"'"'s' 1 "$(moved_donor_is_pr)"
+wt_pr_origin_mark "$MOVED" pr-7 "$(git -C "$MOVED" rev-parse HEAD)"
+eq 'pr-origin: a marked worktree moved out is still a pull request'"'"'s' 0 "$(wt_is_pr_worktree "$MOVED"; echo $?)"
+eq '...and a donor pull request'"'"'s' 0 "$(moved_donor_is_pr)"
+git -C "$DREPO" worktree remove --force "$MOVED"
+git -C "$DREPO" branch -q -D wt-moved
 rm -rf "$DWT/vendor"; rm -f "$(wt_state_path "$DWT")"
 git -C "$DREPO" config branch.wt-dep1.merge refs/pull/11/head
 

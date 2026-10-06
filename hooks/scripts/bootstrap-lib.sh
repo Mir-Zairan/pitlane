@@ -251,7 +251,8 @@ wt_visible() {  # $1 = text
 
 # True when $1 is a pull-request worktree: named `pr-<digits>`, the kind `claude -w "#1234"` makes, or
 # on a branch whose upstream is a pull-request ref — what `gh pr checkout` records for a fork's PR, in
-# the shared git config no branch can write — or started from such a worktree (wt_pr_origin_marked).
+# the shared git config no branch can write — or started from such a worktree (wt_pr_origin_marked),
+# wherever `git worktree move` has since put it, as wt_donor_is_pr sees it.
 # For those, the approval is bound to the commit as well as
 # the content. An approved install runs
 # the branch's own manifests (package lifecycle scripts) and an approved `shell` evaluates its
@@ -260,6 +261,7 @@ wt_visible() {  # $1 = text
 wt_is_pr_worktree() {  # $1 = run directory
   local name digits
   local branch merge
+  wt_pr_origin_marked "$1" && return 0
   case "${1%/}/" in
     *"$WT_SUBPATH"*) ;;
     *) return 1 ;;
@@ -274,7 +276,6 @@ wt_is_pr_worktree() {  # $1 = run directory
       esac
       ;;
   esac
-  wt_pr_origin_marked "$1" && return 0
   branch=$(wt_git "$1" symbolic-ref -q --short HEAD 2>/dev/null) || return 1
   [ -n "$branch" ] || return 1
   merge=$(wt_git "$1" config --get "branch.$branch.merge" 2>/dev/null) || return 1
