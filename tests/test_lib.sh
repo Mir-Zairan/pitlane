@@ -1810,33 +1810,35 @@ JSON
   vw '{"schemaVersion":1,"agentNote":null}'
   eq 'validate: an agentNote of null is no note' '' "$(vv)"
   # The note is validated at session start, before approval, so its cost must not grow with what a
-  # branch puts in it. Both bounds are timed: the byte cap (50000 one-character lines, 200 KB) and,
+  # branch puts in it. Timed with SECONDS, not EPOCHREALTIME, which bash 3.2 lacks; whole seconds are
+  # enough, since the quadratic cut these guard against took 5s to 37s on the same inputs. Both bounds
+  # are timed: the byte cap (50000 one-character lines, 200 KB) and,
   # under the cap, the line count (40000 empty lines, 120 KB).
   huge=$(printf '"a",%.0s' $(seq 50000))
   vw '{"schemaVersion":1,"agentNote":['"${huge%,}"']}'
-  t0=${EPOCHREALTIME/./}
+  t0=$SECONDS
   out=$(vv)
-  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  elapsed=$((SECONDS - t0))
   eq 'validate: an agentNote of 200 KB is refused by its size' \
     'agentNote: is too long — more than 40 lines of 400 characters can hold' "$out"
-  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  eq 'validate: ...in under 4s' 'fast' "$( [ "$elapsed" -lt 4 ] && echo fast || echo "${elapsed}s")"
   huge=$(printf '"",%.0s' $(seq 40000))
   vw '{"schemaVersion":1,"agentNote":['"${huge%,}"']}'
-  t0=${EPOCHREALTIME/./}
+  t0=$SECONDS
   out=$(vv)
-  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  elapsed=$((SECONDS - t0))
   eq 'validate: 40000 empty lines under the byte cap are refused by their count' \
     'agentNote: has more than the 40 lines allowed' "$out"
-  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  eq 'validate: ...in under 4s' 'fast' "$( [ "$elapsed" -lt 4 ] && echo fast || echo "${elapsed}s")"
   # And one line of 190 KB, under the cap, which cutting the literals out one quote at a time took
   # 37s over.
   huge=$(printf 'a%.0s' $(seq 190000))
   vw '{"schemaVersion":1,"agentNote":["'"$huge"'"]}'
-  t0=${EPOCHREALTIME/./}
+  t0=$SECONDS
   out=$(vv)
-  elapsed=$(( ${EPOCHREALTIME/./} - t0 ))
+  elapsed=$((SECONDS - t0))
   eq 'validate: one line of 190 KB is refused by its length' 'agentNote[0]: is longer than 400 characters' "$out"
-  eq 'validate: ...in under 2s' 'fast' "$( [ "$elapsed" -lt 2000000 ] && echo fast || echo "${elapsed}us")"
+  eq 'validate: ...in under 4s' 'fast' "$( [ "$elapsed" -lt 4 ] && echo fast || echo "${elapsed}s")"
   # The cap refuses nothing the bounds allow: 40 lines of 400 four-byte characters are within them.
   long4=$(printf '\360\237\230\200%.0s' $(seq 400))
   lines=''
