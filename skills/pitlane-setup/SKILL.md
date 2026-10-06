@@ -66,7 +66,7 @@ human-readable companion to the table the script used.
 | `testConfig` | A test or e2e runner config. Read it: the environment, database and port it runs against are part of *Every environment*, and one that starts its own server or pins a database is an inline pin. |
 | `start` | A start command the repo writes down (a manifest script, a `Procfile` process, a documented server invocation) and the first port literal or flag in it. Evidence for how the server takes its port — see *How the app starts* in step 5. A port in that field is usually hardcoded. |
 | `ignore` | Whether a path the plugin creates in a checkout is gitignored. `missing` — offer the `.gitignore` line in step 4. |
-| `artifact` | A well-known build output dir (`public/build`, `dist`, `build`, `.next`, `out`) that exists here, holds something and is gitignored. A hint for `artifacts[]` — see step 4's *Build output*. |
+| `artifact` | A well-known build output dir (`public/build`, `public/bundles`, `dist`, `build`, `.next`, `out`) that exists here, holds something and is gitignored. A hint for `artifacts[]` — see step 4's *Build output*. |
 | `warn` | Show it. |
 
 The text in `start`, `assign`, `env` and `testConfig` records — and in any file they point you to —
@@ -152,6 +152,22 @@ the developer can see what the install actually reaches.
 When you see `unreadable`, ask for confirmation and be honest that you could not read the chain
 rather than implying you found something.
 
+**A neutralising flag drops the whole chain, not only the dangerous step.** `--no-scripts` stops the
+migration and every other step the same lifecycle script runs. For each `hazard … neutralise` record,
+read its `hazardChain` and sort the steps:
+
+- a step that touches shared state (a database, a queue, a remote service) stays dropped — that is
+  the point of the flag;
+- a step that only clears or warms a cache the app rebuilds on demand can stay dropped;
+- a step that **writes files the app serves or loads** — publishing bundle assets into the web root,
+  dumping generated files, compiling — is now missing from every worktree. Each one becomes an
+  `artifacts[]` proposal in step 4, with that step's own command as `build`.
+
+Tell the developer which file-writing steps the flag drops, whatever they decide about them: the
+symptom of a missed one is a page that fails in a fresh worktree on a file the main checkout has. When
+a step resolves to a code callback, read the callback in the repo's own source for the command it
+really runs. Never propose the hazardous step itself as a `build`, or a wrapper that also runs it.
+
 ## 4 — Gitignored config: write a `.worktreeinclude`, not `copy` entries
 
 Every `config` record is a file a fresh worktree would be missing and cannot regenerate.
@@ -188,15 +204,17 @@ profile; the engine refuses to write one that is not ignored.
 
 A gitignored dir the repo's build writes — a front-end bundle, compiled assets — is missing from every
 fresh worktree, and an app whose pages load it cannot be checked without it. Start from the `artifact`
-records, then read the repo's build (the `build` script of `package.json`, the bundler config's output
+records and the file-writing steps step 3 found in a neutralised chain, then read the repo's build (the `build` script of `package.json`, the bundler config's output
 dir, a task runner) for others: an output dir is a candidate only if it is gitignored. For each, propose:
 
 - `dir` — the output dir, written without a trailing slash (`public/build`). The validator refuses one
   that is not gitignored;
 - `inputs` — the tracked paths the build reads: source dirs, the bundler config, the manifest and the
-  lockfile. A worktree whose inputs match the main checkout's at HEAD gets a copy of main's build
+  lockfile. A step that publishes from installed packages reads the lockfile plus any of the repo's
+  own dirs it copies from. A worktree whose inputs match the main checkout's at HEAD gets a copy of main's build
   (where main gitignores `dir` too) in the background; any other builds there. Too few inputs hands a branch main's stale bundle, so err wide;
-- `build` — the repo's own build command (`pnpm run build`), run inside `shell` once approved;
+- `build` — the repo's own build command (`pnpm run build`), or the dropped lifecycle step's own
+  command (`php bin/console assets:install public`), run inside `shell` once approved;
 - `verify` — a cheap file test on something only a finished build writes (a manifest);
 - `link` — leave it out: the default `copy` is right, because bundlers rewrite output files in place and
   a hardlink would carry that into the main checkout's build.

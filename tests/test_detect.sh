@@ -696,9 +696,10 @@ for r in json.load(open(sys.argv[1]))["deps"]:
   # --- build output -------------------------------------------------------------
   # A hint only where something builds there: present, non-empty, gitignored.
   r=$(mkrepo art package.json)
-  printf '/public/build/\n/dist/\n/build/\nout/\n' >"$r/.gitignore"
-  mkdir -p "$r/public/build" "$r/dist" "$r/out" "$r/.next" "$r/build"
+  printf '/public/build/\n/public/bundles/\n/dist/\n/build/\nout/\n' >"$r/.gitignore"
+  mkdir -p "$r/public/build" "$r/public/bundles/app" "$r/dist" "$r/out" "$r/.next" "$r/build"
   : >"$r/public/build/manifest.json"
+  : >"$r/public/bundles/app/logo.svg"
   : >"$r/out/index.html"
   : >"$r/.next/BUILD_ID"
   printf 'x\n' >"$r/build/kept.js"
@@ -707,6 +708,7 @@ for r in json.load(open(sys.argv[1]))["deps"]:
   out=$(det "$r")
   has   'artifact: a present, gitignored build dir is a hint' 'artifact|public/build' "$out"
   has   'artifact: so is out/' 'artifact|out' "$out"
+  has   'artifact: so are published bundle assets' 'artifact|public/bundles' "$out"
   hasnt 'artifact: an empty one is not' 'artifact|dist' "$out"
   hasnt 'artifact: nor one that is not gitignored' 'artifact|.next' "$out"
   hasnt 'artifact: nor one holding a tracked file' 'artifact|build' "$out"

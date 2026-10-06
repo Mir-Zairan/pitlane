@@ -561,7 +561,7 @@
       "only when it exists in the checkout, holds something, and is gitignored: that is the evidence",
       "something builds it there. Which command builds it, and from which inputs, is setup's question."
     ],
-    "dirs": ["public/build", "dist", "build", ".next", "out"]
+    "dirs": ["public/build", "public/bundles", "dist", "build", ".next", "out"]
   },
   "runtimeHints": {
     "_comment": [
