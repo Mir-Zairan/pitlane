@@ -99,9 +99,21 @@ Read the existing profile first if there is one.
   a `verify` as step 3 says. Keep-theirs still applies — but if they keep `hardlink`, say in the agent
   note (*The agent note*, step 5) that they chose it knowing this.
 - **A worktree section an earlier setup wrote into the repo's `CLAUDE.md`, `AGENTS.md` or
-  `CLAUDE.local.md`**: the note now lives in the profile's `agentNote`. Offer to carry what is still
-  true into `agentNote`, by the rules in *The agent note*, and to remove the old section — both only on
-  the developer's yes. A section they keep stays theirs; never edit it on your own.
+  `CLAUDE.local.md`**: only part of it has moved. Sort its lines, show the developer the sort, and
+  change the file only on their yes:
+  - lines true only in a worktree — a command that pins the main checkout's database or port, an
+    environment deliberately shared, a server left on its fixed port, a hardlinked dir's in-place
+    rewrites — go into `agentNote`, by the rules in *The agent note*, and leave the section once there;
+  - lines Pitlane's own start-up line now says — the worktree arrives set up, which dirs are in place,
+    not to reinstall or re-seed, its own databases and port, start the app with `/pitlane-serve` — can
+    go;
+  - **everything else stays**, above all how to create a worktree: `claude -w`, `EnterWorktree`, a
+    subagent with `isolation: "worktree"`, and that a raw `git worktree add` outside
+    `.claude/worktrees/` is never set up. That is true in the main checkout too — it is where
+    worktrees are made from — so it has no other home; never move it into `agentNote` or delete it.
+    When it is all that is left, it stays as the section.
+
+  A section or line they keep stays theirs; never edit it on your own.
 - **A hardlinked entry with no `copy` while detection emits `depCopy` for it** (bootstrap warns about
   exactly this every session): raise it as an explicit addition, saying why — the package manager
   rewrites those files in place, so a command in a worktree (`composer dump-autoload`,
@@ -437,7 +449,8 @@ found:
 still running, what is missing, or that the worktree is fully set up — naming the dependency and
 build-output dirs in place and, when this start pointed the worktree at them, its own databases,
 port and URL — and when to use `/pitlane-finish` and `/pitlane-serve`. Nor
-anything true in the main checkout as well — that belongs in the repo's own instructions.
+anything true in the main checkout as well — that belongs in the repo's own instructions, how to
+create a worktree above all (*The worktree-creation line*, step 6).
 
 **Each line one self-contained instruction**, readable without the others and without this
 conversation: `Run the e2e suite with pnpm e2e, never scripts/e2e.sh, which pins the main checkout's
@@ -506,6 +519,20 @@ session. Then ask **who it is for**:
   in `.git/info/exclude` (never committed, shared by every worktree); put the seed and teardown scripts
   in the profile's `copy[]` so each worktree gets them. The agent note needs nothing more: it is in the
   profile, which worktrees read from the main checkout.
+
+### The worktree-creation line
+
+How to make a worktree that gets set up is true in the main checkout, where worktrees are made from,
+so it belongs in the repo's own instructions, never in `agentNote`. When those say nothing about it —
+and the migration in step 2 left no such line — offer this one, and write it only on the developer's
+yes: in `CLAUDE.md` (or `AGENTS.md`, if `CLAUDE.md` only imports it) when the setup is for the team,
+in their `CLAUDE.local.md` when it is only theirs.
+
+```
+Create worktrees with `claude -w <name>`, EnterWorktree, or a subagent with isolation: "worktree"; a raw `git worktree add` outside .claude/worktrees/ is never set up (for an existing branch: `git worktree add .claude/worktrees/<name> <branch>`, then start a session in it).
+```
+
+Neutral, one line, nothing else about this plugin. No is a valid answer.
 
 ### Approve what you wrote
 

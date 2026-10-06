@@ -1,6 +1,6 @@
 ---
 name: pitlane-finish
-description: Wait for, or finish, this worktree's setup — Pitlane installs dependencies and seeds the databases in the background after the session starts, and this waits for that, completes anything left over, and reports what is ready. Use before running tests, builds, the app or database queries when a session was told its worktree "is still being set up in the background" or "is not fully set up yet", when dependencies or the worktree's databases are missing, or when the user asks to finish or repair a worktree's setup.
+description: Wait for, or finish, this worktree's setup — Pitlane installs dependencies and seeds the databases in the background after the session starts, and this waits for that, completes anything left over, and reports what is ready. Use before running tests, builds, the app or database queries when a session was told its worktree "is still being set up in the background" or "is not fully set up yet", when the session was told its profile is held for approval, when dependencies or the worktree's databases are missing, when the user wants the profile or its agent note reviewed and approved, or when the user asks to finish or repair a worktree's setup.
 ---
 
 # Pitlane — finish this worktree's setup
