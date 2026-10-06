@@ -27,7 +27,15 @@ imperfect piece by its state — `<name> missing (<why>)` or `<name> ready with 
 first three and then "and N more" — and, when an install changed tracked files, how many:
 
 - `Pitlane: this worktree is fully set up.` — done. Say so in one line.
-- `Pitlane: this worktree is set up, with warnings — …` — everything is present. A piece `ready with
+- `Pitlane: this worktree is set up, but its profile is held — it is not approved in its current
+  form, agent note included, …`, or `Pitlane: this worktree is set up, with warnings — …, but its
+  profile is held — …` — every piece is present (the second form names the warnings first, as
+  below), but the profile is not approved in its current form, so sessions here are not shown its
+  agent note (the repository's guidance for working in a worktree). Tell the user, then go through
+  **Approval** below: the hold covers the whole profile — its commands and scripts as well as the
+  note — so the user sees all of it, never the note alone.
+- `Pitlane: this worktree is set up, with warnings — …` and **no** `but its profile is held` after the
+  warnings (that line is the held case above) — everything is present. A piece `ready with
   warnings` installed but its install exited non-zero (the reason is in brackets); it counts as
   installed. Tell the user in one line. If the line says an install changed tracked files, see
   **Tracked files an install changed** below.
@@ -48,11 +56,6 @@ first three and then "and N more" — and, when an install changed tracked files
   inputs at HEAD or its build command change, or the user agrees to `--retry-failed`. A `build output
   <dir> ready with warnings` built, exited non-zero, and passed its verify; it counts as built.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
-- A line saying the worktree **is set up but its profile is held, including its agent note** — every
-  piece is present, but the profile is not approved in its current form, so sessions here are not
-  shown its agent note (the repository's guidance for working in a worktree). Tell the user, then go
-  through **Approval** below: the hold covers the whole profile — its commands and scripts as well as
-  the note — so the user sees all of it, never the note alone.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
 
 ## Tracked files an install changed

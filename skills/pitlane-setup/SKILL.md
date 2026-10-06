@@ -423,15 +423,20 @@ found:
 - environments deliberately shared (*Every environment*), and so not to be run from two worktrees at
   once;
 - servers that stay on their fixed ports (*How the app starts*) and collide with the main checkout's
-  while both run; and, only when the profile has no `runtime.serve` and the port is taken by a flag,
-  how to start the dev server on `$WORKTREE_PORT`;
+  while both run — the app's own dev server among them when the profile isolates no port for it (its
+  port taken by a flag and no `runtime.serve` written, or fixed in source): say it stays on its fixed
+  port and collides with the main checkout's while both run, and never point it at `$WORKTREE_PORT`,
+  which such a profile does not set. With a `runtime.serve`, the start-up line already sends the
+  session to `/pitlane-serve`;
 - for a hardlinked dependency dir, the commands of this repo's ecosystem that rewrite files in it in
   place — re-running package install scripts (`npm rebuild`, `yarn install --force`, composer
   scripts) — and so write into the main checkout's copy; and a hardlinked venv kept knowingly (step 2);
 - anything else the developer names that is true only in a worktree of this repo.
 
-**Not what Pitlane already tells the session**: that setup is still running or finished,
-`/pitlane-finish`, `/pitlane-serve` and the worktree's URL arrive in Pitlane's own status line. Nor
+**Not what Pitlane already tells the session**: Pitlane's own start-up line says whether setup is
+still running, what is missing, or that the worktree is fully set up — naming the dependency and
+build-output dirs in place and, when this start pointed the worktree at them, its own databases,
+port and URL — and when to use `/pitlane-finish` and `/pitlane-serve`. Nor
 anything true in the main checkout as well — that belongs in the repo's own instructions.
 
 **Each line one self-contained instruction**, readable without the others and without this
