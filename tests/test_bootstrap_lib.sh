@@ -5913,6 +5913,61 @@ PROFILE_AGENT_NOTE=$'a\r\033[2Kb\xc2\x9bc'
 out=$(wt_approval_describe "$DWT")
 contains 'review: a note line is shown with control characters as ?' 'agent note: a??[2Kb??c' "$out"
 lacks '...no escape reaches the screen' $'\033' "$out"
+# Delivery takes the same care for the same profile: the model is not shown an escape either.
+out=$(wt_agent_note_block)
+lacks 'note block: no escape reaches the model' $'\033' "$out"
+lacks '...nor a C1 control' $'\xc2\x9b' "$out"
+contains '...and what is printable is kept' '- a[2Kbc' "$out"
+
+# --- agentNote delivery: shown once approved, and said to be held otherwise --------------------------
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_PRESENT=1 PROFILE_AGENT_NOTE=$'Run make test, not the root test script.\n\n  indented, with a \\ and "quotes" and $(id)'
+NOTE_HEADER="Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
+eq 'note block: the header naming where it comes from, then one "- " line per note line, literally' \
+  "$NOTE_HEADER$NL_- Run make test, not the root test script.$NL_-$NL_-   indented, with a \\ and \"quotes\" and \$(id)" \
+  "$(wt_agent_note_block)"
+( WT_APPROVAL=yes; wt_agent_note_is_approved )
+eq 'note approved: when the approval says yes' 0 $?
+( WT_APPROVAL=no; wt_agent_note_is_approved )
+eq '...not when it says no' 1 $?
+( WT_APPROVAL=''; wt_agent_note_is_approved )
+eq '...nor before it has been decided' 1 $?
+( WT_APPROVAL=yes PROFILE_AGENT_NOTE=''; wt_agent_note_is_approved )
+eq '...nor when there is no note' 1 $?
+( WT_APPROVAL=yes PROFILE_PRESENT=0; wt_agent_note_is_approved )
+eq '...nor when no usable profile is loaded' 1 $?
+( WT_APPROVAL=no; wt_agent_note_is_held )
+eq 'note held: when the approval says no' 0 $?
+( WT_APPROVAL=yes; wt_agent_note_is_held )
+eq '...not when it says yes' 1 $?
+# shellcheck disable=SC2034  # read by the sourced engine.
+( WT_APPROVAL=no PROFILE_AGENT_NOTE=''; wt_agent_note_is_held )
+eq '...nor when there is no note to hold' 1 $?
+# Held with nothing pending is a state of its own: without it, a note-only profile read "fully set
+# up" from --finish and nothing at start-up, and the developer was never pointed at the approval.
+out=$(WT_APPROVAL=no status_line '' '' '' start)
+contains 'status, note held, nothing pending: start-up says the note is held' 'agent note' "$out"
+contains '...until the developer approves it, pointing at --review' '--review' "$out"
+lacks '...without the note'"'"'s text' 'Run make test' "$out"
+contains '...and without inviting the session to approve it' 'Do not approve it' "$out"
+eq '...on one line' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+# --finish passes `approval` whenever the profile is held, as the entrypoint does.
+out=$(WT_APPROVAL=no status_line '' '' '' finish approval)
+lacks 'status, --finish, note held: not "fully set up"' 'fully set up' "$out"
+contains '...says the note is held' 'agent note' "$out"
+contains '...and points at --review' '--review' "$out"
+lacks '...without the note'"'"'s text' 'Run make test' "$out"
+out=$(WT_APPROVAL=no status_line 'warn|c|peer warning' '' '' finish approval)
+contains 'status, --finish, note held with a warning: names the warning' 'with warnings — c ready with warnings (peer warning)' "$out"
+contains '...and the held note' 'agent note' "$out"
+contains 'status, start-up, note held with a warning: names both' 'agent note' \
+  "$(WT_APPROVAL=no status_line 'warn|c|peer warning' '' '' start)"
+contains 'status, note held with work pending: the approval line covers it' \
+  "not run — the profile's commands are not approved" "$(WT_APPROVAL=no status_line 'missing|b|dirty' b b finish approval)"
+eq 'status, note approved, nothing pending: the status line stays silent (the entrypoint prints the note)' '' \
+  "$(WT_APPROVAL=yes status_line '' '' '' start)"
+eq '...and --finish reads fully set up' 'Pitlane: this worktree is fully set up.' \
+  "$(WT_APPROVAL=yes status_line '' '' '' finish)"
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_AGENT_NOTE=''
 # shellcheck disable=SC2034

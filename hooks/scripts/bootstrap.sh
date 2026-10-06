@@ -7,7 +7,8 @@
 # way that is easy to get fatally wrong:
 #
 #   SessionStart    Fires for launch-time `claude -w`. stdout is INJECTED INTO THE MODEL'S
-#                   CONTEXT, so nothing may go there. Creation was native, so `.worktreeinclude`
+#                   CONTEXT, so nothing goes there but the status line and the approved agent
+#                   note. Creation was native, so `.worktreeinclude`
 #                   has ALREADY been honoured and must not be redone; only the profile's copy[]
 #                   is this hook's business. The session measurably blocks until this
 #                   returns, which is what makes a synchronous bootstrap safe.
@@ -253,6 +254,31 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
   fi
   wt_background_wait "$worktree"
   wt_serve_start "$worktree"
+}
+
+# SessionStart after /clear or a compaction. The session's context is rebuilt without what the
+# start-up hook printed, while CLAUDE.md is read again — so the agent note, which says what CLAUDE.md
+# cannot for a worktree, would be gone for the rest of the session. This prints it again, approved,
+# and does nothing else: the bootstrap ran at start-up, and a compaction fires mid-session, where its
+# cost would land on the user's next prompt. One profile load and the approval check, no state
+# written; the caller silences stderr, which would otherwise repeat on every compaction what start-up
+# already said once.
+wt_agent_note_after_reset() {  # $1 = the session's directory
+  local here=$1 worktree root
+  case "$here/" in
+    *"$WT_SUBPATH"*) ;;
+    *) return 0 ;;
+  esac
+  worktree=$(wt_repo_root "$here") || return 0
+  root=$(wt_main_root "$here") || return 0
+  wt_is_worktree_of "$worktree" "$root" || return 0
+  wt_load_profile_for "$worktree" "$root"
+  wt_profile_has_agent_note || return 0
+  wt_approval_check "$worktree"
+  if wt_agent_note_is_approved; then
+    wt_agent_note_block
+  fi
+  return 0
 }
 
 case ${1-} in
@@ -582,9 +608,14 @@ case $event in
     # Only a genuinely new or resumed session can need bootstrapping. `compact` fires
     # mid-session, where the "the model cannot race the hook" measurement —
     # taken at startup — does not apply, and where re-running a bootstrap would be pure
-    # cost. Stay silent rather than logging on every compaction.
+    # cost. Stay silent rather than logging on every compaction — except for the approved agent
+    # note, which /clear and a compaction drop from the context (wt_agent_note_after_reset).
     case $source_kind in
       startup | resume | '') ;;
+      clear | compact)
+        wt_agent_note_after_reset "$here" 2>/dev/null
+        exit 0
+        ;;
       *) exit 0 ;;
     esac
 
@@ -692,6 +723,11 @@ case $event in
       fi
     fi
     wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
+    # After the status line, which says nothing of it: the note is the repository's text, not
+    # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
+    if wt_is_worktree_of "$worktree" "$root" && wt_agent_note_is_approved; then
+      wt_agent_note_block
+    fi
     exit 0
     ;;
 

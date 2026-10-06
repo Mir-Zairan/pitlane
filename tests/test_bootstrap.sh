@@ -2216,6 +2216,139 @@ PY
 done
 
 # ---------------------------------------------------------------------------
+# agentNote delivery: the approved note reaches the session and its subagents, in a worktree only
+# ---------------------------------------------------------------------------
+# The note is branch text the developer approved, put before the model as guidance: printed after
+# the status line at start-up and resume, printed again after /clear and a compaction (which drop
+# what start-up printed while CLAUDE.md survives), and given to a subagent working in the worktree.
+# Each line arrives literally — quotes, backslashes, `$(...)` and non-ASCII text are text.
+set_agent_note() {  # $1 = checkout, $@ = the note's lines
+  local dir=$1
+  shift
+  python3 - "$dir/.claude/worktree-profile.json" "$@" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["agentNote"] = sys.argv[2:]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+PY
+  git -C "$dir" commit -qam note
+}
+reset_hook() {  # $1 = directory, $2 = source (clear, compact, resume)
+  run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"$2\",\"cwd\":\"$1\"}" "$1"
+}
+gated_reset_hook() ( unset PITLANE_TRUST_PROFILES; reset_hook "$@" )
+NOTE_HDR="Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
+NL1='Run make test, not the root test script.'
+# shellcheck disable=SC2016  # the $(...) and backticks are the payload, kept literal.
+NL2='Quote "this", keep a back\slash and a literal \n, and print $(touch '"$TMP"'/note-ran) and `id` as text; café ✓ 日本'
+NOTE_BLOCK="$NOTE_HDR$NL_- $NL1$NL_- $NL2"
+
+ND=$TMP/nd
+make_repo "$ND" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+set_agent_note "$ND" "$NL1" "$NL2"
+WND=$ND/.claude/worktrees/noted
+git -C "$ND" worktree add -q "$WND" -b worktree-noted 2>/dev/null
+
+# Approved (the suite trusts its fixtures): the note alone, since a complete worktree has no status line.
+out=$(start_hook "$WND")
+eq 'note: start-up prints the header and each line, literally' "$NOTE_BLOCK" "$out"
+eq '...and nothing in it was run' no "$([ -e "$TMP/note-ran" ] && echo yes || echo no)"
+eq 'note: resume prints it like start-up' "$NOTE_BLOCK" "$(reset_hook "$WND" resume)"
+for src in clear compact; do
+  eq "note: $src prints it again" "$NOTE_BLOCK" "$(reset_hook "$WND" "$src")"
+  eq "...and says nothing on stderr ($src)" '' "$(cat "$TMP/err")"
+done
+eq 'note: a compaction in the main checkout prints nothing' '' "$(reset_hook "$ND" compact)$(cat "$TMP/err")"
+eq 'note: nor does a start-up there' '' "$(start_hook "$ND")"
+
+# After /clear or a compaction it is the note and nothing else: no bootstrap, no state written, no
+# background run — checked on a worktree no start-up has touched, with the background run allowed.
+WND2=$ND/.claude/worktrees/fresh
+git -C "$ND" worktree add -q "$WND2" -b worktree-fresh 2>/dev/null
+GDND2=$(git -C "$WND2" rev-parse --absolute-git-dir)
+before=$(ls -A "$GDND2"; git -C "$WND2" status --porcelain --ignored)
+for src in clear compact; do
+  out=$(PITLANE_BACKGROUND=on reset_hook "$WND2" "$src")
+  eq "note: $src in an untouched worktree prints only the note" "$NOTE_BLOCK" "$out"
+done
+eq '...and writes no state, starts no background run, and copies nothing' "$before" \
+  "$(ls -A "$GDND2"; git -C "$WND2" status --porcelain --ignored)"
+
+# Not approved: never printed. Start-up says the note is held and where approval happens, without
+# its text; /clear and a compaction print nothing at all; --finish is not "fully set up".
+NU=$TMP/nu
+make_repo "$NU" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+set_agent_note "$NU" "$NL1"
+WNU=$NU/.claude/worktrees/held
+git -C "$NU" worktree add -q "$WNU" -b worktree-held 2>/dev/null
+out=$(gated_hook "$WNU")
+lacks 'note held: start-up does not print the note' "$NL1" "$out"
+lacks '...nor its header' "$NOTE_HDR" "$out"
+contains '...but says the agent note is held' 'agent note' "$out"
+contains '...and points at the review' '--review' "$out"
+eq '...on one line' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+for src in clear compact; do
+  eq "note held: $src prints nothing" '' "$(gated_reset_hook "$WNU" "$src")"
+done
+outF=$(gated_cli "$WNU" --finish)
+lacks 'note held: --finish does not call the worktree fully set up' 'fully set up' "$outF"
+contains '...and points at --review' '--review' "$outF"
+lacks '...without the note' "$NL1" "$outF"
+# Approved by the developer, it is shown — at start-up and after a compaction alike.
+gated_cli "$WNU" --approve "$(gated_cli "$WNU" --review | fp_of)" >/dev/null
+eq 'note: once approved, start-up prints it' "$NOTE_HDR$NL_- $NL1" "$(gated_hook "$WNU")"
+eq '...and so does a compaction' "$NOTE_HDR$NL_- $NL1" "$(gated_reset_hook "$WNU" compact)"
+eq '...and --finish reads fully set up, without it' 'Pitlane: this worktree is fully set up.' "$(gated_cli "$WNU" --finish)"
+
+# A note the validator refuses makes the whole profile unusable, so nothing of it is shown.
+NV=$TMP/nv
+make_repo "$NV" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+set_agent_note "$NV" "$NL1" $'two\tcolumns'
+WNV=$NV/.claude/worktrees/invalid
+git -C "$NV" worktree add -q "$WNV" -b worktree-invalid 2>/dev/null
+out=$(start_hook "$WNV")
+lacks 'note: an invalid profile prints no note at start-up' "$NL1" "$out"
+contains '...and stderr says the profile is not valid' 'is not valid' "$(cat "$TMP/err")"
+eq '...nor after a compaction' '' "$(reset_hook "$WNV" compact)"
+
+# A profile with no note: resume is as silent as start-up has always been.
+eq 'no note: resume of a complete worktree prints nothing' '' "$(reset_hook "$W1" resume)"
+
+# WorktreeCreate: stdout is the path and nothing else, note or not.
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"made-noted\",\"cwd\":\"$ND\"}" "$ND")
+eq 'note: WorktreeCreate prints only the path' "$ND/.claude/worktrees/made-noted" "$out"
+
+# A subagent in the worktree gets the note, with its line breaks, as one valid JSON object — with no
+# port in this worktree, where it used to be told nothing at all.
+out=$(subagent_hook "$WND" "$ND")
+eq 'note: a subagent in a worktree with no port gets the note, lines kept' "$NOTE_BLOCK" \
+  "$(printf '%s' "$out" | sa_context)"
+eq '...as one line of JSON' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+eq '...and exits 0' 0 "$(cat "$TMP/sa-rc")"
+eq 'note: a subagent in the main checkout gets nothing' '' "$(subagent_hook "$ND" "$ND")"
+NS=$TMP/ns
+make_repo "$NS" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+set_agent_note "$NS" "$NL1"
+WNS=$NS/.claude/worktrees/sub
+git -C "$NS" worktree add -q "$WNS" -b worktree-sub 2>/dev/null
+eq 'note: a subagent in a worktree whose note is not approved gets nothing' '' \
+  "$( (unset PITLANE_TRUST_PROFILES; subagent_hook "$WNS" "$NS") )"
+eq '...even under a parent session started in that worktree' '' \
+  "$( (unset PITLANE_TRUST_PROFILES; subagent_hook "$WNS" "$WNS") )"
+# With a port, the port line is unchanged and the note follows it on lines of its own.
+RTN=$TMP/rtn
+make_rt_repo "$RTN"
+set_agent_note "$RTN" "$NL1"
+WRTN=$RTN/.claude/worktrees/ported
+git -C "$RTN" worktree add -q "$WRTN" -b worktree-ported 2>/dev/null
+start_hook "$WRTN" >/dev/null
+RTNPORT=$(envval "$WRTN" SERVER_PORT)
+ne 'note: (fixture) the worktree has a port' '' "$RTNPORT"
+eq 'note: a subagent in a worktree with a port gets the port line, then the note' \
+  "Pitlane: this worktree is ported; its app port is $RTNPORT — use these, not any inherited WORKTREE_PORT/WORKTREE_URL$NL_$NOTE_HDR$NL_- $NL1" \
+  "$(subagent_hook "$WRTN" "" | sa_context)"
+
+# ---------------------------------------------------------------------------
 # /pitlane-serve: `bootstrap.sh --serve` and `--serve-stop`
 # ---------------------------------------------------------------------------
 # Every server a test starts is stopped on the way out, by its recorded group, whatever happened.

@@ -269,7 +269,12 @@
     "escape, and no bidirectional, zero-width or tag character inside a line; validation rejects the",
     "profile otherwise. A profile carrying a note needs approval even when",
     "it runs no commands: `bootstrap.sh --review` lists every line as `agent note: ...`, and editing",
-    "a line changes the fingerprint, so the edit is approved again before it is shown."
+    "a line changes the fingerprint, so the edit is approved again before it is shown.",
+    "",
+    "Once approved, it is shown to the model as `- <line>` under a header naming this file: at the",
+    "start and resume of every session in a worktree, after its status line; again after /clear and a",
+    "compaction; and to every subagent working in a worktree. Never in the main checkout. Until it is",
+    "approved it is not shown at all, and the session is told only that a note is held for review."
   ],
   "agentNote": [
     "Run the test suite with `pnpm test`, never against the main checkout's database."

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# SubagentStart entrypoint: tells a subagent which worktree it runs in, and that worktree's own app
-# port and URL.
+# SubagentStart entrypoint: tells a subagent which worktree it runs in, that worktree's own app
+# port and URL, and the profile's approved agent note.
 #
 # Measured (ADR-024): a subagent with isolation "worktree" gets a worktree from WorktreeCreate, but no
 # SessionStart fires for it, WorktreeCreate gets no CLAUDE_ENV_FILE, and the subagent INHERITS the
@@ -50,10 +50,22 @@ wt_subagent_json_escape() {  # $1 = text
   printf '%s' "${t//\"/\\\"}"
 }
 
-# The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told.
+# The same for a block of lines: each LF becomes the escape `\n` instead of being dropped, so the
+# lines reach the subagent as lines. Every other control character is still dropped.
+wt_subagent_json_escape_lines() {  # $1 = text
+  local t
+  t=$(printf '%s' "${1-}" | LC_ALL=C tr -d '\000-\011\013-\037')
+  t=${t//\\/\\\\}
+  t=${t//\"/\\\"}
+  printf '%s' "${t//$'\n'/\\n}"
+}
+
+# The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told; and
+# the profile's agent note, in WT_SUBAGENT_AGENT_NOTE, when the subagent works in a worktree whose
+# profile carries one approved for it — empty otherwise, so a held note is never shown.
 wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the parent session started in
   local here=${1-} parent=${2-} name url='' inherited='' parent_name=''
-  WT_SUBAGENT_NOTE=''
+  WT_SUBAGENT_NOTE='' WT_SUBAGENT_AGENT_NOTE=''
   # What the parent session exported (wt_session_env_export): a port, if it started in a Pitlane
   # worktree that has one. Read from the hook's own environment too, should a release pass it on.
   if [ -n "${WORKTREE_PORT:-}${WORKTREE_URL:-}" ]; then
@@ -65,8 +77,17 @@ wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the pa
 
   if wt_subagent_worktree "$here"; then
     name=$(wt_name_from_path "$WT_SA_WORKTREE")
+    # Loaded with or without a port: the agent note does not depend on one. Its approval is decided
+    # for this worktree, as the start-up hook decides it — what the parent session was shown says
+    # nothing about the files here.
+    wt_load_profile_for "$WT_SA_WORKTREE" "$WT_SA_ROOT" 2>/dev/null
+    if wt_profile_has_agent_note; then
+      wt_approval_check "$WT_SA_WORKTREE" 2>/dev/null
+      if wt_agent_note_is_approved; then
+        WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block)
+      fi
+    fi
     if [ -n "$WT_SA_PORT" ]; then
-      wt_load_profile_for "$WT_SA_WORKTREE" "$WT_SA_ROOT" 2>/dev/null
       if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && [ -n "${PROFILE_RT_URL:-}" ]; then
         WT_PORT=$WT_SA_PORT
         WT_SLUG=$(wt_runtime_state_get "$WT_SA_WORKTREE" slug) || WT_SLUG=''
@@ -88,14 +109,18 @@ wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the pa
 }
 
 main() {
-  local here
+  local here context
   wt_read_input
   wt_has_json || return 0
   here=$(wt_read_field cwd) || here=$PWD
   wt_subagent_note "$here" "${CLAUDE_PROJECT_DIR:-}"
-  [ -n "$WT_SUBAGENT_NOTE" ] || return 0
-  printf '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"%s"}}\n' \
-    "$(wt_subagent_json_escape "$WT_SUBAGENT_NOTE")"
+  [ -n "$WT_SUBAGENT_NOTE$WT_SUBAGENT_AGENT_NOTE" ] || return 0
+  # The Pitlane line first, then the note on lines of its own, as at start-up.
+  context=$(wt_subagent_json_escape "$WT_SUBAGENT_NOTE")
+  if [ -n "$WT_SUBAGENT_AGENT_NOTE" ]; then
+    context+=${context:+\\n}$(wt_subagent_json_escape_lines "$WT_SUBAGENT_AGENT_NOTE")
+  fi
+  printf '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"%s"}}\n' "$context"
 }
 
 # In a subshell, so even an error `set -u` makes fatal ends there and the hook still exits 0. Nothing
