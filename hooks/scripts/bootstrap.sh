@@ -102,8 +102,8 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
     printf 'Pitlane: no usable profile at %s — nothing to approve.\n' "$PROFILE_PATH"
     return 0
   fi
-  if ! wt_profile_runs_commands; then
-    printf 'Pitlane: %s runs no commands, so it needs no approval.\n' "$PROFILE_PATH"
+  if ! wt_profile_needs_approval; then
+    printf 'Pitlane: %s runs no commands and has no agent note, so it needs no approval.\n' "$PROFILE_PATH"
     return 0
   fi
   if ! fp=$(wt_approval_fingerprint "$rundir"); then
@@ -117,7 +117,7 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
     if wt_approval_known "$fp" "$store"; then
       printf 'Approved: this exact content is approved (fingerprint %s).\n' "$fp"
     else
-      printf 'NOT approved (fingerprint %s). Read the commands above and the scripts named, and approve only if you trust all of them:\n  bash "%s" --approve %s\n' "$fp" "$WT_BOOTSTRAP_SCRIPT" "$fp"
+      printf 'NOT approved (fingerprint %s). Read everything above and the scripts named, and approve only if you trust all of it:\n  bash "%s" --approve %s\n' "$fp" "$WT_BOOTSTRAP_SCRIPT" "$fp"
     fi
     case ${PITLANE_TRUST_PROFILES:-} in
       1 | yes | on | true) printf 'PITLANE_TRUST_PROFILES is set, so the hooks run these without approval anyway.\n' ;;

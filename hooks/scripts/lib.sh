@@ -1013,7 +1013,7 @@ wt_expand_url() {  # $1 = template
 #  17 runtime.port.var                18 runtime.port.base            19 runtime.port.span
 #  20 runtime.port
 #  21 runtime.serve  22 runtime.stop                23 runtime.url
-#  24 artifacts
+#  24 artifacts     25 agentNote
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum, copy — compact JSON,
@@ -1021,11 +1021,14 @@ wt_expand_url() {  # $1 = template
 # group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
 # list. A plain string yields no group-4 records; the scalar carries it. Group 5 = artifacts[] (dir,
 # inputs, build, verify, link); `inputs` arrives as compact JSON, split by wt_artifact_inputs.
+# Group 6 = agentNote[], one record per line. A new group, like a new scalar, goes on the END: the
+# consumers match records by tag, so an insertion would renumber every later group.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
 # a distinction no record stream can express. `runtime` and `runtime.env.vars` are there for the
-# same reason.
+# same reason, and `agentNote` for one more: a record cannot tell the string "1" from the number 1,
+# nor show a newline the reader folded into a space, and the compact JSON shows both.
 wt_profile_scan() {  # $1 = profile path
   wt_json_scan schemaVersion shell shellArgs deps runtime \
     timeouts.bootstrapSeconds timeouts.seedSeconds \
@@ -1033,12 +1036,13 @@ wt_profile_scan() {  # $1 = profile path
     runtime.seed runtime.teardown runtime.env.file \
     runtime.slug runtime.env.vars copy evidence.shellMarker \
     runtime.port.var runtime.port.base runtime.port.span runtime.port \
-    runtime.serve runtime.stop runtime.url artifacts \
+    runtime.serve runtime.stop runtime.url artifacts agentNote \
     -- deps dir lock strategy install verify lockChecksum copy \
     -- copy . \
     --kv runtime.env.vars \
     -- runtime.env.file . \
-    -- artifacts dir inputs build verify link <"$1"
+    -- artifacts dir inputs build verify link \
+    -- agentNote . <"$1"
 }
 
 # Split the scalar record of a wt_profile_scan stream into named variables — the ONE place that
@@ -1079,7 +1083,7 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_SEED WT_PS_TEARDOWN WT_PS_ENVFILE \
     WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
     WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
-    WT_PS_SERVE WT_PS_STOP WT_PS_URL WT_PS_ARTIFACTS \
+    WT_PS_SERVE WT_PS_STOP WT_PS_URL WT_PS_ARTIFACTS WT_PS_AGENTNOTE \
     <<<"$body" || true
   WT_PS_ENVFILES=''
   case $WT_PS_ENVFILE in
@@ -1190,6 +1194,37 @@ WT_DEFAULT_TIMEOUT=600
 # seedSeconds both run inside ONE invocation of it, so it is their SUM that must fit.
 WT_HOOK_TIMEOUT=600
 
+# The bounds on agentNote. It is read into the context of every session in a worktree of the repo,
+# so a branch must not be able to fill that context with it: 40 lines of 400 characters is room for
+# real guidance and no more.
+WT_AGENT_NOTE_MAX_LINES=40
+WT_AGENT_NOTE_MAX_CHARS=400
+
+# True when $1, JSON text as either backend renders it (wt_json_backend), holds a control character.
+# C0 must be escaped inside a JSON string, so it arrives as `\n`, `\t`, `\u001b` and so on; DEL is
+# escaped by jq and raw from python3; C1 is raw from both, as UTF-8. The rendered JSON is the only
+# place to look: the record readers fold CR and LF into a space and strip US and RS, so a record
+# cannot show them. `\\` pairs are dropped first so an escaped backslash before an `n` is not one —
+# the same order wt_resolve_removal_target uses. LC_ALL=C so the byte ranges below are bytes.
+wt_json_has_control() {  # $1 = rendered JSON
+  local LC_ALL=C escaped_backslash="\\\\" s=${1-}
+  s=${s//"$escaped_backslash"/}
+  case $s in
+    *'\n'* | *'\r'* | *'\t'* | *'\b'* | *'\f'* | *'\u00'[01]* | *'\u007'[fF]* | *'\u00'[89]*) return 0 ;;
+    *$'\x7f'* | *$'\xc2'[$'\x80'-$'\x9f']*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when $2 is longer than $1 characters, counted as UTF-8 whatever the locale: every byte that is
+# not a continuation byte starts a character. ${#s} alone counts bytes in one locale and characters in
+# another, and the hook inherits whichever the developer's shell has.
+wt_is_longer_than() {  # $1 = limit, $2 = text
+  local LC_ALL=C s=${2-}
+  s=${s//[$'\x80'-$'\xbf']/}
+  [ "${#s}" -gt "$1" ]
+}
+
 # True if $1 is a positive whole number of seconds.
 #
 # A timeout is taken from a file that is committed, so it arrives with
@@ -1272,6 +1307,8 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local ef efrest efseen efrebuilt efn
   local serve stopcmd urltpl urlwhy
   local artifacts adir ainputs abuild averify alink nart=0 depdirs=' ' artdirs=' '
+  local agentnote rest shape want lit nlit nline=0 escaped_backslash="\\\\"
+  local -a lits=()
 
   [ -n "$file" ] || { printf 'profile: no path given\n'; return 1; }
   if [ ! -f "$file" ]; then
@@ -1315,6 +1352,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   evshell=$WT_PS_EVSHELL;   portvar=$WT_PS_PORTVAR;   portbase=$WT_PS_PORTBASE
   portspan=$WT_PS_PORTSPAN; portobj=$WT_PS_PORT;     serve=$WT_PS_SERVE
   stopcmd=$WT_PS_STOP;      urltpl=$WT_PS_URL;       artifacts=$WT_PS_ARTIFACTS
+  agentnote=$WT_PS_AGENTNOTE
 
   # --- schemaVersion --------------------------------------------------------
   if [ -z "$version" ]; then
@@ -1561,6 +1599,81 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     if [ "$nart" -eq 0 ]; then
       printf 'artifacts: is a non-empty array but could not be read — refusing to treat it as empty\n'
       bad=1
+    fi
+  fi
+
+  # --- agentNote[] ----------------------------------------------------------
+  # Lines of guidance for the model working in a worktree, which is text from anyone's branch put in
+  # front of a model — so it is held to plain, bounded lines. A newline would let one entry pose as
+  # several, and an escape sequence can make a terminal show other text than the line holds. No
+  # message below repeats the value: it may be 16000 characters, or carry the very bytes refused.
+  # The types, the count and the control characters are read from the rendered JSON (wt_profile_scan
+  # says why the records cannot answer); the length from the records, which are the lines unescaped.
+  if [ -n "$agentnote" ]; then
+    case $agentnote in
+      '['*']') ;;
+      *) printf 'agentNote: must be an array of strings\n'; bad=1; agentnote='' ;;
+    esac
+  fi
+  if [ -n "$agentnote" ] && [ "$agentnote" != '[]' ]; then
+    # Take every string literal out and keep what is between them. Only an array of strings leaves
+    # `[` and `]` with a comma between each pair; a number, an object or a nested array leaves more.
+    # Neither backend puts a space in compact JSON, and with `\\` and `\"` gone first, every
+    # remaining quote opens or closes a literal.
+    rest=${agentnote//"$escaped_backslash"/}
+    rest=${rest//\\\"/}
+    shape=''
+    while :; do
+      case $rest in
+        *'"'*'"'*) ;;
+        *) break ;;
+      esac
+      shape+=${rest%%'"'*}
+      rest=${rest#*'"'}
+      lits+=("${rest%%'"'*}")
+      rest=${rest#*'"'}
+    done
+    shape+=$rest
+    nlit=${#lits[@]}
+    want='['
+    n=1
+    while [ "$n" -lt "$nlit" ]; do want+=','; n=$((n + 1)); done
+    want+=']'
+    if [ "$nlit" -eq 0 ] || [ "$shape" != "$want" ]; then
+      printf 'agentNote: every element must be a string\n'
+      bad=1
+    elif [ "$nlit" -gt "$WT_AGENT_NOTE_MAX_LINES" ]; then
+      printf 'agentNote: has %d lines, more than the %d allowed\n' "$nlit" "$WT_AGENT_NOTE_MAX_LINES"
+      bad=1
+    else
+      n=0
+      for lit in "${lits[@]}"; do
+        if wt_json_has_control "$lit"; then
+          printf 'agentNote[%d]: contains a control character (a newline, a tab, an escape) — each line must be plain text\n' "$n"
+          bad=1
+        fi
+        n=$((n + 1))
+      done
+      n=0
+      while IFS= read -r -d "$WT_RS" rec; do
+        case $rec in
+          6"$WT_US"*) ;;
+          *) continue ;;
+        esac
+        if wt_is_longer_than "$WT_AGENT_NOTE_MAX_CHARS" "${rec#*"$WT_US"}"; then
+          printf 'agentNote[%d]: is longer than %d characters\n' "$n" "$WT_AGENT_NOTE_MAX_CHARS"
+          bad=1
+        fi
+        nline=$((nline + 1))
+        n=$((n + 1))
+      done < <(printf '%s' "$raw")
+      n=0
+      # The fail-closed guard the other arrays have: a stream that lost its group-6 records would
+      # skip the length check and pronounce the note clean.
+      if [ "$nline" -eq 0 ]; then
+        printf 'agentNote: is a non-empty array but could not be read — refusing to treat it as empty\n'
+        bad=1
+      fi
     fi
   fi
 
@@ -1985,13 +2098,17 @@ wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are c
 #                           PROFILE_RT_SERVE / _STOP are UNEXPANDED command templates, and
 #                           PROFILE_RT_URL an unexpanded URL template: expand the URL only with
 #                           wt_expand_url, and a command only after wt_unsafe_command_placeholder.
+#   PROFILE_AGENT_NOTE      agentNote's lines joined with a newline; empty when it is absent or
+#                           []. Text from the branch, meant for the model working in the worktree:
+#                           it makes the profile need approval (wt_profile_needs_approval), and is
+#                           shown to nothing until WT_APPROVAL says yes.
 #
 # SC2034: every PROFILE_* assignment below looks unused to shellcheck because they ARE
 # this function's return value — the callers that read them live in other files.
 # shellcheck disable=SC2034
 wt_load_profile() {  # $1 = repo root (default: $PWD)
   local root=${1:-$PWD} raw version shell runtime boot seed problems
-  local shellargs evdet evmark evshell
+  local shellargs evdet evmark evshell rec nnote=0
 
   PROFILE_PATH="${root%/}/.claude/worktree-profile.json"
   PROFILE_PRESENT=0
@@ -2017,6 +2134,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_SERVE=''
   PROFILE_RT_STOP=''
   PROFILE_RT_URL=''
+  PROFILE_AGENT_NOTE=''
 
   [ -e "$PROFILE_PATH" ] || return 0
 
@@ -2119,6 +2237,25 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_SERVE=$WT_PS_SERVE
   PROFILE_RT_STOP=$WT_PS_STOP
   PROFILE_RT_URL=$WT_PS_URL
+
+  # From group 6 rather than from the scalar: the records are the lines already unescaped, and the
+  # validator has refused any line holding a control character, so the newline joining them is the
+  # only one in the result.
+  case $WT_PS_AGENTNOTE in
+    '['*']')
+      while IFS= read -r -d "$WT_RS" rec; do
+        case $rec in
+          6"$WT_US"*) ;;
+          *) continue ;;
+        esac
+        # A separator before every line but the first, counted rather than inferred from the
+        # text so far: an empty first line must still be a line.
+        [ "$nnote" -eq 0 ] || PROFILE_AGENT_NOTE+=$WT_NL
+        PROFILE_AGENT_NOTE+=${rec#*"$WT_US"}
+        nnote=$((nnote + 1))
+      done < <(printf '%s' "$raw")
+      ;;
+  esac
 
   if [ -n "$boot" ]; then
     if wt_is_seconds "$boot"; then

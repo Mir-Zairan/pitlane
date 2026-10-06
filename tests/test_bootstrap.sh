@@ -1971,7 +1971,41 @@ git -C "$NC" worktree add -q "$WNC" -b worktree-nc 2>/dev/null
 outN=$(gated_hook "$WNC")
 eq 'approval: a profile that runs no commands is set up without one' '' "$outN"
 eq '...and its config copied' 'EXTRA=1' "$(cat "$WNC/.env.extra" 2>/dev/null)"
-contains 'review: says such a profile needs no approval' 'runs no commands, so it needs no approval' "$(gated_cli "$WNC" --review)"
+contains 'review: says such a profile needs no approval' 'runs no commands and has no agent note, so it needs no approval' "$(gated_cli "$WNC" --review)"
+
+# An agentNote runs nothing but is branch text put before the model, so a profile carrying one is
+# held until approved even with no command in it — otherwise a pull request could add a note-only
+# profile and have it read in the reviewer's session. The approval is the fingerprint --review
+# printed, and editing one line of the note changes it.
+AN=$TMP/an
+make_repo "$AN" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}' '' \
+  '"agentNote": ["Run make test, not the root test script.", "Use the worktree database."],'
+approval_of() {  # $1 = checkout, $2 = PITLANE_TRUST_PROFILES or empty; prints WT_APPROVAL
+  # shellcheck disable=SC2016  # expanded by the inner shell.
+  PITLANE_TRUST_PROFILES=${2-} bash -c '. "$1"; wt_load_profile "$2"; wt_approval_check "$2"; printf %s "$WT_APPROVAL"' \
+    _ "$LIB" "$1" 2>"$TMP/err"
+}
+eq 'approval: a profile with only an agent note is held until approved' no "$(approval_of "$AN")"
+contains '...and stderr says the note is what is held' 'the agent note in' "$(cat "$TMP/err")"
+eq '...unless PITLANE_TRUST_PROFILES is set' yes "$(approval_of "$AN" 1)"
+outR=$(gated_cli "$AN" --review)
+contains 'review: lists the first note line' '  agent note: Run make test, not the root test script.' "$outR"
+contains 'review: and the second' '  agent note: Use the worktree database.' "$outR"
+lacks '...and does not call the profile one that needs no approval' 'needs no approval' "$outR"
+FPN=$(printf '%s\n' "$outR" | fp_of)
+ne '...and prints a fingerprint to approve' '' "$FPN"
+gated_cli "$AN" --approve "$FPN" >/dev/null
+eq 'approval: approved, the agent note is cleared' yes "$(approval_of "$AN")"
+python3 - "$AN/.claude/worktree-profile.json" <<'EOF2'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["agentNote"][1] = "Use the shared database."
+json.dump(d, open(p, "w"), indent=2)
+EOF2
+FPN2=$(gated_cli "$AN" --review | fp_of)
+ne 'approval: editing one note line changes the fingerprint' "$FPN" "$FPN2"
+eq '...so the edited note is held again' no "$(approval_of "$AN")"
+contains '...and the old fingerprint does not approve it' 'is not the current fingerprint' "$(gated_cli "$AN" --approve "$FPN")"
 
 # Approving from the main checkout covers a worktree carrying the same content.
 MC=$TMP/mc

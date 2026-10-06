@@ -5889,6 +5889,32 @@ contains 'review: shows the serve command' 'serve (run by /pitlane-serve): bin/s
 contains 'review: shows the stop command' 'stop (run by teardown): bin/server --stop' "$out"
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_RT_SERVE='' PROFILE_RT_STOP=''
+
+# --- agentNote: runs nothing, but is branch text put before the model, so it is approved too -------
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_AGENT_NOTE=''
+wt_profile_needs_approval
+eq 'needs approval: no command and no note needs none' 1 $?
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_AGENT_NOTE=$'Run make test, not the root test script.\nUse the worktree database.'
+wt_profile_runs_commands
+eq 'runs commands: a note is not a command' 1 $?
+wt_profile_needs_approval
+eq 'needs approval: a note alone needs approval' 0 $?
+( PROFILE_PRESENT=0; wt_profile_needs_approval )
+eq 'needs approval: not when no usable profile is loaded' 1 $?
+out=$(wt_approval_describe "$DWT")
+contains 'review: lists the first note line' '  agent note: Run make test, not the root test script.' "$out"
+contains 'review: and the second, on a line of its own' '  agent note: Use the worktree database.' "$out"
+# The validator refuses these; the review sanitises anyway, as it does every other branch text, for a
+# profile loaded with WT_SKIP_VALIDATION.
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_AGENT_NOTE=$'a\r\033[2Kb\xc2\x9bc'
+out=$(wt_approval_describe "$DWT")
+contains 'review: a note line is shown with control characters as ?' 'agent note: a??[2Kb??c' "$out"
+lacks '...no escape reaches the screen' $'\033' "$out"
+# shellcheck disable=SC2034  # read by the sourced engine.
+PROFILE_AGENT_NOTE=''
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0
 

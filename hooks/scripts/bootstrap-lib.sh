@@ -321,7 +321,7 @@ wt_approval_fingerprint() {  # $1 = run directory
 # True when what WT_APPROVAL_FP approved is still what is on disk in $1. For the scripts, which are
 # read from disk when they run: a background run fingerprints before its installs and seeds minutes
 # later, and a `git pull` in the live session meanwhile must not run an unapproved script on a stale
-# answer. Nothing to compare (the gate is off, or the profile runs nothing) is still approved.
+# answer. Nothing to compare (the gate is off, or the profile needs no approval) is still approved.
 wt_approval_still() {  # $1 = run directory
   local now
   [ "${WT_APPROVAL:-}" = no ] && return 1
@@ -359,6 +359,16 @@ wt_profile_runs_commands() {
   return 1
 }
 
+# True when the loaded profile must be approved before the hooks act on all of it: it runs commands
+# (wt_profile_runs_commands), or it carries an agentNote. The note runs nothing, but it is text from
+# the branch put in front of the model as guidance, so without this a pull request could add a
+# profile holding only a note and have it read in the reviewer's session unapproved. Editing the note
+# edits the profile, so the fingerprint, which hashes the whole file, asks again.
+wt_profile_needs_approval() {
+  wt_profile_runs_commands && return 0
+  [ "${PROFILE_PRESENT:-0}" = 1 ] && [ -n "${PROFILE_AGENT_NOTE:-}" ]
+}
+
 # Where the approved fingerprints are kept: the shared git directory, as seen from $1.
 wt_approvals_path() {  # $1 = any directory inside the repository
   local common
@@ -373,15 +383,15 @@ wt_approval_known() {  # $1 = fingerprint, $2 = record file
   awk -v f="$1" '$1 == f { found = 1 } END { exit !found }' "$2" 2>/dev/null
 }
 
-# Decide whether the loaded profile's commands may run in $1, into WT_APPROVAL (yes/no) and
-# WT_APPROVAL_FP. Called once the files it fingerprints are in place — after the config copy, which
-# is what brings a personal profile's scripts into a worktree. Says why on stderr when the answer is
-# no; never fails.
+# Decide whether the loaded profile's commands may run in $1, and its agent note be shown, into
+# WT_APPROVAL (yes/no) and WT_APPROVAL_FP. Called once the files it fingerprints are in place —
+# after the config copy, which is what brings a personal profile's scripts into a worktree. Says why
+# on stderr when the answer is no; never fails.
 wt_approval_check() {  # $1 = directory the profile's commands run in
   local dir=${1%/} store
   WT_APPROVAL=yes
   WT_APPROVAL_FP=''
-  wt_profile_runs_commands || return 0
+  wt_profile_needs_approval || return 0
   case ${PITLANE_TRUST_PROFILES:-} in
     1 | yes | on | true) return 0 ;;
   esac
@@ -395,7 +405,11 @@ wt_approval_check() {  # $1 = directory the profile's commands run in
     return 0
   fi
   WT_APPROVAL=no
-  wt_log "approval: the commands in $PROFILE_PATH (and the seed and teardown scripts it names) are not approved in this form — none of them will run. To see what they are, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
+  if wt_profile_runs_commands; then
+    wt_log "approval: the commands in $PROFILE_PATH (and the seed and teardown scripts it names) are not approved in this form — none of them will run${PROFILE_AGENT_NOTE:+, and its agent note will not be shown}. To see what they are, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
+  else
+    wt_log "approval: the agent note in $PROFILE_PATH is not approved in this form — it will not be shown. To see it, run \`bash \"${WT_BOOTSTRAP_SCRIPT:-bootstrap.sh}\" --review\` in $dir"
+  fi
   return 0
 }
 
@@ -412,10 +426,11 @@ wt_approval_record() {  # $1 = fingerprint, $2 = any directory inside the reposi
   printf '%s %s %s\n' "$fp" "$when" "$(wt_visible "$PROFILE_PATH")" >>"$store" 2>/dev/null
 }
 
-# What the loaded profile would run in $1, for a human to read before approving it. stdout: this is
-# printed by `bootstrap.sh --review`, run by hand or by /pitlane-finish, never by a hook.
+# What the loaded profile would run in $1, and the agent note it would show, for a human to read
+# before approving it. stdout: this is printed by `bootstrap.sh --review`, run by hand or by
+# /pitlane-finish, never by a hook.
 wt_approval_describe() {  # $1 = run directory
-  local dir=${1%/} rec body ddir lock strategy install verify _cksum _copy _inputs build _link
+  local dir=${1%/} rec body ddir lock strategy install verify _cksum _copy _inputs build _link line
   printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
   printf 'Everything below is text from the branch, shown with control characters as ?:\n'
   [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
@@ -446,6 +461,12 @@ wt_approval_describe() {  # $1 = run directory
     [ -n "${PROFILE_RT_TEARDOWN:-}" ] && printf '  teardown script: %s\n' "$(wt_visible "$dir/$PROFILE_RT_TEARDOWN")"
     [ -n "${PROFILE_RT_SERVE:-}" ] && printf '  serve (run by /pitlane-serve): %s\n' "$(wt_visible "$PROFILE_RT_SERVE")"
     [ -n "${PROFILE_RT_STOP:-}" ] && printf '  stop (run by teardown): %s\n' "$(wt_visible "$PROFILE_RT_STOP")"
+  fi
+  # Every line, so what is approved is exactly what was read.
+  if [ -n "${PROFILE_AGENT_NOTE:-}" ]; then
+    while IFS= read -r line; do
+      printf '  agent note: %s\n' "$(wt_visible "$line")"
+    done <<<"$PROFILE_AGENT_NOTE"
   fi
   if wt_is_pr_worktree "$dir"; then
     printf 'This is a pull-request worktree: approving covers this commit only. An approved install runs the PR'"'"'s own package scripts and toolchain files too, so read the diff of those (package.json, composer.json, flake.nix, …) before approving.\n'

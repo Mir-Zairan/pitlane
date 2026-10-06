@@ -259,6 +259,21 @@
     "url": "http://localhost:{port}"
   },
 
+  "_comment_agentNote": [
+    "Lines of guidance for the model working in a worktree of this repo — what a session cannot learn",
+    "from the files in front of it, such as which command runs the tests against this worktree's own",
+    "database. One string per line. OPTIONAL: omit it, or leave it [], when there is nothing to say.",
+    "",
+    "It is text from the branch put in front of a model, so it is bounded and it is approved. At most",
+    "40 lines of at most 400 characters, and no control characters — no newline, tab or escape inside a",
+    "line; validation rejects the profile otherwise. A profile carrying a note needs approval even when",
+    "it runs no commands: `bootstrap.sh --review` lists every line as `agent note: ...`, and editing",
+    "a line changes the fingerprint, so the edit is approved again before it is shown."
+  ],
+  "agentNote": [
+    "Run the test suite with `pnpm test`, never against the main checkout's database."
+  ],
+
   "_comment_timeouts": [
     "Bounds on the WORK, in seconds.",
     "",

@@ -716,6 +716,32 @@ EOF
   eq 'no runtime block -> every RT field is empty' '' \
     "$PROFILE_RT_SLUG$PROFILE_RT_PORTVAR$PROFILE_RT_PORTBASE$PROFILE_RT_PORTSPAN$PROFILE_RT_ENVFILE$PROFILE_RT_ENVVARS$PROFILE_RT_SEED$PROFILE_RT_TEARDOWN$PROFILE_RT_SERVE$PROFILE_RT_STOP$PROFILE_RT_URL"
 
+  # agentNote is published as its lines joined with a newline, the same on both backends: the
+  # expected values are literals, so the jq pass and the python3 pass each have to produce them.
+  eq 'no agentNote -> PROFILE_AGENT_NOTE is empty' '' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":["Run the tests with make test.","Never touch the shared cache."]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote -> present' '1' "$PROFILE_PRESENT"
+  eq 'agentNote -> its lines joined with a newline' \
+    $'Run the tests with make test.\nNever touch the shared cache.' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":["caf\u00e9 — naïve ✓","say \"hi\" to C:\\tmp\\new and \\n stays text"]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote -> unicode, quotes and backslashes survive' \
+    'café — naïve ✓'$'\n''say "hi" to C:\tmp\new and \n stays text' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":["","second"]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote -> an empty first line is still a line' $'\nsecond' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":[]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote [] -> present and empty' "1:" "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
+  # Cleared between loads, like the runtime fields: an invalid note publishes nothing.
+  printf '%s' '{"schemaVersion":1,"agentNote":["kept?"]}' >"$target"
+  wt_load_profile "$pdir"
+  printf '%s' '{"schemaVersion":1,"agentNote":["one\nline"]}' >"$target"
+  wt_load_profile "$pdir" 2>/dev/null
+  eq 'an invalid agentNote -> not present, and no note left from the previous load' '0:' \
+    "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
+
   cp "$TMP/profile-minimal.json" "$target"
   wt_load_profile "$pdir"
   eq 'minimal profile -> present'         '1'   "$PROFILE_PRESENT"
@@ -1235,7 +1261,8 @@ EOF
  "artifacts":[{"dir":"F24_dir","inputs":["F24_src"],"build":"F24_build"}],
  "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
  "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
- "copy":["F15_copy"]}
+ "copy":["F15_copy"],
+ "agentNote":["F25_note"]}
 JSON
   wt_profile_scalars "$(wt_profile_scan "$SCP")"
   eq 'scalars field 1 is schemaVersion'            '1'                "$WT_PS_VERSION"
@@ -1262,6 +1289,7 @@ JSON
   eq 'scalars field 22 is runtime.stop'            'F22_stop'         "$WT_PS_STOP"
   eq 'scalars field 23 is runtime.url'             'F23_url'          "$WT_PS_URL"
   contains 'scalars field 24 is artifacts as compact JSON' 'F24_dir'  "$WT_PS_ARTIFACTS"
+  eq 'scalars field 25 is agentNote as compact JSON' '["F25_note"]'   "$WT_PS_AGENTNOTE"
   # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
   # variables than the record has fields makes bash `read` pack the remainder into the last one —
   # but only visibly when the extra field is non-empty: `read` strips exactly one trailing
@@ -1269,9 +1297,12 @@ JSON
   # Counting the separators catches the scan list growing whether the new field has a value or not.
   scan_rec=$(wt_profile_scan "$SCP")
   scan_rec=${scan_rec%%"$RS"*}
-  eq 'the scalar record carries exactly 24 fields plus its tag' 24 \
+  eq 'the scalar record carries exactly 25 fields plus its tag' 25 \
     "$(printf '%s' "$scan_rec" | tr -cd "$US" | wc -c | tr -d ' ')"
-  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_ARTIFACTS"
+  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_AGENTNOTE"
+  # Group 6 is agentNote[], added last so groups 1-5 keep their tags.
+  contains 'group 6 is agentNote[]' "${RS}6${US}F25_note${RS}" "$(wt_profile_scan "$SCP")"
+  contains 'and group 5 is still artifacts[]' "${RS}5${US}F24_dir${US}" "$(wt_profile_scan "$SCP")"
   # An absent field is EMPTY, not a shift of everything after it.
   wt_profile_scalars "$(printf '%s' '{"schemaVersion":1,"evidence":{"shellMarker":"only"}}' \
     | wt_json_scan schemaVersion shell shellArgs deps runtime \
@@ -1744,6 +1775,73 @@ JSON
   contains 'validate: a copy array whose records are lost is a violation, not an empty one' \
     'copy: is a non-empty array but could not be read' "$out"
   contains 'validate: and a lost hostile copy entry fails validation' '|rc=1' "$out"
+
+  # agentNote[]: plain, bounded lines. Each refusal is ONE line naming agentNote, asserted with eq so
+  # a second message (or none) fails. Old profiles, with no agentNote at all, are covered by every
+  # other fixture in this suite.
+  vw '{"schemaVersion":1,"agentNote":["Run make test, not the root test script.","Use the worktree database."]}'
+  eq 'validate: a plain agentNote is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":[]}'
+  eq 'validate: an empty agentNote is valid' '' "$(vv)"
+  # Text that looks like the structure the shape check reads, and a backslash that is text.
+  vw '{"schemaVersion":1,"agentNote":["a, \"b\"], [c", "ends in a backslash \\", "\\n is two characters here"]}'
+  eq 'validate: commas, brackets, quotes and backslashes inside a line are text' '' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":"one line"}'
+  eq 'validate: an agentNote that is a string is refused' 'agentNote: must be an array of strings' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":{"line":"x"}}'
+  eq 'validate: an agentNote that is an object is refused' 'agentNote: must be an array of strings' "$(vv)"
+  for el in 1 null true '["x"]' '{"k":"v"}'; do
+    vw '{"schemaVersion":1,"agentNote":["ok",'"$el"']}'
+    eq "validate: an agentNote element $el is refused" 'agentNote: every element must be a string' "$(vv)"
+  done
+  # "1" and 1 render as the same record, so this is the case only the compact JSON can tell.
+  vw '{"schemaVersion":1,"agentNote":["1"]}'
+  eq 'validate: a line that reads as a number is still a string' '' "$(vv)"
+  lines=''
+  n=0
+  while [ "$n" -lt 40 ]; do lines="$lines${lines:+,}\"line $n\""; n=$((n + 1)); done
+  vw '{"schemaVersion":1,"agentNote":['"$lines"']}'
+  eq 'validate: 40 lines are allowed' '' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":['"$lines"',"one more"]}'
+  eq 'validate: 41 lines are refused' 'agentNote: has 41 lines, more than the 40 allowed' "$(vv)"
+  # Characters, not bytes: 400 two-byte characters are 800 bytes and still allowed.
+  long=$(printf 'é%.0s' $(seq 400))
+  vw '{"schemaVersion":1,"agentNote":["short","'"$long"'"]}'
+  eq 'validate: a line of 400 characters is allowed, however many bytes' '' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":["short","'"${long}x"'"]}'
+  eq 'validate: a line of 401 characters is refused' 'agentNote[1]: is longer than 400 characters' "$(vv)"
+  for ctl in '\n' '\r' '\t' '\u001b' '\u0000' '\u007f' '\u0085'; do
+    vw '{"schemaVersion":1,"agentNote":["fine","a'"$ctl"'b"]}'
+    eq "validate: an agentNote line holding $ctl is refused" \
+      'agentNote[1]: contains a control character (a newline, a tab, an escape) — each line must be plain text' "$(vv)"
+  done
+  # Raw DEL and C1 are legal unescaped in a JSON string; python3 passes them through as they are.
+  vw '{"schemaVersion":1,"agentNote":["a'$'\x7f''b"]}'
+  contains 'validate: a raw DEL is refused' 'agentNote[0]: contains a control character' "$(vv)"
+  vw '{"schemaVersion":1,"agentNote":["a'$'\xc2\x9b''b"]}'
+  contains 'validate: a raw C1 control is refused' 'agentNote[0]: contains a control character' "$(vv)"
+  # An escaped backslash followed by n is text, not a newline.
+  vw '{"schemaVersion":1,"agentNote":["C:\\new"]}'
+  eq 'validate: an escaped backslash before n is not a control character' '' "$(vv)"
+
+  # The fail-closed guard: a non-empty agentNote whose records are lost is refused, not read as no
+  # lines at all — which would skip the length check. The stub drops group 6 and nothing else.
+  vw '{"schemaVersion":1,"agentNote":["a line"]}'
+  out=$(bash -c ". '$LIB'
+    wt_profile_scan() { wt_json_scan schemaVersion shell shellArgs deps runtime \
+        timeouts.bootstrapSeconds timeouts.seedSeconds \
+        evidence.detectionVersion evidence.markers \
+        runtime.seed runtime.teardown runtime.env.file \
+        runtime.slug runtime.env.vars copy evidence.shellMarker \
+        runtime.port.var runtime.port.base runtime.port.span runtime.port \
+        runtime.serve runtime.stop runtime.url artifacts agentNote \
+        -- deps dir lock strategy install verify lockChecksum copy \
+        -- copy . <\"\$1\"; }
+    wt_validate_profile '$VP' '$VR' 2>/dev/null
+    printf '|rc=%s' \$?" 2>/dev/null)
+  contains 'validate: an agentNote whose records are lost is a violation, not an empty one' \
+    'agentNote: is a non-empty array but could not be read' "$out"
+  contains '...and fails validation' '|rc=1' "$out"
 
   # deps[] AND copy[] populated together — the demultiplexing the single invocation introduced.
   # A mis-scoped tag filter or an unreset index would hand one array's records to the other
