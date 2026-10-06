@@ -2881,6 +2881,8 @@ wt_install_changed_collect() {  # $1 = worktree, $2 = deadline (epoch seconds; e
 wt_install_changed_prune() {  # $1 = worktree, $2 = records, $3 = tracked changes now
   local worktree=${1%/} line dir paths kept rec held=0 path
   local -a keep
+  # A status line rebuilt after /clear or a compaction reads the state and never writes it.
+  [ "${WT_STATE_READ_ONLY:-}" != 1 ] || return 0
   if command -v flock >/dev/null 2>&1; then
     wt_lock_acquire "$(wt_state_path "$worktree").lock" 0 8 || return 0
     held=1
@@ -4308,8 +4310,9 @@ wt_linked_worktree_at() {  # $1 = directory
 # False only when the profile wt_load_profile_for would load for worktree $1 cannot carry an agent
 # note: there is no such file, or the one chosen — by wt_load_profile_for's own rule, the worktree's
 # copy when it has one, else the main checkout's — never spells the key. Read in-process, so a hook
-# that loads the profile only for its note (after /clear and a compaction, a subagent with no port)
-# starts no interpreter for the common profile, which has none.
+# that loads the profile only for its note (SubagentStart for a subagent with no port) starts no
+# interpreter for the common profile, which has none. Not used after /clear or a compaction: the
+# status line printed there needs the profile whether or not it carries a note.
 #
 # NOT A GATE, and it must never become one: it says "no note" only where loading would find none too,
 # so skipping on it hides nothing the approval would have let through, and a yes still goes through
@@ -4405,7 +4408,8 @@ wt_join_words() {  # $1 = and | or, $2 = items, one per line
 # not reinstall dependencies or re-create its databases`, or empty when there is nothing to name.
 # Only facts this run already holds: the dirs wt_bootstrap_pending found done and present, and the
 # runtime's only when wt_runtime_handoff left the worktree pointed at its own state this run
-# (WT_RUNTIME_ISOLATED) — a seed (done, since nothing is pending), the port and URL it published, the
+# (WT_RUNTIME_ISOLATED; after /clear or a compaction, as the last hand-off recorded it,
+# wt_runtime_outcome_read) — a seed (done, since nothing is pending), the port and URL it published, the
 # env files it wrote. Never for a worktree whose runtime is switched off or skipped, nor one whose
 # env file the developer took over or the plugin could not write. It exists so a session can tell a
 # worktree set up from a bare one, and does not reinstall or re-seed out of habit. Never for a profile the approval holds: that is not a
@@ -6742,8 +6746,90 @@ wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, 
 # sibling scan that could see them all. The
 # "fully set up" line names the worktree's own env settings, databases and port only then
 # (wt_ready_clause): a seed recorded done, or a port claimed, says nothing of where the app now points.
+# All three are recorded in the worktree's state as they leave here (wt_runtime_outcome_record), for
+# the status line after /clear or a compaction, which runs no hand-off of its own.
 WT_RUNTIME_ISOLATED=''
 wt_runtime_handoff() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
+  wt_runtime_handoff_steps "$@"
+  wt_runtime_outcome_record "${2%/}"
+  return 0
+}
+
+# What the last hand-off established, as one single-slot `rtrun` record in the worktree's state:
+# `rtrun US <isolated: 1 or empty> US <port> US <url>`, the three globals wt_runtime_handoff
+# publishes. Read back by wt_runtime_outcome_read, so the status line a SessionStart after /clear or a
+# compaction prints (wt_status_after_reset) names the worktree's own databases, port and URL only
+# where the run that set it up found them its own — never on a reset's guess. WRITTEN ONLY WHEN IT
+# CHANGED, so a re-entry pays no rewrite; and a hand-off that established nothing removes the record,
+# so none is ever written for a worktree without a runtime. Advisory: a failed write is said and
+# costs only that reset's runtime clause.
+wt_runtime_outcome_record() {  # $1 = worktree
+  local worktree=${1%/} want=''
+  if [ -n "${WT_RUNTIME_ISOLATED:-}${WT_RUNTIME_PORT:-}${WT_RUNTIME_URL:-}" ]; then
+    wt_state_join rtrun "${WT_RUNTIME_ISOLATED:-}" "${WT_RUNTIME_PORT:-}" "${WT_RUNTIME_URL:-}"
+    want=$WT_STATE_REC
+  fi
+  wt_runtime_outcome_scan "$worktree"
+  [ "$WT_RTRUN_REC" != "$want" ] || return 0
+  wt_state_rewrite "$worktree" rtrun '' "$want" \
+    || wt_log "runtime: could not record this run's runtime outcome in the worktree's state"
+  return 0
+}
+
+# One pass over the worktree's state for what a reset needs of the runtime: the `rtrun` record as
+# written, in WT_RTRUN_REC (empty when there is none, or the file is not one this build trusts), and
+# the `rt` record's slug, in WT_RTRUN_SLUG. bash's own read, no process; the state path's memo is read
+# directly, as in wt_install_changed_collect.
+WT_RTRUN_REC='' WT_RTRUN_SLUG=''
+# shellcheck disable=SC2034  # WT_RTRUN_SLUG is read by bootstrap.sh.
+wt_runtime_outcome_scan() {  # $1 = worktree
+  local worktree=${1%/} file rec seen=0 rec_rt='' rec_run=''
+  WT_RTRUN_REC='' WT_RTRUN_SLUG=''
+  if [ "${WT_STATE_PATH_FOR:-}" = "$worktree" ] && [ -n "${WT_STATE_PATH_IS:-}" ]; then
+    file=$WT_STATE_PATH_IS
+  else
+    file=$(wt_state_path "$worktree")
+  fi
+  [ -r "$file" ] || return 0
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      "wtstate$WT_US"*)
+        [ "${rec#wtstate"$WT_US"}" = "$WT_STATE_VERSION" ] || return 0
+        seen=1
+        ;;
+      "rtrun$WT_US"*)
+        [ "$seen" = 1 ] || return 0
+        rec_run=$rec
+        ;;
+      "rt$WT_US"*)
+        [ "$seen" = 1 ] || return 0
+        rec_rt=${rec#rt"$WT_US"}
+        ;;
+    esac
+  done <"$file"
+  WT_RTRUN_REC=$rec_run
+  WT_RTRUN_SLUG=${rec_rt%%"$WT_US"*}
+  return 0
+}
+
+# WT_RUNTIME_ISOLATED, WT_RUNTIME_PORT and WT_RUNTIME_URL as the last hand-off in worktree $1 left
+# them (wt_runtime_outcome_record), all empty when nothing is recorded — and isolation withdrawn when
+# the opt-out marker has appeared since. Reads only; for a status line rebuilt without a hand-off.
+wt_runtime_outcome_read() {  # $1 = worktree
+  local worktree=${1%/} body iso port url
+  WT_RUNTIME_ISOLATED='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
+  wt_runtime_outcome_scan "$worktree"
+  [ -n "$WT_RTRUN_REC" ] || return 0
+  body=${WT_RTRUN_REC#rtrun"$WT_US"}
+  IFS=$WT_US read -r iso port url <<<"$body" || true
+  [ "$iso" != 1 ] || [ -e "$worktree/$WT_NO_RUNTIME_MARKER" ] || WT_RUNTIME_ISOLATED=1
+  ! wt_is_posint "$port" || WT_RUNTIME_PORT=$port
+  [ -z "$url" ] || ! wt_is_safe_url "$url" || WT_RUNTIME_URL=$url
+  return 0
+}
+
+# The hand-off's steps, wt_runtime_handoff's body.
+wt_runtime_handoff_steps() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
   local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport
   local rest f prior fstate shown nfiles url shared=0

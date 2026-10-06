@@ -2066,6 +2066,12 @@ if command -v flock >/dev/null 2>&1; then
   exec 7>&-
   eq '...and once it is free, it is' '' "$(wt_install_changed_paths "$DWT" >/dev/null; changed_recs)"
 fi
+# A status line rebuilt after /clear or a compaction reads and never writes: WT_STATE_READ_ONLY
+# reports what is still changed and leaves a resolved path's record for a run to prune.
+write_changed 'vendor|conf/work space.yaml|notes.txt'
+eq 'prune: read-only still reports only what is changed' 'conf/work space.yaml' \
+  "$(WT_STATE_READ_ONLY=1 wt_install_changed_paths "$DWT")"
+eq '...and rewrites no record' 'changed|vendor|conf/work space.yaml|notes.txt' "$(changed_recs)"
 # A clean worktree pays nothing: with no `changed` record, not one process outside bash is started.
 mkdir -p "$TMP/no-path"
 collect_with_no_path() {  # run in a subshell: any process the read starts is "not found"
@@ -6644,6 +6650,59 @@ time.sleep(5)' "$TMP/zombie.pid" &
 else
   printf 'SKIP serve bookkeeping: needs /proc and setsid\n' >&2
 fi
+
+# ---------------------------------------------------------------------------
+# The runtime outcome (`rtrun`): what the last hand-off established, for a reset's status line
+# ---------------------------------------------------------------------------
+# Recorded as the hand-off leaves it, read back by a SessionStart after /clear or a compaction, which
+# must claim no more of the runtime than that run established. Written only when it changed.
+OREPO=$TMP/outcome
+mkdir -p "$OREPO"
+git init -q "$OREPO"
+git -C "$OREPO" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+OWT=$OREPO/.claude/worktrees/oc
+git -C "$OREPO" worktree add -q "$OWT" -b worktree-oc 2>/dev/null
+OSTATE=$(wt_state_path "$OWT")
+rtrun_recs() { tr "$RS_" '\n' <"$OSTATE" 2>/dev/null | grep "^rtrun$US_" | tr "$US_" '|'; }
+
+WT_RUNTIME_ISOLATED='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
+wt_runtime_outcome_record "$OWT"
+eq 'outcome: nothing established and nothing recorded writes no state at all' no \
+  "$([ -e "$OSTATE" ] && echo yes || echo no)"
+WT_RUNTIME_ISOLATED=1 WT_RUNTIME_PORT=4123 WT_RUNTIME_URL='http://oc.localhost:4123/'
+wt_runtime_outcome_record "$OWT"
+eq 'outcome: an isolated run is recorded, port and URL with it' 'rtrun|1|4123|http://oc.localhost:4123/' "$(rtrun_recs)"
+wt_state_set "$OWT" vendor install L I "done"
+eq '...and survives a dependency write' 'rtrun|1|4123|http://oc.localhost:4123/' "$(rtrun_recs)"
+# A rewrite is a rename of a new file over the old, so an unchanged inode is no rewrite.
+ino=$(inode_of "$OSTATE")
+wt_runtime_outcome_record "$OWT"
+eq '...and the same outcome again rewrites nothing' "$ino" "$(inode_of "$OSTATE")"
+WT_RUNTIME_ISOLATED='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
+wt_runtime_outcome_read "$OWT"
+eq 'outcome: read back' '1|4123|http://oc.localhost:4123/' "$WT_RUNTIME_ISOLATED|$WT_RUNTIME_PORT|$WT_RUNTIME_URL"
+mkdir -p "$OWT/.claude"; : >"$OWT/$WT_NO_RUNTIME_MARKER"
+wt_runtime_outcome_read "$OWT"
+eq '...isolation withdrawn once the opt-out marker appears, the port and URL kept' '|4123|http://oc.localhost:4123/' \
+  "$WT_RUNTIME_ISOLATED|$WT_RUNTIME_PORT|$WT_RUNTIME_URL"
+rm -f "$OWT/$WT_NO_RUNTIME_MARKER"
+WT_RUNTIME_ISOLATED='' WT_RUNTIME_PORT=4123 WT_RUNTIME_URL=''
+wt_runtime_outcome_record "$OWT"
+eq 'outcome: a run that is no longer isolated replaces the record' 'rtrun||4123|' "$(rtrun_recs)"
+WT_RUNTIME_ISOLATED='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
+wt_runtime_outcome_record "$OWT"
+eq '...and one that established nothing removes it' '' "$(rtrun_recs)"
+contains '...keeping every other record' '|install|L|I|done|' "$(tr "$RS_" '\n' <"$OSTATE" | tr "$US_" '|')"
+wt_runtime_outcome_read "$OWT"
+eq '...so nothing is read back' '||' "$WT_RUNTIME_ISOLATED|$WT_RUNTIME_PORT|$WT_RUNTIME_URL"
+# A record before any header is not ours, and is not believed.
+printf 'rtrun%s1%s4999%s%s' "$US_" "$US_" "$US_" "$RS_" >"$OSTATE"
+wt_runtime_outcome_read "$OWT"
+eq 'outcome: a headerless record is not read' '||' "$WT_RUNTIME_ISOLATED|$WT_RUNTIME_PORT|$WT_RUNTIME_URL"
+# The hand-off records it on every way out: a profile with no runtime clears a stale record.
+printf 'wtstate%s%s%srtrun%s1%s4999%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$US_" "$US_" "$US_" "$RS_" >"$OSTATE"
+PROFILE_HAS_RUNTIME=0 wt_runtime_handoff "$OREPO" "$OWT" ''
+eq 'outcome: a hand-off with no runtime removes a stale record' '' "$(rtrun_recs)"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

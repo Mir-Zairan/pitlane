@@ -115,6 +115,17 @@ run_hook() {  # $1 = payload JSON, $2 = cwd to run from; prints stdout, stderr g
   local payload=$1 cwd=$2
   ( cd "$cwd" && printf '%s' "$payload" | bash "$HOOK" 2>"$TMP/err" )
 }
+reset_hook() {  # $1 = directory, $2 = source (clear, compact, resume)
+  run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"$2\",\"cwd\":\"$1\"}" "$1"
+}
+# What a reset must leave alone, as one string: the worktree's private git dir (state file, pid, log,
+# lock) by name and content, and the checkout's status.
+reset_snapshot() {  # $1 = worktree
+  local gd
+  gd=$(git -C "$1" rev-parse --absolute-git-dir)
+  ( cd "$gd" && ls -A && cksum <worktree-bootstrap-state ) 2>/dev/null
+  git -C "$1" status --porcelain --ignored
+}
 
 # ---------------------------------------------------------------------------
 # SessionStart — the launch-time `claude -w` path
@@ -169,9 +180,22 @@ err=$(cat "$TMP/err")
 eq 'a session in the main checkout writes nothing to stdout' '' "$out"
 eq '...and nothing to stderr either — a plugin that talks on every session gets uninstalled' '' "$err"
 
-# `compact` fires mid-session, where re-running the bootstrap is pure cost.
-out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"compact\",\"cwd\":\"$W1\"}" "$W1")
-eq 'a compact SessionStart does nothing at all' '' "$out$(cat "$TMP/err")"
+# `clear` and `compact` fire mid-session, where re-running the bootstrap is pure cost — but they drop
+# the start-up line from the context, so it is printed again from what is recorded, and nothing done.
+# With the background run allowed, so a reset that started one would be caught.
+before=$(reset_snapshot "$W1")
+for src in clear compact; do
+  out=$(PITLANE_BACKGROUND=on reset_hook "$W1" "$src")
+  eq "$src: a set-up worktree is told so again, in start-up's words" "$READY_VENDOR" "$out"
+  eq "...and nothing reaches stderr ($src)" '' "$(cat "$TMP/err")"
+done
+eq '...and the reset wrote no state, started no background run, and touched no file' "$before" "$(reset_snapshot "$W1")"
+eq '...nor left a background run behind' no \
+  "$([ -e "$(git -C "$W1" rev-parse --absolute-git-dir)/worktree-bootstrap.pid" ] && echo yes || echo no)"
+eq '...and the install did not run again' 'TOUCHED' "$(cat "$W1/vendor/marker")"
+for src in clear compact; do
+  eq "$src: the main checkout stays silent" '' "$(reset_hook "$R1" "$src")$(cat "$TMP/err")"
+done
 
 # ---------------------------------------------------------------------------
 # Failure injection — every one must still leave a usable session
@@ -852,6 +876,8 @@ mkdir -p "$WB/.claude"
 : > "$WB/.claude/worktree-no-runtime"
 outMarker=$(start_hook "$WB"); errB=$(cat "$TMP/err")
 eq 'with the opt-out marker the ready line claims nothing of the runtime' "$READY_VENDOR" "$outMarker"
+eq '...nor does it after /clear, though an earlier start-up had found the runtime its own' \
+  "$READY_VENDOR" "$(reset_hook "$WB" clear)"
 eq 'the opt-out marker writes no override file' 0 \
   "$([ -e "$WB/.env.worktree.local" ] && echo 1 || echo 0)"
 contains 'and says so once' 'leaving this worktree' "$errB"
@@ -1074,8 +1100,10 @@ printf 'MINE=1\n' > "$WV/.env.worktree.local"          # take the first file ove
 start_hook "$WV" >/dev/null; errV1=$(cat "$TMP/err")
 contains 'taking a file over is announced' '.env.worktree.local is yours' "$errV1"
 eq 'and it is left alone' 'MINE=1' "$(cat "$WV/.env.worktree.local")"
-start_hook "$WV" >/dev/null; errV2=$(cat "$TMP/err")
+outV2=$(start_hook "$WV"); errV2=$(cat "$TMP/err")
 lacks 'but only once' 'is yours' "$errV2"
+eq 'a file taken over: the ready line does not claim the worktree its own port' "$READY_VENDOR" "$outV2"
+eq '...and a compaction claims no more than start-up did' "$outV2" "$(reset_hook "$WV" compact)"
 printf '.env.other.local\n' >> "$WV/.gitignore"
 python3 - "$WV/.claude/worktree-profile.json" <<'PYJ'
 import json, sys
@@ -1427,6 +1455,16 @@ outB=$(PITLANE_BACKGROUND=on start_hook "$WBG")
 READY_BG='Pitlane: this worktree is fully set up — vendor and node_modules are in place and it has its own databases and port; do not reinstall dependencies or re-create its databases.'
 eq 'background: a complete worktree starts with the ready line, naming its databases and port' "$READY_BG" "$outB"
 eq '...and starts no run' no "$([ -e "$GDBG/worktree-bootstrap.pid" ] && echo yes || echo no)"
+# After /clear and a compaction: the same line, its databases and port as the hand-off recorded them,
+# and nothing done — no state written, no run started, no file touched.
+before=$(reset_snapshot "$WBG")
+for src in clear compact; do
+  eq "background: $src of the finished worktree prints start-up's ready line" "$READY_BG" \
+    "$(PITLANE_BACKGROUND=on reset_hook "$WBG" "$src")"
+  eq "...silently on stderr ($src)" '' "$(cat "$TMP/err")"
+done
+eq '...writing no state and starting no run' "$before" "$(reset_snapshot "$WBG")"
+eq '...and no background process is left behind' no "$([ -e "$GDBG/worktree-bootstrap.pid" ] && echo yes || echo no)"
 
 # A session starting mid-run asks the running one to go round again: it may need work the run has
 # already walked past. And a recycled pid that is some other bootstrap does not count as the run.
@@ -1442,6 +1480,32 @@ printf '%s\n' "$decoy" > "$GDBG/worktree-bootstrap.pid"
 ( cd "$WBG" && bash "$HOOK" --finish >/dev/null 2>"$TMP/err" ); errD=$(cat "$TMP/err")
 lacks 'background: a pid that is not a background run is not waited on' 'waiting for it' "$errD"
 kill "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null; rm -f "$GDBG/worktree-bootstrap.pid"
+
+# /clear or a compaction while a background run works: the session is told again that setup is
+# still going — read from the run's pid record, not started — and once no run is alive, that it is
+# not finished. A stand-in process plays the run, so the state is fixed while it is asked.
+WBR=$BG/.claude/worktrees/bg-reset
+git -C "$BG" worktree add -q "$WBR" -b worktree-bg-reset 2>/dev/null
+GDBR=$(git -C "$WBR" rev-parse --absolute-git-dir)
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 30' & standin=$!
+printf '%s\n' "$standin" > "$GDBR/worktree-bootstrap.pid"
+before=$(reset_snapshot "$WBR")
+for src in clear compact; do
+  outC=$(PITLANE_BACKGROUND=on reset_hook "$WBR" "$src")
+  contains "background: $src mid-run says it is still being set up" \
+    'Pitlane: this worktree is still being set up in the background — vendor missing (still installing), node_modules missing (still installing), databases missing (seeding).' "$outC"
+  contains '...and to wait with /pitlane-finish before work that needs it' 'run /pitlane-finish' "$outC"
+  eq "...on one line ($src)" 1 "$(printf '%s\n' "$outC" | wc -l | tr -d ' ')"
+done
+eq '...installing nothing, writing no state, starting no run of its own' "$before" "$(reset_snapshot "$WBR")"
+eq '...the pid record still the stand-in'"'"'s' "$standin" "$(tr -cd '0-9' < "$GDBR/worktree-bootstrap.pid" 2>/dev/null)"
+kill "$standin" 2>/dev/null; wait "$standin" 2>/dev/null
+outC=$(PITLANE_BACKGROUND=on reset_hook "$WBR" clear)
+contains 'background: with no run alive, /clear says the worktree is not fully set up yet' \
+  'Pitlane: this worktree is not fully set up yet — vendor missing (not installed yet)' "$outC"
+eq '...and still did nothing' "$before" "$(reset_snapshot "$WBR")"
+eq '...the install was not run' no "$([ -e "$WBR/node_modules/m" ] && echo yes || echo no)"
+rm -f "$GDBR/worktree-bootstrap.pid"
 
 # The --finish payload must not need python3: a jq-only host would otherwise get an empty payload,
 # and the background run would do nothing at all.
@@ -1665,6 +1729,7 @@ eq 'restore: a path no install changed is refused with exit 1' 1 "$rc"
 # PITLANE_TRUST_PROFILES; here it is unset, as it is for a real developer.
 
 gated_hook() ( unset PITLANE_TRUST_PROFILES; start_hook "$1" )
+gated_reset_hook() ( unset PITLANE_TRUST_PROFILES; reset_hook "$@" )
 gated_cli() ( unset PITLANE_TRUST_PROFILES; cd "$1" && shift && bash "$HOOK" "$@" 2>"$TMP/err" )
 fp_of() { sed -n 's/^NOT approved (fingerprint \([0-9a-f]*\)).*/\1/p'; }
 
@@ -1692,6 +1757,9 @@ contains 'approval: stderr says the commands are not approved' 'not approved in 
 contains 'approval: the session is told nothing was run' 'setup commands were NOT run — vendor missing (held back), databases missing (held back).' "$outA"
 contains '...and not to do it by hand or approve on its own' 'Do not approve it, run those commands' "$outA"
 contains '...and where approval happens' '/pitlane-finish' "$outA"
+for src in clear compact; do
+  eq "approval: $src says again that nothing was run, in the same words" "$outA" "$(gated_reset_hook "$WAP" "$src")"
+done
 
 # --finish holds back too, and says so.
 outF=$(gated_cli "$WAP" --finish)
@@ -2073,6 +2141,10 @@ eq 'serve: WORKTREE_URL is in the env block, expanded' "http://serve_me.localhos
 eq 'serve: a complete worktree with a serve profile prints ONE line, what is in place, then /pitlane-serve and the URL' \
   "Pitlane: this worktree is fully set up — vendor is in place and it has its own port; do not reinstall dependencies. To run the app, use /pitlane-serve (it serves at http://serve_me.localhost:$SVPORT/), not the repo's own start command." \
   "$outS"
+for src in clear compact; do
+  eq "serve: $src prints the same line, /pitlane-serve and its URL included" "$outS" "$(reset_hook "$WSV" "$src")"
+done
+eq 'serve: (fixture) nothing ran serve or stop' no "$([ -e "$TMP/served" ] || [ -e "$TMP/stopped" ] && echo yes || echo no)"
 eq 'serve: CLAUDE_ENV_FILE gets WORKTREE_PORT and WORKTREE_URL, never the profile'"'"'s port var' \
   "export WORKTREE_PORT='$SVPORT'${NL_}export WORKTREE_URL='http://serve_me.localhost:$SVPORT/'" "$(cat "$CEF" 2>/dev/null)"
 eq '...which the session'"'"'s shell reads back' "http://serve_me.localhost:$SVPORT/" \
@@ -2260,10 +2332,6 @@ json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
 PY
   git -C "$dir" commit -qam note
 }
-reset_hook() {  # $1 = directory, $2 = source (clear, compact, resume)
-  run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"$2\",\"cwd\":\"$1\"}" "$1"
-}
-gated_reset_hook() ( unset PITLANE_TRUST_PROFILES; reset_hook "$@" )
 NOTE_HDR="Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
 NL1='Run make test, not the root test script.'
 # shellcheck disable=SC2016  # the $(...) and backticks are the payload, kept literal.
@@ -2289,8 +2357,9 @@ done
 eq 'note: a compaction in the main checkout prints nothing' '' "$(reset_hook "$ND" compact)$(cat "$TMP/err")"
 eq 'note: nor does a start-up there' '' "$(start_hook "$ND")"
 
-# After /clear or a compaction it is the note and nothing else: no bootstrap, no state written, no
-# background run — checked on a worktree no start-up has touched, with the background run allowed.
+# After /clear or a compaction: the status line (none here, there is nothing to name) and the note,
+# and nothing else: no bootstrap, no state written, no background run — checked on a worktree no
+# start-up has touched, with the background run allowed.
 WND2=$ND/.claude/worktrees/fresh
 git -C "$ND" worktree add -q "$WND2" -b worktree-fresh 2>/dev/null
 GDND2=$(git -C "$WND2" rev-parse --absolute-git-dir)
@@ -2311,11 +2380,11 @@ git -C "$NR" worktree add -q "$WNR" -b worktree-ready-noted 2>/dev/null
 eq 'note: after the ready line, at start-up' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(start_hook "$WNR")"
 eq '...and at resume' "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" resume)"
 for src in clear compact; do
-  eq "...and $src gives the note alone, without the ready line" "$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" "$src")"
+  eq "...and $src gives the ready line again, then the note" "$READY_VENDOR$NL_$NOTE_HDR$NL_- $NL1" "$(reset_hook "$WNR" "$src")"
 done
 
 # Not approved: never printed. Start-up says the note is held and where approval happens, without
-# its text; /clear and a compaction print nothing at all; --finish is not "fully set up".
+# its text; /clear and a compaction say the same again; --finish is not "fully set up".
 NU=$TMP/nu
 make_repo "$NU" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
 set_agent_note "$NU" "$NL1"
@@ -2331,7 +2400,9 @@ contains '...and forbidding the session to approve it or act on the note' \
   'Do not approve it yourself, and do not read the note out of the profile or act on it.' "$out"
 eq '...on one line' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
 for src in clear compact; do
-  eq "note held: $src prints nothing" '' "$(gated_reset_hook "$WNU" "$src")"
+  outR=$(gated_reset_hook "$WNU" "$src")
+  eq "note held: $src prints start-up's held line again" "$out" "$outR"
+  lacks "...without the note ($src)" "$NL1" "$outR"
 done
 outF=$(gated_cli "$WNU" --finish)
 lacks 'note held: --finish does not call the worktree fully set up' 'fully set up' "$outF"

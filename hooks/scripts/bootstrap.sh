@@ -257,20 +257,49 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
 }
 
 # SessionStart after /clear or a compaction. The session's context is rebuilt without what the
-# start-up hook printed, while CLAUDE.md is read again — so the agent note, which says what CLAUDE.md
-# cannot for a worktree, would be gone for the rest of the session. This prints it again, approved,
-# and does nothing else: the bootstrap ran at start-up, and a compaction fires mid-session, where its
-# cost would land on the user's next prompt. No state written; the caller silences stderr, which
-# would otherwise repeat on every compaction what start-up already said once. Cheapest first: a
-# session outside .claude/worktrees/ spawns nothing, and a worktree whose profile cannot carry a note
-# (wt_profile_may_carry_agent_note) costs the git calls that find it and no interpreter. Only a
-# profile that may carry one is loaded and put to the approval check.
-wt_agent_note_after_reset() {  # $1 = the session's directory
+# start-up hook printed, while CLAUDE.md is read again — so the status line (set up, still installing,
+# held, failed; the /pitlane-serve clause) and the agent note would be gone for the rest of the
+# session, and a session no longer told its worktree is set up goes back to installing and seeding by
+# hand. This prints both again — the status line first, rebuilt from what is RECORDED, then the note
+# when approved — and does nothing else: no install, no seed, no background run, no state write
+# (WT_STATE_READ_ONLY keeps the status line's tidy-up of resolved changed paths from writing). The
+# bootstrap ran at start-up, and a compaction fires mid-session, where its cost would land on the
+# user's next prompt.
+#
+# The line's runtime clause (its own databases, port and URL) is what the last hand-off recorded
+# (wt_runtime_outcome_read), never re-derived: a reset cannot tell whether the env files still point
+# where that run left them, and does not claim to. Pending work reads `still being set up in the
+# background` only while that run is alive, and `held back` when the approval says no, as at start-up.
+#
+# One profile load and no other interpreter; a session outside .claude/worktrees/ spawns nothing, and
+# a worktree with no usable profile prints nothing. The caller silences stderr, which would otherwise
+# repeat on every compaction what start-up already said once.
+wt_status_after_reset() {  # $1 = the session's directory
+  local worktree root how=''
   wt_linked_worktree_at "${1-}" || return 0
-  wt_profile_may_carry_agent_note "$WT_LINKED_WORKTREE" "$WT_LINKED_ROOT" || return 0
-  wt_load_profile_for "$WT_LINKED_WORKTREE" "$WT_LINKED_ROOT"
-  wt_profile_has_agent_note || return 0
-  wt_approval_check "$WT_LINKED_WORKTREE"
+  worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
+  WT_NAME=$(wt_name_from_path "$worktree")
+  WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
+  WT_PATH=$worktree
+  WT_ROOT=$root
+  wt_load_profile_for "$worktree" "$root"
+  [ "${PROFILE_PRESENT:-0}" = 1 ] || return 0
+  wt_state_path "$worktree" >/dev/null
+  wt_runtime_outcome_read "$worktree"
+  # The slug the hand-off settled on, which a dependency's install command may name: its checksum is
+  # what the dependency's record was written against.
+  [ -z "$WT_RTRUN_SLUG" ] || WT_SLUG=$WT_RTRUN_SLUG
+  export WT_NAME WT_SLUG WT_PATH WT_ROOT
+  wt_approval_check "$worktree"
+  wt_bootstrap_pending "$worktree"
+  if [ -n "$WT_PENDING" ]; then
+    if [ "${WT_APPROVAL:-}" = no ]; then
+      how=approval
+    elif wt_background_pid "$worktree" >/dev/null; then
+      how=background
+    fi
+  fi
+  WT_STATE_READ_ONLY=1 wt_bootstrap_status_line "$worktree" start "$how" ''
   if wt_agent_note_is_approved; then
     wt_agent_note_block
   fi
@@ -604,12 +633,13 @@ case $event in
     # Only a genuinely new or resumed session can need bootstrapping. `compact` fires
     # mid-session, where the "the model cannot race the hook" measurement —
     # taken at startup — does not apply, and where re-running a bootstrap would be pure
-    # cost. Stay silent rather than logging on every compaction — except for the approved agent
-    # note, which /clear and a compaction drop from the context (wt_agent_note_after_reset).
+    # cost. Stay silent rather than logging on every compaction — except for the status line and
+    # the approved agent note, which /clear and a compaction drop from the context and which are
+    # printed again from what is recorded (wt_status_after_reset).
     case $source_kind in
       startup | resume | '') ;;
       clear | compact)
-        wt_agent_note_after_reset "$here" 2>/dev/null
+        wt_status_after_reset "$here" 2>/dev/null
         exit 0
         ;;
       *) exit 0 ;;
