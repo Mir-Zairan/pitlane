@@ -6176,7 +6176,7 @@ WT_ENV_FILE_MAX_BYTES=65536
 # each `read` asking for no more than the budget has left, so a file that grows between the two is
 # still never read past the bound, however long its lines.
 wt_runtime_env_split() {  # $1 = file
-  local LC_ALL=C f=${1-} line inblock=0 bytes=0 size
+  local LC_ALL=C f=${1-} line inblock=0 bytes=0 size nl
   local -a blines=() alines=()
   WT_ENV_BEFORE='' WT_ENV_AFTER='' WT_ENV_HAS_BLOCK=0
   [ -f "$f" ] && [ -r "$f" ] || return 1
@@ -6190,8 +6190,12 @@ wt_runtime_env_split() {  # $1 = file
     wt_log "  runtime: $f is over $WT_ENV_FILE_MAX_BYTES bytes — too big to be an env file the plugin manages, so it is left alone"
     return 1
   fi
-  while IFS= read -r -n "$((WT_ENV_FILE_MAX_BYTES - bytes + 1))" line || [ -n "$line" ]; do
-    bytes=$((bytes + ${#line} + 1))
+  # A line counts its newline only when read stopped at one: a last line with none is the file's
+  # last bytes, so a file of exactly WT_ENV_FILE_MAX_BYTES without a final newline is within bound.
+  while :; do
+    nl=1
+    IFS= read -r -n "$((WT_ENV_FILE_MAX_BYTES - bytes + 1))" line || { nl=0; [ -n "$line" ] || break; }
+    bytes=$((bytes + ${#line} + nl))
     if [ "$bytes" -gt "$WT_ENV_FILE_MAX_BYTES" ]; then
       wt_log "  runtime: $f is over $WT_ENV_FILE_MAX_BYTES bytes — too big to be an env file the plugin manages, so it is left alone"
       WT_ENV_HAS_BLOCK=0

@@ -6823,6 +6823,38 @@ eq 'env file: 60 KB of short lines is read' "1 $(yes a | head -n 10000 | cksum)"
 eq '...the lines after its block too, the last given its newline' \
   "$( { yes b | head -n 20000; echo last-without-newline; } | cksum)" "$(printf '%s' "$WT_ENV_AFTER" | cksum)"
 eq '...in under 4s' fast "$(fast "$elapsed")"
+# Exactly at the bound is within it, whether or not the last line ends in a newline: a newline
+# counts only where read stopped at one. One byte more is refused, by the measurement and, should
+# that understate it, while it is read.
+half=$((WT_ENV_FILE_MAX_BYTES / 2))
+yes a | head -n "$half" >"$BWT/.cap-nl.env"
+{ yes a | head -n "$((half - 1))"; printf 'ab'; } >"$BWT/.cap-nonl.env"
+{ yes a | head -n "$half"; printf 'b'; } >"$BWT/.over-nonl.env"
+eq 'env file: fixtures are exactly the bound, and one byte over' \
+  "$WT_ENV_FILE_MAX_BYTES $WT_ENV_FILE_MAX_BYTES $((WT_ENV_FILE_MAX_BYTES + 1))" \
+  "$(wc -c <"$BWT/.cap-nl.env" | tr -d ' ') $(wc -c <"$BWT/.cap-nonl.env" | tr -d ' ') $(wc -c <"$BWT/.over-nonl.env" | tr -d ' ')"
+wt_runtime_env_split "$BWT/.cap-nl.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
+eq 'env file: exactly the bound, ending in a newline, is read' "0 $(cksum <"$BWT/.cap-nl.env")" \
+  "$rc $(printf '%s' "$WT_ENV_BEFORE" | cksum)"
+eq '...and nothing is said' '' "$(cat "$TMP/bounds.err")"
+wt_runtime_env_split "$BWT/.cap-nonl.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
+eq 'env file: exactly the bound, with no final newline, is read' \
+  "0 $( { cat "$BWT/.cap-nonl.env"; echo; } | cksum)" "$rc $(printf '%s' "$WT_ENV_BEFORE" | cksum)"
+eq '...and nothing is said' '' "$(cat "$TMP/bounds.err")"
+eq '...and its state is unmarked, not theirs' unmarked "$(wt_runtime_env_state "$BWT" .cap-nonl.env 2>/dev/null)"
+wt_runtime_env_split "$BWT/.over-nonl.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
+eq 'env file: one byte over the bound, with no final newline, is refused' 1 "$rc"
+contains '...and says why' ".over-nonl.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
+out=$(
+  # shellcheck disable=SC2329  # called by the engine, as `wc`.
+  wc() { echo 10; }
+  wt_runtime_env_split "$BWT/.cap-nonl.env" 2>&1 && echo read || echo refused
+  wt_runtime_env_split "$BWT/.over-nonl.env" 2>&1 && echo read || echo refused
+)
+eq 'env file: read past an understated size, the bound itself is read and one byte over is not' \
+  'read refused' "$(printf '%s\n' "$out" | grep -x 'read\|refused' | tr '\n' ' ' | sed 's/ $//')"
+contains '...and says why' ".over-nonl.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$out"
+rm -f "$BWT/.cap-nl.env" "$BWT/.cap-nonl.env" "$BWT/.over-nonl.env"
 # And the plugin never writes one it would then refuse: a block that would take the file past the
 # bound is not written.
 printf '*.env\n' >"$BWT/.gitignore"
