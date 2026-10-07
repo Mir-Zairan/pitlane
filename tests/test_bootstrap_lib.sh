@@ -6260,6 +6260,26 @@ wt_linked_worktree_at "$TMP/no-such-dir/.claude/worktrees/x"
 eq '...nor a directory that does not exist' 1 $?
 wt_linked_worktree_at ''
 eq '...nor no directory at all' 1 $?
+# Nor a repository of its own there, nor a directory whose `.git` file borrows a sibling worktree's
+# git dir: git follows that file and reports this directory and the sibling's main checkout — what a
+# worktree reports — so only the back-link git keeps for each worktree it made tells them apart.
+git init -q "$DREPO/.claude/worktrees/own"
+wt_linked_worktree_at "$DREPO/.claude/worktrees/own"
+eq '...nor a repository of its own under .claude/worktrees/' '1 ' "$? $WT_LINKED_WORKTREE"
+mkdir -p "$DREPO/.claude/worktrees/borrow"
+printf 'gitdir: %s\n' "$(git -C "$DWT" rev-parse --absolute-git-dir)" >"$DREPO/.claude/worktrees/borrow/.git"
+wt_linked_worktree_at "$DREPO/.claude/worktrees/borrow"
+eq "...nor a directory whose .git file borrows a sibling worktree's git dir" '1 ' "$? $WT_LINKED_WORKTREE"
+wt_linked_worktree_at "$DWT"
+eq '...while the sibling itself is still one' "0 $PDREPO/.claude/worktrees/dep1" "$? $WT_LINKED_WORKTREE"
+# Both links relative, as git 2.48's worktree.useRelativePaths writes them: still a worktree.
+RLW=$DREPO/.claude/worktrees/rel
+git -C "$DREPO" worktree add -q "$RLW" -b wt-rel 2>/dev/null
+rl_gd=$(git -C "$RLW" rev-parse --absolute-git-dir)
+printf 'gitdir: ../../../.git/worktrees/%s\n' "${rl_gd##*/}" >"$RLW/.git"
+printf '../../../.claude/worktrees/rel/.git\n' >"$rl_gd/gitdir"
+wt_linked_worktree_at "$RLW"
+eq '...and one whose links are relative is one too' "0 $PDREPO/.claude/worktrees/rel $PDREPO" "$? $WT_LINKED_WORKTREE $WT_LINKED_ROOT"
 
 # The guard the entry points that act on a worktree apply: 0 inside one, 2 silently outside any
 # .claude/worktrees/, and 1 with a line on stderr for a directory beneath it that is not one.

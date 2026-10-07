@@ -2566,6 +2566,50 @@ ne '...and its own port' '' "$(envval "$WOR" SERVER_PORT)"
 contains '...and its seed ran' real "$(cat "$TMP/orphan-seeded" 2>/dev/null)"
 eq '...while the main checkout keeps its own env file' 'DATABASE_NAME=main_dev' "$(cat "$OR/.env.worktree.local")"
 
+# A REPOSITORY of its own under .claude/worktrees/ is not one of this repository's worktrees either:
+# a `git init` made there by hand, a `.git` file planted to point into another repository's worktree
+# git dir, a linked worktree of another repository, or a `.git` file borrowing a SIBLING worktree's
+# git dir of this very repository. Each answers with its own top level, which sits under
+# .claude/worktrees/ like a real worktree's would, so a check of the path alone lets WorktreeCreate
+# set it up against the main checkout — installs, seed, a port in the main ledger that no teardown
+# of a path git never registered releases. Creation prints no path, and a session there changes
+# nothing, in the main checkout, the other repository, or the directory itself.
+FR=$TMP/foreign
+make_rt_repo "$FR"
+git -C "$FR" add -A; git -C "$FR" commit -qm init
+git -C "$FR" worktree add -q "$TMP/foreign-wt" -b worktree-elsewhere 2>/dev/null
+NW=$OR/.claude/worktrees
+git init -q "$NW/standalone"
+mkdir -p "$NW/planted" "$NW/borrowed"
+printf 'gitdir: %s\n' "$(git -C "$TMP/foreign-wt" rev-parse --absolute-git-dir)" >"$NW/planted/.git"
+git -C "$FR" worktree add -q "$NW/foreignwt" -b worktree-foreignwt 2>/dev/null
+printf 'gitdir: %s\n' "$(git -C "$WOR" rev-parse --absolute-git-dir)" >"$NW/borrowed/.git"
+nested_snapshot() {
+  local d
+  for d in "$OR" "$FR" "$TMP/foreign-wt"; do
+    ( cd "$d" && find . -path ./.git/objects -prune -o -type f ! -path ./.git/index -print \
+      | LC_ALL=C sort | while IFS= read -r f; do printf '%s %s\n' "$(cksum <"$f")" "$d/$f"; done )
+  done
+  wc -l <"$TMP/orphan-seeded"
+}
+nested_before=$(nested_snapshot)
+for n in standalone planted foreignwt borrowed; do
+  out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"$n\",\"cwd\":\"$OR\"}" "$OR"); err=$(cat "$TMP/err")
+  eq "nested $n: WorktreeCreate onto it prints no path" '' "$out"
+  contains '...and says why' "$NW/$n is under .claude/worktrees/ but is not a linked worktree of $OR" "$err"
+  eq '...and sets nothing up: no install, no seed, no port, in either repository' "$nested_before" "$(nested_snapshot)"
+  for src in startup clear; do
+    eq "nested $n: SessionStart $src there prints nothing" '' "$(reset_hook "$NW/$n" "$src")"
+    eq '...and changes nothing' "$nested_before" "$(nested_snapshot)"
+  done
+  eq "nested $n: no vendor was installed into it" no "$([ -e "$NW/$n/vendor" ] && echo yes || echo no)"
+  eq "nested $n: no env file was written into it" no "$([ -e "$NW/$n/.env.worktree.local" ] && echo yes || echo no)"
+done
+# The real worktree beside them still reopens, exactly as before.
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"real\",\"cwd\":\"$OR\"}" "$OR")
+eq 'nested: the real worktree beside them still reopens' "$WOR" "$out"
+contains '...as a reopening' "reopening existing worktree $WOR" "$(cat "$TMP/err")"
+
 # ---------------------------------------------------------------------------
 # /pitlane-serve: `bootstrap.sh --serve` and `--serve-stop`
 # ---------------------------------------------------------------------------

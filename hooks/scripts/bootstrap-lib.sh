@@ -4299,7 +4299,9 @@ wt_is_worktree_of() {  # $1 = top level of the checkout, $2 = main checkout
 
 # The linked worktree directory $1 lies in and its main checkout, into WT_LINKED_WORKTREE and
 # WT_LINKED_ROOT; returns 1 when $1 is not inside a linked worktree under <root>/.claude/worktrees/
-# (wt_is_worktree_of). The string test comes first, so a directory outside any .claude/worktrees/ —
+# (wt_is_worktree_of) that git itself registered there (wt_worktree_registered) — not a repository of
+# its own, which is its own main checkout, nor a directory a hand-made `.git` file points into
+# another worktree's git dir. The string test comes first, so a directory outside any .claude/worktrees/ —
 # every session in a main checkout — costs no git process. The one rule the hooks that only read a
 # worktree apply: SessionStart after /clear or a compaction, and SubagentStart.
 WT_LINKED_WORKTREE='' WT_LINKED_ROOT=''
@@ -4315,7 +4317,39 @@ wt_linked_worktree_at() {  # $1 = directory
   worktree=$(wt_repo_root "$here") || return 1
   root=$(wt_main_root "$here" 2>/dev/null) || return 1
   wt_is_worktree_of "$worktree" "$root" || return 1
+  wt_worktree_registered "$worktree" || return 1
   WT_LINKED_WORKTREE=$worktree WT_LINKED_ROOT=$root
+}
+
+# True when git's own record of the linked worktree at top level $1 names $1: its `.git` file points
+# at a per-worktree git dir whose `gitdir` file points back at $1/.git. git follows a `.git` file
+# made by hand all the same — one pointing at a sibling worktree's git dir reports this directory as
+# the top level and the sibling's main checkout as the root, which is exactly what a worktree of
+# that repository reports — so only the back-link git writes on `worktree add` (and `move`, `repair`)
+# tells a worktree git made here from a directory borrowing another's git dir. Either link may be
+# relative (git 2.48's worktree.useRelativePaths): the first to $1, the second to the git dir. Read
+# from the files, so it costs no git process.
+wt_worktree_registered() {  # $1 = top level of a linked worktree
+  local wt=${1%/} line='' gd back=''
+  [ -f "$wt/.git" ] && [ -r "$wt/.git" ] || return 1
+  IFS= read -r line <"$wt/.git" || [ -n "$line" ] || return 1
+  line=${line%$'\r'}
+  case $line in
+    'gitdir: '?*) gd=${line#gitdir: } ;;
+    *) return 1 ;;
+  esac
+  case $gd in /*) ;; *) gd=$wt/$gd ;; esac
+  [ -f "$gd/gitdir" ] && [ -r "$gd/gitdir" ] || return 1
+  IFS= read -r back <"$gd/gitdir" || [ -n "$back" ] || return 1
+  back=${back%$'\r'}
+  case $back in
+    */.git) ;;
+    *) return 1 ;;
+  esac
+  case $back in /*) ;; *) back=$gd/$back ;; esac
+  back=$(cd "${back%/.git}" 2>/dev/null && pwd -P) || return 1
+  wt=$(cd "$wt" 2>/dev/null && pwd -P) || return 1
+  [ "$back" = "$wt" ]
 }
 
 # The guard every entry point that ACTS on "the worktree" applies to the directory it runs from:

@@ -559,10 +559,18 @@ case $event in
       # not finish left behind, or a folder made there by hand. git answers from one with the MAIN
       # checkout's top level, and everything below would set up that directory against the main
       # checkout's git dir — its state, its ledger, a port and a seed. Refused like any failure here:
-      # no path, so Claude Code reports it. The root is the one already resolved, so this holds for
-      # every repository layout creation itself supports.
-      if ! wt_is_worktree_of "$(wt_repo_root "$worktree")" "$root"; then
-        wt_log "$worktree is under .claude/worktrees/ but is not a linked worktree — not reopening it; /pitlane-tidy finds directories a worktree removal left behind"
+      # no path, so Claude Code reports it.
+      #
+      # Nor is every repository there one of THIS repository's worktrees: a `git init` or a clone
+      # made there by hand, a linked worktree of another repository, or a `.git` file planted to
+      # borrow another worktree's git dir. Each answers with its own top level, which sits under
+      # .claude/worktrees/ like a worktree's would. So the proof is the one wt_worktree_guard
+      # applies to every later session here — git's own main checkout for the directory, and its
+      # registration — and both must be this very path and the root already resolved; a directory
+      # the guard would refuse at the next start-up is not set up now.
+      if ! wt_linked_worktree_at "$worktree" || [ "$WT_LINKED_WORKTREE" != "$worktree" ] \
+         || [ "$WT_LINKED_ROOT" != "$root" ]; then
+        wt_log "$worktree is under .claude/worktrees/ but is not a linked worktree of $root — not reopening it; /pitlane-tidy finds directories a worktree removal left behind"
         exit 0
       fi
       wt_log "reopening existing worktree $worktree"
