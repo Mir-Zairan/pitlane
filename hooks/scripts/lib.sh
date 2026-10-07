@@ -803,6 +803,49 @@ wt_port_candidates() {  # $1 = slug, $2 = base, $3 = span, $4 = max (default WT_
   done
 }
 
+# Split $2 at every $1 (one byte) into the array WT_SPLIT, in one pass: n separators make n + 1
+# fields, empty ones included, so an empty $2 is one empty field. A global rather than a name passed
+# in, since bash 3.2 has no namerefs; copy it out before calling again.
+#
+# WHY NOT CUT AT EACH SEPARATOR. The loops this replaces took the remainder apart one field at a time
+# with ${rest%%:*} and ${rest#*:}. Bash measures the string again at every offset such a cut tries,
+# so each one costs the field's length times the remainder's, and the loop the square or the cube
+# of what it walks. What it walked is text from a profile on whatever branch is checked out, read
+# before anyone has approved it: a 4 KB template of `{` took seconds, a list as long as a profile
+# allows minutes. `read` walks it once.
+#
+# Text with no newline — every profile value, which the scan folds them out of — is read as one
+# line, which bash reads in blocks; `read` drops a trailing empty field, so one is put back after a
+# trailing separator. Text with a newline is read with `-d ''`, through it, which bash does a byte
+# at a time — ten times slower — and the newline the here-string adds comes back off the last field.
+wt_split() {  # $1 = separator, $2 = text
+  local n
+  WT_SPLIT=()
+  case ${2-} in
+    *"$WT_NL"*)
+      IFS=$1 read -r -d '' -a WT_SPLIT <<<"$2" || true
+      n=$((${#WT_SPLIT[@]} - 1))
+      WT_SPLIT[n]=${WT_SPLIT[n]%"$WT_NL"}
+      ;;
+    *)
+      IFS=$1 read -r -a WT_SPLIT <<<"${2-}" || true
+      case ${2-} in
+        '' | *"$1") WT_SPLIT+=('') ;;
+      esac
+      ;;
+  esac
+}
+
+# wt_split for a `:`-joined (or other) LIST: the same fields, less one empty field after a trailing
+# separator, so "" is no element at all and "a:" is one — how every `while [ -n "$rest" ]` walk of
+# such a list in this plugin read it.
+wt_split_list() {  # $1 = separator, $2 = list
+  local n
+  wt_split "$@"
+  n=$((${#WT_SPLIT[@]} - 1))
+  [ -n "${WT_SPLIT[n]}" ] || unset 'WT_SPLIT[n]'
+}
+
 # Substitute the profile placeholders in $1 from the WT_* environment:
 #
 #   {name} -> $WT_NAME   {slug} -> $WT_SLUG   {port} -> $WT_PORT
@@ -822,26 +865,57 @@ wt_port_candidates() {  # $1 = slug, $2 = base, $3 = span, $4 = max (default WT_
 # `q; rm -rf x` into two commands. A caller placing an unconstrained placeholder in
 # command position must quote it itself; bootstrap owns that.
 wt_expand() {  # $1 = template
-  local rest=${1-} out='' pre tok
-  while [ "${rest#*\{}" != "$rest" ]; do
-    pre=${rest%%\{*}
-    rest=${rest#*\{}
-    out+=$pre
-    if [ "${rest#*\}}" = "$rest" ]; then   # a { with no closing }
-      out+='{'
-      break
-    fi
-    tok=${rest%%\}*}
-    case $tok in
-      name)     out+=${WT_NAME-};  rest=${rest#*\}} ;;
-      slug)     out+=${WT_SLUG-};  rest=${rest#*\}} ;;
-      port)     out+=${WT_PORT-};  rest=${rest#*\}} ;;
-      worktree) out+=${WT_PATH-};  rest=${rest#*\}} ;;
-      root)     out+=${WT_ROOT-};  rest=${rest#*\}} ;;
-      *)        out+='{' ;;                # not ours — emit the brace, keep scanning
+  local LC_ALL=C p
+  local -a pieces=()
+  # Nothing to substitute is the template itself: every other brace passes through.
+  case ${1-} in
+    *'{name}'* | *'{slug}'* | *'{port}'* | *'{worktree}'* | *'{root}'*) ;;
+    *) printf '%s' "${1-}"; return 0 ;;
+  esac
+  # One pass: split at every `{`, then each piece after the first either starts with a name and its
+  # `}` — a placeholder — or is a literal brace and the text up to the next one. A placeholder holds
+  # no brace, so this is the same reading as scanning brace by brace, and an unbalanced `{` is just a
+  # piece with no `}` in it. Cutting the remainder at each brace instead (${rest#*\{}) costs bash the
+  # cube of the template's length, and a template is text from anyone's branch (wt_split).
+  #
+  # Past a few hundred bytes the pieces run to thousands, and a turn of a bash loop each adds up to
+  # seconds over every command and value a profile holds: one awk walks them by the same rule
+  # instead, the values passed in its environment, where nothing is unescaped. An `x` after the
+  # template, taken off the last piece, keeps a trailing newline that awk would drop with its line.
+  # tests/test_lib.sh holds the two to the same output.
+  if [ "${#1}" -gt 512 ]; then
+    printf '%sx' "$1" | WT_X_NAME=${WT_NAME-} WT_X_SLUG=${WT_SLUG-} WT_X_PORT=${WT_PORT-} \
+      WT_X_PATH=${WT_PATH-} WT_X_ROOT=${WT_ROOT-} LC_ALL=C awk '
+      { s = (NR > 1) ? s "\n" $0 : $0 }
+      END {
+        n = split(s, piece, "[{]")
+        piece[n] = substr(piece[n], 1, length(piece[n]) - 1)
+        printf "%s", piece[1]
+        for (i = 2; i <= n; i++) {
+          p = piece[i]
+          if (substr(p, 1, 5) == "name}") printf "%s%s", ENVIRON["WT_X_NAME"], substr(p, 6)
+          else if (substr(p, 1, 5) == "slug}") printf "%s%s", ENVIRON["WT_X_SLUG"], substr(p, 6)
+          else if (substr(p, 1, 5) == "port}") printf "%s%s", ENVIRON["WT_X_PORT"], substr(p, 6)
+          else if (substr(p, 1, 9) == "worktree}") printf "%s%s", ENVIRON["WT_X_PATH"], substr(p, 10)
+          else if (substr(p, 1, 5) == "root}") printf "%s%s", ENVIRON["WT_X_ROOT"], substr(p, 6)
+          else printf "{%s", p
+        }
+      }'
+    return 0
+  fi
+  wt_split '{' "$1"
+  pieces=("${WT_SPLIT[0]}")
+  for p in "${WT_SPLIT[@]:1}"; do
+    case $p in
+      'name}'*)     pieces+=("${WT_NAME-}${p#'name}'}") ;;
+      'slug}'*)     pieces+=("${WT_SLUG-}${p#'slug}'}") ;;
+      'port}'*)     pieces+=("${WT_PORT-}${p#'port}'}") ;;
+      'worktree}'*) pieces+=("${WT_PATH-}${p#'worktree}'}") ;;
+      'root}'*)     pieces+=("${WT_ROOT-}${p#'root}'}") ;;
+      *)            pieces+=("{$p") ;;  # not ours — the brace stays, and so does the text
     esac
   done
-  printf '%s' "$out$rest"
+  printf '%s' "${pieces[@]}"
 }
 
 # Collect the `{token}` placeholders in $1 that wt_expand does NOT substitute, one per
@@ -863,40 +937,78 @@ wt_expand() {  # $1 = template
 # The scanner mirrors wt_expand's, including its treatment of an unbalanced brace AND its
 # case-dependent advance, so the two agree about what counts as a placeholder.
 wt_unknown_placeholders() {  # $1 = template
-  local rest=${1-} tok found='' prev=''
-  while [ "${rest#*\{}" != "$rest" ]; do
-    prev=${rest%%\{*}
-    rest=${rest#*\{}
-    # An unbalanced `{` is emitted literally by wt_expand; nothing to report.
-    [ "${rest#*\}}" = "$rest" ] && break
-    tok=${rest%%\}*}
-    case $tok in
-      name | slug | port | worktree | root) ;;
-      # `${FOO}` is a shell expansion the profile author meant to keep.
-      *) case $prev in
-           *'$') ;;
-           *) case $tok in
-                # A bare identifier only. Anything with a space, a dot, a quote or a
-                # sigil is a program fragment, not a botched placeholder.
-                '' | *[!A-Za-z0-9_]*) ;;
-                *) found="$found$tok
-" ;;
-              esac ;;
-         esac ;;
+  local LC_ALL=C p tok prev cur
+  local -a found=()
+  case ${1-} in
+    *'{'*) ;;
+    *) return 0 ;;
+  esac
+  # The pieces between braces, as wt_expand reads them. The token after a `{` is its piece up to the
+  # first `}`. A piece with no `}` has none worth reporting: either no `}` follows at all (an
+  # unbalanced brace, emitted literally) or the next one is past another `{`, so the token holds a
+  # brace and is not a bare identifier.
+  #
+  # The scan used to advance exactly as wt_expand's did, which differed by case — through the `}`
+  # for a name it recognised, to just after the `{` for anything else — so that in `demo_{X{slugg}`
+  # it saw `{slugg}` where wt_expand leaves it literal, rather than skipping to the first `}` and
+  # seeing only the fragment `X{slugg`. Splitting at every brace reads it that way by construction:
+  # `X` and `slugg}` are separate pieces.
+  #
+  # Past a few hundred bytes the pieces run to thousands, and a turn of a bash loop each, cheap as it
+  # is, adds up to seconds over a profile's worth (runtime.env.vars is scanned whole): one awk walks
+  # them by the same rule instead. Below that, the loop, which costs no process. tests/test_lib.sh
+  # holds the two to the same answers.
+  if [ "${#1}" -gt 512 ]; then
+    tok=$(printf '%s' "$1" | LC_ALL=C awk '
+      { s = (NR > 1) ? s "\n" $0 : $0 }
+      END {
+        n = split(s, piece, "[{]")
+        for (i = 2; i <= n; i++) {
+          j = index(piece[i], "}")
+          if (j == 0) continue
+          tok = substr(piece[i], 1, j - 1)
+          if (tok == "" || tok ~ /[^A-Za-z0-9_]/ || tok ~ /^(name|slug|port|worktree|root)$/) continue
+          prev = piece[i - 1]
+          if (substr(prev, length(prev), 1) == "$") continue
+          print tok
+        }
+      }')
+    [ -n "$tok" ] || return 0
+    printf '%s\n' "$tok"
+    return 1
+  fi
+  # Every piece costs a turn of the loop, so all but a candidate — an identifier character first, a
+  # `}` somewhere — are let go with one pattern and one assignment.
+  wt_split '{' "$1"
+  cur=${WT_SPLIT[0]}
+  for p in "${WT_SPLIT[@]:1}"; do
+    case $p in
+      [A-Za-z0-9_]*'}'*) ;;
+      # A space, a dot, a quote, a sigil or the `}` itself first, or no `}` — a program fragment,
+      # not a botched placeholder.
+      *) cur=$p; continue ;;
     esac
-    # Advance EXACTLY as wt_expand does, which differs by case: for a name it recognises it
-    # consumes through the `}`, but for anything else it emits the brace and keeps scanning
-    # from just after it. Consuming to the `}` unconditionally is NOT equivalent, and the
-    # difference is observable: in `demo_{X{slugg}` wt_expand leaves `{slugg}` literal,
-    # while a scanner that skipped to the first `}` saw only the fragment `X{slugg` and
-    # reported nothing — missing the typo in precisely the inputs that mix a placeholder
-    # with shell or awk braces.
+    # The piece before this one, whose last character is the one before this piece's `{`.
+    prev=$cur
+    cur=$p
+    # The token. ${p%%\}*} costs bash the token's length times the piece's, so a long piece is
+    # split by `read`, which walks it once.
+    if [ "${#p}" -le 256 ]; then
+      tok=${p%%\}*}
+    else
+      IFS='}' read -r -d '' tok _ <<<"$p" || true
+    fi
     case $tok in
-      name | slug | port | worktree | root) rest=${rest#*\}} ;;
+      name | slug | port | worktree | root | *[!A-Za-z0-9_]*) continue ;;
     esac
+    # `${FOO}` is a shell expansion the profile author meant to keep: the piece before ends in `$`.
+    case $prev in
+      *'$') continue ;;
+    esac
+    found+=("$tok")
   done
-  [ -n "$found" ] || return 0
-  printf '%s' "$found"
+  [ "${#found[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${found[@]}"
   return 1
 }
 
@@ -912,17 +1024,16 @@ wt_unknown_placeholders() {  # $1 = template
 # the result looks reasonable is how a `dir` of `../../..` ends up naming the home
 # directory; refusing the shape outright cannot be talked round.
 wt_is_safe_relpath() {  # $1 = candidate
-  local p=${1-} seg rest
+  local p=${1-}
   case $p in
     '' | '.' | /* | '~'* ) return 1 ;;
   esac
-  # Split on / without a subshell or bash-4 features.
-  rest=$p
-  while [ -n "$rest" ]; do
-    seg=${rest%%/*}
-    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
-    [ "$seg" = '..' ] && return 1
-  done
+  # A `..` segment, found by one pattern over the path with a `/` at each end, so the first and last
+  # segments are matched like the rest. Linear: cutting the path apart segment by segment cost the
+  # square of its length (wt_split says why), and the path is a profile's, from anyone's branch.
+  case /$p/ in
+    */../*) return 1 ;;
+  esac
   return 0
 }
 
@@ -1029,20 +1140,24 @@ wt_expand_url() {  # $1 = template
 # a distinction no record stream can express. `runtime` and `runtime.env.vars` are there for the
 # same reason, and `agentNote` for one more: a record cannot tell the string "1" from the number 1,
 # nor show a newline the reader folded into a space, and the compact JSON shows both.
+#
+# The list is an array, not inline, so wt_profile_limits can name every field it bounds from the same
+# definition rather than from a second copy of the order.
+WT_PROFILE_SCAN=(schemaVersion shell shellArgs deps runtime
+  timeouts.bootstrapSeconds timeouts.seedSeconds
+  evidence.detectionVersion evidence.markers
+  runtime.seed runtime.teardown runtime.env.file
+  runtime.slug runtime.env.vars copy evidence.shellMarker
+  runtime.port.var runtime.port.base runtime.port.span runtime.port
+  runtime.serve runtime.stop runtime.url artifacts agentNote
+  -- deps dir lock strategy install verify lockChecksum copy
+  -- copy .
+  --kv runtime.env.vars
+  -- runtime.env.file .
+  -- artifacts dir inputs build verify link
+  -- agentNote .)
 wt_profile_scan() {  # $1 = profile path
-  wt_json_scan schemaVersion shell shellArgs deps runtime \
-    timeouts.bootstrapSeconds timeouts.seedSeconds \
-    evidence.detectionVersion evidence.markers \
-    runtime.seed runtime.teardown runtime.env.file \
-    runtime.slug runtime.env.vars copy evidence.shellMarker \
-    runtime.port.var runtime.port.base runtime.port.span runtime.port \
-    runtime.serve runtime.stop runtime.url artifacts agentNote \
-    -- deps dir lock strategy install verify lockChecksum copy \
-    -- copy . \
-    --kv runtime.env.vars \
-    -- runtime.env.file . \
-    -- artifacts dir inputs build verify link \
-    -- agentNote . <"$1"
+  wt_json_scan "${WT_PROFILE_SCAN[@]}" <"$1"
 }
 
 # Split the scalar record of a wt_profile_scan stream into named variables — the ONE place that
@@ -1061,8 +1176,9 @@ wt_profile_scan() {  # $1 = profile path
 # remainder in the LAST variable, so naming fewer would silently pack the rest — separators and
 # all — into whichever variable happened to come last.
 #
-# Sets WT_PS_* and nothing else. `|| true` because a short record makes `read` return 1, which
-# would abort a caller running under `set -e`.
+# Sets WT_PS_* and nothing else — WT_PS_RECS among them, the stream's records, for the callers to
+# walk. `|| true` because a short record makes `read` return 1, which would abort a caller running
+# under `set -e`.
 #
 # WT_PS_ENVFILES is DERIVED, not positional: runtime.env.file normalised to a `:`-joined list
 # A string is a list of one; a list is its group-4 elements in order. The validator
@@ -1074,9 +1190,14 @@ wt_profile_scan() {  # $1 = profile path
 # shellcheck disable=SC2034
 wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   local raw=${1-} rec body
-  # The first record is read, not cut with ${raw%%"$WT_RS"*}: bash tries that pattern at every
-  # offset, which is quadratic in a stream whose length the branch decides (5s for a 200 KB note).
-  IFS= read -r -d "$WT_RS" rec <<<"$raw" || true
+  local -a files=()
+  # The stream is split into its records once, and they are published as WT_PS_RECS for the callers'
+  # own walks. Not cut with ${raw%%"$WT_RS"*}, which bash tries at every offset — quadratic in a stream
+  # whose length the branch decides (5s for a 200 KB note) — nor read record by record from a pipe,
+  # which bash does a byte at a time, several times slower than one split (wt_split).
+  wt_split "$WT_RS" "$raw"
+  WT_PS_RECS=("${WT_SPLIT[@]}")
+  rec=${WT_PS_RECS[0]}
   body=${rec#*"$WT_US"}
   IFS=$WT_US read -r \
     WT_PS_VERSION WT_PS_SHELL WT_PS_SHELLARGS WT_PS_DEPS WT_PS_RUNTIME \
@@ -1090,13 +1211,21 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   WT_PS_ENVFILES=''
   case $WT_PS_ENVFILE in
     '['*)
-      while IFS= read -r -d "$WT_RS" rec; do
+      # Gathered, then joined once: appending to the joined string per element costs its length
+      # each time. An empty element before the first is dropped, as the append always did.
+      for rec in "${WT_PS_RECS[@]}"; do
         case $rec in
           4"$WT_US"*) ;;
           *) continue ;;
         esac
-        WT_PS_ENVFILES=${WT_PS_ENVFILES:+$WT_PS_ENVFILES:}${rec#*"$WT_US"}
-      done < <(printf '%s' "$raw")
+        rec=${rec#*"$WT_US"}
+        [ -n "$rec" ] || [ "${#files[@]}" -gt 0 ] || continue
+        files[${#files[@]}]=$rec
+      done
+      if [ "${#files[@]}" -gt 0 ]; then
+        printf -v WT_PS_ENVFILES '%s:' "${files[@]}"
+        WT_PS_ENVFILES=${WT_PS_ENVFILES%:}
+      fi
       ;;
     *) WT_PS_ENVFILES=$WT_PS_ENVFILE ;;
   esac
@@ -1121,7 +1250,8 @@ wt_is_safe_envfile() {  # $1 = candidate
 # splitting the rendered text on commas is exact on both backends, and no element can carry git
 # pathspec magic (`:`) or a glob into the `git diff -- <inputs>` that decides whether to link.
 wt_artifact_inputs() {  # $1 = the rendered inputs value
-  local raw=${1-} item out=''
+  local raw=${1-} item
+  local -a items=()
   case $raw in
     '[]' | '' ) return 1 ;;
     '['*']') ;;
@@ -1129,17 +1259,17 @@ wt_artifact_inputs() {  # $1 = the rendered inputs value
   esac
   raw=${raw#[}
   raw=${raw%]}
-  while [ -n "$raw" ]; do
-    item=${raw%%,*}
-    if [ "$item" = "$raw" ]; then raw=''; else raw=${raw#*,}; [ -n "$raw" ] || return 1; fi
+  # Split once (wt_split): every field is an element, so an empty one — a trailing comma — is refused.
+  wt_split , "$raw"
+  for item in "${WT_SPLIT[@]}"; do
     case $item in
       '"'?*'"') item=${item#\"}; item=${item%\"} ;;
       *) return 1 ;;
     esac
     wt_is_safe_envfile "$item" || return 1
-    out+=$item$WT_NL
+    items+=("$item")
   done
-  printf '%s' "$out"
+  printf '%s\n' "${items[@]}"
 }
 
 # Split deps[].copy — the paths inside a hardlinked dir that must be real copies — into one path per
@@ -1165,17 +1295,16 @@ wt_dep_copy_paths() {  # $1 = the rendered copy value
 # No whitespace: the scan turns a control character into a space, so "dist\nx" would arrive as a
 # different, real-looking dir.
 wt_is_artifact_dir() {  # $1 = candidate
-  local p=${1-} seg rest
+  local p=${1-}
   wt_is_safe_relpath "$p" || return 1
   case $p in
     */ | *[[:space:][:cntrl:]]*) return 1 ;;
   esac
-  rest=$p
-  while [ -n "$rest" ]; do
-    seg=${rest%%/*}
-    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
-    case $seg in '' | .) return 1 ;; esac
-  done
+  # An empty or `.` segment, by one pattern as wt_is_safe_relpath finds `..`: the path neither starts
+  # nor ends with `/` by now, so `//` can only be an empty segment.
+  case /$p/ in
+    *//* | */./*) return 1 ;;
+  esac
   return 0
 }
 
@@ -1207,6 +1336,113 @@ WT_AGENT_NOTE_MAX_CHARS=400
 # quotes and a comma, the array its brackets. Neither backend escapes that much today, so the cap
 # only ever refuses a note the bounds refuse anyway.
 WT_AGENT_NOTE_MAX_BYTES=$((WT_AGENT_NOTE_MAX_LINES * (WT_AGENT_NOTE_MAX_CHARS * 12 + 3) + 2))
+
+# The bounds on a whole profile, checked before anything else reads it. The profile, and files it
+# names, are read at session start, at worktree creation, at every subagent start and at removal —
+# before anyone has approved it, on whatever the branch holds — and bash's own string operations
+# cost the square, or the cube, of the text they walk (wt_split says why). The loops that were worst
+# are linear now; these keep every other one small enough not to matter, whatever is left in it:
+#   - 256 KiB for the file. A real profile is about 7 KiB; the commented template is 23 KiB.
+#   - 4096 bytes for every scalar and every field of every record the scan produces — a path, a
+#     command, a key, a value. It is PATH_MAX on Linux, and longer than any command a profile runs.
+#     agentNote keeps its own, tighter bounds (WT_AGENT_NOTE_*).
+#   - 64 entries in every list: deps, copy, artifacts, each one's inputs and copy, runtime.env.file,
+#     runtime.env.vars and evidence.markers. A repo with more dependency dirs than that installs them
+#     from a workspace root, which is one entry.
+# Over any of them the profile is unusable, exactly as an invalid one is: the hooks warn and use the
+# defaults, and the validator says which bound and where.
+WT_PROFILE_MAX_BYTES=262144
+WT_PROFILE_MAX_VALUE=4096
+WT_PROFILE_MAX_ITEMS=64
+
+# Print why the profile file $1 is too big to read, and return 1; print nothing and return 0 when it
+# is within WT_PROFILE_MAX_BYTES. `wc -c` on a regular file asks the filesystem for its size rather
+# than reading it. A size that cannot be measured is refused too: a branch can make a file that
+# cannot be read cheaply, and nothing downstream should be the first to find out.
+wt_profile_size_check() {  # $1 = profile path
+  local size
+  size=$(wc -c <"$1" 2>/dev/null) || size=''
+  size=${size//[!0-9]/}
+  if [ -z "$size" ]; then
+    printf 'profile: %s could not be measured, so it is not read\n' "$1"
+    return 1
+  fi
+  if [ "$size" -gt "$WT_PROFILE_MAX_BYTES" ]; then
+    printf 'profile: %s is %s bytes, over the %d (256 KiB) a profile may be\n' "$1" "$size" "$WT_PROFILE_MAX_BYTES"
+    return 1
+  fi
+  return 0
+}
+
+# Print every value and list in the wt_profile_scan stream $1 over WT_PROFILE_MAX_VALUE or
+# WT_PROFILE_MAX_ITEMS, one per line in the validator's form, naming where it is and never repeating
+# it; return 1 if there were any. ONE awk over the stream, which is linear, rather than a bash loop,
+# whose cost per record is what is being bounded. LC_ALL=C so a length is bytes.
+#
+# The field names come from WT_PROFILE_SCAN, the one definition of the order. What is not bounded
+# here, and why:
+#   - the scalars that render a container — deps, runtime, copy, runtime.env.vars, runtime.port,
+#     artifacts and a runtime.env.file list: the file's own cap bounds them, and their elements
+#     arrive as records, which are bounded one by one;
+#   - agentNote, scalar and records: it has its own caps, and its own messages (WT_AGENT_NOTE_*).
+# A list that has no records is counted by its commas: evidence.markers, and deps[].copy and
+# artifacts[].inputs, which arrive as compact JSON inside a record. Every consumer of those splits
+# them at the commas, so that is the count that costs; none of them allows a comma in an element.
+wt_profile_limits() {  # $1 = a wt_profile_scan stream
+  local IFS=' ' rc=0
+  printf '%s' "${1-}" | LC_ALL=C awk -v RS="$WT_RS" -v FS="$WT_US" \
+    -v maxv="$WT_PROFILE_MAX_VALUE" -v maxn="$WT_PROFILE_MAX_ITEMS" -v spec="${WT_PROFILE_SCAN[*]}" \
+    -v containers='deps runtime copy runtime.env.vars runtime.port artifacts' -v own='agentNote' \
+    -v nested='deps.copy artifacts.inputs' -v counted='evidence.markers' '
+    function set(list, arr,   t, i, k) { k = split(list, t, " "); for (i = 1; i <= k; i++) arr[t[i]] = 1 }
+    function long(name) { printf "%s: is longer than the %d bytes a value may be\n", name, maxv; bad = 1 }
+    function many(name) { printf "%s: has more than the %d entries a list may have\n", name, maxn; bad = 1 }
+    function items(v) { return v == "[]" ? 0 : gsub(/,/, ",", v) + 1 }
+    function check(name, v, listy) {
+      if (length(v) > maxv) long(name)
+      else if (listy && substr(v, 1, 1) == "[" && items(v) > maxn) many(name)
+    }
+    BEGIN {
+      set(containers, iscont); set(own, isown); set(nested, isnested); set(counted, iscounted)
+      k = split(spec, a, " ")
+      g = 0
+      for (i = 1; i <= k; i++) {
+        if (a[i] == "--" || a[i] == "--kv") { g++; kv[g] = (a[i] == "--kv"); path[g] = a[++i]; nf[g] = 0; continue }
+        if (g == 0) scal[++ns] = a[i]; else fld[g, ++nf[g]] = a[i]
+      }
+      ng = g
+    }
+    NR == 1 {
+      for (i = 2; i <= NF; i++) {
+        name = scal[i - 1]
+        if ((name in iscont) || (name in isown)) continue
+        if (name == "runtime.env.file" && substr($i, 1, 1) == "[") continue
+        check(name, $i, name in iscounted)
+      }
+      next
+    }
+    {
+      t = $1 + 0
+      n = cnt[t]++
+      if (path[t] in isown) next
+      if (kv[t]) { check(path[t] "[" n "].key", $2, 0); check(path[t] "[" n "].value", $3, 0); next }
+      for (i = 2; i <= NF; i++) {
+        f = fld[t, i - 1]
+        if (f == ".") check(path[t] "[" n "]", $i, 0)
+        else check(path[t] "[" n "]." f, $i, (path[t] "." f) in isnested)
+      }
+    }
+    END {
+      for (t = 1; t <= ng; t++) if (!(path[t] in isown) && cnt[t] > maxn) many(path[t])
+      exit bad
+    }' || rc=$?
+  case $rc in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  printf 'profile: its size limits could not be checked (awk exited %s), so it is not used\n' "$rc"
+  return 1
+}
 
 # True when $1, JSON text as either backend renders it (wt_json_backend), holds a character that
 # does not print as itself, so a line holding it can look like other text than it is — to the human
@@ -1273,12 +1509,13 @@ wt_is_seconds() {  # $1 = candidate
 # once for the JSON value renderer, once for the drift comparator. Reading `wt_is_seconds "$base"`
 # at a port call site would also be a small lie in the source.
 wt_is_posint() {  # $1 = candidate
-  local n=${1-}
-  case $n in
+  # Digits only, and not all of them zeros. One pattern each: stripping the leading zeros one at a
+  # time cost the square of their number, and the number is a profile's.
+  case ${1-} in
     '' | *[!0-9]*) return 1 ;;
+    *[1-9]*) return 0 ;;
   esac
-  while [ "${n#0}" != "$n" ]; do n=${n#0}; done   # strip leading zeros
-  [ -n "$n" ]                                      # "0" and "000" strip to empty
+  return 1
 }
 
 # The allowed values for deps[].strategy. "store" is accepted because it is a valid schema
@@ -1333,7 +1570,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   local slug envvars copy cpath dcopy
   local seedp downp envfile unk tok
   local portvar portbase portspan portobj ekey eval_ nkeys=0
-  local ef efrest efseen efrebuilt efn
+  local ef efseen efrebuilt efn
   local serve stopcmd urltpl urlwhy
   local artifacts adir ainputs abuild averify alink nart=0 depdirs=' ' artdirs=' '
   local agentnote rest shape want lit nlit nline=0 toomany escaped_backslash="\\\\"
@@ -1360,15 +1597,20 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   # made — wt_load_profile does, so a profile load costs one backend spawn rather than two.
   # The leading scalar record is emitted whenever the document parsed, so its presence is the
   # parse check; the caveat that used to force a separate scalar read is gone.
+  # A caller handing the scan over has measured the file already, before scanning it (wt_load_profile).
   if [ "$#" -ge 3 ]; then
     raw=$3
   else
+    wt_profile_size_check "$file" || return 1
     raw=$(wt_profile_scan "$file") || true
   fi
   if [ -z "$raw" ]; then
     printf 'profile: %s is not parseable as a single JSON document\n' "$file"
     return 1
   fi
+  # Bounded before any check below walks a value: those checks are what the bounds keep cheap, and
+  # a profile over them is refused whatever else it holds, so nothing more is said about it.
+  wt_profile_limits "$raw" || return 1
   # ONE reader for the field order, shared with wt_load_profile. The locals below are aliases for
   # readability in the checks that follow — the positional knowledge lives in wt_profile_scalars
   # and nowhere else, so adding a field cannot shift this function's view of the record.
@@ -1411,7 +1653,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     esac
   fi
   if [ -n "$deps" ] && [ "$deps" != '[]' ]; then
-    while IFS= read -r -d "$WT_RS" rec; do
+    for rec in "${WT_PS_RECS[@]}"; do
       # Group 1 is deps[]; skip the scalar record and the copy[] records.
       case $rec in
         1"$WT_US"*) ;;
@@ -1503,7 +1745,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       done
 
       n=$((n + 1))
-    done < <(printf '%s' "$raw")
+    done
 
     # A non-empty deps array that yielded no records must NOT be treated as empty. The reader
     # swallows a backend failure by contract, so without this a half-produced stream would skip
@@ -1528,7 +1770,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   fi
   if [ -n "$copy" ] && [ "$copy" != '[]' ]; then
     n=0
-    while IFS= read -r -d "$WT_RS" rec; do
+    for rec in "${WT_PS_RECS[@]}"; do
       # Group 2 is copy[].
       case $rec in
         2"$WT_US"*) ;;
@@ -1541,7 +1783,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       fi
       ncopy=$((ncopy + 1))
       n=$((n + 1))
-    done < <(printf '%s' "$raw")
+    done
     n=0
 
     # The same fail-closed guard the deps loop has, and for a sharper reason now that both
@@ -1567,7 +1809,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
   fi
   if [ -n "$artifacts" ] && [ "$artifacts" != '[]' ]; then
     n=0
-    while IFS= read -r -d "$WT_RS" rec; do
+    for rec in "${WT_PS_RECS[@]}"; do
       case $rec in
         5"$WT_US"*) ;;
         *) continue ;;
@@ -1622,7 +1864,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         unk=$(wt_unknown_placeholders "$tok") || wt_log "artifacts[$n]: \"$tok\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
       done
       n=$((n + 1))
-    done < <(printf '%s' "$raw")
+    done
     n=0
     # The fail-closed guard deps[] and copy[] have, for the same reason.
     if [ "$nart" -eq 0 ]; then
@@ -1698,7 +1940,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         n=$((n + 1))
       done
       n=0
-      while IFS= read -r -d "$WT_RS" rec; do
+      for rec in "${WT_PS_RECS[@]}"; do
         case $rec in
           6"$WT_US"*) ;;
           *) continue ;;
@@ -1709,7 +1951,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         fi
         nline=$((nline + 1))
         n=$((n + 1))
-      done < <(printf '%s' "$raw")
+      done
       n=0
       # The fail-closed guard the other arrays have: a stream that lost its group-6 records would
       # skip the length check and pronounce the note clean.
@@ -1796,10 +2038,8 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
               printf 'runtime.env.file: must be a path or a list of path strings, got %s\n' "$envfile"
               bad=1
             else
-              efrest=$WT_PS_ENVFILES
-              while [ -n "$efrest" ]; do
-                ef=${efrest%%:*}
-                if [ "$ef" = "$efrest" ]; then efrest=''; else efrest=${efrest#*:}; fi
+              wt_split_list : "$WT_PS_ENVFILES"
+              for ef in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
                 if ! wt_is_safe_envfile "$ef"; then
                   printf 'runtime.env.file[%d]: "%s" must be a relative path of letters, digits and . _ - @ + /\n' "$efn" "$ef"
                   bad=1
@@ -1940,7 +2180,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       case $envvars in
         '' | 'null' | '{}') ;;
         '{'*'}')
-          while IFS= read -r -d "$WT_RS" rec; do
+          for rec in "${WT_PS_RECS[@]}"; do
             # Group 3 is runtime.env.vars; skip the scalar record and the deps[]/copy[] records.
             case $rec in
               3"$WT_US"*) ;;
@@ -1985,7 +2225,7 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
                 bad=1
                 ;;
             esac
-          done < <(printf '%s' "$raw")
+          done
           # A non-empty map that yielded no pairs must not be treated as empty, for the same
           # reason deps[] and copy[] are not: the reader swallows a backend failure by contract,
           # so without this a half-produced stream would skip every key check while the profile
@@ -2194,6 +2434,14 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
     return 0
   fi
 
+  # Measured before it is read, and refused over the size bound whether or not validation is on:
+  # the bound is not about the profile's meaning but about what reading it costs, before approval.
+  if ! problems=$(wt_profile_size_check "$PROFILE_PATH"); then
+    wt_log "$PROFILE_PATH is not valid — using defaults. Run /pitlane-setup to rewrite it:"
+    wt_log "$problems"
+    return 0
+  fi
+
   # ONE backend invocation for the whole load, validation included: this reads the document
   # once with wt_profile_scan and hands the very same output to wt_validate_profile below,
   # rather than each of them parsing the file for itself.
@@ -2235,6 +2483,13 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   # disable validation for every session silently.
   if [ -n "${WT_SKIP_VALIDATION:-}" ]; then
     wt_log "WT_SKIP_VALIDATION is set — $PROFILE_PATH is being used without validation"
+    # Except for the bounds on its values and lists, which wt_validate_profile checks first: every
+    # consumer below walks them, validated or not.
+    problems=$(wt_profile_limits "$raw") || {
+      wt_log "$PROFILE_PATH is not valid — using defaults. Run /pitlane-setup to rewrite it:"
+      wt_log "$problems"
+      return 0
+    }
   fi
   if [ -z "${WT_SKIP_VALIDATION:-}" ]; then
     problems=$(wt_validate_profile "$PROFILE_PATH" "$root" "$raw") || {
@@ -2286,7 +2541,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   # only one in the result.
   case $WT_PS_AGENTNOTE in
     '['*']')
-      while IFS= read -r -d "$WT_RS" rec; do
+      for rec in "${WT_PS_RECS[@]}"; do
         case $rec in
           6"$WT_US"*) ;;
           *) continue ;;
@@ -2296,7 +2551,7 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
         [ "$nnote" -eq 0 ] || PROFILE_AGENT_NOTE+=$WT_NL
         PROFILE_AGENT_NOTE+=${rec#*"$WT_US"}
         nnote=$((nnote + 1))
-      done < <(printf '%s' "$raw")
+      done
       ;;
   esac
 

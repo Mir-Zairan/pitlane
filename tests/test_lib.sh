@@ -1923,6 +1923,193 @@ JSON
   vw '{"schemaVersion":1,"agentNote":["C:\\new"]}'
   eq 'validate: an escaped backslash before n is not a control character' '' "$(vv)"
 
+  # --- The bounds on a whole profile (WT_PROFILE_MAX_*) -----------------------------------------
+  # The profile is read and validated at session start, before approval, on whatever the branch
+  # holds, so what that costs must not grow with what the branch puts in it. Over a bound it is
+  # refused with one line naming where; at the bounds, the worst shapes validate quickly. Timed with
+  # SECONDS, as the agentNote bounds are above; each shape took from tens of seconds to hours before.
+  pad() { head -c "$2" /dev/zero | tr '\0' "$1"; }
+  pads() { local s='' i=0; while [ "$i" -lt "$2" ]; do s+=$1; i=$((i + 1)); done; printf '%s' "$s"; }
+  fast() { [ "$1" -lt 4 ] && echo fast || echo "${1}s"; }
+  timed() { t0=$SECONDS; out=$("$@"); elapsed=$((SECONDS - t0)); }
+
+  vw '{"schemaVersion":1,"shell":"'"$(pad a 300000)"'"}'
+  timed vv
+  eq 'bounds: a 300 KB profile is refused by its size, before it is read' \
+    "profile: $VP is $(($(wc -c <"$VP"))) bytes, over the 262144 (256 KiB) a profile may be" "$out"
+  eq 'bounds: ...in under 4s (a 300 KB profile is refused by its size, before it is read)' fast "$(fast "$elapsed")"
+  t0=$SECONDS
+  wt_load_profile "$VR" 2>"$TMP/bounds.err"
+  elapsed=$((SECONDS - t0))
+  err=$(cat "$TMP/bounds.err")
+  eq 'bounds: a load refuses it and uses the defaults' 0 "$PROFILE_PRESENT"
+  contains 'bounds: ...saying it is not valid' 'is not valid — using defaults' "$err"
+  contains 'bounds: ...and why' 'bytes, over the 262144 (256 KiB) a profile may be' "$err"
+  eq 'bounds: ...in under 4s (a load refuses it and uses the defaults)' fast "$(fast "$elapsed")"
+  vw '{"schemaVersion":1,"shell":"'"$(pad a 262100)"'"}'
+  eq 'bounds: a profile just under the size bound is measured, not refused for its size' \
+    'shell: is longer than the 4096 bytes a value may be' "$(vv)"
+
+  # Every scalar and every record field: 4096 bytes is allowed, one more is not.
+  vw '{"schemaVersion":1,"shell":"'"$(pad a 4096)"'"}'
+  eq 'bounds: a value of 4096 bytes is allowed' '' "$(vv)"
+  vw '{"schemaVersion":1,"shell":"'"$(pad a 5000)"'"}'
+  eq 'bounds: a value of 5000 bytes is refused' 'shell: is longer than the 4096 bytes a value may be' "$(vv)"
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"'"$(pad a 5000)"'"}]}'
+  eq 'bounds: a record field over 4096 bytes is refused, named by its place' \
+    'deps[0].install: is longer than the 4096 bytes a value may be' "$(vv)"
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{"A":"'"$(pad a 5000)"'","'"$(pad B 5000)"'":"x"}}}}'
+  eq 'bounds: an env.vars value and key over 4096 bytes are each named' \
+    'runtime.env.vars[0].value: is longer than the 4096 bytes a value may be
+runtime.env.vars[1].key: is longer than the 4096 bytes a value may be' "$(vv)"
+  # Bytes, whatever the locale: 2000 two-byte characters are 4000 bytes, 2100 are 4200.
+  vw '{"schemaVersion":1,"shell":"'"$(pads 'é' 2000)"'"}'
+  eq 'bounds: 4000 bytes of two-byte characters are allowed' '' "$(vv)"
+  vw '{"schemaVersion":1,"shell":"'"$(pads 'é' 2100)"'"}'
+  eq 'bounds: 4200 bytes of two-byte characters are refused' 'shell: is longer than the 4096 bytes a value may be' "$(vv)"
+
+  # Every list: 64 entries are allowed, 65 are not.
+  items64=$(pads '"a",' 63)'"a"'
+  items65=$items64',"a"'
+  files65=$(n=0; while [ "$n" -lt 65 ]; do printf '"e%d",' "$n"; n=$((n + 1)); done)'"e"'
+  vars65=$(n=0; while [ "$n" -lt 65 ]; do printf '"K%d":"v",' "$n"; n=$((n + 1)); done)'"K":"v"'
+  deps65=$(pads '{"dir":"d","strategy":"skip"},' 65)'{"strategy":"skip"}'
+  arts65=$(pads '{"dir":"o","build":"b","inputs":["a"]},' 65)'{"dir":"o"}'
+  vw '{"schemaVersion":1,"copy":['"$items64"']}'
+  eq 'bounds: a list of 64 entries is allowed' '' "$(vv)"
+  for shape in 'copy:{"schemaVersion":1,"copy":[ITEMS]}' \
+    'evidence.markers:{"schemaVersion":1,"evidence":{"markers":[ITEMS]}}' \
+    'deps[0].copy:{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":[ITEMS]}]}' \
+    'artifacts[0].inputs:{"schemaVersion":1,"artifacts":[{"dir":"dist","build":"b","inputs":[ITEMS]}]}' \
+    'runtime.env.file:{"schemaVersion":1,"runtime":{"env":{"file":[FILES]}}}' \
+    'runtime.env.vars:{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{VARS}}}}' \
+    'deps:{"schemaVersion":1,"deps":[DEPS]}' \
+    'artifacts:{"schemaVersion":1,"artifacts":[ARTS]}'; do
+    name=${shape%%:*}
+    doc=${shape#*:}
+    doc=${doc//ITEMS/$items65}
+    doc=${doc//FILES/$files65}
+    doc=${doc//VARS/$vars65}
+    doc=${doc//DEPS/$deps65}
+    doc=${doc//ARTS/$arts65}
+    vw "$doc"
+    eq "bounds: $name with 65 entries or more is refused" "$name: has more than the 64 entries a list may have" "$(vv)"
+  done
+  # The bounds hold with validation switched off: they are what reading the profile costs.
+  vw '{"schemaVersion":1,"copy":['"$items65"']}'
+  WT_SKIP_VALIDATION=1 wt_load_profile "$VR" 2>"$TMP/bounds.err"
+  err=$(cat "$TMP/bounds.err")
+  eq 'bounds: WT_SKIP_VALIDATION does not lift them' 0 "$PROFILE_PRESENT"
+  contains 'bounds: ...and says which' 'copy: has more than the 64 entries a list may have' "$err"
+
+  # The worst shapes within the bounds. Placeholder runs in env.vars, which is scanned whole for
+  # botched placeholders: 60 values of 4000 '{', and of '{a}', each nearly the size bound in all.
+  vars=''
+  n=0
+  while [ "$n" -lt 60 ]; do vars="$vars${vars:+,}\"K$n\":\"$(pad '{' 4000)\""; n=$((n + 1)); done
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{'"$vars"'}}}}'
+  timed vv
+  eq "bounds: 60 env.vars values of 4000 '{' are valid" '' "$out"
+  eq 'bounds: ...in under 4s (60 values of 4000 braces)' fast "$(fast "$elapsed")"
+  aaa=$(pads '{a}' 1300)
+  vars=''
+  n=0
+  while [ "$n" -lt 60 ]; do vars="$vars${vars:+,}\"K$n\":\"$aaa\""; n=$((n + 1)); done
+  vw '{"schemaVersion":1,"runtime":{"env":{"file":".e","vars":{'"$vars"'}}}}'
+  timed vv
+  eq "bounds: 60 env.vars values of 1300 '{a}' are valid" '' "$out"
+  eq 'bounds: ...in under 4s (60 values of 1300 {a})' fast "$(fast "$elapsed")"
+  # Paths of 4095 bytes, `a/a/…`: 60 in copy[], 60 distinct env files, and deps and artifacts dirs.
+  apath=$(pads 'a/' 2045)
+  paths='' files=''
+  n=0
+  while [ "$n" -lt 60 ]; do
+    paths="$paths${paths:+,}\"${apath}a\""
+    files="$files${files:+,}\"${apath}$(printf '%02d' "$n")\""
+    n=$((n + 1))
+  done
+  vw '{"schemaVersion":1,"copy":['"$paths"']}'
+  timed vv
+  eq 'bounds: 60 copy[] paths of 4095 bytes are valid' '' "$out"
+  eq 'bounds: ...in under 4s (60 copy[] paths of 4095 bytes are valid)' fast "$(fast "$elapsed")"
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"P","base":4100,"span":10},"env":{"file":['"$files"']}}}'
+  timed vv
+  eq 'bounds: 60 env files of 4095 bytes are valid' '' "$out"
+  eq 'bounds: ...in under 4s (60 env files of 4095 bytes are valid)' fast "$(fast "$elapsed")"
+  vw '{"schemaVersion":1,"deps":[{"dir":"'"${apath}a"'","lock":"'"${apath}a"'","strategy":"skip"}],
+       "artifacts":[{"dir":"'"${apath}."'","build":"b","inputs":["'"${apath}a"'"]}]}'
+  timed vv
+  eq 'bounds: 4095-byte deps and artifacts paths are read in one pass each' \
+    "artifacts[0].dir: \"${apath}.\" must be a relative path inside the repository, with no whitespace and no \".\" or empty segment" "$out"
+  eq 'bounds: ...in under 4s (4095-byte deps and artifacts paths are read in one pass each)' fast "$(fast "$elapsed")"
+  # Numbers of 4096 digits, leading zeros all but the last.
+  zeros=$(pad 0 4095)1
+  vw '{"schemaVersion":1,"timeouts":{"bootstrapSeconds":"'"$zeros"'","seedSeconds":"'"$zeros"'"},
+       "runtime":{"port":{"var":"P","base":"'"$zeros"'","span":"'"$zeros"'"}}}'
+  timed vv
+  eq 'bounds: 4096-digit numbers with leading zeros validate' '' "$out"
+  eq 'bounds: ...in under 4s (4096-digit numbers with leading zeros validate)' fast "$(fast "$elapsed")"
+  # Every list at its count: 64 deps, each copying 64 paths.
+  dcopy=$(pads '"c",' 63)'"c"'
+  deps=$(pads '{"dir":"d","lock":"composer.lock","strategy":"skip","install":"x","copy":['"$dcopy"']},' 63)
+  vw '{"schemaVersion":1,"deps":['"$deps"'{"dir":"d","lock":"composer.lock","strategy":"skip","install":"x","copy":['"$dcopy"']}]}'
+  timed vv
+  eq 'bounds: 64 deps of 64 copy paths each are valid' '' "$out"
+  eq 'bounds: ...in under 4s (64 deps of 64 copy paths each are valid)' fast "$(fast "$elapsed")"
+
+  # The scanners themselves, on more than any one value may hold — env.vars is scanned whole, as
+  # its compact JSON. Cutting the remainder at each brace cost the cube of this.
+  big=$(pad '{' 200000)
+  timed wt_expand "$big"
+  eq "expand: 200 KB of '{' passes through" 200000 "${#out}"
+  eq 'expand: ...in under 4s (200 KB of braces)' fast "$(fast "$elapsed")"
+  big=$(pads '{a}' 60000)
+  t0=$SECONDS
+  out=$(wt_unknown_placeholders "$big" | wc -l)
+  elapsed=$((SECONDS - t0))
+  eq "unknown_placeholders: 60000 '{a}' are 60000 reports" 60000 "$((out))"
+  eq 'unknown_placeholders: ...in under 4s (60000 {a})' fast "$(fast "$elapsed")"
+  big=$(pads '{name}' 30000)
+  t0=$SECONDS
+  out=$(WT_NAME=n wt_expand "$big")
+  elapsed=$((SECONDS - t0))
+  eq "expand: 30000 '{name}' are 30000 names" "$(pad n 30000)" "$out"
+  eq 'expand: ...in under 4s (30000 {name})' fast "$(fast "$elapsed")"
+  # Its two scanners — a bash loop up to 512 bytes, awk past them — give the same answers: each
+  # template as it is, and behind 600 spaces, which hold no brace and change no token.
+  pad600=$(pad ' ' 600)
+  # shellcheck disable=SC2016  # the dollars are the text under test
+  for tpl in 'demo_{slugg}' 'demo_{X{slugg}' '${FOO}{BAR}' '{name}{PORT}{port}' 'a{b c}d{e}' '{' '}{' \
+    '{a}{' $'{a\n}{b}' '{_9}$' 'x${y}{z}' '{root}}{w}' '{}{a.b}{é}' '$${a}' '{{a}}' "{$(pad a 300)}"; do
+    eq "unknown_placeholders: the loop and awk agree on $tpl" \
+      "$(wt_unknown_placeholders "$tpl"; echo "rc=$?")" "$(wt_unknown_placeholders "$pad600$tpl"; echo "rc=$?")"
+  done
+  # wt_expand's too, with values that look like printf formats, escapes and placeholders.
+  # shellcheck disable=SC2016  # the dollar is the text under test
+  for tpl in 'a{name}b' '{port}{slug}{worktree}{root}' '{name' 'x{name}}' '{{name}}' '${name}{X}' \
+    $'{name}\n' $'\n{root}\n\n' '{nam{name}e}' '{slug}{' '}{name}{'; do
+    a=$(WT_NAME='n%s\{root}' WT_SLUG=s WT_PORT=1 WT_PATH='/w\n' WT_ROOT='/r{name}' wt_expand "$tpl"; echo x)
+    b=$(WT_NAME='n%s\{root}' WT_SLUG=s WT_PORT=1 WT_PATH='/w\n' WT_ROOT='/r{name}' wt_expand "$pad600$tpl"; echo x)
+    eq "expand: the loop and awk agree on $tpl" "$pad600$a" "$b"
+  done
+  # Path and number checks on 200 KB, past any bound: one pattern each, not a cut per segment.
+  big=$(pads 'a/' 100000)a
+  t0=$SECONDS
+  wt_is_safe_relpath "$big"; rc1=$?
+  wt_is_artifact_dir "$big"; rc2=$?
+  wt_is_safe_relpath "$big/.."; rc3=$?
+  wt_is_artifact_dir "$big//a"; rc4=$?
+  elapsed=$((SECONDS - t0))
+  eq 'relpath/artifact_dir: a 200 KB path is judged' '0 0 1 1' "$rc1 $rc2 $rc3 $rc4"
+  eq 'relpath/artifact_dir: ...in under 4s (a 200 KB path is judged)' fast "$(fast "$elapsed")"
+  big=$(pad 0 200000)
+  t0=$SECONDS
+  wt_is_posint "${big}7"; rc1=$?
+  wt_is_posint "$big"; rc2=$?
+  elapsed=$((SECONDS - t0))
+  eq 'posint: 200000 leading zeros are judged' '0 1' "$rc1 $rc2"
+  eq 'posint: ...in under 4s (200000 leading zeros are judged)' fast "$(fast "$elapsed")"
+
   # The fail-closed guard: a non-empty agentNote whose records are lost is refused, not read as no
   # lines at all — which would skip the length check. The stub drops group 6 and nothing else.
   vw '{"schemaVersion":1,"agentNote":["a line"]}'

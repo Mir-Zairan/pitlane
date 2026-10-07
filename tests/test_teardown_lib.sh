@@ -836,6 +836,22 @@ wt_release_env_overrides "$RW" '.env.e' 'ours'
 eq 'release: a single-file record still works' 'OLD=1' "$(cat "$RW/.env.e")"
 wt_release_env_overrides "$RW" '' ''
 eq 'release: an empty record is a no-op' 0 $?
+# 64 recorded files of 4095-byte paths, none of them ours, then one that is: the lists are split once,
+# not cut a field at a time, which cost the length of the rest of the list every field — seconds.
+apath=$(yes a/ | head -n 2045 | tr -d '\n')
+files='' states='' n=0
+while [ "$n" -lt 64 ]; do
+  files=$files${files:+:}$apath$(printf '%02d' "$n")
+  states=$states${states:+:}theirs
+  n=$((n + 1))
+done
+printf 'MINE=1\n%s\n' "$blk" >"$RW/.env.f"
+t0=$SECONDS
+wt_release_env_overrides "$RW" "$files:.env.f" "$states:ours"
+elapsed=$((SECONDS - t0))
+eq 'release: 64 recorded files of 4095 bytes are walked in under 4s' fast \
+  "$([ "$elapsed" -lt 4 ] && echo fast || echo "${elapsed}s")"
+eq '...to the one after them that is ours' 'MINE=1' "$(cat "$RW/.env.f")"
 
 printf '%d passed, %d failed, %d backend(s) exercised\n' "$pass" "$fail" "$backends_run" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$backends_run" -gt 0 ]

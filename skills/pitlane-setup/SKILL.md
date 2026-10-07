@@ -491,6 +491,9 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
 - `agentNote` — the lines from step 5's *The agent note*, exactly as the developer accepted them; leave
   it out when there are none.
 - No `_comment` keys in the file you write. Those are the template's annotations, not schema.
+- The bounds: the file at most 256 KiB, every value at most 4096 bytes, every list at most 64
+  entries. The hooks read the profile before it is approved, so these keep that cheap whatever a
+  branch puts in it; a real profile is nowhere near them.
 
 Then **validate, and treat failure as fatal here** — unlike the hooks, which warn and fall back to
 defaults, you must not write a profile that does not validate:

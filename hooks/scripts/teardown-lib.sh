@@ -1090,15 +1090,19 @@ wt_mirror_allocation_free() {  # $1 = main checkout, $2 = the app's url
 # or empty is the developer's, or was never written, and is not opened at all. The recorded list,
 # never the profile's current one: a profile edited since would name files the plugin never wrote.
 wt_release_env_overrides() {  # $1 = worktree, $2 = recorded env files, $3 = recorded dispositions
-  local worktree=${1%/} files=${2-} states=${3-} f st
-  while [ -n "$files" ]; do
-    f=${files%%:*}
-    st=${states%%:*}
-    if [ "$f" = "$files" ]; then files=''; else files=${files#*:}; fi
-    if [ "$st" = "$states" ]; then states=''; else states=${states#*:}; fi
-    [ "$st" = ours ] || continue
-    wt_runtime_env_release "$worktree" "$f" \
-      || wt_log "could not remove the plugin's block from $f"
+  local worktree=${1%/} i=0
+  local -a files=() states=()
+  # Split once each, not cut a field at a time, which costs the list's length per field (wt_split).
+  wt_split_list : "${2-}"
+  files=(${WT_SPLIT[@]+"${WT_SPLIT[@]}"})
+  wt_split : "${3-}"
+  states=("${WT_SPLIT[@]}")
+  while [ "$i" -lt "${#files[@]}" ]; do
+    if [ "${states[i]-}" = ours ]; then
+      wt_runtime_env_release "$worktree" "${files[i]}" \
+        || wt_log "could not remove the plugin's block from ${files[i]}"
+    fi
+    i=$((i + 1))
   done
   return 0
 }

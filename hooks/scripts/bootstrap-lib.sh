@@ -849,15 +849,19 @@ wt_worktreeinclude_paths() {  # $1 = main checkout, $2 = worktree (optional)
 # outside the repository. A branch is untrusted input and this is a file write, so every
 # component is checked, not just the last.
 wt_has_symlinked_parent() {  # $1 = base directory, $2 = relative path
-  local base=${1%/} rel=${2-} acc='' seg rest
-  rest=${rel%/*}
-  [ "$rest" = "$rel" ] && return 1      # no parent components at all
-  while [ -n "$rest" ]; do
-    seg=${rest%%/*}
-    if [ "$seg" = "$rest" ]; then rest=''; else rest=${rest#*/}; fi
+  local base=${1%/} rel=${2-} acc='' seg
+  case $rel in
+    */*) ;;
+    *) return 1 ;;                      # no parent components at all
+  esac
+  # Split once (wt_split): cutting a profile's path apart a segment at a time cost its length per
+  # segment. A component that is not there ends the walk — nothing below it can be a symlink.
+  wt_split / "${rel%/*}"
+  for seg in "${WT_SPLIT[@]}"; do
     [ -n "$seg" ] || continue
     acc="${acc:+$acc/}$seg"
     [ -L "$base/$acc" ] && return 0
+    [ -e "$base/$acc" ] || return 1
   done
   return 1
 }
@@ -870,7 +874,7 @@ wt_has_symlinked_parent() {  # $1 = base directory, $2 = relative path
 # present, that is N stats and ZERO subprocesses, which is what "well under a second" needs.
 wt_copy_paths() {  # $1 = main checkout, $2 = worktree
   local root=${1%/} worktree=${2%/} p q n=0 present=0 copied=0 cand=() ignored=() is_ignored
-  local dest src parent irc ictmp
+  local dest src parent irc ictmp qi
 
   while IFS= read -r -d '' p; do
     [ -n "$p" ] || continue
@@ -935,11 +939,18 @@ wt_copy_paths() {  # $1 = main checkout, $2 = worktree
   esac
   rm -f "$ictmp"
 
+  # check-ignore answers in the order it was asked, each path as given, so the ignored ones are the
+  # candidates in order with the rest left out: one walk down both lists matches them up. Matching
+  # every candidate against every answer instead cost their product, and a `.worktreeinclude` can
+  # select every untracked file there is. An answer that matched no candidate would only stop the
+  # walk early, refusing the rest — never copying a path git did not name.
+  qi=0
   for p in "${cand[@]}"; do
     is_ignored=0
-    for q in ${ignored[@]+"${ignored[@]}"}; do
-      if [ "$q" = "$p" ]; then is_ignored=1; break; fi
-    done
+    if [ "$qi" -lt "${#ignored[@]}" ] && [ "${ignored[qi]}" = "$p" ]; then
+      is_ignored=1
+      qi=$((qi + 1))
+    fi
     case $is_ignored in
       1) ;;
       *)
@@ -4344,11 +4355,15 @@ wt_worktree_guard() {  # $1 = directory
 # the full load, the validation and wt_approval_check. A key written with a \u escape decodes to
 # agentNote, so any \u in the file counts as a yes.
 wt_profile_may_carry_agent_note() {  # $1 = worktree, $2 = main checkout
-  local file=${1%/}/.claude/worktree-profile.json chunk
+  local LC_ALL=C file=${1%/}/.claude/worktree-profile.json chunk n=0
   [ -f "$file" ] || file=${2%/}/.claude/worktree-profile.json
   [ -f "$file" ] && [ -r "$file" ] || return 1
-  # NUL-delimited, so a profile is one read, and a NUL byte cannot cut the rest of the file off.
-  while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
+  # NUL-delimited, so a profile is one read, and a NUL byte cannot cut the rest of the file off. At
+  # most WT_PROFILE_MAX_BYTES of it, in one piece: anything bigger, or broken up by a NUL, which no
+  # JSON holds, is a yes — the load refuses it, and that is not this function's call to make.
+  while IFS= read -r -d '' -n "$((WT_PROFILE_MAX_BYTES + 1))" chunk || [ -n "$chunk" ]; do
+    n=$((n + 1))
+    [ "$n" -eq 1 ] && [ "${#chunk}" -le "$WT_PROFILE_MAX_BYTES" ] || return 0
     case $chunk in
       *'"agentNote"'* | *'\u'*) return 0 ;;
     esac
@@ -5714,9 +5729,9 @@ wt_warn_hardlinked_venvs() {  # $1 = main checkout
       *) continue ;;
     esac
     body=${rec#*"$WT_US"}
-    dir=${body%%"$WT_US"*}
-    strategy=${body#*"$WT_US"*"$WT_US"}
-    strategy=${strategy%%"$WT_US"*}
+    # Read, not cut out with ${body#*US*US}: that cut is quadratic in bash in the fields before the
+    # strategy, and they are a branch's.
+    IFS=$WT_US read -r dir _ strategy _ <<<"$body" || true
     [ "$strategy" = hardlink ] && [ -n "$dir" ] || continue
     case /${dir%/} in
       */.venv) ;;
@@ -6105,20 +6120,35 @@ WT_ENV_MARKER='# managed by the worktree plugin'
 WT_ENV_BEGIN="$WT_ENV_MARKER — begin. Rewritten every session: to override a value, set it below the end line; to take this file over, delete the whole block."
 WT_ENV_END='# end of the block managed by the worktree plugin'
 
+# The most an env file may hold for the plugin to read it: 64 KiB. Real ones are a few dozen lines.
+# The file is named by a profile from anyone's branch and may be one the branch commits, and it is
+# read at session start, line by line: past this the plugin leaves it alone (wt_runtime_env_split).
+WT_ENV_FILE_MAX_BYTES=65536
+
 # Split the file at $1 around its managed block(s). Sets WT_ENV_BEFORE (every line before the first
 # block), WT_ENV_AFTER (every line after it that is not itself inside a block) and WT_ENV_HAS_BLOCK.
 # Every line is kept newline-terminated, including a last line that had none, so the pieces can be
 # concatenated with a block between them. A second block — two sessions' worth, pasted by hand — is
 # dropped rather than kept, so a rewrite always leaves exactly one. Returns 1 if the file cannot be
-# read, which callers treat as "not ours".
+# read, which callers treat as "not ours" — and so does a file over WT_ENV_FILE_MAX_BYTES, which it
+# says on stderr.
 #
 # Read with bash's own `read`, not a subprocess: this runs on the session-start path, and the files
-# it reads are a few dozen lines.
+# it reads are a few dozen lines. The lines are gathered and joined once, because appending each to
+# the text so far costs that text's length every time — the square of the file — and the bytes are
+# counted as they are read, so a bigger file is never read past the bound.
 wt_runtime_env_split() {  # $1 = file
-  local f=${1-} line inblock=0
+  local LC_ALL=C f=${1-} line inblock=0 bytes=0
+  local -a blines=() alines=()
   WT_ENV_BEFORE='' WT_ENV_AFTER='' WT_ENV_HAS_BLOCK=0
   [ -f "$f" ] && [ -r "$f" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
+    bytes=$((bytes + ${#line} + 1))
+    if [ "$bytes" -gt "$WT_ENV_FILE_MAX_BYTES" ]; then
+      wt_log "  runtime: $f is over $WT_ENV_FILE_MAX_BYTES bytes — too big to be an env file the plugin manages, so it is left alone"
+      WT_ENV_HAS_BLOCK=0
+      return 1
+    fi
     if [ "$inblock" = 1 ]; then
       case $line in
         "$WT_ENV_END"*) inblock=0 ;;
@@ -6133,11 +6163,13 @@ wt_runtime_env_split() {  # $1 = file
         ;;
     esac
     if [ "$WT_ENV_HAS_BLOCK" = 1 ]; then
-      WT_ENV_AFTER=$WT_ENV_AFTER$line$WT_NL
+      alines[${#alines[@]}]=$line
     else
-      WT_ENV_BEFORE=$WT_ENV_BEFORE$line$WT_NL
+      blines[${#blines[@]}]=$line
     fi
   done <"$f"
+  [ "${#blines[@]}" -eq 0 ] || printf -v WT_ENV_BEFORE '%s\n' "${blines[@]}"
+  [ "${#alines[@]}" -eq 0 ] || printf -v WT_ENV_AFTER '%s\n' "${alines[@]}"
   return 0
 }
 
@@ -6201,6 +6233,65 @@ wt_runtime_env_put() {  # $1 = destination, $2 = content
   return 0
 }
 
+# The env.vars pairs of the stream $1 (group 3 of a wt_profile_scan stream), each value checked and
+# expanded for this worktree: WT_EP_KEYS, the keys as written; WT_EP_VALS, the values expanded, line
+# breaks folded; WT_EP_UNSAFE, the placeholder that makes a value unsafe here, or empty. ONCE for a
+# stream and a worktree, however many env files the block goes into: done per file, it cost every
+# file the whole stream and every value's expansion, and both are a branch's, so a profile within its
+# bounds could still hold the session start for minutes (WT_PROFILE_MAX_*).
+#
+# A NEWLINE IN A VALUE WOULD FORGE A SECOND ASSIGNMENT, naming a variable the profile does not — the
+# same damage as a bad key, arriving from the other side of the `=`. dotenv is line-oriented, so the
+# value is folded rather than its input trusted to have no line break. The JSON layer folds these
+# already; this is the backstop for a stream built another way.
+# AN UNCONSTRAINED PLACEHOLDER MUST NOT CARRY SHELL SYNTAX INTO A FILE THE APP PARSES. The block goes
+# into the file the framework really loads, and several dotenv dialects (Symfony's, Ruby's) run
+# `$(...)` in an unquoted value — so `DB=app_{name}` plus a colleague's branch named `x$(cmd)` would
+# run `cmd` on every boot of the app. {name}, {worktree} and {root} are raw text from a less trusted
+# party than the committed profile; the same refusal the install commands get applies here, and for
+# the same reason quoting is not attempted instead. Such a value is not expanded at all.
+WT_EP_FOR=''
+WT_EP_KEYS=()
+WT_EP_VALS=()
+WT_EP_UNSAFE=()
+wt_runtime_env_pairs() {  # $1 = a stream holding group-3 records
+  local id rec body key val unsafe
+  local -a recs=()
+  id=${WT_NAME-}$WT_US${WT_SLUG-}$WT_US${WT_PORT-}$WT_US${WT_PATH-}$WT_US${WT_ROOT-}$WT_RS${1-}
+  [ "$id" != "$WT_EP_FOR" ] || return 0
+  WT_EP_KEYS=()
+  WT_EP_VALS=()
+  WT_EP_UNSAFE=()
+  # Split once, and copied out: wt_expand below splits too.
+  wt_split "$WT_RS" "${1-}"
+  recs=("${WT_SPLIT[@]}")
+  for rec in "${recs[@]}"; do
+    case $rec in
+      3"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    # Read rather than cut at the separator, which costs the key's length squared (wt_split).
+    case $body in
+      *"$WT_US"*)
+        IFS=$WT_US read -r -d '' key val <<<"$body" || true
+        val=${val%"$WT_NL"}
+        ;;
+      *) key=$body val=$body ;;
+    esac
+    unsafe=$(wt_unsafe_command_placeholder "$val")
+    if [ -z "$unsafe" ]; then
+      val=$(wt_expand "$val")
+      val=${val//"$WT_CR"/ }
+      val=${val//"$WT_NL"/ }
+    fi
+    WT_EP_KEYS+=("$key")
+    WT_EP_VALS+=("$val")
+    WT_EP_UNSAFE+=("$unsafe")
+  done
+  WT_EP_FOR=$id
+}
+
 # Write the managed block into one override file. Sets WT_ENV_WROTE to `written`, `developer`, or
 # `skipped`.
 #
@@ -6222,7 +6313,8 @@ wt_runtime_env_put() {  # $1 = destination, $2 = content
 # because that is the .gitignore that governs the file and a branch can legitimately differ.
 wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = port, $5 = pairs stream, $6 = recorded disposition, $7 = expanded runtime.url or empty
   local worktree=${1%/} rel=${2-} pvar=${3-} port=${4-} pairs=${5-} recorded=${6-} url=${7-}
-  local dest parent state rec body key val block before='' after='' n=0 irc verb unsafe wtname scoped
+  local dest parent state body key block before='' after='' n=0 irc verb wtname scoped i size=0
+  local -a vlines=()
 
   # SC2034: WT_ENV_WROTE is this function's result — the caller records it in the state file so
   # the developer-managed warning is said once rather than on every session.
@@ -6257,10 +6349,10 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
   # people scroll past, and this is the escape hatch the design most wants a developer to trust.
   case $state in
     theirs)
-      # Not a regular, readable file — a directory, or one this user cannot read. Nothing can be
-      # written there and no developer "took it over", so it is reported as a refusal: the seed
-      # then refuses too, and the recorded disposition carries through unchanged.
-      wt_log "  runtime: refusing to write $rel — it is not a regular file this user can read"
+      # Not a regular, readable file — a directory, one this user cannot read, or one too big to be
+      # an env file. Nothing can be written there and no developer "took it over", so it is reported
+      # as a refusal: the seed then refuses too, and the recorded disposition carries through unchanged.
+      wt_log "  runtime: refusing to write $rel — it is not a regular file this user can read, or is too big to manage"
       return 0
       ;;
     unmarked)
@@ -6353,29 +6445,20 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
 
   # SCOPED KEYS: `<file>:<VAR>` sets VAR in that one file only, in place of the shared VAR there. So
   # the pass below first collects which VARs this file scopes, then writes each shared VAR this
-  # file does not scope, then this file's scoped ones — every VAR once, with the right value.
+  # file does not scope, then this file's scoped ones — every VAR once, with the right value. Both
+  # passes walk the pairs as wt_runtime_env_pairs parsed and expanded them, once for every file.
+  wt_runtime_env_pairs "$pairs"
   scoped=' '
-  while IFS= read -r -d "$WT_RS" rec; do
-    case $rec in
-      3"$WT_US"*) ;;
-      *) continue ;;
-    esac
-    body=${rec#*"$WT_US"}
-    key=${body%%"$WT_US"*}
+  for key in ${WT_EP_KEYS[@]+"${WT_EP_KEYS[@]}"}; do
     case $key in
       "$rel":*) scoped="$scoped${key#"$rel":} " ;;
     esac
-  done < <(printf '%s' "$pairs")
+  done
 
-  while IFS= read -r -d "$WT_RS" rec; do
-    # Group 3 of the profile scan is runtime.env.vars.
-    case $rec in
-      3"$WT_US"*) ;;
-      *) continue ;;
-    esac
-    body=${rec#*"$WT_US"}
-    key=${body%%"$WT_US"*}
-    val=${body#*"$WT_US"}
+  vlines=()
+  i=-1
+  for key in ${WT_EP_KEYS[@]+"${WT_EP_KEYS[@]}"}; do
+    i=$((i + 1))
     case $key in
       "$rel":*) key=${key#"$rel":} ;;
       *:*) continue ;;
@@ -6392,29 +6475,28 @@ wt_runtime_env_write() {  # $1 = worktree, $2 = rel path, $3 = port var, $4 = po
       wt_log "  runtime: skipping \"$key\" — not a legal environment variable name"
       continue
     fi
-    # A NEWLINE IN A VALUE WOULD FORGE A SECOND ASSIGNMENT, naming a variable the profile does not
-    # — the same damage as a bad key, arriving from the other side of the `=`. dotenv is
-    # line-oriented, so the writer folds line breaks rather than trusting its input not to have
-    # any. The JSON layer folds these already; this is the backstop for a stream built another way.
-    # AN UNCONSTRAINED PLACEHOLDER MUST NOT CARRY SHELL SYNTAX INTO A FILE THE APP PARSES. Since
-    # the block now goes into the file the framework really loads, and several dotenv dialects
-    # (Symfony's, Ruby's) run `$(...)` in an unquoted value — so `DB=app_{name}` plus a colleague's
-    # branch named `x$(cmd)` would run `cmd` on every boot of the app. {name}, {worktree} and {root}
-    # are raw text from a less trusted party than the committed profile; the same refusal the
-    # install commands get applies here, and for the same reason quoting is not attempted instead.
-    unsafe=$(wt_unsafe_command_placeholder "$val")
-    if [ -n "$unsafe" ]; then
-      wt_log "  runtime: skipping \"$key\" — its {$unsafe} expands to text with shell syntax in it, which a dotenv parser may execute"
+    if [ -n "${WT_EP_UNSAFE[i]}" ]; then
+      wt_log "  runtime: skipping \"$key\" — its {${WT_EP_UNSAFE[i]}} expands to text with shell syntax in it, which a dotenv parser may execute"
       continue
     fi
-    val=$(wt_expand "$val")
-    val=${val//"$WT_CR"/ }
-    val=${val//"$WT_NL"/ }
-    block=$block"$key=$val$WT_NL"
+    vlines+=("$key=${WT_EP_VALS[i]}")
     n=$((n + 1))
-  done < <(printf '%s' "$pairs")
+    # Counted as it grows, so a block already past the bound below is not built any further; in
+    # characters, which are never more than the bytes, so this stops nothing the bound would allow.
+    size=$((size + ${#vlines[n - 1]} + 1))
+    [ "$size" -le "$WT_ENV_FILE_MAX_BYTES" ] || break
+  done
+  # Joined once: appending each line to the block costs the block's length every time.
+  [ "${#vlines[@]}" -eq 0 ] || { printf -v body '%s\n' "${vlines[@]}"; block=$block$body; }
   block=$block$WT_ENV_END$WT_NL
 
+  # Never a file the next session would refuse to read (WT_ENV_FILE_MAX_BYTES): the block grows with
+  # what the profile's values expand to, and a branch decides those.
+  if [ "$size" -gt "$WT_ENV_FILE_MAX_BYTES" ] \
+    || wt_is_longer_in_bytes_than "$WT_ENV_FILE_MAX_BYTES" "$before$block$after"; then
+    wt_log "  runtime: not writing $rel — with the block it would be over $WT_ENV_FILE_MAX_BYTES bytes, more than an env file the plugin manages may hold"
+    return 0
+  fi
   if wt_runtime_env_put "$dest" "$before$block$after"; then
     # shellcheck disable=SC2034
     WT_ENV_WROTE=written
@@ -6743,25 +6825,6 @@ EOF
 # still works; only isolation is skipped.
 WT_NO_RUNTIME_MARKER='.claude/worktree-no-runtime'
 
-# The disposition recorded for env file $3, given the recorded `:`-joined file list $1 and the
-# aligned `:`-joined dispositions $2. Prints `ours`, `theirs`, or nothing. A record from an
-# older version holds one file and one disposition, which is the same shape with a single element.
-wt_runtime_env_recorded() {  # $1 = recorded files, $2 = recorded dispositions, $3 = file
-  local files=${1-} states=${2-} want=${3-} f st
-  [ -n "$files" ] && [ -n "$want" ] || return 0
-  while :; do
-    f=${files%%:*}
-    st=${states%%:*}
-    if [ "$f" = "$want" ]; then
-      case $st in ours | theirs) printf '%s' "$st" ;; esac
-      return 0
-    fi
-    [ "$f" != "$files" ] || return 0
-    files=${files#*:}
-    if [ "$st" = "$states" ]; then states=''; else states=${states#*:}; fi
-  done
-}
-
 # Layer 3 for one worktree: slug, port, env blocks, seed. Publishes WT_RUNTIME_PORT (the claimed
 # port, when runtime.port.var names a variable to carry it) and WT_RUNTIME_URL (runtime.url expanded,
 # when it is safe), for the session's environment and status line; both empty when nothing was set.
@@ -6856,8 +6919,9 @@ wt_runtime_outcome_read() {  # $1 = worktree
 # The hand-off's steps, wt_runtime_handoff's body.
 wt_runtime_handoff_steps() {  # $1 = root, $2 = worktree, $3 = the bootstrap deadline (epoch seconds)
   local root=${1%/} worktree=${2%/} deadline=${3-}
-  local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport
-  local rest f prior fstate shown nfiles url shared=0
+  local slug tpl envfiles envstate oldenv oldstates recenv port psrc oldslug oldseed oldcksum sslug sport j
+  local -a efiles=() ofiles=() ostates=() vrecs=()
+  local f prior fstate shown nfiles url shared=0 vpairs=''
 
   WT_RUNTIME_PORT=''
   WT_RUNTIME_URL=''
@@ -6959,11 +7023,39 @@ wt_runtime_handoff_steps() {  # $1 = root, $2 = worktree, $3 = the bootstrap dea
     envstate=ours
     recenv=''
     nfiles=0
-    rest=$envfiles
-    while [ -n "$rest" ]; do
-      f=${rest%%:*}
-      if [ "$f" = "$rest" ]; then rest=''; else rest=${rest#*:}; fi
-      prior=$(wt_runtime_env_recorded "$oldenv" "$oldstates" "$f")
+    # Each list split once, up front, into arrays of its own: wt_split's array is reused by the
+    # calls below. Cutting a list apart a field at a time costs its length per field (wt_split).
+    wt_split_list : "$envfiles"
+    efiles=(${WT_SPLIT[@]+"${WT_SPLIT[@]}"})
+    wt_split_list : "$oldenv"
+    ofiles=(${WT_SPLIT[@]+"${WT_SPLIT[@]}"})
+    wt_split : "$oldstates"
+    ostates=("${WT_SPLIT[@]}")
+    # Only the env.vars records are handed to each file's write, not the whole profile stream: the
+    # write takes them apart once (wt_runtime_env_pairs), but bash copies an argument every time it
+    # is passed, and the rest of the stream is a branch's to make large.
+    wt_split "$WT_RS" "${PROFILE_RAW:-}"
+    for f in "${WT_SPLIT[@]}"; do
+      case $f in
+        3"$WT_US"*) vrecs+=("$f") ;;
+      esac
+    done
+    [ "${#vrecs[@]}" -eq 0 ] || printf -v vpairs "%s$WT_RS" "${vrecs[@]}"
+    for f in ${efiles[@]+"${efiles[@]}"}; do
+      # The disposition recorded for f: the slot aligned with its first appearance in the recorded
+      # list — `ours`, `theirs`, or nothing. A record from an older version holds one file and one
+      # disposition, which is the same shape with a single element.
+      prior=''
+      if [ -n "$f" ]; then
+        j=0
+        while [ "$j" -lt "${#ofiles[@]}" ]; do
+          if [ "${ofiles[j]}" = "$f" ]; then
+            case ${ostates[j]-} in ours | theirs) prior=${ostates[j]} ;; esac
+            break
+          fi
+          j=$((j + 1))
+        done
+      fi
       # A FILE NOTHING RECORDS, WITHOUT A BLOCK, THAT DIFFERS FROM THE MAIN CHECKOUT'S was written in
       # this worktree by hand — most often one set up before the plugin was adopted, pointed at a
       # database cloned by hand. Appending the block would silently re-point it. A file
@@ -6974,7 +7066,7 @@ wt_runtime_handoff_steps() {  # $1 = root, $2 = worktree, $3 = the bootstrap dea
         prior=theirs
         wt_log "runtime: $f is yours — it differs from the main checkout's copy, so it was set up in this worktree by hand; it will be left alone, and nothing will be seeded. To hand it to the plugin, add this line at its end: $WT_ENV_MARKER"
       fi
-      wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "${PROFILE_RAW:-}" "$prior" "$url"
+      wt_runtime_env_write "$worktree" "$f" "${PROFILE_RT_PORTVAR:-}" "$port" "$vpairs" "$prior" "$url"
       case $WT_ENV_WROTE in
         written) fstate=ours ;;
         developer)

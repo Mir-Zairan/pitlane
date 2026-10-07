@@ -6304,6 +6304,13 @@ eq '...the quoted word anywhere is a yes: it errs towards loading, never towards
 printf '{"schemaVersion":1,"agentNotes":["x"],"copy":["agent note"]}\n' >"$PCW/.claude/worktree-profile.json"
 wt_profile_may_carry_agent_note "$PCW" "$PCR"
 eq '...a profile that never spells the key is a no' 1 $?
+# Bounded: past WT_PROFILE_MAX_BYTES it is a yes without reading on, and the load refuses the file.
+{ printf '{"schemaVersion":1,"shell":"'; head -c 300000 /dev/zero | tr '\0' a; printf '"}\n'; } \
+  >"$PCW/.claude/worktree-profile.json"
+t0=$SECONDS
+wt_profile_may_carry_agent_note "$PCW" "$PCR"
+eq '...a profile over the size bound is a yes, left for the load to refuse' "0 fast" \
+  "$? $([ $((SECONDS - t0)) -lt 4 ] && echo fast || echo slow)"
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_AGENT_NOTE=''
 # shellcheck disable=SC2034
@@ -6719,6 +6726,84 @@ eq 'outcome: a headerless record is not read' '||' "$WT_RUNTIME_ISOLATED|$WT_RUN
 printf 'wtstate%s%s%srtrun%s1%s4999%s%s' "$US_" "$WT_STATE_VERSION" "$RS_" "$US_" "$US_" "$US_" "$RS_" >"$OSTATE"
 PROFILE_HAS_RUNTIME=0 wt_runtime_handoff "$OREPO" "$OWT" ''
 eq 'outcome: a hand-off with no runtime removes a stale record' '' "$(rtrun_recs)"
+
+# ---------------------------------------------------------------------------
+# What a branch's profile and the files it names cost to read, at the bounds
+# ---------------------------------------------------------------------------
+# All of this runs at session start, before anyone has approved the profile. Timed with SECONDS (bash
+# 3.2 has no EPOCHREALTIME); each shape took from several seconds to hours before it was made linear.
+fast() { [ "$1" -lt 4 ] && echo fast || echo "${1}s"; }
+BREPO=$TMP/bounds
+mkdir -p "$BREPO"
+git init -q "$BREPO"
+git -C "$BREPO" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+BWT=$BREPO/.claude/worktrees/bw
+git -C "$BREPO" worktree add -q "$BWT" -b worktree-bw 2>/dev/null
+
+# An env file over WT_ENV_FILE_MAX_BYTES is left alone, read no further than the bound: a megabyte of
+# short lines, which the plugin used to read whole, appending each line to all before it.
+yes a | head -c 1048576 >"$BWT/.big.env"
+t0=$SECONDS
+state=$(wt_runtime_env_state "$BWT" .big.env 2>"$TMP/bounds.err")
+elapsed=$((SECONDS - t0))
+eq 'env file: one of 1 MiB is not managed' theirs "$state"
+contains '...and says why' ".big.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
+eq '...in under 4s' fast "$(fast "$elapsed")"
+# Just under the bound, short lines with a block among them split exactly, and quickly.
+{
+  yes a | head -n 10000
+  printf '%s\n' "$WT_ENV_BEGIN" 'X=1' "$WT_ENV_END"
+  yes b | head -n 20000
+  printf 'last-without-newline'
+} >"$BWT/.near.env"
+t0=$SECONDS
+wt_runtime_env_split "$BWT/.near.env"
+elapsed=$((SECONDS - t0))
+eq 'env file: 60 KB of short lines is read' "1 $(yes a | head -n 10000 | cksum)" "$WT_ENV_HAS_BLOCK $(printf '%s' "$WT_ENV_BEFORE" | cksum)"
+eq '...the lines after its block too, the last given its newline' \
+  "$( { yes b | head -n 20000; echo last-without-newline; } | cksum)" "$(printf '%s' "$WT_ENV_AFTER" | cksum)"
+eq '...in under 4s' fast "$(fast "$elapsed")"
+# And the plugin never writes one it would then refuse: a block that would take the file past the
+# bound is not written.
+printf '*.env\n' >"$BWT/.gitignore"
+out=$(wt_runtime_env_write "$BWT" .grow.env '' '' "$(mk_pairs "BIG=$(head -c 70000 /dev/zero | tr '\0' v)")" 2>&1)
+eq 'env file: a block past the bound is not written' absent "$(wt_runtime_env_state "$BWT" .grow.env)"
+contains '...and says why' 'with the block it would be over' "$out"
+
+# The hand-off over 60 env files of 4 KB paths, twice: the second run looks each up in the list
+# the first recorded. Cutting both lists apart a field at a time cost minutes. Segments of 255 bytes,
+# the most a name may have: git's own check of a path 2000 directories deep costs more than this does.
+bounds_handoff() (  # a subshell, so the profile it fakes stays in it
+  local apath files='' n=0
+  apath=$(seg=$(head -c 255 /dev/zero | tr '\0' a); yes "$seg/" | head -n 15 | tr -d '\n')
+  while [ "$n" -lt 60 ]; do files=$files${files:+:}$apath$(printf '%02d' "$n"); n=$((n + 1)); done
+  # shellcheck disable=SC2034  # read by the sourced engine.
+  PROFILE_HAS_RUNTIME=1 PROFILE_RT_ENVFILES=$files PROFILE_RT_ENVFILE=${files%%:*} PROFILE_RAW=''
+  WT_SLUG='' WT_NAME=bw
+  wt_runtime_handoff "$BREPO" "$BWT" '' 2>/dev/null
+  t0=$SECONDS
+  wt_runtime_handoff "$BREPO" "$BWT" '' 2>/dev/null
+  printf '%s %s' "$(fast $((SECONDS - t0)))" "$([ "$(wt_runtime_state_get "$BWT" envfile)" = "$files" ] && echo recorded)"
+)
+t0=$SECONDS
+out=$(bounds_handoff)
+elapsed=$((SECONDS - t0))
+eq 'hand-off: 60 env files of 4 KB paths, the second time, in under 4s' 'fast recorded' "$out"
+eq '...and both times in under 8s' fast "$(fast $((elapsed / 2)))"
+
+# A large .worktreeinclude selection: 6000 gitignored files, each refused (a symlink), so the time is
+# the matching of candidates to git's answers, which compared every one with every other.
+mkdir -p "$BREPO/src" "$BREPO/l"
+(cd "$BREPO/src" && seq -f 'f%05g' 6000 | xargs touch)
+(cd "$BREPO/l" && seq -f '../src/f%05g' 6000 | xargs sh -c 'ln -s "$@" .' _)
+printf 'l/\n' >"$BREPO/.gitignore"
+printf 'l/\n' >"$BREPO/.worktreeinclude"
+rm -f "$BWT/.worktreeinclude"
+t0=$SECONDS
+out=$(wt_copy_config "$BREPO" "$BWT" 1 2>&1 | grep -c 'it is a symlink')
+elapsed=$((SECONDS - t0))
+eq 'copy: 6000 selected paths are each matched to what git said of them' 6000 "$((out))"
+eq '...in under 4s' fast "$(fast "$elapsed")"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

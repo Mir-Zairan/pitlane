@@ -23,7 +23,11 @@
     "This is not defensive tidiness: because the profile is committed, it arrives with any branch anyone",
     "pushes, and consumers act on these fields with `cp -al`, file writes and teardown deletion. A `dir`",
     "of `../../..` would put those operations on the main checkout or the home directory — damage",
-    "strictly outside the worktree, which is the one boundary this design has to hold."
+    "strictly outside the worktree, which is the one boundary this design has to hold.",
+    "",
+    "EVERYTHING IS BOUNDED, because the hooks read the profile before anyone has approved it: the file",
+    "at most 256 KiB, every value at most 4096 bytes, every list at most 64 entries (agentNote has its",
+    "own, tighter bounds). A profile over any of them is refused like an invalid one."
   ],
 
   "schemaVersion": 1,
