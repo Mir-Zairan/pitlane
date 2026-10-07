@@ -86,8 +86,10 @@
 # rejects clean checkouts of repos whose committed bytes differ from the working ones (CRLF
 # conversion, LFS), because hashing runs without filters: a clean filter could write into .git,
 # and report mode writes nothing. A `.git` file that still names an existing admin dir, or an admin
-# dir anywhere but this repository's, is not an orphan at all: it refuses, pointing at
-# `git worktree repair`. That is also what a moved or renamed main checkout looks like.
+# dir anywhere but this repository's, is not an orphan at all: it refuses. It points at
+# `git worktree repair` only where that re-links a worktree moved by hand, or a moved or renamed
+# main checkout — never where the admin dir is a live worktree's, borrowed by a hand-made `.git`
+# file, which repair would take that live worktree's registration from.
 #
 # BYTES COUNT HARDLINKED FILES IN FULL. `du` counts each inode once per invocation, and every item
 # is measured on its own, so a dependency directory hardlinked from the main checkout shows its
@@ -459,6 +461,55 @@ wt_dir_holds_unsaved_content() {  # $1 = physical directory
   return 1
 }
 
+# Whom admin dir $1 is registered to, by the back-link git keeps in its gitdir file: that worktree's
+# path on stdout, when the file can be read, and as the status
+#   0  a worktree that is live through $1: its .git names $1, and $1 names it (wt_worktree_registered)
+#   1  a path that no longer exists — a worktree moved by hand, which `git worktree repair` re-links
+#   2  a path that exists but is not registered through $1
+#   3  nothing: the gitdir file cannot be read
+# `git worktree repair <dir>` rewrites $1's back-link to <dir>, so it is safe advice for a directory
+# whose .git names $1 only on status 1: on 0 it takes a live worktree's registration away from it.
+wt_prune_admin_owner() {  # $1 = admin dir
+  local back owner pointer
+  back=$(wt_read_git_pointer "$1/gitdir" "$1") || return 3
+  owner=${back%/.git}
+  printf '%s' "$owner"
+  [ -e "$owner" ] || [ -L "$owner" ] || return 1
+  wt_worktree_registered "$owner" || return 2
+  pointer=$(wt_read_git_pointer "$owner/.git" "$owner") || return 2
+  [ "$(wt_physical_path "$pointer")" = "$(wt_physical_path "$1")" ] || return 2
+  return 0
+}
+
+# Why directory $1, whose .git names the existing admin dir $2, is not an orphan, into WT_PRUNE_WHY.
+# `git worktree repair` is suggested only where it re-links a worktree moved by hand — never where it
+# would hand a live worktree's registration to $1, after which every guarded entry point refuses
+# that worktree. Nothing here changes anything: the .git file to remove is the developer's to remove.
+wt_prune_why_admin_linked() {  # $1 = directory, $2 = admin dir
+  local dir=$1 admin=$2 owner rc
+  if wt_worktree_registered "$dir"; then
+    WT_PRUNE_WHY="not an orphan: git registers it through the admin dir $admin"
+    return 0
+  fi
+  owner=$(wt_prune_admin_owner "$admin")
+  rc=$?
+  case $rc in
+    0)
+      WT_PRUNE_WHY="borrows the registration of the live worktree $owner: its .git file names that worktree's admin dir $admin. Do not run \`git worktree repair\` here — it would take the registration away from $owner. What to remove is this directory's own .git file, $dir/.git, never $owner; once it is gone, re-run tidy to judge the directory itself"
+      ;;
+    1)
+      WT_PRUNE_WHY="not an orphan: its .git links the admin dir $admin, registered to $owner, which no longer exists — the worktree was probably moved by hand; run \`git worktree repair $dir\` to register it again"
+      ;;
+    2)
+      WT_PRUNE_WHY="not an orphan: its .git links the admin dir $admin, registered to $owner, which exists but is not registered through it, so which checkout owns that admin dir is unclear — do not run \`git worktree repair\` here until that is settled: it would hand the admin dir to this directory"
+      ;;
+    *)
+      WT_PRUNE_WHY="not an orphan: its .git links the admin dir $admin, whose gitdir file cannot be read, so which checkout it serves is unknown — do not run \`git worktree repair\` here until that is settled: it would hand the admin dir to this directory"
+      ;;
+  esac
+  return 0
+}
+
 # Judge one orphan candidate into WT_PRUNE_VERDICT (delete | refuse) and WT_PRUNE_WHY.
 wt_prune_judge_orphan() {  # $1 = physical directory
   local dir=$1 pointer reasons
@@ -473,7 +524,7 @@ wt_prune_judge_orphan() {  # $1 = physical directory
       return 0
     fi
     if [ -e "$pointer" ]; then
-      WT_PRUNE_WHY="not an orphan: its .git still links the admin dir $pointer — run \`git worktree repair $dir\` to register it again"
+      wt_prune_why_admin_linked "$dir" "$pointer"
       return 0
     fi
     if [ "$(wt_physical_path "$pointer")" != "$WT_PRUNE_COMMON/worktrees/${pointer##*/}" ]; then
@@ -502,7 +553,7 @@ wt_find_orphan_dirs() {
 # Why the worktree an admin dir or ledger entry recorded may still be alive somewhere, one reason
 # per line, or nothing. $2 is the admin id when there is one.
 wt_prune_alive_elsewhere() {  # $1 = recorded worktree path, $2 = admin id or empty
-  local wt=$1 id=${2-} dir pointer
+  local wt=$1 id=${2-} dir pointer owner
   case $wt in
     "$WT_PRUNE_ROOT$WT_SUBPATH"*) ;;
     *)
@@ -518,8 +569,14 @@ wt_prune_alive_elsewhere() {  # $1 = recorded worktree path, $2 = admin id or em
     pointer=$(wt_read_git_pointer "$dir/.git" "$dir") || continue
     case $pointer in
       */worktrees/"$id")
-        # shellcheck disable=SC2016  # the backticks are literal text
-        printf 'the directory %s still links an admin dir named %s — it may have moved; run `git worktree repair` there\n' "$dir" "$id"
+        # A live worktree's admin dir borrowed by a hand-made .git file says nothing about this one.
+        if [ -e "$pointer" ] && owner=$(wt_prune_admin_owner "$pointer"); then
+          # shellcheck disable=SC2016  # the backticks are literal text
+          printf 'the directory %s links an admin dir named %s, which is the live worktree %s'\''s — never run `git worktree repair` there\n' "$dir" "$id" "$owner"
+        else
+          # shellcheck disable=SC2016  # the backticks are literal text
+          printf 'the directory %s still links an admin dir named %s — it may have moved; run `git worktree repair` there\n' "$dir" "$id"
+        fi
         ;;
     esac
   done

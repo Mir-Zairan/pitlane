@@ -89,7 +89,7 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
       rundir=$worktree
       ;;
     1)
-      printf 'Pitlane: %s is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind.\n' "$here"
+      printf 'Pitlane: %s is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind, and ones borrowing the registration of another worktree.\n' "$here"
       return 0
       ;;
     *)
@@ -570,7 +570,7 @@ case $event in
       # the guard would refuse at the next start-up is not set up now.
       if ! wt_linked_worktree_at "$worktree" || [ "$WT_LINKED_WORKTREE" != "$worktree" ] \
          || [ "$WT_LINKED_ROOT" != "$root" ]; then
-        wt_log "$worktree is under .claude/worktrees/ but is not a linked worktree of $root — not reopening it; /pitlane-tidy finds directories a worktree removal left behind"
+        wt_log "$worktree is under .claude/worktrees/ but is not a linked worktree of $root — not reopening it; /pitlane-tidy finds directories a worktree removal left behind, and ones borrowing the registration of another worktree"
         exit 0
       fi
       wt_log "reopening existing worktree $worktree"

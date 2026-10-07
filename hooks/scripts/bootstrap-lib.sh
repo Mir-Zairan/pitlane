@@ -4373,7 +4373,7 @@ wt_worktree_guard() {  # $1 = directory
       ;;
   esac
   wt_linked_worktree_at "$1" && return 0
-  wt_log "$1 is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind"
+  wt_log "$1 is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind, and ones borrowing the registration of another worktree"
   return 1
 }
 

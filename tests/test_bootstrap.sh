@@ -2542,7 +2542,7 @@ or_same '--changed and --restore'
 for mode in --review --approve; do
   out=$( cd "$ORPHAN" && bash "$HOOK" "$mode" 0000 2>/dev/null )
   eq "orphan: $mode is refused" \
-    "Pitlane: $ORPHAN is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind." "$out"
+    "Pitlane: $ORPHAN is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind, and ones borrowing the registration of another worktree." "$out"
 done
 or_same '--review and --approve'
 # WorktreeCreate's path is constructed from the name, so an existing orphan of that name is "reopened":

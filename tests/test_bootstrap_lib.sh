@@ -6292,7 +6292,7 @@ eq '...silently' '' "$(cat "$TMP/guard-err")"
 wt_worktree_guard "$DREPO/.claude/worktrees/plain" 2>"$TMP/guard-err"
 eq '...a plain directory beneath .claude/worktrees/ is refused' '1 ' "$? $WT_LINKED_WORKTREE"
 eq '...naming it and /pitlane-tidy on stderr' \
-  "worktree: $DREPO/.claude/worktrees/plain is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind" \
+  "worktree: $DREPO/.claude/worktrees/plain is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind, and ones borrowing the registration of another worktree" \
   "$(cat "$TMP/guard-err")"
 wt_worktree_guard "$DREPO/.claude/worktrees" 2>/dev/null
 eq '...as is the worktrees directory itself' 1 $?

@@ -428,6 +428,71 @@ eq 'moved: nothing changed but the sweep'\''s lock file' "$before" \
   "$(snapshot "$RM2" "$DB" | grep -v '/worktree-locks/prune\.lock$')"
 
 # ---------------------------------------------------------------------------
+# A .git file naming an admin dir that exists: repair is advice only for a worktree moved by hand
+# ---------------------------------------------------------------------------
+
+RB=$TMP/repo-borrow
+make_repo "$RB"
+WB=$RB/.claude/worktrees
+git -C "$RB" worktree add -q "$WB/sib" -b sib 2>/dev/null
+# A hand-made .git file borrowing the live sibling's admin dir: `git worktree repair` here would
+# rewrite the sibling's back-link to it, and every guarded entry point would then refuse the sibling.
+BW=$WB/borrower
+mkdir -p "$BW"
+printf 'gitdir: %s\n' "$RB/.git/worktrees/sib" >"$BW/.git"
+# A worktree moved by hand: its admin dir's back-link names a path that no longer exists.
+git -C "$RB" worktree add -q "$WB/handmoved" -b handmoved 2>/dev/null
+mv "$WB/handmoved" "$WB/handmoved-now"
+HM=$WB/handmoved-now
+# A true orphan: no .git at all, holding only a copy of a committed file.
+TO=$WB/plainleft
+mkdir -p "$TO"
+cp "$RB/app.txt" "$TO/app.txt"
+# An admin dir whose back-link names a directory that exists but no longer links it: unclear, so no
+# repair either.
+git -C "$RB" worktree add -q "$WB/amb" -b amb 2>/dev/null
+rm -f "$WB/amb/.git"
+AB=$WB/amb-borrower
+mkdir -p "$AB"
+printf 'gitdir: %s\n' "$RB/.git/worktrees/amb" >"$AB/.git"
+backlink=$(cat "$RB/.git/worktrees/sib/gitdir")
+before=$(snapshot "$RB")
+prune "$RB"
+eq 'borrow: report exits 0' 0 "$(cat "$TMP/rc")"
+eq 'borrow: the borrower is refused' refuse "$(field orphan-dir "$BW" 5)"
+lacks 'borrow: never suggesting git worktree repair on it' "git worktree repair $BW" \
+  "$(field orphan-dir "$BW" 6)"
+contains 'borrow: naming the live worktree it borrows from' \
+  "borrows the registration of the live worktree $WB/sib" "$(field orphan-dir "$BW" 6)"
+contains 'borrow: warning repair would take the registration' 'would take the registration away' \
+  "$(field orphan-dir "$BW" 6)"
+contains 'borrow: naming its own .git file as what to remove' "What to remove is this directory's own .git file, $BW/.git, never $WB/sib" \
+  "$(field orphan-dir "$BW" 6)"
+eq 'borrow: the live sibling is not an item' '' "$(field orphan-dir "$WB/sib" 1)"
+eq 'borrow: the sibling'\''s back-link is untouched' "$backlink" "$(cat "$RB/.git/worktrees/sib/gitdir")"
+eq 'borrow: and git still lists the sibling at its own path' yes \
+  "$(git -C "$RB" worktree list --porcelain | grep -qx "worktree $WB/sib" && echo yes || echo no)"
+eq 'borrow: the report changed nothing' "$before" "$(snapshot "$RB")"
+eq 'moved by hand: refused' refuse "$(field orphan-dir "$HM" 5)"
+contains 'moved by hand: repair is still suggested' "run \`git worktree repair $HM\`" \
+  "$(field orphan-dir "$HM" 6)"
+contains 'moved by hand: naming the vanished path' "registered to $WB/handmoved, which no longer exists" \
+  "$(field orphan-dir "$HM" 6)"
+eq 'unclear owner: refused' refuse "$(field orphan-dir "$AB" 5)"
+lacks 'unclear owner: never suggesting git worktree repair on it' "git worktree repair $AB" \
+  "$(field orphan-dir "$AB" 6)"
+contains 'unclear owner: saying why' "registered to $WB/amb, which exists but is not registered through it" \
+  "$(field orphan-dir "$AB" 6)"
+eq 'true orphan: deleted, as before' delete "$(field orphan-dir "$TO" 5)"
+contains 'true orphan: for the same reason' 'git no longer lists it as a worktree' "$(field orphan-dir "$TO" 6)"
+# Applying the borrower re-judges it and refuses; neither it nor the sibling is touched.
+prune "$RB" --apply "$(field orphan-dir "$BW" 1)"
+eq 'borrow: apply refuses it' 1 "$(cat "$TMP/rc")"
+eq 'borrow: its .git file is kept' yes "$(exists "$BW/.git")"
+eq 'borrow: the sibling'\''s back-link is still untouched' "$backlink" "$(cat "$RB/.git/worktrees/sib/gitdir")"
+eq 'borrow: the sibling is untouched' yes "$(exists "$WB/sib/app.txt")"
+
+# ---------------------------------------------------------------------------
 # Never released: a registered or locked worktree, an unloadable profile, a held allocation
 # ---------------------------------------------------------------------------
 

@@ -167,6 +167,14 @@ may offer to re-run the report once. That starts again at step 1, with a fresh q
   filters, so a file whose working bytes differ from what was committed does not prove itself. Line-
   ending normalisation with LF working files (`* text=auto eol=lf`) is fine — measured; a working copy
   with CRLF endings, or LFS pointers, refuses. Delete such a directory by hand once you have checked it.
+- **An orphan directory's reason mentions `git worktree repair`.** Pass that on only as the report
+  words it. The report suggests repair only for a worktree that was moved by hand — its admin dir
+  names a path that no longer exists. **A directory that borrows a live worktree's registration**
+  (its `.git` file names another live worktree's admin dir) must never be repaired: repair would move
+  that live worktree's registration to the borrower, and every Pitlane entry point would then refuse
+  the real worktree. What the developer removes, by hand, once they have checked it, is the
+  borrower's own `.git` file — never the live worktree. You remove neither. Re-run the report
+  afterwards so the directory is judged on its own.
 - **`abandoned` is not offered for a subagent worktree you expected.** It must be unlocked, hold no
   work, and have had nothing change in it for an hour. A running subagent keeps writing, so a recent
   one is left until it has been quiet that long.
