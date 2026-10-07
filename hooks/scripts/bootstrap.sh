@@ -79,16 +79,18 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
     printf 'Pitlane: neither jq nor python3 is on PATH, so the profile cannot be read.\n'
     return 0
   fi
-  case "$here/" in
-    *"$WT_SUBPATH"*)
-      worktree=$(wt_repo_root "$here") || worktree=$here
-      root=$(wt_main_root "$here") || root=''
-      if [ -z "$root" ]; then
-        printf 'Pitlane: cannot find the main checkout for %s.\n' "$here"
-        return 0
-      fi
+  # From a directory under .claude/worktrees/ that is not a worktree, git answers with the main
+  # checkout: reviewing or approving "this worktree's" profile there would be the main checkout's.
+  wt_worktree_guard "$here" 2>/dev/null
+  case $? in
+    0)
+      worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
       wt_load_profile_for "$worktree" "$root"
       rundir=$worktree
+      ;;
+    1)
+      printf 'Pitlane: %s is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind.\n' "$here"
+      return 0
       ;;
     *)
       if ! root=$(wt_repo_root "$here"); then
@@ -143,28 +145,13 @@ wt_approval_cli() {  # $1 = --review or --approve, $2 = fingerprint for --approv
 wt_serve_cli() {  # $1 = --serve or --serve-stop
   local mode=$1 here=$PWD worktree root rc not_one
   not_one='Pitlane: run /pitlane-serve from inside a worktree under .claude/worktrees/ — this is not one.'
-  case "$here/" in
-    *"$WT_SUBPATH"*) ;;
-    *)
-      printf '%s\n' "$not_one"
-      return 1
-      ;;
-  esac
-  if ! worktree=$(wt_repo_root "$here"); then
+  # From the worktrees directory itself, or a plain directory beneath it, git answers with the MAIN
+  # checkout, and serve would start (and record) the main checkout's app (wt_worktree_guard).
+  if ! wt_worktree_guard "$here"; then
     printf '%s\n' "$not_one"
     return 1
   fi
-  if ! root=$(wt_main_root "$here"); then
-    printf 'Pitlane: cannot find the main checkout for %s.\n' "$here"
-    return 1
-  fi
-  # A path under .claude/worktrees/ is not yet a worktree: from that directory itself, or a plain
-  # directory beneath it, git answers with the MAIN checkout, and serve would start (and record) the
-  # main checkout's app. Only a linked worktree that sits under <root>/.claude/worktrees/ qualifies.
-  case "$worktree/" in
-    "$root$WT_SUBPATH"?*) ;;
-    *) printf '%s\n' "$not_one"; return 1 ;;
-  esac
+  worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
   WT_NAME=$(wt_name_from_path "$worktree")
   WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
   WT_PATH=$worktree
@@ -308,6 +295,27 @@ wt_status_after_reset() {  # $1 = the session's directory
   return 0
 }
 
+# The checkout --changed and --restore act on, into WT_CLI_CHECKOUT: the linked worktree $1 lies in,
+# or the checkout of a directory outside any .claude/worktrees/. Returns 1, having said why on stderr,
+# for a directory beneath .claude/worktrees/ that is not a worktree (wt_worktree_guard) — git would
+# answer there with the main checkout, whose tracked files --restore would then put back — and for
+# one outside any repository.
+WT_CLI_CHECKOUT=''
+wt_cli_checkout() {  # $1 = directory
+  WT_CLI_CHECKOUT=''
+  wt_worktree_guard "$1"
+  case $? in
+    0) WT_CLI_CHECKOUT=$WT_LINKED_WORKTREE ;;
+    1) return 1 ;;
+    *)
+      if ! WT_CLI_CHECKOUT=$(wt_repo_root "$1"); then
+        wt_log "$1 is not inside a git repository"
+        return 1
+      fi
+      ;;
+  esac
+}
+
 case ${1-} in
   --review | --approve)
     wt_approval_cli "$@"
@@ -321,22 +329,17 @@ case ${1-} in
   # still changed, one per line and nothing else on stdout, nothing when there is none. A name
   # holding a control byte is printed $'…'-quoted. /pitlane-finish reads it to offer restores.
   --changed)
-    if worktree=$(wt_repo_root "$PWD"); then
-      changed=$(wt_paths_display "$(wt_install_changed_paths "$worktree")" "$WT_NL")
+    if wt_cli_checkout "$PWD"; then
+      changed=$(wt_paths_display "$(wt_install_changed_paths "$WT_CLI_CHECKOUT")" "$WT_NL")
       [ -z "$changed" ] || printf '%s\n' "$changed"
-    else
-      wt_log "$PWD is not inside a git repository"
     fi
     exit 0
     ;;
   # `bootstrap.sh --restore <path>`: puts back one path --changed printed, and nothing else, matched
   # literally. Run by /pitlane-finish only on the user's word, path by path; exits 1 when refused.
   --restore)
-    if ! worktree=$(wt_repo_root "$PWD"); then
-      wt_log "$PWD is not inside a git repository"
-      exit 1
-    fi
-    wt_install_restore "$worktree" "${2-}"
+    wt_cli_checkout "$PWD" || exit 1
+    wt_install_restore "$WT_CLI_CHECKOUT" "${2-}"
     exit $?
     ;;
 esac
@@ -551,6 +554,17 @@ case $event in
     if [ -d "$worktree" ]; then
       # Reopening. Measured: the hook is re-invoked for an existing name, so this is a
       # normal path, not an error.
+      #
+      # But a directory of that name is not necessarily a worktree: an orphan a removal that did
+      # not finish left behind, or a folder made there by hand. git answers from one with the MAIN
+      # checkout's top level, and everything below would set up that directory against the main
+      # checkout's git dir — its state, its ledger, a port and a seed. Refused like any failure here:
+      # no path, so Claude Code reports it. The root is the one already resolved, so this holds for
+      # every repository layout creation itself supports.
+      if ! wt_is_worktree_of "$(wt_repo_root "$worktree")" "$root"; then
+        wt_log "$worktree is under .claude/worktrees/ but is not a linked worktree — not reopening it; /pitlane-tidy finds directories a worktree removal left behind"
+        exit 0
+      fi
       wt_log "reopening existing worktree $worktree"
     elif wt_git "$root" show-ref --verify --quiet "refs/heads/$branch"; then
       # The branch already exists — check it out rather than inventing a new name, which
@@ -650,20 +664,15 @@ case $event in
     # Measured: for `claude -w <name>` this fires with cwd already set to the worktree.
     # For a session in the main checkout there is nothing to bootstrap, so stay silent —
     # a plugin that logs on every single session start is a plugin people uninstall.
-    case "$here/" in
-      *"$WT_SUBPATH"*) ;;
-      *)
-        [ "${WT_FINISH:-}" = 1 ] && printf 'Pitlane: run /pitlane-finish from inside a worktree under .claude/worktrees/ — this is not one.\n'
-        exit 0
-        ;;
-    esac
-
-    worktree=$(wt_repo_root "$here") || worktree=$here
-    root=$(wt_main_root "$here") || root=''
-    if [ -z "$root" ]; then
-      wt_log "could not resolve the main checkout for $worktree — skipping bootstrap"
+    #
+    # Nor is everything under .claude/worktrees/ a worktree: from an orphaned or hand-made directory
+    # there git answers with the MAIN checkout, which this would then bootstrap as if it were one
+    # (wt_worktree_guard). That is refused with a line on stderr, and stdout stays empty.
+    if ! wt_worktree_guard "$here"; then
+      [ "${WT_FINISH:-}" = 1 ] && printf 'Pitlane: run /pitlane-finish from inside a worktree under .claude/worktrees/ — this is not one.\n'
       exit 0
     fi
+    worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
 
     # SessionStart carries no `name`, so it comes from the directory — but NOT from its basename
     # (wt_name_from_path says why).
@@ -754,7 +763,7 @@ case $event in
     wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
     # After the status line, which says nothing of it: the note is the repository's text, not
     # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
-    if wt_is_worktree_of "$worktree" "$root" && wt_agent_note_is_approved; then
+    if wt_agent_note_is_approved; then
       wt_agent_note_block
     fi
     exit 0

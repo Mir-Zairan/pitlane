@@ -6261,6 +6261,22 @@ eq '...nor a directory that does not exist' 1 $?
 wt_linked_worktree_at ''
 eq '...nor no directory at all' 1 $?
 
+# The guard the entry points that act on a worktree apply: 0 inside one, 2 silently outside any
+# .claude/worktrees/, and 1 with a line on stderr for a directory beneath it that is not one.
+wt_worktree_guard "$DWT/deep/er" 2>"$TMP/guard-err"
+eq 'worktree guard: inside a linked worktree' "0 $PDREPO/.claude/worktrees/dep1 $PDREPO" "$? $WT_LINKED_WORKTREE $WT_LINKED_ROOT"
+eq '...silently' '' "$(cat "$TMP/guard-err")"
+wt_worktree_guard "$DREPO" 2>"$TMP/guard-err"
+eq '...the main checkout is no worktree path at all' '2 ' "$? $WT_LINKED_WORKTREE"
+eq '...silently' '' "$(cat "$TMP/guard-err")"
+wt_worktree_guard "$DREPO/.claude/worktrees/plain" 2>"$TMP/guard-err"
+eq '...a plain directory beneath .claude/worktrees/ is refused' '1 ' "$? $WT_LINKED_WORKTREE"
+eq '...naming it and /pitlane-tidy on stderr' \
+  "worktree: $DREPO/.claude/worktrees/plain is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind" \
+  "$(cat "$TMP/guard-err")"
+wt_worktree_guard "$DREPO/.claude/worktrees" 2>/dev/null
+eq '...as is the worktrees directory itself' 1 $?
+
 # The in-process pre-check: no interpreter unless the profile it would load may carry a note. It may
 # only ever say "no" where the load would find no note too.
 PCW=$TMP/precheck/wt PCR=$TMP/precheck/root

@@ -390,6 +390,40 @@ eq 'git refuses: the teardown script ran' no "$(exists "$DB/refused")"
 eq 'git refuses: the ledger entry is forgotten' no "$(exists "$R/.git/worktree-ledger/refused")"
 
 # ---------------------------------------------------------------------------
+# A plain directory under .claude/worktrees/ is not a worktree, nor the main checkout
+# ---------------------------------------------------------------------------
+# An orphan a removal that did not finish left behind, or a folder made there by hand. git answers
+# from it with the MAIN checkout, so a teardown that trusted git's top level would release the main
+# checkout's env block, run its teardown script and remove into it. Refused: nothing run, nothing
+# removed, the directory and the main checkout exactly as they were.
+RP=$TMP/repo-plain
+make_repo "$RP"
+WPL=$(create "$RP" live)
+printf 'DATABASE=main_dev\n' >"$RP/.env.worktree.local"
+PLAIN=$RP/.claude/worktrees/plain
+mkdir -p "$PLAIN/sub"
+printf 'left behind\n' >"$PLAIN/sub/file.txt"
+before_plain=$(footprint "$RP")
+before_logs=$(ls -A "$LOGS" "$DB")
+for cwd in "$RP" "$PLAIN"; do
+  out=$(remove "$(remove_payload "$PLAIN" "$cwd")" "$cwd")
+  err=$(cat "$TMP/err")
+  eq "plain dir (from ${cwd#"$TMP"/}): exits 0" 0 "$(cat "$TMP/rc")"
+  eq '...nothing on stdout' '' "$out"
+  contains '...stderr says it is not a worktree' 'not a git worktree' "$err"
+  eq '...the directory is kept with its file' 'left behind' "$(cat "$PLAIN/sub/file.txt" 2>/dev/null)"
+  eq '...the main checkout is untouched' "$before_plain" "$(footprint "$RP")"
+  eq "...its env file is byte-identical" 'DATABASE=main_dev' "$(cat "$RP/.env.worktree.local")"
+  eq '...no teardown script ran' "$before_logs" "$(ls -A "$LOGS" "$DB")"
+  eq '...the live worktree is untouched' yes "$(exists "$WPL/.env.worktree.local")"
+  eq "...and its ledger entry kept" yes "$(exists "$RP/.git/worktree-ledger/live")"
+done
+# Its subdirectory, named as the removal target, is refused the same way.
+out=$(remove "$(remove_payload "$PLAIN/sub" "$RP")" "$RP")
+eq 'plain subdir: exits 0' 0 "$(cat "$TMP/rc")"
+eq '...and nothing changed' "$before_plain" "$(footprint "$RP")"
+
+# ---------------------------------------------------------------------------
 # A main checkout moved since creation: nothing can be proven, so nothing is done
 # ---------------------------------------------------------------------------
 

@@ -2476,7 +2476,6 @@ eq 'note: a subagent in a worktree with a port and an unapproved note gets the p
 
 # A plain directory under .claude/worktrees/ is not a worktree: git answers from it with the main
 # checkout's top level, so only wt_is_worktree_of tells the two apart. No note there, from any hook.
-# Last in this section: a start-up from there treats the main checkout as its worktree.
 PLAIN=$ND/.claude/worktrees/plain
 mkdir -p "$PLAIN"
 for src in clear compact; do
@@ -2484,6 +2483,88 @@ for src in clear compact; do
 done
 lacks 'note: nor does a start-up there print it' "$NOTE_HDR" "$(start_hook "$PLAIN")"
 eq '...nor does a subagent there get it' '' "$(subagent_hook "$PLAIN" "$ND")"
+
+# ---------------------------------------------------------------------------
+# A directory under .claude/worktrees/ that is not a linked worktree
+# ---------------------------------------------------------------------------
+# An orphan a worktree removal that did not finish left behind — what /pitlane-tidy exists for — or a
+# folder made there by hand. git answers from it with the MAIN checkout's top level, so an entry point
+# that took that for "the worktree" would bootstrap the main checkout: write the runtime block into
+# its env files (pointing the main app at a worktree's databases), claim a port for it, and with an
+# approved profile run its seed. Every entry point refuses, and the main checkout stays byte-identical.
+OR=$TMP/orphaned
+make_rt_repo "$OR" ',
+    "seed": ".claude/worktree-seed.sh"'
+# shellcheck disable=SC2016  # $WT_SLUG belongs to the seed script.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$WT_SLUG" >> "%s/orphan-seeded"\n' "$TMP" >"$OR/.claude/worktree-seed.sh"
+chmod +x "$OR/.claude/worktree-seed.sh"
+git -C "$OR" add -A; git -C "$OR" commit -qm seed
+printf 'DATABASE_NAME=main_dev\n' >"$OR/.env.worktree.local"
+ORPHAN=$OR/.claude/worktrees/orphan
+mkdir -p "$ORPHAN/sub"
+# Every file of the main checkout and its git dir by content — the env file, the state file, the
+# ledger's port claims, any lock — less git's own object store and index.
+or_snapshot() {
+  ( cd "$OR" && find . -path ./.git/objects -prune -o -type f ! -path ./.git/index -print \
+    | LC_ALL=C sort | while IFS= read -r f; do printf '%s %s\n' "$(cksum <"$f")" "$f"; done )
+}
+or_before=$(or_snapshot)
+or_same() {  # $1 = label
+  eq "orphan: $1 leaves the main checkout byte-identical" "$or_before" "$(or_snapshot)"
+  eq "orphan: $1 runs no seed" no "$([ -e "$TMP/orphan-seeded" ] && echo yes || echo no)"
+}
+for d in "$ORPHAN" "$ORPHAN/sub"; do
+  for src in startup resume; do
+    out=$(run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"$src\",\"cwd\":\"$d\"}" "$d"); err=$(cat "$TMP/err")
+    eq "orphan: $src from ${d#"$OR"/} prints nothing" '' "$out"
+    contains '...stderr names the directory' "$d is under .claude/worktrees/ but is not a linked worktree" "$err"
+    contains '...and points at /pitlane-tidy' '/pitlane-tidy' "$err"
+    or_same "$src from ${d#"$OR"/}"
+  done
+  for src in clear compact; do
+    eq "orphan: $src from ${d#"$OR"/} prints nothing" '' "$(reset_hook "$d" "$src")"
+    or_same "$src from ${d#"$OR"/}"
+  done
+done
+eq 'orphan: the main checkout env file still names its own database' 'DATABASE_NAME=main_dev' \
+  "$(cat "$OR/.env.worktree.local")"
+out=$( cd "$ORPHAN" && bash "$HOOK" --finish 2>"$TMP/err" ); rc=$?
+eq 'orphan: --finish says this is not a worktree' \
+  'Pitlane: run /pitlane-finish from inside a worktree under .claude/worktrees/ — this is not one.' "$out"
+eq '...and exits 0' 0 "$rc"
+contains '...stderr says why' 'is not a linked worktree' "$(cat "$TMP/err")"
+or_same '--finish'
+eq 'orphan: --changed prints nothing' '' "$( cd "$ORPHAN" && bash "$HOOK" --changed 2>"$TMP/err" )"
+contains '...and says why on stderr' 'is not a linked worktree' "$(cat "$TMP/err")"
+( cd "$ORPHAN" && bash "$HOOK" --restore .gitignore >/dev/null 2>&1 ); rc=$?
+eq 'orphan: --restore is refused' 1 "$rc"
+or_same '--changed and --restore'
+for mode in --review --approve; do
+  out=$( cd "$ORPHAN" && bash "$HOOK" "$mode" 0000 2>/dev/null )
+  eq "orphan: $mode is refused" \
+    "Pitlane: $ORPHAN is under .claude/worktrees/ but is not a linked worktree — run this from the worktree, or from the main checkout. /pitlane-tidy finds directories a worktree removal left behind." "$out"
+done
+or_same '--review and --approve'
+# WorktreeCreate's path is constructed from the name, so an existing orphan of that name is "reopened":
+# refused without a path on stdout, which leaves the failure for Claude Code to report.
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"orphan\",\"cwd\":\"$OR\"}" "$OR"); err=$(cat "$TMP/err")
+eq 'orphan: WorktreeCreate onto it prints no path' '' "$out"
+contains '...and says why' "$ORPHAN is under .claude/worktrees/ but is not a linked worktree" "$err"
+or_same 'WorktreeCreate'
+eq '...nor is anything copied into it' "$ORPHAN/sub" "$(find "$ORPHAN" -mindepth 1)"
+# From inside the orphan, a WorktreeCreate for a NEW name still works: its repository is the main one.
+out=$(run_hook "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"fresh\",\"cwd\":\"$ORPHAN\"}" "$ORPHAN")
+eq 'orphan: a new worktree created from inside it is made in the repository' "$OR/.claude/worktrees/fresh" "$out"
+# And a real linked worktree beside it still bootstraps exactly as before.
+WOR=$OR/.claude/worktrees/real
+git -C "$OR" worktree add -q "$WOR" -b worktree-real 2>/dev/null
+eq 'orphan: a real worktree beside it still bootstraps' \
+  'Pitlane: this worktree is fully set up — vendor is in place and it has its own databases and port; do not reinstall dependencies or re-create its databases.' \
+  "$(start_hook "$WOR")"
+eq '...with its own database' demo_real "$(envval "$WOR" DATABASE_NAME)"
+ne '...and its own port' '' "$(envval "$WOR" SERVER_PORT)"
+contains '...and its seed ran' real "$(cat "$TMP/orphan-seeded" 2>/dev/null)"
+eq '...while the main checkout keeps its own env file' 'DATABASE_NAME=main_dev' "$(cat "$OR/.env.worktree.local")"
 
 # ---------------------------------------------------------------------------
 # /pitlane-serve: `bootstrap.sh --serve` and `--serve-stop`

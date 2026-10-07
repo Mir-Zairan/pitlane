@@ -4307,6 +4307,31 @@ wt_linked_worktree_at() {  # $1 = directory
   WT_LINKED_WORKTREE=$worktree WT_LINKED_ROOT=$root
 }
 
+# The guard every entry point that ACTS on "the worktree" applies to the directory it runs from:
+# SessionStart at start-up and resume, --finish, --changed, --restore, --review, --approve, --serve.
+# A directory under .claude/worktrees/ is not yet a worktree — an orphan a removal that did not
+# finish left behind (/pitlane-tidy's business), or a folder made there by hand — and from one git
+# answers with the MAIN checkout's top level, so taking that for the worktree would bootstrap the main
+# checkout: write the runtime block into its env files, claim a port for it, run its seed.
+#
+# 0: $1 lies inside a linked worktree, which wt_linked_worktree_at has put in WT_LINKED_WORKTREE and
+# WT_LINKED_ROOT. 2, silently: $1 is not under a .claude/worktrees/ directory at all — a main
+# checkout session, which each caller handles as it always did. 1, with one line on stderr: $1 is
+# under one but not inside a linked worktree; the caller does nothing and says so on its own channel.
+wt_worktree_guard() {  # $1 = directory
+  case "${1-}/" in
+    *"$WT_SUBPATH"*) ;;
+    *)
+      # shellcheck disable=SC2034  # both are read by bootstrap.sh.
+      WT_LINKED_WORKTREE='' WT_LINKED_ROOT=''
+      return 2
+      ;;
+  esac
+  wt_linked_worktree_at "$1" && return 0
+  wt_log "$1 is under .claude/worktrees/ but is not a linked worktree — doing nothing there; /pitlane-tidy finds directories a worktree removal left behind"
+  return 1
+}
+
 # False only when the profile wt_load_profile_for would load for worktree $1 cannot carry an agent
 # note: there is no such file, or the one chosen — by wt_load_profile_for's own rule, the worktree's
 # copy when it has one, else the main checkout's — never spells the key. Read in-process, so a hook
