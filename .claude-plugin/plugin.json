@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "pitlane",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Run several Claude Code sessions on one project at the same time without them getting in each other's way. Every new worktree comes ready to run \u2014 its settings copied in, its packages installed \u2014 with its own database and its own port. /pitlane-setup fits it to your project once; /pitlane-tidy cleans up what finished worktrees leave behind.",
   "author": {
     "name": "Zairan Mir"
