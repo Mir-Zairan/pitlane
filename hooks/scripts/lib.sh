@@ -938,7 +938,7 @@ wt_expand() {  # $1 = template
 # case-dependent advance, so the two agree about what counts as a placeholder.
 wt_unknown_placeholders() {  # $1 = template
   local LC_ALL=C p tok prev cur
-  local -a found=()
+  local -a unknown=()
   case ${1-} in
     *'{'*) ;;
     *) return 0 ;;
@@ -1005,10 +1005,10 @@ wt_unknown_placeholders() {  # $1 = template
     case $prev in
       *'$') continue ;;
     esac
-    found+=("$tok")
+    unknown+=("$tok")
   done
-  [ "${#found[@]}" -gt 0 ] || return 0
-  printf '%s\n' "${found[@]}"
+  [ "${#unknown[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${unknown[@]}"
   return 1
 }
 
@@ -1190,7 +1190,7 @@ wt_profile_scan() {  # $1 = profile path
 # shellcheck disable=SC2034
 wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   local raw=${1-} rec body
-  local -a files=()
+  local -a envfiles=()
   # The stream is split into its records once, and they are published as WT_PS_RECS for the callers'
   # own walks. Not cut with ${raw%%"$WT_RS"*}, which bash tries at every offset — quadratic in a stream
   # whose length the branch decides (5s for a 200 KB note) — nor read record by record from a pipe,
@@ -1219,11 +1219,11 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
           *) continue ;;
         esac
         rec=${rec#*"$WT_US"}
-        [ -n "$rec" ] || [ "${#files[@]}" -gt 0 ] || continue
-        files[${#files[@]}]=$rec
+        [ -n "$rec" ] || [ "${#envfiles[@]}" -gt 0 ] || continue
+        envfiles[${#envfiles[@]}]=$rec
       done
-      if [ "${#files[@]}" -gt 0 ]; then
-        printf -v WT_PS_ENVFILES '%s:' "${files[@]}"
+      if [ "${#envfiles[@]}" -gt 0 ]; then
+        printf -v WT_PS_ENVFILES '%s:' "${envfiles[@]}"
         WT_PS_ENVFILES=${WT_PS_ENVFILES%:}
       fi
       ;;
@@ -1384,10 +1384,13 @@ wt_profile_size_check() {  # $1 = profile path
 #   - the scalars that render a container — deps, runtime, copy, runtime.env.vars, runtime.port,
 #     artifacts and a runtime.env.file list: the file's own cap bounds them, and their elements
 #     arrive as records, which are bounded one by one;
-#   - agentNote, scalar and records: it has its own caps, and its own messages (WT_AGENT_NOTE_*).
+#   - agentNote, scalar and records: it has its own caps, and its own messages (WT_AGENT_NOTE_*),
+#     checked by the validator, or by wt_agent_note_limits when a load skips it.
 # A list that has no records is counted by its commas: evidence.markers, and deps[].copy and
 # artifacts[].inputs, which arrive as compact JSON inside a record. Every consumer of those splits
 # them at the commas, so that is the count that costs; none of them allows a comma in an element.
+# Each element is held to the value bound on its own, named by its index, and the list to the count:
+# the bound is on a value, and 64 values of 4096 bytes are still well within the file's.
 wt_profile_limits() {  # $1 = a wt_profile_scan stream
   local IFS=' ' rc=0
   printf '%s' "${1-}" | LC_ALL=C awk -v RS="$WT_RS" -v FS="$WT_US" \
@@ -1397,10 +1400,19 @@ wt_profile_limits() {  # $1 = a wt_profile_scan stream
     function set(list, arr,   t, i, k) { k = split(list, t, " "); for (i = 1; i <= k; i++) arr[t[i]] = 1 }
     function long(name) { printf "%s: is longer than the %d bytes a value may be\n", name, maxv; bad = 1 }
     function many(name) { printf "%s: has more than the %d entries a list may have\n", name, maxn; bad = 1 }
-    function items(v) { return v == "[]" ? 0 : gsub(/,/, ",", v) + 1 }
-    function check(name, v, listy) {
-      if (length(v) > maxv) long(name)
-      else if (listy && substr(v, 1, 1) == "[" && items(v) > maxn) many(name)
+    function check(name, v, listy,   body, e, k, i) {
+      if (!listy || substr(v, 1, 1) != "[" || substr(v, length(v), 1) != "]") {
+        if (length(v) > maxv) long(name)
+        return
+      }
+      body = substr(v, 2, length(v) - 2)
+      if (body == "") return
+      k = split(body, e, ",")
+      if (k > maxn) { many(name); return }
+      for (i = 1; i <= k; i++) {
+        if (e[i] ~ /^".*"$/) e[i] = substr(e[i], 2, length(e[i]) - 2)
+        if (length(e[i]) > maxv) long(name "[" (i - 1) "]")
+      }
     }
     BEGIN {
       set(containers, iscont); set(own, isown); set(nested, isnested); set(counted, iscounted)
@@ -1442,6 +1454,41 @@ wt_profile_limits() {  # $1 = a wt_profile_scan stream
   esac
   printf 'profile: its size limits could not be checked (awk exited %s), so it is not used\n' "$rc"
   return 1
+}
+
+# Print why agentNote, $1 as compact JSON (WT_PS_AGENTNOTE), is over its bounds, and return 1; print
+# nothing and return 0 when it is within them or is not an array, which no note is built from. Its lines
+# are read from the group-6 records of the stream wt_profile_scalars last read (WT_PS_RECS). The same
+# bounds and the same messages as wt_validate_profile's — the bytes before anything else, then the
+# lines, stopping at the first past the count, then each line's characters — for a load that skips
+# validation (WT_SKIP_VALIDATION): the note is joined into every session's context, validated or not.
+wt_agent_note_limits() {  # $1 = agentNote as compact JSON
+  local note=${1-} rec n=0 bad=0
+  case $note in
+    '['*']') ;;
+    *) return 0 ;;
+  esac
+  if wt_is_longer_in_bytes_than "$WT_AGENT_NOTE_MAX_BYTES" "$note"; then
+    printf 'agentNote: is too long — more than %d lines of %d characters can hold\n' \
+      "$WT_AGENT_NOTE_MAX_LINES" "$WT_AGENT_NOTE_MAX_CHARS"
+    return 1
+  fi
+  for rec in "${WT_PS_RECS[@]}"; do
+    case $rec in
+      6"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    if [ "$n" -eq "$WT_AGENT_NOTE_MAX_LINES" ]; then
+      printf 'agentNote: has more than the %d lines allowed\n' "$WT_AGENT_NOTE_MAX_LINES"
+      return 1
+    fi
+    if wt_is_longer_than "$WT_AGENT_NOTE_MAX_CHARS" "${rec#*"$WT_US"}"; then
+      printf 'agentNote[%d]: is longer than %d characters\n' "$n" "$WT_AGENT_NOTE_MAX_CHARS"
+      bad=1
+    fi
+    n=$((n + 1))
+  done
+  return "$bad"
 }
 
 # True when $1, JSON text as either backend renders it (wt_json_backend), holds a character that
@@ -2391,7 +2438,8 @@ wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are c
 # shellcheck disable=SC2034
 wt_load_profile() {  # $1 = repo root (default: $PWD)
   local root=${1:-$PWD} raw version shell runtime boot seed problems
-  local shellargs evdet evmark evshell rec nnote=0
+  local shellargs evdet evmark evshell rec
+  local -a notelines=()
 
   PROFILE_PATH="${root%/}/.claude/worktree-profile.json"
   PROFILE_PRESENT=0
@@ -2484,8 +2532,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   if [ -n "${WT_SKIP_VALIDATION:-}" ]; then
     wt_log "WT_SKIP_VALIDATION is set — $PROFILE_PATH is being used without validation"
     # Except for the bounds on its values and lists, which wt_validate_profile checks first: every
-    # consumer below walks them, validated or not.
-    problems=$(wt_profile_limits "$raw") || {
+    # consumer below walks them, validated or not. agentNote's own bounds too, which only the
+    # validator would otherwise check: it is joined below and put in every session's context.
+    problems=$(wt_profile_limits "$raw" && wt_agent_note_limits "$WT_PS_AGENTNOTE") || {
       wt_log "$PROFILE_PATH is not valid — using defaults. Run /pitlane-setup to rewrite it:"
       wt_log "$problems"
       return 0
@@ -2538,7 +2587,9 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
 
   # From group 6 rather than from the scalar: the records are the lines already unescaped, and the
   # validator has refused any line holding a control character, so the newline joining them is the
-  # only one in the result.
+  # only one in the result. Gathered, then joined once: appending each line to the note so far costs
+  # the note's length every time. Every line is given a newline and the last one taken off again, so
+  # an empty first or last line is still a line.
   case $WT_PS_AGENTNOTE in
     '['*']')
       for rec in "${WT_PS_RECS[@]}"; do
@@ -2546,12 +2597,12 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
           6"$WT_US"*) ;;
           *) continue ;;
         esac
-        # A separator before every line but the first, counted rather than inferred from the
-        # text so far: an empty first line must still be a line.
-        [ "$nnote" -eq 0 ] || PROFILE_AGENT_NOTE+=$WT_NL
-        PROFILE_AGENT_NOTE+=${rec#*"$WT_US"}
-        nnote=$((nnote + 1))
+        notelines[${#notelines[@]}]=${rec#*"$WT_US"}
       done
+      if [ "${#notelines[@]}" -gt 0 ]; then
+        printf -v PROFILE_AGENT_NOTE '%s\n' "${notelines[@]}"
+        PROFILE_AGENT_NOTE=${PROFILE_AGENT_NOTE%"$WT_NL"}
+      fi
       ;;
   esac
 

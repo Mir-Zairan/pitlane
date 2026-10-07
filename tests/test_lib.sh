@@ -731,6 +731,12 @@ EOF
   printf '%s' '{"schemaVersion":1,"agentNote":["","second"]}' >"$target"
   wt_load_profile "$pdir"
   eq 'agentNote -> an empty first line is still a line' $'\nsecond' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":["first",""]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote -> an empty last line is still a line' $'first\n' "$PROFILE_AGENT_NOTE"
+  printf '%s' '{"schemaVersion":1,"agentNote":[""]}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'agentNote [""] -> present, one empty line' '1:' "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
   printf '%s' '{"schemaVersion":1,"agentNote":[]}' >"$target"
   wt_load_profile "$pdir"
   eq 'agentNote [] -> present and empty' "1:" "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
@@ -2001,6 +2007,52 @@ runtime.env.vars[1].key: is longer than the 4096 bytes a value may be' "$(vv)"
   err=$(cat "$TMP/bounds.err")
   eq 'bounds: WT_SKIP_VALIDATION does not lift them' 0 "$PROFILE_PRESENT"
   contains 'bounds: ...and says which' 'copy: has more than the 64 entries a list may have' "$err"
+  # The lists that arrive as one compact-JSON value are bounded element by element, not as a whole:
+  # 20 paths of 250 bytes are 5 KB in all and allowed, and one element over 4096 is named by its index.
+  p250=$(pad p 250)
+  list20=$(n=0; while [ "$n" -lt 19 ]; do printf '"%s%02d",' "$p250" "$n"; n=$((n + 1)); done)"\"${p250}xx\""
+  listbig=$(pads '"a",' 2)'"'"$(pad b 4097)"'","c"'
+  for shape in 'deps[0].copy:{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":[ITEMS]}]}' \
+    'artifacts[0].inputs:{"schemaVersion":1,"artifacts":[{"dir":"dist","build":"b","inputs":[ITEMS]}]}' \
+    'evidence.markers:{"schemaVersion":1,"evidence":{"markers":[ITEMS]}}'; do
+    name=${shape%%:*}
+    doc=${shape#*:}
+    vw "${doc//ITEMS/$list20}"
+    eq "bounds: $name of 20 paths of 250 bytes is allowed" '' "$(wt_profile_limits "$(wt_profile_scan "$VP")")"
+    vw "${doc//ITEMS/$listbig}"
+    eq "bounds: $name with an element over 4096 bytes names it" \
+      "${name}[2]: is longer than the 4096 bytes a value may be" "$(wt_profile_limits "$(wt_profile_scan "$VP")")"
+    eq "bounds: ...and the validator refuses it" \
+      "${name}[2]: is longer than the 4096 bytes a value may be" "$(vv | grep 'bytes a value may be')"
+  done
+  vw '{"schemaVersion":1,"deps":[{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"x","copy":['"$list20"']}]}'
+  eq 'bounds: a deps copy list of 20 paths of 250 bytes validates' '' "$(vv)"
+  # agentNote's bounds hold with validation switched off too: the note is joined into every
+  # session's context. Each is refused as the validator would refuse it, the whole profile with it.
+  lines40=$(n=0; while [ "$n" -lt 39 ]; do printf '"%s",' "$(pad n 400)"; n=$((n + 1)); done)"\"$(pad n 400)\""
+  for case_ in "41 lines|[$lines40,\"x\"]|agentNote: has more than the 40 lines allowed" \
+    "a line of 401 characters|[\"ok\",\"$(pad n 401)\"]|agentNote[1]: is longer than 400 characters" \
+    "200 KB|[$(printf '"a",%.0s' $(seq 49999))\"a\"]|agentNote: is too long — more than 40 lines of 400 characters can hold" \
+    "40000 empty lines|[$(printf '"",%.0s' $(seq 39999))\"\"]|agentNote: has more than the 40 lines allowed"; do
+    label=${case_%%|*}
+    rest=${case_#*|}
+    vw '{"schemaVersion":1,"agentNote":'"${rest%%|*}"'}'
+    t0=$SECONDS
+    WT_SKIP_VALIDATION=1 wt_load_profile "$VR" 2>"$TMP/bounds.err"
+    elapsed=$((SECONDS - t0))
+    err=$(cat "$TMP/bounds.err")
+    eq "bounds: WT_SKIP_VALIDATION does not lift agentNote's ($label)" '0:' "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
+    contains '...and says which' "${rest#*|}" "$err"
+    eq '...as the validator does' "${rest#*|}" "$(vv)"
+    eq '...in under 4s' fast "$(fast "$elapsed")"
+  done
+  vw '{"schemaVersion":1,"agentNote":['"$lines40"']}'
+  t0=$SECONDS
+  WT_SKIP_VALIDATION=1 wt_load_profile "$VR" 2>/dev/null
+  elapsed=$((SECONDS - t0))
+  eq 'bounds: WT_SKIP_VALIDATION loads a note at its bounds, joined' \
+    "1:40:$((40 * 400 + 39))" "$PROFILE_PRESENT:$(printf '%s\n' "$PROFILE_AGENT_NOTE" | wc -l | tr -d ' '):${#PROFILE_AGENT_NOTE}"
+  eq '...in under 4s' fast "$(fast "$elapsed")"
 
   # The worst shapes within the bounds. Placeholder runs in env.vars, which is scanned whole for
   # botched placeholders: 60 values of 4000 '{', and of '{a}', each nearly the size bound in all.

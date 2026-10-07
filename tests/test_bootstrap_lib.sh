@@ -6769,6 +6769,46 @@ elapsed=$((SECONDS - t0))
 eq 'env file: one of 1 MiB is not managed' theirs "$state"
 contains '...and says why' ".big.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
 eq '...in under 4s' fast "$(fast "$elapsed")"
+# One line of 8 MiB with no newline at all is refused by its size, before a byte of it is read.
+head -c 8388608 /dev/zero | tr '\0' a >"$BWT/.line.env"
+t0=$SECONDS
+WT_ENV_BEFORE='left from before'
+wt_runtime_env_split "$BWT/.line.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
+elapsed=$((SECONDS - t0))
+eq 'env file: one line of 8 MiB is refused' '1 0' "$rc ${#WT_ENV_BEFORE}"
+contains '...and says why' ".line.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
+eq '...in under 4s' fast "$(fast "$elapsed")"
+eq '...and so is its state: not managed' theirs "$(wt_runtime_env_state "$BWT" .line.env 2>/dev/null)"
+# Measured, not read: a sparse GiB of NUL bytes, which takes no disk, holds no newline, and costs
+# `read` seconds to get through — and which, read whole, comes out as one empty line.
+dd if=/dev/zero of="$BWT/.sparse.env" bs=1 count=0 seek=1073741824 2>/dev/null
+t0=$SECONDS
+wt_runtime_env_split "$BWT/.sparse.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
+elapsed=$((SECONDS - t0))
+eq 'env file: a sparse GiB is refused by its size' 1 "$rc"
+contains '...and says why' ".sparse.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
+eq '...without reading it: in under 4s' fast "$(fast "$elapsed")"
+rm -f "$BWT/.sparse.env"
+# The second guard: should the measurement understate it (the file grew after it), no read asks for
+# more than the budget has left, so the line is still never read whole.
+t0=$SECONDS
+out=$(
+  # shellcheck disable=SC2329  # called by the engine, as `wc`.
+  wc() { echo 10; }
+  wt_runtime_env_split "$BWT/.line.env" 2>&1 && echo read || echo "refused ${#WT_ENV_BEFORE}"
+)
+elapsed=$((SECONDS - t0))
+contains 'env file: a line past the bound is refused while it is read' 'refused 0' "$out"
+contains '...and says why' ".line.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$out"
+eq '...in under 4s' fast "$(fast "$elapsed")"
+# A file whose size cannot be measured is not read either.
+out=$(
+  # shellcheck disable=SC2329  # called by the engine, as `wc`.
+  wc() { return 1; }
+  wt_runtime_env_split "$BWT/.big.env" 2>&1 && echo read || echo refused
+)
+contains 'env file: one that cannot be measured is refused' 'could not be measured, so it is left alone' "$out"
+contains '...and is not read' refused "$out"
 # Just under the bound, short lines with a block among them split exactly, and quickly.
 {
   yes a | head -n 10000

@@ -6156,7 +6156,8 @@ WT_ENV_END='# end of the block managed by the worktree plugin'
 
 # The most an env file may hold for the plugin to read it: 64 KiB. Real ones are a few dozen lines.
 # The file is named by a profile from anyone's branch and may be one the branch commits, and it is
-# read at session start, line by line: past this the plugin leaves it alone (wt_runtime_env_split).
+# read at session start, line by line: past this the plugin leaves it alone, measured before it reads
+# a byte of it (wt_runtime_env_split).
 WT_ENV_FILE_MAX_BYTES=65536
 
 # Split the file at $1 around its managed block(s). Sets WT_ENV_BEFORE (every line before the first
@@ -6169,14 +6170,27 @@ WT_ENV_FILE_MAX_BYTES=65536
 #
 # Read with bash's own `read`, not a subprocess: this runs on the session-start path, and the files
 # it reads are a few dozen lines. The lines are gathered and joined once, because appending each to
-# the text so far costs that text's length every time — the square of the file — and the bytes are
-# counted as they are read, so a bigger file is never read past the bound.
+# the text so far costs that text's length every time — the square of the file. The file is measured
+# before any of it is read — `wc -c` on a regular file asks the filesystem, as wt_profile_size_check
+# does — and one that cannot be measured is refused too. The bytes are also counted as they are read,
+# each `read` asking for no more than the budget has left, so a file that grows between the two is
+# still never read past the bound, however long its lines.
 wt_runtime_env_split() {  # $1 = file
-  local LC_ALL=C f=${1-} line inblock=0 bytes=0
+  local LC_ALL=C f=${1-} line inblock=0 bytes=0 size
   local -a blines=() alines=()
   WT_ENV_BEFORE='' WT_ENV_AFTER='' WT_ENV_HAS_BLOCK=0
   [ -f "$f" ] && [ -r "$f" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
+  size=$(wc -c <"$f" 2>/dev/null) || size=''
+  size=${size//[!0-9]/}
+  if [ -z "$size" ]; then
+    wt_log "  runtime: $f could not be measured, so it is left alone"
+    return 1
+  fi
+  if [ "$size" -gt "$WT_ENV_FILE_MAX_BYTES" ]; then
+    wt_log "  runtime: $f is over $WT_ENV_FILE_MAX_BYTES bytes — too big to be an env file the plugin manages, so it is left alone"
+    return 1
+  fi
+  while IFS= read -r -n "$((WT_ENV_FILE_MAX_BYTES - bytes + 1))" line || [ -n "$line" ]; do
     bytes=$((bytes + ${#line} + 1))
     if [ "$bytes" -gt "$WT_ENV_FILE_MAX_BYTES" ]; then
       wt_log "  runtime: $f is over $WT_ENV_FILE_MAX_BYTES bytes — too big to be an env file the plugin manages, so it is left alone"
