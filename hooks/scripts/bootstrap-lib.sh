@@ -4422,12 +4422,22 @@ wt_agent_note_is_held() {
 # The validator refuses a control character in a line; one is dropped here anyway, for a profile
 # loaded with WT_SKIP_VALIDATION, so no escape reaches the model or the transcript it is shown in.
 # LC_ALL=C so the patterns match bytes, as in wt_json_has_nonprinting; every other byte is kept.
-wt_agent_note_block() {
-  local LC_ALL=C line
+#
+# `{slug}` in a line becomes $1, this worktree's slug, so a note can name the worktree's own
+# databases (`-D app_wt_{slug}_dev`) and no session has to open a gitignored env file — where the
+# real names sit beside the developer's credentials — to find them. Only a slug of [a-z0-9_] alone,
+# what wt_slugify makes, is put in; with none, `{slug}` stays as written. The approval covers the
+# line as written: the slug is Pitlane's own value, not the branch's.
+wt_agent_note_block() {  # $1 = the worktree's slug, or empty
+  local LC_ALL=C line slug=${1-} placeholder='{slug}'
+  case $slug in
+    '' | *[!a-z0-9_]*) slug='' ;;
+  esac
   printf '%s\n' "Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
   while IFS= read -r line; do
     line=${line//[$'\x01'-$'\x1f'$'\x7f']/}
     line=${line//$'\xc2'[$'\x80'-$'\x9f']/}
+    [ -z "$slug" ] || line=${line//"$placeholder"/$slug}
     printf -- '-%s\n' "${line:+ $line}"
   done <<<"${PROFILE_AGENT_NOTE:-}"
 }

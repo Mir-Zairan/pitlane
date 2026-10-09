@@ -2474,6 +2474,32 @@ eq 'note: a subagent in a worktree with a port and an unapproved note gets the p
   "Pitlane: this worktree is ported; its app port is $RTNPORT — use these, not any inherited WORKTREE_PORT/WORKTREE_URL" \
   "$( (unset PITLANE_TRUST_PROFILES; subagent_hook "$WRTN" "" | sa_context) )"
 
+# {slug} in a note line is filled in with the worktree's own slug wherever the note is shown — start-up,
+# /clear, a compaction, a subagent — so it can name the worktree's databases without a session opening
+# its env files. The review shows the line as written, which is what the approval covers.
+NSL=$TMP/nsl
+make_repo "$NSL" '{"dir":"vendor","lock":"composer.lock","strategy":"skip"}'
+SLUGL='Query this worktree with -D app_wt_{slug}_dev, never -D app.'
+set_agent_note "$NSL" "$SLUGL"
+WNSL=$NSL/.claude/worktrees/fix-99
+git -C "$NSL" worktree add -q "$WNSL" -b worktree-fix-99 2>/dev/null
+SLUG_BLOCK="$NOTE_HDR$NL_- Query this worktree with -D app_wt_fix_99_dev, never -D app."
+eq 'note {slug}: start-up fills in the worktree slug' "$SLUG_BLOCK" "$(start_hook "$WNSL")"
+for src in resume clear compact; do
+  eq "...and so does $src" "$SLUG_BLOCK" "$(reset_hook "$WNSL" "$src")"
+done
+eq '...and so does a subagent there' "$SLUG_BLOCK" "$(subagent_hook "$WNSL" "$NSL" | sa_context)"
+contains '...while the review shows the line as written' "  agent note: $SLUGL" "$(gated_cli "$WNSL" --review)"
+# With a runtime, the slug is the one the runtime named the worktree's state after — the one in its env
+# block — for a subagent as for the session.
+RSL=$TMP/rsl
+make_rt_repo "$RSL"
+set_agent_note "$RSL" "$SLUGL"
+WRSL=$RSL/.claude/worktrees/rt-slug
+git -C "$RSL" worktree add -q "$WRSL" -b worktree-rt-slug 2>/dev/null
+contains 'note {slug}: with a runtime, start-up fills in its slug' '-D app_wt_rt_slug_dev,' "$(start_hook "$WRSL")"
+contains '...and a subagent there gets the same' '-D app_wt_rt_slug_dev,' "$(subagent_hook "$WRSL" "" | sa_context)"
+
 # A plain directory under .claude/worktrees/ is not a worktree: git answers from it with the main
 # checkout's top level, so only wt_is_worktree_of tells the two apart. No note there, from any hook.
 PLAIN=$ND/.claude/worktrees/plain

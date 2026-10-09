@@ -492,6 +492,13 @@ port and URL — and when to use `/pitlane-finish` and `/pitlane-serve`. Nor
 anything true in the main checkout as well — that belongs in the repo's own instructions, how to
 create a worktree above all (*The worktree-creation line*, step 6).
 
+**Name the worktree's own state with `{slug}`, never by pointing into a file.** Pitlane shows `{slug}`
+as the worktree's slug, so `query this worktree's with -D app_wt_{slug}_dev` reaches the session as
+`-D app_wt_alice_fix_99_dev`. Never send a session into a gitignored env file for a value ("the names
+are in the block at the end of `.env.local`"). That file holds the developer's credentials, and a
+session sent there reads it, or asks the developer to print it into the conversation. `{slug}` is the
+only placeholder filled in; for the port and URL, the start-up line already gives them.
+
 **Each line one self-contained instruction**, readable without the others and without this
 conversation: `Run the e2e suite with pnpm e2e, never scripts/e2e.sh, which pins the main checkout's
 database.` Neutral wording, nothing about this plugin's internals. The validator holds it to **at most

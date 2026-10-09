@@ -290,7 +290,7 @@ wt_status_after_reset() {  # $1 = the session's directory
   fi
   WT_STATE_READ_ONLY=1 wt_bootstrap_status_line "$worktree" start "$how" ''
   if wt_agent_note_is_approved; then
-    wt_agent_note_block
+    wt_agent_note_block "${WT_SLUG-}"
   fi
   return 0
 }
@@ -772,7 +772,7 @@ case $event in
     # After the status line, which says nothing of it: the note is the repository's text, not
     # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
     if wt_agent_note_is_approved; then
-      wt_agent_note_block
+      wt_agent_note_block "${WT_SLUG-}"
     fi
     exit 0
     ;;

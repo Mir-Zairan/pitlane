@@ -282,10 +282,15 @@
     "start and resume of every session in a worktree, after its status line; again after /clear and a",
     "compaction; and to every subagent working in a worktree. Never in the main checkout. Until it is",
     "approved it is not shown at all, and the session is told only that the profile, note included, is held",
-    "for review — and that the developer approves it from the full `--review` output, not the note alone."
+    "for review — and that the developer approves it from the full `--review` output, not the note alone.",
+    "",
+    "`{slug}` in a line is shown as the worktree's slug, so a line can name the worktree's own",
+    "databases (`app_wt_{slug}_dev`) and no session has to open a gitignored env file to find them.",
+    "No other placeholder is filled in. `--review` shows the line as written; that is what is approved."
   ],
   "agentNote": [
-    "Run the test suite with `pnpm test`, never against the main checkout's database."
+    "Run the test suite with `pnpm test`, never against the main checkout's database.",
+    "Query this worktree's database with `psql app_wt_{slug}_dev`, never `psql app`."
   ],
 
   "_comment_timeouts": [

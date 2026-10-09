@@ -6172,6 +6172,19 @@ NOTE_HEADER="Pitlane: notes from this repository's worktree profile (.claude/wor
 eq 'note block: the header naming where it comes from, then one "- " line per note line, literally' \
   "$NOTE_HEADER$NL_- Run make test, not the root test script.$NL_-$NL_-   indented, with a \\ and \"quotes\" and \$(id)" \
   "$(wt_agent_note_block)"
+# {slug} is filled in with the slug given, every time it appears, so a note can name the worktree's
+# own databases; with no slug, or one that is not wt_slugify's [a-z0-9_], it stays as written.
+SLUG_NOTE='Query app_wt_{slug}_dev, then app_wt_{slug}_dev_test; {port} and {SLUG} stay.'
+eq 'note block: {slug} becomes the slug, each time' \
+  "$NOTE_HEADER$NL_- Query app_wt_alice_fix_99_dev, then app_wt_alice_fix_99_dev_test; {port} and {SLUG} stay." \
+  "$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block alice_fix_99)"
+eq '...and with no slug it stays as written' "$NOTE_HEADER$NL_- $SLUG_NOTE" \
+  "$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block)"
+# shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
+for bad in 'a&b' 'a/b' 'Alice' 'a b' '$(id)' 'a-b'; do
+  eq "...and a slug that is not [a-z0-9_] ($bad) is not put in" "$NOTE_HEADER$NL_- $SLUG_NOTE" \
+    "$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block "$bad")"
+done
 ( WT_APPROVAL=yes; wt_agent_note_is_approved )
 eq 'note approved: when the approval says yes' 0 $?
 ( WT_APPROVAL=no; wt_agent_note_is_approved )
