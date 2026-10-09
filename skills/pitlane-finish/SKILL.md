@@ -56,7 +56,11 @@ first three and then "and N more" — and, when an install changed tracked files
   inputs at HEAD or its build command change, or the user agrees to `--retry-failed`. A `build output
   <dir> ready with warnings` built, exited non-zero, and passed its verify; it counts as built.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
-- `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree; say so.
+- `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree, so there
+  is nothing to finish here; say so. If the user wants the profile approved, that works from here too:
+  go through **Approval** below, running `--review` and `--approve` from this directory. The approval
+  covers every worktree of the repository whose profile and scripts match it, so the next worktree
+  session starts set up.
 
 ## Tracked files an install changed
 
@@ -112,7 +116,7 @@ the diff of those files before saying yes.
 
 When the setup is waiting on approval:
 
-1. Run, from the worktree's root:
+1. Run, from the worktree's root (or from the main checkout, when that is where the user asked):
 
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --review

@@ -58,8 +58,11 @@ That's it. When you want the app running, type `/pitlane-serve`.
   reason.
 - **No waiting.** Your first prompt starts at once. Setup runs at low priority, so your machine stays
   usable.
-- **Cleanup.** Removing a worktree stops the server Pitlane started there. `/pitlane-tidy` clears what
-  old worktrees left behind.
+- **Cleanup.** Removing a worktree stops the server Pitlane started there and runs your teardown
+  script, which drops that worktree's database. `/pitlane-tidy` clears what old worktrees left behind.
+  Claude Code removes a worktree with no changes when its session exits, and Ctrl+C at its exit
+  prompt counts as yes. Git can't see what is in a database, so copy out anything you need first, or
+  exit with `/exit` and choose to keep the worktree.
 
 ## Commands
 

@@ -563,7 +563,10 @@ noise.
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
 get hardlinked and which get installed, which build output is copied or built, what shell that runs inside, roughly how long the first
 bootstrap will take, what — if anything — will be isolated, and what the agent note tells a worktree
-session. Then finish what the answer to **who it is for** (step 1) asked for:
+session. If there is a teardown, say what removing a worktree does: Claude Code removes a worktree that
+git sees as clean when its session exits (a Ctrl+C at the exit prompt included), and the teardown then
+drops what the seed made. Data someone added only to those databases goes with them, because git
+does not see it. Then finish what the answer to **who it is for** (step 1) asked for:
 
 - **the team** — say which files to commit: the profile, `.worktreeinclude` and the scripts. The agent
   note goes with the profile;
@@ -598,8 +601,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/bootstrap.sh" --review
 
 Show the developer what it lists — the agent note's lines among it, as `agent note: …` — and on their
 confirmation run the `--approve <fingerprint>` command it printed. Until then no session is shown the
-note. Tell them that any later edit to the profile, its note or those scripts — theirs, a teammate's, a pull
-request's — needs approving again, which `/pitlane-finish` walks them through; and that the approval
+note. If they say not yet, tell them both ways to approve later: run `/pitlane-finish` in any session,
+in the main checkout or in a worktree, or run the `--review` and `--approve` commands above themselves.
+Never tell them a step that you have not checked works from where they are. Tell them that any later
+edit to the profile, its note or those scripts — theirs, a teammate's, a pull request's — needs
+approving again, which `/pitlane-finish` walks them through; and that the approval
 covers the commands Pitlane starts, not what an approved install runs from the branch's own manifests
 (package lifecycle scripts) or toolchain files.
 
