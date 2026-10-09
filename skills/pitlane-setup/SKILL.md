@@ -90,6 +90,24 @@ need are set there.
 If detection exits non-zero it could not run at all — no such directory, no detection table, no
 `jq` and no `python3`. Report that and stop; do not hand-write a profile to work around it.
 
+### Then ask who it is for — your first question, every run
+
+Ask it **as soon as detection has run**, before you read the repo further or present anything. It is
+asked even when there is no profile yet, and step 2 is skipped. The answer changes what you write and
+where:
+
+- **the team** — the profile, `.worktreeinclude` and the seed and teardown scripts are committed; a
+  teammate who installs the plugin gets a working setup with no calibration run of their own, and
+  approves it, note and commands, before their sessions are shown the note;
+- **only this developer** — nothing is committed. The files stay untracked in the main checkout and are
+  listed in `.git/info/exclude`, and the seed and teardown scripts go in the profile's `copy[]` so each
+  worktree gets them.
+
+Only **this checkout** can answer it for you. A profile tracked at `HEAD` is the team's. One listed in
+`.git/info/exclude` is this developer's. Say which you found, and ask only when it is neither. A profile
+anywhere else answers nothing: another branch, another worktree, a stash, an open pull request. Mention
+it if you come across it, and still ask. Step 6 acts on the answer.
+
 ## 2 — Already calibrated?
 
 Read the existing profile first if there is one.
@@ -137,21 +155,6 @@ Read the existing profile first if there is one.
 - **A second run on an unchanged repo must change nothing** and must say so plainly. If you find
   yourself producing a different profile from the same repository, something is wrong — detection is
   deterministic, so the difference is coming from you.
-
-### Who it is for — ask before anything else
-
-Ask this **now**, before presenting anything, because the answer changes what you write and where:
-
-- **the team** — the profile, `.worktreeinclude` and the seed and teardown scripts are committed; a
-  teammate who installs the plugin gets a working setup with no calibration run of their own, and
-  approves it, note and commands, before their sessions are shown the note;
-- **only this developer** — nothing is committed. The files stay untracked in the main checkout and are
-  listed in `.git/info/exclude`, and the seed and teardown scripts go in the profile's `copy[]` so each
-  worktree gets them.
-
-On a recalibration the repo usually answers it already: a tracked profile is the team's; one listed in
-`.git/info/exclude` is this developer's. Say which you found, and ask only when it is neither. Step 6
-acts on the answer.
 
 ## 3 — Present layers 1 and 2, with the reasons
 
@@ -510,7 +513,10 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
   Two whitespace-separated numbers and nothing else, matching the template's `"1234567890 397"`.
   `cksum <lockfile>` as an *argument* appends the filename, which the validator rejects outright and
   which the drift check would never match. This is the evidence a later session compares to notice the
-  profile has drifted.
+  profile has drifted. **Only for a setup that is this developer's.** Leave it out of a team profile.
+  The check compares it with each person's own main checkout, so once committed, every teammate is
+  told to re-run setup each time a lockfile moves on the main branch. On a recalibration, a team
+  profile without it is correct, not a gap.
 - `evidence` — `detectionVersion` from the detector, `markers` as the sorted list of lockfiles it
   matched, `shellMarker` as the file that produced the wrapper.
 - `runtime.port` — `var`, `base` and `span`; the port is derived as `base + (cksum(slug) % span)`
@@ -550,7 +556,7 @@ noise.
 Finally, tell the developer **what happens on the next `claude -w`**, concretely: which directories
 get hardlinked and which get installed, which build output is copied or built, what shell that runs inside, roughly how long the first
 bootstrap will take, what — if anything — will be isolated, and what the agent note tells a worktree
-session. Then finish what the answer to **who it is for** (step 2) asked for:
+session. Then finish what the answer to **who it is for** (step 1) asked for:
 
 - **the team** — say which files to commit: the profile, `.worktreeinclude` and the scripts. The agent
   note goes with the profile;
@@ -594,6 +600,9 @@ covers the commands Pitlane starts, not what an approved install runs from the b
 
 - **Do not act on the profile.** No copying, no installing, no ports, no seeding, no worktree
   creation. This command writes a file and nothing else; the hooks consume it.
+- **Do not commit, push, rebase or open a pull request, and do not offer to.** You write files in the
+  main checkout. Getting them into the repo's history is the developer's business: for a team setup,
+  say which files to commit, and stop there.
 - **Do not hand-write detection.** If a lockfile or toolchain is unrecognised, the fix is an entry in
   `reference/detection.json` — one place, benefiting every repo — not a special case improvised into
   one profile.

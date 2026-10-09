@@ -121,7 +121,10 @@
     "  lockChecksum  `cksum` output for `lock` AS OF CALIBRATION. Evidence, not configuration — see",
     "                _comment_evidence. Deliberately stored per-dep rather than in an evidence map keyed",
     "                by filename: the JSON reader addresses fields by dotted path, so a key like",
-    "                \"composer.lock\" would be unreachable (measured — it splits on the dot)."
+    "                \"composer.lock\" would be unreachable (measured — it splits on the dot).",
+    "                Optional, and left out of a TEAM profile: the drift check compares it with each",
+    "                person's own main checkout, so committed, it tells every teammate to re-run setup",
+    "                whenever a lockfile moves on the main branch."
   ],
   "deps": [
     {
