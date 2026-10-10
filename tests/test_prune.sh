@@ -387,6 +387,28 @@ contains 'failing: refused with the outcome' 'outcome was failed' "$(cat "$TMP/o
 prune "$RF"
 eq 'failing: and listed again, with the same id' teardown "$(field runtime-leftover "$F" 5)"
 
+# A seed that never ran made nothing, so there is nothing to tear down — and the entry still goes.
+# Refusing it kept such an entry for ever (seen on a real repository: entries whose seed was refused).
+RV=$TMP/repo-never
+make_repo "$RV"
+V=$(create "$RV" never)
+python3 - "$RV/.git/worktree-ledger/never" <<'PY'
+import sys
+p = sys.argv[1]
+b = open(p, 'rb').read()
+assert b.count(b'\x1fdone\x1f') == 1
+open(p, 'wb').write(b.replace(b'\x1fdone\x1f', b'\x1frefused\x1f'))
+PY
+git -C "$RV" worktree remove --force "$V"
+prune "$RV"
+v_id=$(field runtime-leftover "$V" 1)
+eq 'never seeded: reported as teardown' teardown "$(field runtime-leftover "$V" 5)"
+prune "$RV" --apply "$v_id"
+eq 'never seeded: applied' 0 "$(cat "$TMP/rc")"
+contains '...saying there was nothing to tear down' 'nothing to tear down: its seed never ran' "$(cat "$TMP/out")"
+eq '...the ledger entry is forgotten' no "$(exists "$RV/.git/worktree-ledger/never")"
+eq '...and the teardown script did not run' no "$(exists "$LOGS/never.log")"
+
 # No teardown script: the entry is only forgotten, and the report says to do so by hand.
 RN=$TMP/repo-noscript
 make_repo "$RN"

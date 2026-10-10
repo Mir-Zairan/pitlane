@@ -1176,10 +1176,20 @@ wt_prune_release_allocation() {  # $1 = item index
       return 1
     fi
     wt_run_teardown_script "$WT_PRUNE_ROOT" "$wt" "$WT_PRUNE_ROOT" ''
-    if [ "$WT_TD_STATUS" != "done" ]; then
-      WT_PRUNE_DETAIL="the teardown script's outcome was $WT_TD_STATUS — $record is kept, and its database or containers may still exist"
-      return 1
-    fi
+    # `none` for an allocation that WAS read is the script's own "nothing of the plugin's to undo" —
+    # a seed that never ran — and lets the entry go, as wt_settle_ledger_entry does for teardown.sh.
+    # Refusing it kept such an entry for ever: nothing could release it.
+    case $WT_TD_STATUS in
+      "done") ;;
+      none) [ -n "$WT_TD_SOURCE" ] || {
+          WT_PRUNE_DETAIL="the allocation in $record could not be read — $record is kept"
+          return 1
+        } ;;
+      *)
+        WT_PRUNE_DETAIL="the teardown script's outcome was $WT_TD_STATUS — $record is kept, and its database or containers may still exist"
+        return 1
+        ;;
+    esac
   fi
   if [ -n "$entry" ]; then
     wt_settle_ledger_entry "$WT_PRUNE_ROOT" "$entry" 1
@@ -1203,7 +1213,13 @@ wt_prune_release_allocation() {  # $1 = item index
     husk="; deleted what the removal left of its git admin dir"
   fi
   case $action in
-    teardown) WT_PRUNE_DETAIL="teardown script ran (slug=$WT_TD_SLUG); record forgotten$husk" ;;
+    teardown)
+      if [ "$WT_TD_STATUS" = none ]; then
+        WT_PRUNE_DETAIL="nothing to tear down: its seed never ran (slug=$WT_TD_SLUG); record forgotten$husk"
+      else
+        WT_PRUNE_DETAIL="teardown script ran (slug=$WT_TD_SLUG); record forgotten$husk"
+      fi
+      ;;
     *) WT_PRUNE_DETAIL="record forgotten without running anything (slug=$WT_TD_SLUG)$husk" ;;
   esac
 }
