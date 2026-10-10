@@ -17,8 +17,8 @@
 #   id  kind  path  bytes  action  reason
 #
 #   id      stable for the same item across runs: `p` + the cksum of its kind and key, in hex.
-#   kind    orphan-dir | stale-admin | server-leftover | runtime-leftover | ledger-junk |
-#           removed-dep-leftover | abandoned | held; `store` is reserved
+#   kind    orphan-dir | stale-admin | admin-leftover | server-leftover | runtime-leftover |
+#           ledger-junk | removed-dep-leftover | abandoned | held; `store` is reserved
 #           for a future finder of unreferenced dependency stores, so a reader must accept it already.
 #   bytes   `du -sk` x 1024, or `-` where there is nothing to measure — a runtime allocation is a
 #           database or a container, which only the repo's teardown script can see.
@@ -591,7 +591,10 @@ wt_prune_alive_elsewhere() {  # $1 = recorded worktree path, $2 = admin id or em
 wt_prune_list_allocation_holds() {  # $1 = recorded worktree path, $2 = admin id or empty
   local wt=$1 id=${2-}
   wt_prune_alive_elsewhere "$wt" "$id"
-  if [ -n "$id" ] && { [ -e "$WT_PRUNE_COMMON/worktrees/$id" ] || [ -L "$WT_PRUNE_COMMON/worktrees/$id" ]; }; then
+  # Registered means git lists it: it has a `gitdir`. What Claude Code's removal leaves — this
+  # plugin's files, no `gitdir` (wt_admin_husk) — registers nothing, and goes once this is released.
+  if [ -n "$id" ] && { wt_admin_registered "$WT_PRUNE_COMMON/worktrees/$id" \
+    || [ -L "$WT_PRUNE_COMMON/worktrees/$id" ]; }; then
     printf 'its admin dir %s is still registered — the worktree may have been moved or locked\n' \
       "$WT_PRUNE_COMMON/worktrees/$id"
   fi
@@ -602,11 +605,38 @@ wt_prune_list_allocation_holds() {  # $1 = recorded worktree path, $2 = admin id
   return 0
 }
 
+# What Claude Code's removal left of admin dir $1 (wt_admin_husk). One a ledger entry still records
+# is released with that entry (wt_prune_release_allocation), so it is not an item of its own. One
+# whose state file is the only record of a seed that ran cannot be torn down — nothing records where
+# its worktree was, which the teardown script is told — so it is refused, not deleted with that
+# record. Anything else is plain litter.
+wt_prune_judge_husk() {  # $1 = husk
+  local admin=$1 id slug seed
+  id=${admin##*/}
+  wt_ledger_entry_for "$WT_PRUNE_ROOT" '' "$id" >/dev/null && return 0
+  seed=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" seedstatus 2>/dev/null) || seed=''
+  case $seed in
+    "done" | failed | timeout)
+      slug=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" slug 2>/dev/null) || slug=''
+      wt_prune_add admin-leftover "$admin" "$admin" "$(wt_prune_bytes "$admin")" refuse \
+        "its state file is the only record of databases a seed made (slug=$slug), and nothing records where its worktree was, so its teardown script cannot be run — release them by hand, then delete this directory" "$admin"
+      ;;
+    *)
+      wt_prune_add admin-leftover "$admin" "$admin" "$(wt_prune_bytes "$admin")" delete \
+        "what a removed worktree's git admin dir left behind: only this plugin's state, logs and locks, recording nothing still allocated" "$admin"
+      ;;
+  esac
+}
+
 wt_find_stale_admin_dirs() {
   local admin id pointer wt alive why marker head count slug entry rt_id state bytes shared
   [ -d "$WT_PRUNE_COMMON/worktrees" ] || return 0
   for admin in "$WT_PRUNE_COMMON"/worktrees/*; do
     [ -d "$admin" ] && [ ! -L "$admin" ] || continue
+    if wt_admin_husk "$admin"; then
+      wt_prune_judge_husk "$admin"
+      continue
+    fi
     wt_rm_is_admin_dir "$admin" || continue
     id=${admin##*/}
     bytes=$(wt_prune_bytes "$admin")
@@ -1024,6 +1054,28 @@ wt_apply_stale_admin() {  # $1 = item index
   WT_PRUNE_DETAIL='deleted (only this admin dir; no repository-wide prune)'
 }
 
+# Delete what a removal left of an admin dir, re-judged now: still nothing but this plugin's files,
+# and still no record of an allocation in it or in the ledger.
+wt_apply_admin_leftover() {  # $1 = item index
+  local admin=${PRUNE_KEY[$1]} seed
+  if wt_ledger_entry_for "$WT_PRUNE_ROOT" '' "${admin##*/}" >/dev/null; then
+    WT_PRUNE_DETAIL='a ledger entry records it now — release that instead'
+    return 1
+  fi
+  seed=$(wt_runtime_state_read "$admin/worktree-bootstrap-state" seedstatus 2>/dev/null) || seed=''
+  case $seed in
+    "done" | failed | timeout)
+      WT_PRUNE_DETAIL='its state file now records databases a seed made'
+      return 1
+      ;;
+  esac
+  if ! wt_remove_admin_husk "$admin"; then
+    WT_PRUNE_DETAIL='it is no longer only this plugin'\''s files, or it would not go'
+    return 1
+  fi
+  WT_PRUNE_DETAIL='deleted'
+}
+
 # The descriptor an allocation's lock is held on while one runtime-leftover is applied; the prune
 # lock holds 8.
 WT_PRUNE_ALLOCATION_FD=9
@@ -1097,8 +1149,12 @@ wt_prune_recheck_allocation() {  # $1 = item index
 # script ran to `done`, or the action is `forget` and the allocation could be read.
 wt_prune_release_allocation() {  # $1 = item index
   local key=${PRUNE_KEY[$1]} wt=${PRUNE_PATH[$1]} action=${PRUNE_ACTION[$1]} entry='' state='' why record
+  local admin='' husk=''
   case $key in
-    ledger:*) entry=${key#ledger:}; record="the ledger entry $entry" ;;
+    ledger:*)
+      entry=${key#ledger:}; record="the ledger entry $entry"
+      admin=$(wt_ledger_field "$WT_PRUNE_ROOT" "$entry" admin 2>/dev/null) || admin=''
+      ;;
     state:*) state=${key#state:}; record="the state file $state" ;;
   esac
   why=$(wt_prune_recheck_allocation "$1")
@@ -1139,9 +1195,16 @@ wt_prune_release_allocation() {  # $1 = item index
       return 1
     fi
   fi
+  # What Claude Code's removal left of the admin dir goes with the last record of it.
+  if [ -n "$admin" ] && wt_ledger_is_entry_name "$admin" \
+    && ! wt_ledger_entry_for "$WT_PRUNE_ROOT" '' "$admin" >/dev/null \
+    && wt_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin" \
+    && wt_remove_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin"; then
+    husk="; deleted what the removal left of its git admin dir"
+  fi
   case $action in
-    teardown) WT_PRUNE_DETAIL="teardown script ran (slug=$WT_TD_SLUG); record forgotten" ;;
-    *) WT_PRUNE_DETAIL="record forgotten without running anything (slug=$WT_TD_SLUG)" ;;
+    teardown) WT_PRUNE_DETAIL="teardown script ran (slug=$WT_TD_SLUG); record forgotten$husk" ;;
+    *) WT_PRUNE_DETAIL="record forgotten without running anything (slug=$WT_TD_SLUG)$husk" ;;
   esac
 }
 

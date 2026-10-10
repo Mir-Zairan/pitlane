@@ -68,7 +68,10 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 | `none` | Kept on purpose, listed so the developer sees why (a live worktree holding work). | No |
 
 Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `stale-admin` (git's
-registration of a worktree that is gone), `runtime-leftover` (a runtime allocation nothing uses),
+registration of a worktree that is gone), `admin-leftover` (what Claude Code's removal of a worktree
+left of git's registration: only Pitlane's own logs, state and locks; one still recorded by a
+`runtime-leftover` goes when that is applied, and is not listed on its own), `runtime-leftover` (a
+runtime allocation nothing uses),
 `server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
 as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record),
 `removed-dep-leftover` (a copy of a hardlinked dependency dir — `.vendor.pitlane-removed.<pid>.<n>`

@@ -1015,6 +1015,73 @@ eq 'install daemon: teardown exits 0' 0 "$(cat "$TMP/rc")"
 eq 'install daemon: the worktree is removed' no "$(exists "$WD")"
 lacks '...and no bootstrap lock was found held' 'a bootstrap is still running' "$err"
 kill "$daemon_pid" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# Claude Code's own removal on exit keeps the allocation for a re-entry (ADR-015)
+# ---------------------------------------------------------------------------
+# Measured (2.1.296): `claude -w` worktrees are removed by Claude Code itself on exit, with no
+# WorktreeRemove, and what is left of the admin dir is this plugin's files with git's gone.
+# native_remove does exactly that. The allocation stays in the ledger for a re-entry of the same
+# name to reuse; /pitlane-tidy releases it.
+XR=$TMP/exit-repo
+make_repo "$XR"
+native_add() {  # $1 = repo, $2 = name; prints the worktree path
+  local wt=$1/.claude/worktrees/$2
+  git -C "$1" worktree add -q -b "worktree-$2" "$wt" 2>/dev/null
+  ( cd "$wt" && printf '{"hook_event_name":"SessionStart","source":"startup","cwd":"%s"}' "$wt" \
+    | bash "$CREATE_HOOK" >/dev/null 2>"$TMP/start-err" )
+  printf '%s' "$wt"
+}
+native_remove() {  # $1 = repo, $2 = name, $3 = admin id
+  local admin=$1/.git/worktrees/$3
+  rm -rf "$1/.claude/worktrees/$2"
+  find "$admin" -mindepth 1 -maxdepth 1 ! -name 'worktree-*' ! -name 'pitlane-*' -exec rm -rf {} +
+  git -C "$1" branch -q -D "worktree-$2" 2>/dev/null
+}
+
+WX=$(native_add "$XR" gone)
+eq 'native: the seed created its database' yes "$(exists "$DB/gone")"
+native_remove "$XR" gone gone
+eq 'native: the removal leaves a husk of the admin dir' yes "$(exists "$XR/.git/worktrees/gone")"
+eq '...that git does not list' '' "$(git -C "$XR" worktree list --porcelain | grep "$WX")"
+eq '...and keeps the database' yes "$(exists "$DB/gone")"
+
+# The husk registers nothing, so it is no sibling: it must not stop other worktrees seeding.
+native_add "$XR" other >/dev/null
+eq 'native: another name still seeds' yes "$(exists "$DB/other")"
+lacks '...with no word of an enumeration it could not do' 'could not enumerate' "$(cat "$TMP/start-err")"
+
+# Re-entering the same name: git gives it another admin id (the husk holds the first), and the seed
+# runs as usual — the seed contract keeps an existing database, so this is where it is reused.
+WX2=$(native_add "$XR" gone)
+eq 're-entry: the worktree is back at the same path' "$WX" "$WX2"
+eq '...under another admin id' yes "$(exists "$XR/.git/worktrees/gone1/gitdir")"
+lacks '...and the seed is not refused' 'not seeding' "$(cat "$TMP/start-err")"
+eq '...and its database is there' yes "$(exists "$DB/gone")"
+
+# /pitlane-tidy leaves alone what the live worktree at that path is using.
+report=$(bash "$SCRIPTS/prune.sh" --repo "$XR" 2>/dev/null)
+eq 're-entry: tidy offers nothing for the live path' '' \
+  "$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/')"
+lacks '...nor the husk its ledger entry still records' "$XR/.git/worktrees/gone"$'\t' "$report"
+
+# Removed again: both entries are leftovers now, and releasing them takes the husks with them.
+native_remove "$XR" gone gone1
+report=$(bash "$SCRIPTS/prune.sh" --repo "$XR" 2>/dev/null)
+ids=$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/ { print $1 }')
+eq 'released: tidy offers both entries' 2 "$(printf '%s\n' "$ids" | grep -c .)"
+eq '...each as a teardown' 'teardown teardown' \
+  "$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/ { printf "%s%s", s, $5; s=" " }')"
+# shellcheck disable=SC2086  # the ids are one word each
+bash "$SCRIPTS/prune.sh" --repo "$XR" --apply $ids >"$TMP/apply-out" 2>&1
+eq 'released: both applied' '2' "$(grep -c '^applied' "$TMP/apply-out")"
+eq '...the database is dropped' no "$(exists "$DB/gone")"
+eq '...both ledger entries are forgotten' 'no no' \
+  "$(exists "$XR/.git/worktree-ledger/gone") $(exists "$XR/.git/worktree-ledger/gone1")"
+eq '...and both husks are deleted' 'no no' \
+  "$(exists "$XR/.git/worktrees/gone") $(exists "$XR/.git/worktrees/gone1")"
+contains '...saying so' 'deleted what the removal left of its git admin dir' "$(cat "$TMP/apply-out")"
+eq '...and the other worktree is untouched' yes "$(exists "$DB/other")"
 }
 
 for BACKEND in jq python3; do

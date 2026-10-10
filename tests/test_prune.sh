@@ -1131,6 +1131,51 @@ prune "$R" --apply
 eq 'usage: --apply with no ids exits 2' 2 "$(cat "$TMP/rc")"
 prune "$TMP" --repo "$TMP"
 eq 'usage: outside any repository exits 2' 2 "$(cat "$TMP/rc")"
+
+# ---------------------------------------------------------------------------
+# What Claude Code's removal leaves of an admin dir (a husk)
+# ---------------------------------------------------------------------------
+# Measured (2.1.296): Claude Code deletes git's files from a removed worktree's admin dir and leaves
+# this plugin's, so the directory stays with no gitdir. Husks are made here the way it leaves them.
+RH=$TMP/husk-repo
+make_repo "$RH"
+husk() {  # $1 = id; makes the husk with a plain lock file in it
+  mkdir -p "$RH/.git/worktrees/$1"
+  : >"$RH/.git/worktrees/$1/worktree-bootstrap-state.lock"
+  printf 'log\n' >"$RH/.git/worktrees/$1/worktree-bootstrap.log"
+}
+husk litter
+husk seeded
+US=$'\037' RS=$'\036'
+printf '%s' "wtstate${US}1${RS}rt${US}seeded${US}${US}derived${US}${US}${US}done${US}${US}1${RS}" \
+  >"$RH/.git/worktrees/seeded/worktree-bootstrap-state"
+husk stray
+printf 'mine\n' >"$RH/.git/worktrees/stray/notes.txt"
+husk gclog
+printf 'warning: too many unreachable loose objects\n' >"$RH/.git/worktrees/gclog/gc.log"
+prune "$RH"
+eq 'husk: plain litter is deleted' delete "$(field admin-leftover "$RH/.git/worktrees/litter" 5)"
+eq 'husk: one holding the gc.log a failed auto-gc wrote is a husk too' delete \
+  "$(field admin-leftover "$RH/.git/worktrees/gclog" 5)"
+eq 'husk: one whose state records a seed that ran is refused' refuse \
+  "$(field admin-leftover "$RH/.git/worktrees/seeded" 5)"
+contains '...saying why' 'only record of databases a seed made (slug=seeded)' \
+  "$(field admin-leftover "$RH/.git/worktrees/seeded" 6)"
+eq 'husk: one holding a file not ours is not listed as a husk' '' \
+  "$(field admin-leftover "$RH/.git/worktrees/stray" 5)"
+hid=$(field admin-leftover "$RH/.git/worktrees/litter" 1)
+prune "$RH" --apply "$hid"
+eq 'husk: apply exits 0' 0 "$(cat "$TMP/rc")"
+eq '...and deletes it' no "$(exists "$RH/.git/worktrees/litter")"
+eq '...and nothing else' yes "$(exists "$RH/.git/worktrees/stray/notes.txt")"
+# Re-judged at apply: a husk that gained someone else's file since the report is not deleted.
+husk late
+prune "$RH"
+lid=$(field admin-leftover "$RH/.git/worktrees/late" 1)
+printf 'mine\n' >"$RH/.git/worktrees/late/notes.txt"
+prune "$RH" --apply "$lid"
+eq 'husk: one that changed since the report is not applied' 1 "$(cat "$TMP/rc")"
+eq '...and is kept' yes "$(exists "$RH/.git/worktrees/late/notes.txt")"
 }
 
 for BACKEND in jq python3; do

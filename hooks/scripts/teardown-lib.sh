@@ -59,9 +59,10 @@ WT_GUARD_REFUSE=0
 # before it is believed.
 #
 # THE DIRECTORY MAY ALREADY BE GONE. A launch-time `claude -w` worktree is created natively, and
-# there is no evidence either way on whether native removal runs before or after this hook. So a
-# missing directory is a normal input: the runtime ledger (bootstrap-lib.sh) outlives the worktree
-# and is the only proof left that the path was ever ours.
+# Claude Code removes it itself on exit with no WorktreeRemove at all (ADR-015; measured again on
+# 2.1.296), leaving its allocation in the ledger for a re-entry of the same name to reuse and
+# /pitlane-tidy to release. So a missing directory is a normal input: the runtime ledger
+# (bootstrap-lib.sh) outlives the worktree and is the only proof left that the path was ever ours.
 #
 # PATHS ARE COMPARED PHYSICALLY. git records a worktree by its real path, and every path this
 # plugin wrote to the ledger came from `pwd -P` or `--show-toplevel`. A symlinked ANCESTOR is
@@ -462,6 +463,57 @@ wt_resolve_removal_target() {  # $1 = payload JSON (default: $HOOK_INPUT)
     return 1
   fi
   wt_resolve_worktree_path "$target" "$cwd"
+}
+
+# ---------------------------------------------------------------------------
+# What a removal leaves of an admin dir
+# ---------------------------------------------------------------------------
+#
+# Claude Code's own removal of a `claude -w` worktree deletes git's files from its admin dir and
+# leaves the rest (measured, 2.1.296): this plugin's state, logs and locks keep the directory, with
+# no `gitdir`, so git no longer lists it and nothing else ever deletes it. That remainder is a HUSK;
+# /pitlane-tidy deletes it with the last record of it (prune.sh).
+
+# True if $1 is a husk: a real directory directly under the `worktrees/` of a git dir, holding none
+# of git's files and nothing but this plugin's — `worktree-bootstrap*`, `worktree-serve*` and
+# `pitlane-*` entries — and `gc.log`, the report a failed auto-gc writes there, which the removal
+# leaves too (measured: a repository whose gc complains). One stray file of anyone else's and it is
+# not ours to delete.
+wt_admin_husk() {  # $1 = directory
+  local dir=${1%/} gitroot entry name
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  gitroot=${dir%/*}
+  [ "${gitroot##*/}" = worktrees ] || return 1
+  gitroot=${gitroot%/worktrees}
+  [ -n "$gitroot" ] && [ -f "$gitroot/HEAD" ] && [ -d "$gitroot/refs" ] && [ -d "$gitroot/objects" ] \
+    || return 1
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=${entry##*/}
+    case $name in
+      gitdir | commondir | HEAD | .git) return 1 ;;
+      worktree-bootstrap* | worktree-serve* | pitlane-* | gc.log) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Delete husk $1, re-proved right before. A `pitlane-removed` dependency copy in it may be read-only,
+# as wt_clear_linked_dep found it. Returns 1, saying why, when it is not a husk or will not go.
+wt_remove_admin_husk() {  # $1 = directory
+  local dir=${1%/}
+  if ! wt_admin_husk "$dir"; then
+    wt_log "not deleting $dir: it is not only what this plugin left of a removed worktree's git admin dir"
+    return 1
+  fi
+  chmod -R u+w -- "$dir" 2>/dev/null
+  rm -rf -- "${dir:?}" 2>/dev/null
+  if [ -e "$dir" ]; then
+    wt_log "could not delete $dir completely"
+    return 1
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
