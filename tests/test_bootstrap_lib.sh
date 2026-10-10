@@ -6188,6 +6188,13 @@ eq 'note block: {slug} becomes the slug, each time' \
   "$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block alice_fix_99)"
 eq '...and with no slug it stays as written' "$NOTE_HEADER$NL_- $SLUG_NOTE" \
   "$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block)"
+# With something still missing, the header says the notes describe a finished worktree and that the
+# status line above wins where they disagree: "its own databases" must not read as fact over "databases missing".
+out=$(PROFILE_AGENT_NOTE=$SLUG_NOTE wt_agent_note_block alice_fix_99 incomplete)
+contains 'note block, incomplete: the header says the notes describe a fully set-up worktree' \
+  'They describe one that is fully set up; where they disagree with the line above, the line above is what is true here:' "$out"
+contains '...and the lines are the same' '- Query app_wt_alice_fix_99_dev, then' "$out"
+eq '...and only then' "$NOTE_HEADER" "$(PROFILE_AGENT_NOTE=x wt_agent_note_block alice_fix_99 '' | head -n 1)"
 # shellcheck disable=SC2016  # the $(...) is the payload, kept literal.
 for bad in 'a&b' 'a/b' 'Alice' 'a b' '$(id)' 'a-b'; do
   eq "...and a slug that is not [a-z0-9_] ($bad) is not put in" "$NOTE_HEADER$NL_- $SLUG_NOTE" \

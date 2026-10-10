@@ -115,6 +115,19 @@ run_hook() {  # $1 = payload JSON, $2 = cwd to run from; prints stdout, stderr g
   local payload=$1 cwd=$2
   ( cd "$cwd" && printf '%s' "$payload" | bash "$HOOK" 2>"$TMP/err" )
 }
+# What SessionStart's output gives the model: the output itself when it is plain text, its
+# additionalContext when it is the JSON a message for the developer comes in; and that message.
+ctx() {  # $1 = SessionStart stdout
+  case $1 in
+    '{'*) printf '%s' "$1" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"], end="")' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+sysmsg() {  # $1 = SessionStart stdout
+  case $1 in
+    '{'*) printf '%s' "$1" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("systemMessage", ""), end="")' ;;
+  esac
+}
 reset_hook() {  # $1 = directory, $2 = source (clear, compact, resume)
   run_hook "{\"hook_event_name\":\"SessionStart\",\"source\":\"$2\",\"cwd\":\"$1\"}" "$1"
 }
@@ -1540,6 +1553,8 @@ eq "...then holds main's tree, copied, not installed" MAIN "$(cat "$WPR/vendor/a
 eq '...sharing no inode with it' no "$([ "$WPR/vendor/autoload.php" -ef "$BG/vendor/autoload.php" ] && echo yes || echo no)"
 contains '...and the log says what the copy cost' 'vendor: copied from the main checkout in ' \
   "$(cat "$GDPR/worktree-bootstrap.log" 2>/dev/null)"
+eq '...leaving no empty staging dir behind in its git admin dir' no \
+  "$([ -e "$GDPR/pitlane-copying" ] && echo yes || echo no)"
 printf 'PR\n' >> "$WPR/vendor/autoload.php"
 eq "...a write in it leaves main's file alone" MAIN "$(cat "$BG/vendor/autoload.php" 2>/dev/null)"
 outB=$(PITLANE_BACKGROUND=on start_hook "$WPR")
@@ -1757,8 +1772,11 @@ contains 'approval: stderr says the commands are not approved' 'not approved in 
 contains 'approval: the session is told nothing was run' 'setup commands were NOT run — vendor missing (held back), databases missing (held back).' "$outA"
 contains '...and not to do it by hand or approve on its own' 'Do not approve it, run those commands' "$outA"
 contains '...and where approval happens' '/pitlane-finish' "$outA"
+eq 'approval: the developer sees the hold in the terminal, not only the model' \
+  "Pitlane: this worktree's setup is held until you approve its profile. Run /pitlane-finish to review it." \
+  "$(sysmsg "$outA")"
 for src in clear compact; do
-  eq "approval: $src says again that nothing was run, in the same words" "$outA" "$(gated_reset_hook "$WAP" "$src")"
+  eq "approval: $src says again that nothing was run, in the same words" "$(ctx "$outA")" "$(gated_reset_hook "$WAP" "$src")"
 done
 
 # --finish holds back too, and says so.
@@ -2398,10 +2416,10 @@ contains '...and points at the review' '--review' "$out"
 contains '...naming the profile as held, not the note alone' 'Its profile is held' "$out"
 contains '...and forbidding the session to approve it or act on the note' \
   'Do not approve it yourself, and do not read the note out of the profile or act on it.' "$out"
-eq '...on one line' 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+eq '...on one line' 1 "$(printf '%s\n' "$(ctx "$out")" | wc -l | tr -d ' ')"
 for src in clear compact; do
   outR=$(gated_reset_hook "$WNU" "$src")
-  eq "note held: $src prints start-up's held line again" "$out" "$outR"
+  eq "note held: $src prints start-up's held line again" "$(ctx "$out")" "$outR"
   lacks "...without the note ($src)" "$NL1" "$outR"
 done
 outF=$(gated_cli "$WNU" --finish)
@@ -3238,6 +3256,73 @@ contains 'serve: refuses while the build output is missing, naming it' \
   'not served — this worktree'"'"'s setup is not complete — build output public/build not built (its build failed: error: bundle failed)' "$out"
 ne '...non-zero' 0 "$SV_RC"
 eq '...and nothing was started' '' "$(serve_pid "$WAU")"
+
+# ---------------------------------------------------------------------------
+# A checkout that lost most of its tracked files: nothing is done over it, and the developer is told
+# ---------------------------------------------------------------------------
+# What a removal interrupted half-way leaves (measured on a real repository: 9,808 of 12,714 tracked
+# files gone, `.gitignore` and the lockfiles among them).
+GR=$TMP/gutted
+make_repo "$GR" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor && printf fellback > vendor/m"}' \
+  '' '"evidence": { "detectionVersion": 0, "markers": ["composer.lock"], "shellMarker": "" },'
+mkdir -p "$GR/vendor/pkg" "$GR/src"; printf 'src\n' > "$GR/vendor/pkg/f"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do printf '%s\n' "$i" > "$GR/src/f$i"; done
+git -C "$GR" add src; git -C "$GR" commit -qm src
+WG=$GR/.claude/worktrees/gutted
+git -C "$GR" worktree add -q "$WG" -b worktree-gutted 2>/dev/null
+rm -f "$WG/.gitignore" "$WG/composer.lock" "$WG"/src/f1 "$WG"/src/f1?
+out=$(start_hook "$WG"); err=$(cat "$TMP/err")
+# With its lockfile gone the profile no longer validates, so `.gitignore` is the key file left to
+# notice it by — as on the real repository, where it was gone too.
+contains 'gutted: the session is told how many tracked files are missing' \
+  "this worktree's checkout is missing 13 tracked files (.gitignore among them)" "$(ctx "$out")"
+contains '...and not to set anything up by hand' 'Do not install, build or seed anything by hand' "$(ctx "$out")"
+contains '...and the developer is told in the terminal' \
+  'Pitlane: this worktree is missing 13 tracked files, most likely from an interrupted removal.' "$(sysmsg "$out")"
+contains '...with the way back' 'git restore .' "$(sysmsg "$out")"
+eq '...nothing is linked into it' no "$([ -e "$WG/vendor" ] && echo yes || echo no)"
+eq '...nor copied' no "$([ -e "$WG/.env" ] && echo yes || echo no)"
+lacks '...and the session is given no other advice for it' '/pitlane-setup' "$(ctx "$out")"
+outF=$( (cd "$WG" && bash "$HOOK" --finish 2>/dev/null) )
+contains 'gutted: --finish refuses too, saying why' \
+  "Pitlane: still not complete — this worktree's checkout is missing 13 tracked files" "$outF"
+# Restored, it is set up as any other worktree — and with nothing to tell the developer, the output
+# is plain text again.
+git -C "$WG" restore .
+out=$(start_hook "$WG")
+eq 'gutted, restored: set up as usual, in plain text' "$READY_VENDOR" "$out"
+# One lockfile deleted on purpose is not a broken checkout.
+rm -f "$WG/composer.lock"
+out=$(start_hook "$WG")
+lacks 'one deleted lockfile: not called a broken checkout' 'tracked files' "$out"
+eq '...and nothing is shown in the terminal' '' "$(sysmsg "$out")"
+git -C "$WG" restore composer.lock
+
+# ---------------------------------------------------------------------------
+# A linked dependency dir that lost entries is linked again
+# ---------------------------------------------------------------------------
+# Measured: after an interrupted removal, a worktree kept 61 of the main checkout's 113 packages in
+# vendor/ and no autoload.php, and every later run called it "already up to date".
+IR=$TMP/incomplete
+make_repo "$IR" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor && printf fellback > vendor/m"}'
+mkdir -p "$IR/vendor/a" "$IR/vendor/b"
+printf 'A\n' > "$IR/vendor/a/x"; printf 'B\n' > "$IR/vendor/b/y"; printf 'AUTO\n' > "$IR/vendor/autoload.php"
+WI=$IR/.claude/worktrees/inc
+git -C "$IR" worktree add -q "$WI" -b worktree-inc 2>/dev/null
+out=$(start_hook "$WI")
+eq 'incomplete: fixture — linked and set up' "$READY_VENDOR" "$out"
+rm -rf "$WI/vendor/b" "$WI/vendor/autoload.php"
+out=$(start_hook "$WI"); err=$(cat "$TMP/err")
+contains 'incomplete: a linked dir missing entries is noticed' \
+  "vendor: recorded as linked, but it lacks entries the main checkout's has — moving it aside and linking it again" "$err"
+eq '...and linked again, complete' 'yes yes' \
+  "$([ "$WI/vendor/b/y" -ef "$IR/vendor/b/y" ] && echo yes || echo no) $([ "$WI/vendor/autoload.php" -ef "$IR/vendor/autoload.php" ] && echo yes || echo no)"
+eq "...the main checkout's files untouched" 'A B AUTO' "$(cat "$IR/vendor/a/x" "$IR/vendor/b/y" "$IR/vendor/autoload.php" | tr '\n' ' ' | sed 's/ $//')"
+eq '...and the session is told it is set up' "$READY_VENDOR" "$out"
+eq '...leaving no empty dir behind in its git admin dir' no \
+  "$([ -e "$(git -C "$WI" rev-parse --absolute-git-dir)/pitlane-removed" ] && echo yes || echo no)"
+out=$(start_hook "$WI"); err=$(cat "$TMP/err")
+contains '...after which it is up to date again' 'vendor: already up to date' "$err"
 
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

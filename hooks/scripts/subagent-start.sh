@@ -40,16 +40,7 @@ wt_subagent_worktree() {  # $1 = directory
 # function for both, so the two cannot drift. In-process: LC_ALL=C so the ranges match bytes, and
 # every other byte is kept.
 wt_subagent_json_escape() {  # $1 = text, $2 = lines or empty
-  local LC_ALL=C t=${1-}
-  if [ "${2-}" = lines ]; then
-    t=${t//[$'\x01'-$'\x09'$'\x0b'-$'\x1f']/}
-  else
-    t=${t//[$'\x01'-$'\x1f']/}
-  fi
-  t=${t//\\/\\\\}
-  t=${t//\"/\\\"}
-  [ "${2-}" != lines ] || t=${t//$'\n'/\\n}
-  printf '%s' "$t"
+  wt_json_text "$@"
 }
 
 # The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told; and

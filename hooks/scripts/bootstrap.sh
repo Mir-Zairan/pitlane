@@ -290,7 +290,7 @@ wt_status_after_reset() {  # $1 = the session's directory
   fi
   WT_STATE_READ_ONLY=1 wt_bootstrap_status_line "$worktree" start "$how" ''
   if wt_agent_note_is_approved; then
-    wt_agent_note_block "${WT_SLUG-}"
+    wt_agent_note_block "${WT_SLUG-}" "$([ -z "$WT_PENDING" ] || printf incomplete)"
   fi
   return 0
 }
@@ -452,6 +452,15 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # then have to work around.
   wt_prime_paths "$root" "$worktree"
   wt_lock_acquire "$(wt_state_path "$worktree").lock" 5 8 && held=1
+
+  # A checkout that lost a large part of its tracked files — a removal interrupted half-way — is no
+  # base to install, build or seed on: lockfiles, sources and `.gitignore` may be gone, and what
+  # would be set up over them is a guess. Nothing at all is done; the caller says why (WT_GUTTED).
+  if wt_checkout_gutted "$worktree"; then
+    wt_log "this checkout is missing $WT_GUTTED tracked files ($WT_GUTTED_KEYS among them) — most likely a removal that was interrupted; nothing is copied, installed, built or seeded. Restore them with \`git restore .\` in the worktree, or remove the worktree"
+    [ "$held" -eq 1 ] && wt_lock_release 8
+    return 0
+  fi
 
   # The copy walk and the drift check both cost real time — `git ls-files` over the main checkout,
   # and one interpreter start — so the "global" budget has to bound them too, not just the
@@ -745,6 +754,19 @@ case $event in
     # install and clone by hand (measured: it is what sessions did before this plugin existed); and
     # what is in place when it is, so a session does not redo it out of habit. EMPTY only when the
     # profile gives it nothing to name. /pitlane-finish reads the same list as a plain status line.
+    if [ -n "${WT_GUTTED:-}" ]; then
+      gutted="this worktree's checkout is missing $WT_GUTTED tracked files ($WT_GUTTED_KEYS among them) — most likely its removal was interrupted. Nothing was copied, installed, built or seeded"
+      if [ "${WT_FINISH:-}" = 1 ]; then
+        # shellcheck disable=SC2016  # the backticks are literal text
+        printf 'Pitlane: still not complete — %s. Restore the files with `git restore .` in the worktree and run this again, or remove the worktree.\n' "$gutted"
+        exit 0
+      fi
+      wt_session_start_emit \
+        "Pitlane: $gutted. Do not install, build or seed anything by hand: ask the developer whether to restore the files with \`git restore .\` (then /pitlane-finish) or to remove this worktree." \
+        "Pitlane: this worktree is missing $WT_GUTTED tracked files, most likely from an interrupted removal. Restore them with \`git restore .\` and run /pitlane-finish, or remove the worktree."
+      exit 0
+    fi
+
     wt_bootstrap_pending "$worktree"
     pending=$WT_PENDING
     if [ "${WT_FINISH:-}" = 1 ]; then
@@ -768,12 +790,22 @@ case $event in
         wt_log "not finished: $(printf '%s' "$pending" | paste -sd, - | sed 's/,/, /g')"
       fi
     fi
-    wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
-    # After the status line, which says nothing of it: the note is the repository's text, not
-    # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
-    if wt_agent_note_is_approved; then
-      wt_agent_note_block "${WT_SLUG-}"
+    # Gathered rather than printed, so that a message for the developer can go with it (below).
+    context=$(
+      wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
+      # After the status line, which says nothing of it: the note is the repository's text, not
+      # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
+      if wt_agent_note_is_approved; then
+        wt_agent_note_block "${WT_SLUG-}" "$([ -z "$pending" ] || printf incomplete)"
+      fi
+    )
+    # The one state the developer has to act on before the worktree is any use: told in the
+    # terminal, since the context above reaches only the model.
+    notice=''
+    if [ "${WT_APPROVAL:-}" = no ]; then
+      notice="Pitlane: this worktree's setup is held until you approve its profile. Run /pitlane-finish to review it."
     fi
+    wt_session_start_emit "$context" "$notice"
     exit 0
     ;;
 

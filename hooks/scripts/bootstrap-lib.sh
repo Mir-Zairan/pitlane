@@ -132,6 +132,72 @@ wt_admin_registered() {  # $1 = admin dir
   [ -e "${1%/}/gitdir" ] || [ -L "${1%/}/gitdir" ]
 }
 
+# True when worktree $1's checkout has lost a large part of its tracked files — what a removal
+# interrupted half-way leaves (measured: 9,808 of 12,714 deleted, `.gitignore` and the lockfiles
+# among them). Sets WT_GUTTED to how many are missing and WT_GUTTED_KEYS to the key files among them.
+#
+# Cheap unless something is wrong: only the key files are looked at — `.gitignore` and the profile's
+# evidence markers (its lockfiles) — one stat each. git is asked only when one of them is gone, and
+# it counts only when git says it was tracked and at least a tenth of the checkout is missing with it:
+# a developer who deletes one lockfile on purpose is not told their checkout is broken.
+WT_GUTTED='' WT_GUTTED_KEYS=''
+wt_checkout_gutted() {  # $1 = worktree
+  local wt=${1%/} m absent=() keys deleted tracked
+  WT_GUTTED='' WT_GUTTED_KEYS=''
+  while IFS= read -r m; do
+    m=${m#"${m%%[![:space:]]*}"} m=${m%"${m##*[![:space:]]}"}
+    if [ -z "$m" ] || ! wt_is_safe_relpath "$m"; then
+      continue
+    fi
+    [ -e "$wt/$m" ] || [ -L "$wt/$m" ] || absent+=("$m")
+  done < <(printf '.gitignore\n'; printf '%s\n' "${PROFILE_EV_MARKERS:-}" | tr -d '[]"' | tr ',' '\n')
+  [ "${#absent[@]}" -gt 0 ] || return 1
+  keys=$(wt_git "$wt" ls-files --deleted -- "${absent[@]}" 2>/dev/null) || return 1
+  [ -n "$keys" ] || return 1
+  deleted=$(wt_git "$wt" ls-files --deleted 2>/dev/null | wc -l) || return 1
+  tracked=$(wt_git "$wt" ls-files 2>/dev/null | wc -l) || return 1
+  deleted=${deleted//[!0-9]/} tracked=${tracked//[!0-9]/}
+  [ -n "$deleted" ] && [ -n "$tracked" ] && [ "$tracked" -gt 0 ] || return 1
+  [ $((deleted * 10)) -ge "$tracked" ] || return 1
+  # shellcheck disable=SC2034  # both are this function's results, read by bootstrap.sh.
+  WT_GUTTED=$deleted
+  # shellcheck disable=SC2034
+  WT_GUTTED_KEYS=$(printf '%s\n' "$keys" | head -n 3 | paste -sd, - | sed 's/,/, /g')
+  return 0
+}
+
+# $1 as the inside of a JSON string, with no interpreter: backslashes and quotes escaped, control
+# characters dropped — except line breaks with $2 = `lines`, which become \n. Shared by the two hooks
+# that print JSON of their own (SubagentStart, and SessionStart when it has a message for the user).
+wt_json_text() {  # $1 = text, $2 = lines or empty
+  local LC_ALL=C t=${1-}
+  if [ "${2-}" = lines ]; then
+    t=${t//[$'\x01'-$'\x09'$'\x0b'-$'\x1f']/}
+  else
+    t=${t//[$'\x01'-$'\x1f']/}
+  fi
+  t=${t//\\/\\\\}
+  t=${t//\"/\\\"}
+  [ "${2-}" != lines ] || t=${t//$'\n'/\\n}
+  printf '%s' "$t"
+}
+
+# What a SessionStart prints: context for the model, and — only when the developer must know
+# something before they start — a line for them. Plain stdout reaches the model but is never shown to
+# the user (measured, and documented: "Neither channel produces a visible transcript entry"), so a
+# held profile or a broken checkout went unnoticed until someone asked. With a message, the output
+# is SessionStart's JSON: `systemMessage` is shown in the terminal at startup, `additionalContext`
+# reaches the model exactly as the plain text did. Without one, the output stays plain.
+wt_session_start_emit() {  # $1 = context, $2 = message for the developer, or empty
+  local context=${1-} message=${2-}
+  if [ -z "$message" ]; then
+    [ -z "$context" ] || printf '%s\n' "$context"
+    return 0
+  fi
+  printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' \
+    "$(wt_json_text "$message")" "$(wt_json_text "$context" lines)"
+}
+
 # True when linked worktree $1 carries the marker wt_pr_origin_mark writes.
 wt_pr_origin_marked() {  # $1 = worktree
   wt_worktree_admin "$1" || return 1
@@ -3213,13 +3279,21 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
 # missing would set it up again on every session. A record from before the flag is done as recorded,
 # as it was then. WT_DEP_GONE is 1 when an emptied dir is why it is not done, for the log.
 WT_DEP_GONE=0
-wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy
+wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy, $7 = main checkout, $8 = lock
   WT_DEP_GONE=0
   if ! wt_state_is_done "$1" "$2" "$3" "$4" "$5"; then
     [ "${6-}" = 1 ] || return 1
     wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy || return 1
   fi
-  wt_dep_has_content "${1%/}/$2" && return 0
+  if wt_dep_has_content "${1%/}/$2"; then
+    # Recorded as linked, but missing what it was linked from has: what an interrupted removal of
+    # the worktree leaves (measured: 61 of 113 packages and no autoload.php, kept as "up to date").
+    if [ "$5" = hardlink ] && [ "${6-}" != 1 ] && [ -n "${7-}" ] && wt_dep_incomplete "$7" "$1" "$2" "${8-}"; then
+      WT_DEP_GONE=2
+      return 1
+    fi
+    return 0
+  fi
   # Only an empty dir pays the second read. Another session may have rewritten the record between the
   # two reads (to doing while it sets the dir up again), so this one's status is checked too, and a
   # record gone since is not done.
@@ -3227,6 +3301,31 @@ wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cks
   case $WT_DEP_STATUS in done | warn) ;; *) return 1 ;; esac
   [ "$WT_DEP_CONTENT" = 1 ] || return 0
   WT_DEP_GONE=1
+  return 1
+}
+
+# True when the hardlinked dependency dir $3 of worktree $2 lacks an entry, one or two levels down,
+# that the main checkout's has — so it is not the tree it was linked from any more. Only while the
+# two lockfiles ($4) match, since a different lockfile means a different tree by design, and only
+# for a dir that IS linked from there — a file in both is the same file: a `hardlink` entry that fell
+# back to an install (no hardlinks across devices) holds its own tree, which no name comparison with
+# the main checkout's describes. Names only, no content and no deeper walk: globs, no fork, so it
+# costs a session start next to nothing, and a removal that was interrupted leaves its holes at the
+# top as much as anywhere.
+wt_dep_incomplete() {  # $1 = main checkout, $2 = worktree, $3 = dir, $4 = lock
+  local src=${1%/}/$3 dst=${2%/}/$3 entry rel lacking=0 linked=0
+  [ -d "$src" ] && [ -d "$dst" ] && [ -n "${4-}" ] || return 1
+  cmp -s "${1%/}/$4" "${2%/}/$4" || return 1
+  for entry in "$src"/* "$src"/.[!.]* "$src"/..?* "$src"/*/* "$src"/*/.[!.]*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    rel=${entry#"$src"/}
+    if [ -e "$dst/$rel" ] || [ -L "$dst/$rel" ]; then
+      [ "$linked" = 1 ] || { [ -f "$entry" ] && [ ! -L "$entry" ] && [ "$dst/$rel" -ef "$entry" ] && linked=1; }
+    else
+      lacking=1
+    fi
+    [ "$lacking$linked" = 11 ] && return 0
+  done
   return 1
 }
 
@@ -3255,6 +3354,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
   local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits content
+  local admin_copying
   WT_OWN_COPY=''
 
   [ -n "${PROFILE_RAW:-}" ] || return 0
@@ -3346,7 +3446,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     lckhash=$(wt_cksum_file "$worktree/$lock")
     ickhash=$(wt_cksum_string "$install")
 
-    if wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy"; then
+    if wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy" "$root" "$lock"; then
       wt_log "  $dir: already up to date"
       if [ "$strategy" = hardlink ]; then
         wt_state_dep_read "$worktree" "$dir" || true
@@ -3354,7 +3454,10 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       fi
       continue
     fi
-    [ "$WT_DEP_GONE" = 0 ] || wt_log "  $dir: recorded as set up, but the directory is gone or empty — setting it up again"
+    case $WT_DEP_GONE in
+      1) wt_log "  $dir: recorded as set up, but the directory is gone or empty — setting it up again" ;;
+      2) wt_log "  $dir: recorded as linked, but it lacks entries the main checkout's has — moving it aside and linking it again" ;;
+    esac
     own_fits=0
     if [ "$own_copy" = 1 ] && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
       own_fits=1
@@ -3427,7 +3530,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # outside it; without this the second waits out the lock and then repeats an install the
     # first just finished. Checking the marker outside the lock and acting on it inside is the
     # source conversation's bug 1 in a different costume.
-    if [ "$held" -eq 1 ] && wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy"; then
+    if [ "$held" -eq 1 ] && wt_dep_is_done "$worktree" "$dir" "$lckhash" "$ickhash" "$strategy" "$own_copy" "$root" "$lock"; then
       wt_log "  $dir: another session finished it while we waited"
       wt_lock_release 9
       continue
@@ -3457,11 +3560,19 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         wt_log "  $dir: a previous run was interrupted, but another process holds the lock — leaving the directory alone"
       fi
     fi
+    # A linked dir that lost entries (wt_dep_incomplete) is moved aside, so the link below starts
+    # from nothing: over a dir already there it would only report it present. Its links are only
+    # unlinked, never written through, so the tree it shares files with keeps every one of them.
+    if [ "${WT_DEP_GONE:-0}" = 2 ] && [ "$strategy" = hardlink ] && { [ "$held" -eq 1 ] || [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; }; then
+      wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc" "it lacks entries the main checkout's has" aside || true
+    fi
     # What a removal moved aside and could not finish (wt_clear_linked_dep). Under the lock, or with
     # no flock to take: the same rule as the partial dir above. An interrupted copy only under the
     # lock (held is never 1 without flock): without it, another run may be making that copy now.
     if { [ "$strategy" = hardlink ] || [ "$own_copy" = 1 ]; } && { [ "$held" -eq 1 ] || [ "${WT_LOCK_NO_FLOCK:-0}" = 1 ]; }; then
       wt_sweep_removed_dep "$worktree" "$dir" "$held"
+      # And its holder in the admin dir once that is empty, as for the copy's (below).
+      admin_copying=$(wt_removed_dep_admin_dir "$worktree" 2>/dev/null) && rmdir -- "$admin_copying" 2>/dev/null
     fi
 
     # The budget may have gone while waiting for the lock and clearing the tree. Without this
@@ -3530,7 +3641,12 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         continue
       fi
       wt_own_copy_from_main "$root" "$worktree" "$dir" "$left"
-      case $? in
+      rc=$?
+      # Its staging dir in the admin dir, once nothing is left in it: kept, it is a stray directory
+      # in every pull request's git admin dir. `rmdir` takes only an empty one, so a copy another run
+      # may be making there, or a temp `rm` could not finish, stays for that run or /pitlane-tidy.
+      admin_copying=$(wt_copying_dep_admin_dir "$worktree" 2>/dev/null) && rmdir -- "$admin_copying" 2>/dev/null
+      case $rc in
         0) effective=copy ;;
         2) wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
            [ "$held" -eq 1 ] && wt_lock_release 9
@@ -4437,12 +4553,17 @@ wt_agent_note_is_held() {
 # real names sit beside the developer's credentials — to find them. Only a slug of [a-z0-9_] alone,
 # what wt_slugify makes, is put in; with none, `{slug}` stays as written. The approval covers the
 # line as written: the slug is Pitlane's own value, not the branch's.
-wt_agent_note_block() {  # $1 = the worktree's slug, or empty
-  local LC_ALL=C line slug=${1-} placeholder='{slug}'
+wt_agent_note_block() {  # $1 = the worktree's slug, or empty; $2 = `incomplete` when the status line names something missing
+  local LC_ALL=C line slug=${1-} placeholder='{slug}' header
   case $slug in
     '' | *[!a-z0-9_]*) slug='' ;;
   esac
-  printf '%s\n' "Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
+  header="Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree:"
+  # A note describes a worktree that is fully set up — "this worktree has its own databases" — and
+  # read after a status line saying the databases are missing, it still reads as fact. So the header
+  # says which of the two to believe.
+  [ "${2-}" != incomplete ] || header="Pitlane: notes from this repository's worktree profile (.claude/worktree-profile.json) for working in a worktree. They describe one that is fully set up; where they disagree with the line above, the line above is what is true here:"
+  printf '%s\n' "$header"
   while IFS= read -r line; do
     line=${line//[$'\x01'-$'\x1f'$'\x7f']/}
     line=${line//$'\xc2'[$'\x80'-$'\x9f']/}
