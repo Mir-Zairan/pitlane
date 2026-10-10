@@ -4921,10 +4921,18 @@ printf 'wtstate%s99%srt%sx%s3901%sderived%s.e%sours%snone%s%s1%s' \
   "$US_" "$RS_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$US_" "$RS_" \
   > "$BADMIN/worktree-bootstrap-state"
 eq 'a foreign-version sibling state file contributes no record' '' "$(sib "$PREPO" "$PA")"
-# An admin dir with no gitdir pointer at all cannot be classified, so the scan is not trustworthy.
+# An admin dir with no gitdir pointer is what Claude Code's removal leaves (measured, 2.1.296):
+# git no longer registers it, so it is no sibling — and must not blind the scan, which would stop
+# every seed in the repository.
 mv "$BADMIN/gitdir" "$BADMIN/gitdir.away"
 wt_runtime_siblings "$PREPO" "$PA"
-eq 'an unclassifiable admin entry drops the trust flag' 0 "$WT_SIBLINGS_OK"
+eq 'an admin dir with no gitdir keeps the scan trustworthy' 1 "$WT_SIBLINGS_OK"
+eq '...and is not a sibling' '' "$WT_SIBLINGS"
+# A gitdir that is there but cannot be read is another matter: that entry cannot be classified.
+mkdir "$BADMIN/gitdir"
+wt_runtime_siblings "$PREPO" "$PA"
+eq 'an unreadable gitdir drops the trust flag' 0 "$WT_SIBLINGS_OK"
+rmdir "$BADMIN/gitdir"
 mv "$BADMIN/gitdir.away" "$BADMIN/gitdir"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 

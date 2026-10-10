@@ -123,6 +123,15 @@ wt_worktree_admin() {  # $1 = worktree
   WT_WORKTREE_ADMIN=${admin%/}
 }
 
+# True while git still registers the admin dir $1 (<common>/worktrees/<id>): it holds the `gitdir`
+# file git lists the worktree by. Claude Code's removal of a `claude -w` worktree deletes git's files
+# from the admin dir and leaves this plugin's (measured, 2.1.296: its state, logs and locks survive),
+# and `git worktree prune` treats a gitdir-less entry as gone. So does everything here: such a
+# directory is a removed worktree's leftover, never a live sibling.
+wt_admin_registered() {  # $1 = admin dir
+  [ -e "${1%/}/gitdir" ] || [ -L "${1%/}/gitdir" ]
+}
+
 # True when linked worktree $1 carries the marker wt_pr_origin_mark writes.
 wt_pr_origin_marked() {  # $1 = worktree
   wt_worktree_admin "$1" || return 1
@@ -5964,6 +5973,11 @@ wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
   for admin in "$common"/worktrees/*/; do
     admin=${admin%/}
     [ -d "$admin" ] || continue                      # an unmatched glob
+    # What a removal left of an admin dir — this plugin's files, no `gitdir` — registers no
+    # worktree, so it is not a sibling. Counting it unreadable instead let one removed worktree
+    # stop every seed in the repository. Its allocation stays in the ledger for a re-entry of the
+    # same name to reuse (ADR-015), which is exactly what not counting it allows.
+    wt_admin_registered "$admin" || continue
     if ! wt_admin_worktree "$admin"; then
       # shellcheck disable=SC2034
       WT_SIBLINGS_OK=0                               # an entry we cannot classify at all
