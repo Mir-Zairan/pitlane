@@ -564,9 +564,9 @@ Finally, tell the developer **what happens on the next `claude -w`**, concretely
 get hardlinked and which get installed, which build output is copied or built, what shell that runs inside, roughly how long the first
 bootstrap will take, what — if anything — will be isolated, and what the agent note tells a worktree
 session. If there is a teardown, say what removing a worktree does: Claude Code removes a worktree that
-git sees as clean when its session exits (a Ctrl+C at the exit prompt included), and the teardown then
-drops what the seed made. Data someone added only to those databases goes with them, because git
-does not see it. Then finish what the answer to **who it is for** (step 1) asked for:
+git sees as clean when its session exits, and may not ask first. Pitlane keeps what the seed made, so
+reopening the same name reuses it; `/pitlane-tidy` runs the teardown when the developer is done with
+it. Then finish what the answer to **who it is for** (step 1) asked for:
 
 - **the team** — say which files to commit: the profile, `.worktreeinclude` and the scripts. The agent
   note goes with the profile;
