@@ -57,10 +57,12 @@ first three and then "and N more" — and, when an install changed tracked files
   <dir> ready with warnings` built, exited non-zero, and passed its verify; it counts as built.
 - `Pitlane: not run — the profile's commands are not approved …` — see **Approval** below.
 - `Pitlane: run /pitlane-finish from inside a worktree …` — the session is not in a worktree, so there
-  is nothing to finish here; say so. If the user wants the profile approved, that works from here too:
-  go through **Approval** below, running `--review` and `--approve` from this directory. The approval
-  covers every worktree of the repository whose profile and scripts match it, so the next worktree
-  session starts set up.
+  is nothing to finish here. Run `--review` from this directory before saying anything else: if it
+  prints `Approved: this exact content is approved`, tell the user in one line that there is nothing
+  to finish here and the profile is already approved, so new worktrees set themselves up — and offer
+  no review. Otherwise say the profile is not approved and offer to go through **Approval** below
+  from here, running `--approve` from this directory too. The approval covers every worktree of the
+  repository whose profile and scripts match it, so the next worktree session starts set up.
 
 ## Tracked files an install changed
 
