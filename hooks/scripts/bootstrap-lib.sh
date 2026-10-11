@@ -456,10 +456,12 @@ wt_approvals_path() {  # $1 = any directory inside the repository
 }
 
 # True when the record $2 lists fingerprint $1. The first field of a line is the fingerprint; the
-# rest (when, and which profile) is for a human reading the file.
+# rest (when, and which profile) is for a human reading the file. Compared as strings, byte for
+# byte: awk's `==` on a field and a -v value that both look like numbers compares them as numbers,
+# so two different digests of the form 0e<digits> would both be 0 and match each other.
 wt_approval_known() {  # $1 = fingerprint, $2 = record file
   [ -n "${1-}" ] && [ -f "${2-}" ] || return 1
-  awk -v f="$1" '$1 == f { found = 1 } END { exit !found }' "$2" 2>/dev/null
+  LC_ALL=C awk -v f="$1" '($1 "") == (f "") { found = 1 } END { exit !found }' "$2" 2>/dev/null
 }
 
 # Decide whether the loaded profile's commands may run in $1, and its agent note be shown, into

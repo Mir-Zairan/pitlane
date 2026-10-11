@@ -6144,6 +6144,20 @@ contains 'review: shows the stop command' 'stop (run by teardown): bin/server --
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_RT_SERVE='' PROFILE_RT_STOP=''
 
+# --- the approval record: a fingerprint matches only itself, compared as a string -----------------
+# Two different digests of the form 0e<digits> are both the number 0 to awk; an approval of one must
+# not approve the other.
+APK=$TMP/approved-known
+ZERO_A=$(printf '0e%062d' 1)
+ZERO_B=$(printf '0e%062d' 2)
+printf '%s 2026-01-01T00:00:00Z .claude/worktree-profile.json\n' "$ZERO_A" >"$APK"
+wt_approval_known "$ZERO_A" "$APK"
+eq 'approval known: the recorded fingerprint is known' 0 $?
+wt_approval_known "$ZERO_B" "$APK"
+eq '...a different 0e<digits> fingerprint is not, though both read as the number 0' 1 $?
+wt_approval_known "$(printf '0%063d' 0)" "$APK"
+eq '...nor an all-zero one' 1 $?
+
 # --- agentNote: runs nothing, but is branch text put before the model, so it is approved too -------
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_AGENT_NOTE=''
