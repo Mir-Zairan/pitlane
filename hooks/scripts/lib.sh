@@ -1244,6 +1244,20 @@ wt_is_safe_envfile() {  # $1 = candidate
   wt_is_safe_relpath "$1"
 }
 
+# True if $1 is acceptable as deps[].dir or deps[].lock: relative, inside the tree, at most 255
+# bytes, and drawn from the env file character set (a trailing `/` allowed). Both come from the
+# branch's profile and are repeated in what Pitlane says, to the developer and to the model, before
+# anyone has approved the profile; a set with no space, quote or punctuation cannot carry a sentence
+# of instructions in there. Every dependency dir and lockfile a package manager uses fits it.
+wt_is_dep_path() {  # $1 = candidate
+  local p=${1-}
+  [ "${#p}" -le 255 ] || return 1
+  case $p in
+    '' | *[!A-Za-z0-9._@+/-]*) return 1 ;;
+  esac
+  wt_is_safe_relpath "$p"
+}
+
 # Split artifacts[].inputs — compact JSON, as the scan renders a nested array — into one path per
 # line. Returns 1, printing nothing, unless it is a non-empty array of quoted paths drawn from the
 # env file character set, each inside the repository. That set has no quote, comma or backslash, so
@@ -1728,8 +1742,10 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       # with a lock of ../../../etc/passwd would turn a valid profile into a
       # file-existence-and-content oracle for paths outside the worktree — and a lock
       # pointing at /dev/zero would make that read never return, hanging the hook.
-      if [ -n "$lock" ] && ! wt_is_safe_relpath "$lock"; then
-        printf 'deps[%d].lock: "%s" must be a relative path inside the repository\n' "$n" "$lock"
+      # A rejected lock or dir is not quoted back, nor kept for a later message: it is branch text
+      # that failed the very check that keeps such text out of what Pitlane says (wt_is_dep_path).
+      if [ -n "$lock" ] && ! wt_is_dep_path "$lock"; then
+        printf 'deps[%d].lock: must be a relative path inside the repository, at most 255 characters of letters, digits and . _ - @ + /\n' "$n"
         bad=1
         lock=''
       fi
@@ -1737,9 +1753,10 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
       # A skipped dependency is not acted on, so only its path SHAPE matters.
       case $strategy in
         skip)
-          if [ -n "$dir" ] && ! wt_is_safe_relpath "$dir"; then
-            printf 'deps[%d].dir: "%s" must be a relative path inside the repository\n' "$n" "$dir"
+          if [ -n "$dir" ] && ! wt_is_dep_path "$dir"; then
+            printf 'deps[%d].dir: must be a relative path inside the repository, at most 255 characters of letters, digits and . _ - @ + /\n' "$n"
             bad=1
+            dir=''
           fi
           ;;
         *)
@@ -1752,9 +1769,10 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
             printf 'deps[%d].dir: missing, but strategy "%s" needs a directory to populate\n' \
               "$n" "${strategy:-?}"
             bad=1
-          elif ! wt_is_safe_relpath "$dir"; then
-            printf 'deps[%d].dir: "%s" must be a relative path inside the repository\n' "$n" "$dir"
+          elif ! wt_is_dep_path "$dir"; then
+            printf 'deps[%d].dir: must be a relative path inside the repository, at most 255 characters of letters, digits and . _ - @ + /\n' "$n"
             bad=1
+            dir=''
           fi
           if [ -z "$lock" ]; then
             printf 'deps[%d].lock: missing, but hardlink validity and drift detection are keyed on it\n' "$n"
@@ -1868,12 +1886,14 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
         printf 'artifacts[%d].dir: missing\n' "$n"
         bad=1
       elif ! wt_is_artifact_dir "$adir"; then
-        # Shown with control characters as ?: a newline would forge a second line of the report.
+        # Quoted back only when the slash is all that is wrong: the rest is then a valid dir, with no
+        # whitespace or control character to forge a line of the report or carry a sentence.
         if wt_is_artifact_dir "${adir%/}"; then
           printf 'artifacts[%d].dir: "%s" must not end in a slash — write "%s"\n' "$n" "$adir" "${adir%/}"
         else
-          printf 'artifacts[%d].dir: "%s" must be a relative path inside the repository, with no whitespace and no "." or empty segment\n' \
-            "$n" "$(printf '%s' "$adir" | tr '[:cntrl:]' '?')"
+          # Not quoted back: with whitespace in it, it could be a sentence from the branch.
+          printf 'artifacts[%d].dir: must be a relative path inside the repository, with no whitespace and no "." or empty segment\n' \
+            "$n"
         fi
         bad=1
       else
