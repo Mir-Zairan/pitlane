@@ -1982,6 +1982,15 @@ eq 'subagent of a detached HEAD: based on its commit' "$APBASE" "$(git -C "$WSD"
 eq '...and marked, since a detached HEAD may be a PR checkout' "$APBASE loose" "$(pr_mark_of "$WSD")"
 gated_hook "$WSD" >/dev/null
 eq '...and held back' no "$([ -e "$WSD/vendor/marker" ] && echo yes || echo no)"
+# The detached worktree itself, at content the developer approved: a fork's PR checked out this way
+# (`git worktree add <dir> FETCH_HEAD`) must not inherit that approval, so its commit is approved
+# on its own.
+outD=$(gated_hook "$WDET")
+eq 'a detached worktree, at approved content: its install is held back' no \
+  "$([ -e "$WDET/vendor/marker" ] && echo yes || echo no)"
+contains '...and the session is told' 'setup commands were NOT run' "$outD"
+contains '...review flags it as a pull request' 'pull-request worktree: approving covers this commit only' \
+  "$(gated_cli "$WDET" --review)"
 
 sub_create agent-own "$WAP"
 WSO=$AP/.claude/worktrees/agent-own

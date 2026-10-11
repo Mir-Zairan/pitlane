@@ -77,7 +77,9 @@ You never have to run `/pitlane-finish`. Claude does it when it needs something 
 ## Pull requests
 
 `claude -w "#1234"` opens a pull request in its own worktree. **Nothing from it runs until you
-approve**, and you're asked again after every new push.
+approve**, and you're asked again after every new push. A worktree on a detached commit
+(`git worktree add <dir> FETCH_HEAD`, `gh pr checkout --detach`) is treated the same way, since it may
+be a PR too.
 
 - If the PR doesn't change the lockfile, it gets a private copy of your packages, so none of its code
   runs.

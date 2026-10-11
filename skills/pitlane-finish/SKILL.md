@@ -112,7 +112,8 @@ and shows no session its agent note until the developer has approved that exact 
 worktree's branch wrote them, and the branch
 may be someone else's: a pull request opened with `claude -w "#1234"` can put any command there.
 Any change to the profile or to a script it names needs approving again. In a pull-request worktree
-(`pr-…`) the approval also covers only the current commit, because an approved install runs the PR's
+(`pr-…`, or any worktree on a detached commit, which may be a PR's checkout) the approval also covers
+only the current commit, because an approved install runs the PR's
 own package scripts and toolchain files: each new push needs approving again, and the user should read
 the diff of those files before saying yes.
 

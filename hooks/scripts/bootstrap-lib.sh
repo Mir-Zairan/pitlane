@@ -327,7 +327,10 @@ wt_visible() {  # $1 = text
 # True when $1 is a pull-request worktree: named `pr-<digits>`, the kind `claude -w "#1234"` makes, or
 # on a branch whose upstream is a pull-request ref — what `gh pr checkout` records for a fork's PR, in
 # the shared git config no branch can write — or started from such a worktree (wt_pr_origin_marked),
-# wherever `git worktree move` has since put it, as wt_donor_is_pr sees it.
+# wherever `git worktree move` has since put it, as wt_donor_is_pr sees it. Under the worktrees dir,
+# a HEAD that is unreadable or not on a branch counts too, as wt_donor_is_pr counts it: a detached
+# checkout (`git worktree add <dir> FETCH_HEAD`, `gh pr checkout --detach`) cannot be told apart
+# from a PR's, and a wrong no hands a stranger's commit the developer's own approval.
 # For those, the approval is bound to the commit as well as
 # the content. An approved install runs
 # the branch's own manifests (package lifecycle scripts) and an approved `shell` evaluates its
@@ -351,8 +354,8 @@ wt_is_pr_worktree() {  # $1 = run directory
       esac
       ;;
   esac
-  branch=$(wt_git "$1" symbolic-ref -q --short HEAD 2>/dev/null) || return 1
-  [ -n "$branch" ] || return 1
+  branch=$(wt_git "$1" symbolic-ref -q --short HEAD 2>/dev/null) || return 0
+  [ -n "$branch" ] || return 0
   merge=$(wt_git "$1" config --get "branch.$branch.merge" 2>/dev/null) || return 1
   case $merge in
     refs/pull/*) return 0 ;;

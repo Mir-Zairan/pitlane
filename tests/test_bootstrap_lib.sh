@@ -3221,6 +3221,18 @@ contains '...saying why' "vendor: a pull request's worktree copies the main chec
 eq '...no file of it shares an inode' '' "$(find "$DWT/vendor" -type f -links +1)"
 rm -f "$PMARK"
 eq 'pr-origin: without the marker it is not' 1 "$(wt_is_pr_worktree "$DWT"; echo $?)"
+# Under the worktrees dir a detached HEAD may be a PR checkout (`git worktree add <dir> FETCH_HEAD`,
+# `gh pr checkout --detach`), whatever the name: it counts as one, as wt_donor_is_pr counts it.
+git -C "$DWT" checkout -q --detach
+eq "pr: a worktree on a detached HEAD, not named pr-N, may be a pull request's" 0 \
+  "$(wt_is_pr_worktree "$DWT"; echo $?)"
+git -C "$DWT" checkout -q wt-dep1
+eq '...back on its branch it is not' 1 "$(wt_is_pr_worktree "$DWT"; echo $?)"
+DMAIN_BRANCH=$(git -C "$DREPO" symbolic-ref -q --short HEAD)
+git -C "$DREPO" checkout -q --detach
+eq '...and the main checkout on a detached HEAD is not: only the worktrees dir is judged so' 1 \
+  "$(wt_is_pr_worktree "$DREPO"; echo $?)"
+git -C "$DREPO" checkout -q "$DMAIN_BRANCH"
 # Moved out of the worktrees dir, the marker still decides, and the two tests agree.
 MOVED=$(mktemp -d)/moved-wt
 git -C "$DREPO" worktree add -q -b wt-moved "$DREPO${WT_SUBPATH}moved-wt" HEAD
