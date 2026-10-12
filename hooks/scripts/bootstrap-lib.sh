@@ -724,6 +724,241 @@ wt_shell_program_warn() {
 }
 
 # ---------------------------------------------------------------------------
+# The box — the profile's commands in a running compose service
+# ---------------------------------------------------------------------------
+#
+# A teammate with neither the profile's toolchain nor the project's tools on the machine runs the
+# project only in Docker: one long-running compose service (box.service) bind-mounts the main
+# checkout at box.mount. Worktrees live inside the main checkout, so the box already sees each one,
+# at the mount plus its path in the checkout, and a step runs there with `docker exec` — nothing to
+# build, start or download.
+#
+# THE SELECTION is made per run from what is installed and running, never by asking:
+#   PITLANE_TOOLCHAIN=box          the box, whatever `shell` says
+#   PITLANE_TOOLCHAIN=auto, unset  the box when `shell` is set and its program is not installed here
+#   PITLANE_TOOLCHAIN=shell, host  never the box
+# and in every case only when docker is installed, the service is running and the worktree is inside
+# the main checkout. A box that is wanted but cannot be used is said once, and the step runs as it
+# would with no box.
+#
+# The `compose ps` probe costs about half a second, so it runs once per process; everything else in
+# the selection is a variable or a PATH lookup and is decided again for each step, because a caller
+# may narrow it for one call (a verify, which runs on the host by contract, passes
+# PITLANE_TOOLCHAIN=host).
+WT_BOX_COMPOSE_ARGV=()
+WT_BOX_ENV_FILES=()   # the env files compose reads, given or by its own default
+WT_BOX_ROOT=''        # the main checkout the box was last selected for
+WT_BOX_CONTAINER=''   # the service's running container, once probed
+WT_BOX_PROBED=''      # the main checkout the probe ran for, set when it found nothing too
+WT_BOX_USER=''        # uid:gid, so what a step writes in the worktree is the developer's, not root's
+WT_BOX_LOGGED=''      # the reasons said this run, one per line
+WT_BOX_PROBE_SECONDS=20
+
+wt_box_log_once() {  # $1 = reason, $2 = message
+  case $WT_NL$WT_BOX_LOGGED in
+    *"$WT_NL$1$WT_NL"*) return 0 ;;
+  esac
+  WT_BOX_LOGGED=$WT_BOX_LOGGED$1$WT_NL
+  wt_log "$2"
+}
+
+# True when the profile's commands for worktree $1 run in the box; sets WT_BOX_ROOT and
+# WT_BOX_CONTAINER for wt_box_exec_argv.
+wt_toolchain_is_box() {  # $1 = worktree
+  local worktree=${1%/} want=${PITLANE_TOOLCHAIN:-auto} root why
+  WT_BOX_ROOT=''
+  case $want in
+    shell | host) return 1 ;;
+    box | auto) ;;
+    *)
+      wt_box_log_once toolchain "PITLANE_TOOLCHAIN is \"$(wt_visible "$want")\", which is not auto, box, shell or host — treating it as auto"
+      want=auto
+      ;;
+  esac
+  if [ "${PROFILE_HAS_BOX:-0}" != 1 ]; then
+    [ "$want" = auto ] || wt_box_log_once nobox "PITLANE_TOOLCHAIN=box, but the profile names no box — running its commands as it says"
+    return 1
+  fi
+  # An empty `shell` has no program to miss, so such a profile uses the box only when asked to.
+  if [ "$want" = auto ] && ! wt_shell_program_missing; then
+    return 1
+  fi
+  why="the profile's commands would run in the box (compose service $PROFILE_BOX_SERVICE)"
+  root=${WT_ROOT:-}
+  [ -n "$root" ] || root=$(wt_main_root "$worktree" 2>/dev/null) || root=''
+  root=${root%/}
+  if [ -z "$root" ]; then
+    wt_box_log_once noroot "$why, but the main checkout of $worktree could not be found — running them outside it"
+    return 1
+  fi
+  if ! wt_box_path "$worktree" "$root" >/dev/null; then
+    wt_box_log_once outside "$why, but $worktree is outside the main checkout $root, the only part of this machine the box sees — running them outside it"
+    return 1
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    wt_box_log_once nodocker "$why, but docker is not installed here — running them outside it"
+    return 1
+  fi
+  if ! wt_box_container "$root"; then
+    wt_box_log_once stopped "$why, but it is not running (start it with \`docker compose up -d $PROFILE_BOX_SERVICE\`) — running them outside it"
+    return 1
+  fi
+  WT_BOX_ROOT=$root
+  wt_box_log_once selected "running the profile's commands in the box: compose service $PROFILE_BOX_SERVICE, where this worktree is under $PROFILE_BOX_MOUNT (PITLANE_TOOLCHAIN=shell runs them as the profile's shell says)"
+  return 0
+}
+
+# The path $1 has in the box: the mount plus its path in the main checkout $2. Fails, printing
+# nothing, when $1 is outside the main checkout, which is all the box mounts. A path reached through a
+# symlink is compared by its real path too: wt_main_root reports the main checkout by its real path.
+wt_box_path() {  # $1 = host path, $2 = main checkout; prints the path in the box
+  local path=${1%/} root=${2%/} spelling
+  [ -n "$root" ] || return 1
+  for spelling in given real; do
+    if [ "$spelling" = real ]; then
+      path=$(cd "$path" 2>/dev/null && pwd -P) || return 1
+      root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+    fi
+    case $path in
+      */.. | */../*) ;;
+      "$root") printf '%s' "$PROFILE_BOX_MOUNT"; return 0 ;;
+      "$root"/*) printf '%s' "$PROFILE_BOX_MOUNT${path#"$root"}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# The compose command for the box's stack in main checkout $1, into WT_BOX_COMPOSE_ARGV; the env
+# files compose reads go into WT_BOX_ENV_FILES too. The project name is left to compose, so it is
+# the stack the developer started by hand from the same checkout.
+#
+# An explicit --env-file switches off compose's own reading of `.env`, so when box.envFiles names
+# files, `.env` goes first (unless listed itself, where the list places it) to keep what a bare
+# `docker compose` in the checkout would see. A listed file that does not exist is left out rather
+# than failing every compose call: it is usually a gitignored file this developer has not made.
+wt_box_compose_argv() {  # $1 = main checkout; sets WT_BOX_COMPOSE_ARGV and WT_BOX_ENV_FILES
+  local root=${1%/} f
+  WT_BOX_COMPOSE_ARGV=(docker compose --project-directory "$root")
+  WT_BOX_ENV_FILES=()
+  wt_split_list : "${PROFILE_BOX_COMPOSE-}"
+  for f in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
+    WT_BOX_COMPOSE_ARGV+=(-f "$root/$f")
+  done
+  wt_split_list : "${PROFILE_BOX_PROFILES-}"
+  for f in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
+    WT_BOX_COMPOSE_ARGV+=(--profile "$f")
+  done
+  if [ -z "${PROFILE_BOX_ENV_FILES-}" ]; then
+    [ ! -f "$root/.env" ] || WT_BOX_ENV_FILES=("$root/.env")
+    return 0
+  fi
+  case :$PROFILE_BOX_ENV_FILES: in
+    *:.env:*) ;;
+    *) [ ! -f "$root/.env" ] || WT_BOX_ENV_FILES=("$root/.env") ;;
+  esac
+  wt_split_list : "$PROFILE_BOX_ENV_FILES"
+  for f in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
+    [ ! -f "$root/$f" ] || WT_BOX_ENV_FILES+=("$root/$f")
+  done
+  for f in ${WT_BOX_ENV_FILES[@]+"${WT_BOX_ENV_FILES[@]}"}; do
+    WT_BOX_COMPOSE_ARGV+=(--env-file "$f")
+  done
+}
+
+# Export box.env's defaults for compose to read, each only where the developer has not set the name:
+# in their environment, or in an env file compose reads — compose ranks its own environment above
+# its env files, so a default exported over a file's value would win. Values go into the environment,
+# never onto a command line, where `ps` shows them to every user of the machine. Call it in the
+# subshell that runs compose: neither the hook nor the steps it starts may take them on.
+wt_box_export_env() {
+  local rec body name value f
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      10"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r name value <<<"$body" || true
+    wt_is_safe_envkey "$name" || continue
+    [ -z "${!name+set}" ] || continue
+    for f in ${WT_BOX_ENV_FILES[@]+"${WT_BOX_ENV_FILES[@]}"}; do
+      grep -Eq "^[[:space:]]*(export[[:space:]]+)?${name}[[:space:]]*=" "$f" 2>/dev/null && continue 2
+    done
+    export "$name=$value"
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+}
+
+# Probe, once per process and main checkout, for the box service's running container: sets
+# WT_BOX_CONTAINER and fails when there is none. `ps` lists running containers only. Bounded, because
+# a docker daemon that does not answer must not hold a session start.
+wt_box_container() {  # $1 = main checkout
+  local root=${1%/} out=''
+  local -a bound=()
+  if [ "$WT_BOX_PROBED" != "$root" ]; then
+    WT_BOX_PROBED=$root
+    wt_box_compose_argv "$root"
+    command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+    out=$( wt_box_export_env
+           exec ${bound[@]+"${bound[@]}"} "${WT_BOX_COMPOSE_ARGV[@]}" ps -q "$PROFILE_BOX_SERVICE" </dev/null 2>/dev/null ) || out=''
+    WT_BOX_CONTAINER=${out%%"$WT_NL"*}
+    # An id goes where docker reads options, so anything but one is no container.
+    case $WT_BOX_CONTAINER in
+      '' | *[!0-9a-f]*) WT_BOX_CONTAINER='' ;;
+    esac
+  fi
+  [ -n "$WT_BOX_CONTAINER" ]
+}
+
+# Build the argv that runs command $1 in the box, in directory $2, into WT_CMD_ARGV. Fails, with a
+# log line, when $2 is outside the main checkout: the step must not run in some other directory.
+# Only after wt_toolchain_is_box said yes, which sets the box it runs in.
+#
+# The command reaches exactly one shell, as in wt_build_shell_argv. That shell is POSIX `sh -c`, not a
+# login shell: a login shell's profile can reset the PATH the image sets, losing the project's tools.
+#
+# Pitlane's own variables (WT_*, WORKTREE_*, MYSQL_PWD) are passed by NAME only, so docker reads their
+# values from its own environment and none appears in `ps`. HOME=/tmp because the developer's uid
+# usually has no home in the image, and the tools write their caches under HOME.
+#
+# `env -u` clears what the box's compose `environment:` pins but the worktree's env files must decide
+# — runtime.env.vars' names, which hold the worktree's own databases and port, and box.clearEnv: most
+# frameworks rank the process environment above a .env file, so the main checkout's values would win.
+#
+# A step stopped by its timeout stops the docker client only; what it started in the box runs on.
+wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
+  local cmd=${1-} dir=${2-} where name rec body key
+  local -a pass=(-e HOME=/tmp) cleared=()
+  WT_CMD_ARGV=()
+  if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
+    wt_log "cannot run \"$cmd\" in the box: $dir is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
+    return 1
+  fi
+  [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
+  while IFS= read -r name; do
+    case $name in
+      WT_* | WORKTREE_* | MYSQL_PWD) pass+=(-e "$name") ;;
+    esac
+  done <<<"$(compgen -e)"
+  while IFS= read -r -d "$WT_RS" rec; do
+    case $rec in
+      3"$WT_US"*) ;;
+      *) continue ;;
+    esac
+    body=${rec#*"$WT_US"}
+    IFS=$WT_US read -r key _ <<<"$body" || true
+    # A `<file>:<VAR>` key sets VAR in that one file.
+    cleared+=(-u "${key##*:}")
+  done < <(printf '%s' "${PROFILE_RAW:-}")
+  wt_split_list : "${PROFILE_BOX_CLEAR_ENV-}"
+  for name in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
+    cleared+=(-u "$name")
+  done
+  WT_CMD_ARGV=(docker exec -i -u "$WT_BOX_USER" -w "$where" "${pass[@]}" "$WT_BOX_CONTAINER")
+  [ "${#cleared[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${cleared[@]}")
+  WT_CMD_ARGV+=(sh -c "$cmd")
+}
+
+# ---------------------------------------------------------------------------
 # The resource guard — a setup step must never take the desktop down with it
 # ---------------------------------------------------------------------------
 #
@@ -850,7 +1085,7 @@ wt_capture_unfollow() {  # $1 = capture file
 # It NEVER lets a failure escape as a shell error: the caller is a hook that must exit 0 whatever
 # happens, so every path here returns a status rather than tripping `set -e`.
 wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
-  local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0 capture=${WT_RUN_CAPTURE:-}
+  local cmd=${1-} dir=${2-} secs=${3-} rc=0 host=0 box=0 capture=${WT_RUN_CAPTURE:-}
 
   [ -n "$cmd" ] || return 0
   # THE BACKSTOP. Every caller that runs a profile's command checks the approval first and records
@@ -865,7 +1100,10 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
   fi
   wt_is_seconds "$secs" || secs=$WT_DEFAULT_TIMEOUT
 
-  if wt_nix_shell_missing "$dir"; then
+  # The box is chosen for the worktree; the step's own directory must then be one the box sees.
+  if wt_toolchain_is_box "${WT_PATH:-$dir}"; then
+    box=1
+  elif wt_nix_shell_missing "$dir"; then
     wt_log "the profile's shell is \"$PROFILE_SHELL\" but this branch has no flake.nix/shell.nix — running on the host shell instead, which may not have the project's toolchain"
     host=1
   elif wt_shell_program_missing; then
@@ -873,7 +1111,9 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
     host=1
   fi
 
-  if [ "$host" -eq 1 ]; then
+  if [ "$box" -eq 1 ]; then
+    wt_box_exec_argv "$cmd" "$dir" || return 1
+  elif [ "$host" -eq 1 ]; then
     WT_CMD_ARGV=(bash -lc "$cmd")
   else
     wt_build_shell_argv "$cmd"
@@ -2452,7 +2692,7 @@ wt_hardlink_donor_find() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 
         left=$(wt_budget_left "$deadline")
         if [ "$left" -gt 0 ] && [ -z "$(WT_PATH=$wtpath wt_unsafe_command_placeholder "$vtpl")" ]; then
           verify=$(WT_PATH=$wtpath wt_expand "$vtpl")
-          if WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$wtpath" "$left"; then
+          if WT_GUARD=off PITLANE_TOOLCHAIN=host PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$wtpath" "$left"; then
             WT_DONOR=$wtpath
             return 0
           fi
@@ -2765,6 +3005,11 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
     ready) return 0 ;;
     broken | lowmem) return 1 ;;
   esac
+  # A box the selection found running is ready: a step in it starts nothing.
+  if wt_toolchain_is_box "$worktree"; then
+    WT_TOOLCHAIN=ready
+    return 0
+  fi
   # Nothing to start: every step runs on the host shell (wt_run_in_shell).
   if wt_shell_program_missing; then
     wt_shell_program_warn
@@ -3810,7 +4055,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # The optional cheap sanity check. It decides the recorded outcome, and `dirty` is what makes
     # the next entry try again rather than trust this one.
     #
-    # IT RUNS IN THE HOST SHELL, NOT THE TOOLCHAIN WRAPPER. A verify is a cheap check by contract —
+    # IT RUNS IN THE HOST SHELL, NOT THE TOOLCHAIN WRAPPER OR THE BOX. A verify is a cheap check by contract —
     # every one the detection table proposes is a plain file test — while the wrapper is not cheap:
     # measured on a real repository, one `nix develop --command true` costs 14s warm in the main
     # checkout and 25–38s in a fresh worktree, and a repo with nine dependency entries paid that nine
@@ -3836,7 +4081,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
         outcome=dirty
       else
-        WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
+        WT_GUARD=off PITLANE_TOOLCHAIN=host PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
         vrc=$?
         if [ "$vrc" -eq 0 ] && [ "$outcome" = failed ]; then
           outcome=warn
@@ -4283,7 +4528,7 @@ wt_bootstrap_artifacts() {  # $1 = root, $2 = worktree, $3 = deadline
         wt_log "  $dir: no budget left to verify — recording it as needing another look"
         outcome=dirty
       else
-        WT_GUARD=off PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
+        WT_GUARD=off PITLANE_TOOLCHAIN=host PROFILE_SHELL='' PROFILE_SHELLARGS='' wt_run_in_shell "$verify" "$worktree" "$left"
         vrc=$?
         if [ "$vrc" -eq 0 ] && [ "$outcome" = failed ]; then
           outcome=warn

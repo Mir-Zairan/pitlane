@@ -375,6 +375,195 @@ contains 'with no timeout binary it says so' 'without a time limit' "$err"
 contains '...and still runs the command' 'ok' "$err"
 
 # ---------------------------------------------------------------------------
+# The box
+# ---------------------------------------------------------------------------
+# Driven through a fake `docker` that records each call's argv, one argument per line after a CALL
+# line, answers `compose … ps -q <service>` with $TMP/box/id (empty: the service is not running) and
+# runs an `exec`'s final `sh -c` command itself, so a step routed to the box visibly runs. Real docker
+# is never called.
+BOXM=$TMP/box-main
+BOXWT=$BOXM/.claude/worktrees/alice-fix-99
+mkdir -p "$TMP/box/bin" "$TMP/box/empty" "$BOXM/.claude"
+cat >"$TMP/box/bin/docker" <<SH
+#!/usr/bin/env bash
+{ printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/box/docker.log"
+case " \$* " in
+  *' ps -q '*)
+    printf 'probe\n' >>"$TMP/box/probes"
+    printf 'APP_MODE=%s KEEP=%s FROMFILE=%s\n' "\${APP_MODE-unset}" "\${KEEP-unset}" "\${FROMFILE-unset}" >"$TMP/box/probe.env"
+    cat "$TMP/box/id" 2>/dev/null
+    ;;
+  *' exec '*) exec sh -c "\${@: -1}" ;;
+esac
+SH
+chmod +x "$TMP/box/bin/docker"
+printf 'c0ffee12\n' >"$TMP/box/id"
+git -C "$BOXM" init -q -b main
+git -C "$BOXM" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+git -C "$BOXM" worktree add -q "$BOXWT" -b alice/fix-99 2>/dev/null
+mkdir -p "$BOXM/with space"
+: >"$BOXM/compose.yaml"; : >"$BOXM/compose.dev.yaml"
+printf 'FROMFILE=fromfile\n' >"$BOXM/.env.box"
+printf '%s' '{"schemaVersion":1,"shell":"pitlane-no-such-wrapper --command","shellArgs":"argv",
+  "runtime":{"slug":"{slug}","env":{"file":[".env.local"],"vars":{"APP_PORT":"{port}",".env.local:DB_NAME":"app_{slug}"}}},
+  "box":{"service":"app","mount":"/srv/app","compose":["compose.yaml","compose.dev.yaml"],"profiles":["dev"],
+         "envFiles":[".env.box",".env.missing"],"env":{"APP_MODE":"devmode","KEEP":"keepdefault","FROMFILE":"filedefault"},
+         "clearEnv":["APP_ENV"]}}' >"$BOXM/.claude/worktree-profile.json"
+# Loaded in a subshell and carried over by value, so the rest of the file keeps the profile state it
+# set up; reset at the end of this section.
+( unset PITLANE_TRUST_PROFILES
+  wt_load_profile "$BOXM" 2>/dev/null
+  declare -p PROFILE_RAW PROFILE_SHELL PROFILE_SHELLARGS PROFILE_HAS_BOX PROFILE_BOX_SERVICE PROFILE_BOX_MOUNT \
+    PROFILE_BOX_COMPOSE PROFILE_BOX_PROFILES PROFILE_BOX_ENV_FILES PROFILE_BOX_ENV PROFILE_BOX_CLEAR_ENV
+) >"$TMP/box/profile.sh"
+# shellcheck disable=SC1091
+. "$TMP/box/profile.sh"
+eq 'box: the profile loads with its box' '1' "$PROFILE_HAS_BOX"
+REALPATH_=$PATH
+PATH=$TMP/box/bin:$PATH
+unset PITLANE_TOOLCHAIN WT_PATH
+WT_ROOT=$BOXM
+box_fresh() {  # forget this process's probe and what it said
+  # shellcheck disable=SC2034  # read by the sourced engine
+  WT_BOX_PROBED='' WT_BOX_CONTAINER='' WT_BOX_LOGGED='' WT_SHELL_PROGRAM_WARNED=''
+  : >"$TMP/box/docker.log"; : >"$TMP/box/probes"
+}
+box_selected() {  # $1 = worktree; prints yes or no, and what was said on stderr
+  box_fresh
+  if wt_toolchain_is_box "$1" 2>"$TMP/box/err"; then printf yes; else printf no; fi
+}
+
+# --- the selection, condition by condition ---
+eq 'box: auto, with the shell program missing, uses the running box' yes "$(box_selected "$BOXWT")"
+contains '...and says so once' 'running the profile'"'"'s commands in the box: compose service app' "$(cat "$TMP/box/err")"
+eq 'box: PITLANE_TOOLCHAIN=auto is the same' yes "$(PITLANE_TOOLCHAIN=auto box_selected "$BOXWT")"
+eq 'box: PITLANE_TOOLCHAIN=box uses it' yes "$(PITLANE_TOOLCHAIN=box box_selected "$BOXWT")"
+eq 'box: PITLANE_TOOLCHAIN=shell never does' no "$(PITLANE_TOOLCHAIN=shell box_selected "$BOXWT")"
+eq '...nor does PITLANE_TOOLCHAIN=host' no "$(PITLANE_TOOLCHAIN=host box_selected "$BOXWT")"
+eq '...and neither probes docker' '' "$(PITLANE_TOOLCHAIN=host box_selected "$BOXWT" >/dev/null; cat "$TMP/box/probes")"
+eq 'box: an unknown PITLANE_TOOLCHAIN is treated as auto' yes "$(PITLANE_TOOLCHAIN=weird box_selected "$BOXWT")"
+contains '...and says so' 'not auto, box, shell or host' "$(PITLANE_TOOLCHAIN=weird box_selected "$BOXWT"; cat "$TMP/box/err")"
+eq 'box: auto, with the shell program installed, does not' no "$(PROFILE_SHELL='env WT_WRAPPED=1' box_selected "$BOXWT")"
+eq '...unless PITLANE_TOOLCHAIN=box' yes "$(PROFILE_SHELL='env WT_WRAPPED=1' PITLANE_TOOLCHAIN=box box_selected "$BOXWT")"
+eq 'box: auto, with an empty shell, does not' no "$(PROFILE_SHELL='' box_selected "$BOXWT")"
+eq '...unless PITLANE_TOOLCHAIN=box' yes "$(PROFILE_SHELL='' PITLANE_TOOLCHAIN=box box_selected "$BOXWT")"
+eq 'box: a profile without one never does' no "$(PROFILE_HAS_BOX=0 PITLANE_TOOLCHAIN=box box_selected "$BOXWT")"
+contains '...and PITLANE_TOOLCHAIN=box says it has none' 'the profile names no box' \
+  "$(PROFILE_HAS_BOX=0 PITLANE_TOOLCHAIN=box box_selected "$BOXWT"; cat "$TMP/box/err")"
+eq 'box: without docker it is not used' no "$(PATH=$TMP/box/empty box_selected "$BOXWT")"
+contains '...and says why' 'docker is not installed here' "$(PATH=$TMP/box/empty box_selected "$BOXWT"; cat "$TMP/box/err")"
+: >"$TMP/box/id"
+eq 'box: a service that is not running is not used' no "$(box_selected "$BOXWT")"
+# shellcheck disable=SC2016  # the backquotes are the message's own
+contains '...and says why' 'it is not running (start it with `docker compose up -d app`)' "$(box_selected "$BOXWT"; cat "$TMP/box/err")"
+printf 'c0ffee12\n' >"$TMP/box/id"
+eq 'box: a worktree outside the main checkout is not used' no "$(box_selected "$TMP/run")"
+contains '...and says why' "$TMP/run is outside the main checkout $BOXM" "$(box_selected "$TMP/run"; cat "$TMP/box/err")"
+eq 'box: the main checkout is found from the worktree when WT_ROOT is unset' "yes $(cd "$BOXM" && pwd -P)" \
+  "$(unset WT_ROOT; box_selected "$BOXWT"; printf ' %s' "$WT_BOX_ROOT")"
+printf 'not an id\n' >"$TMP/box/id"
+eq 'box: an answer that is not a container id is no container' no "$(box_selected "$BOXWT")"
+printf 'c0ffee12\n' >"$TMP/box/id"
+
+# --- the probe runs once per process ---
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+wt_run_in_shell 'true' "$BOXWT" 10 >/dev/null 2>&1
+wt_run_in_shell 'true' "$BOXWT" 10 >/dev/null 2>&1
+eq 'box: compose ps runs once per process, however many steps ask' 1 "$(grep -c probe "$TMP/box/probes")"
+eq '...and the container it found is kept' c0ffee12 "$WT_BOX_CONTAINER"
+
+# --- the compose argv ---
+compose_argv() {  # prints WT_BOX_COMPOSE_ARGV one per line
+  wt_box_compose_argv "$BOXM"
+  printf '%s\n' "${WT_BOX_COMPOSE_ARGV[@]}"
+}
+: >"$BOXM/.env"
+eq 'box: compose gets the checkout, each file, each profile, then .env and each listed env file that exists' \
+  "docker${NL_}compose${NL_}--project-directory${NL_}$BOXM${NL_}-f${NL_}$BOXM/compose.yaml${NL_}-f${NL_}$BOXM/compose.dev.yaml${NL_}--profile${NL_}dev${NL_}--env-file${NL_}$BOXM/.env${NL_}--env-file${NL_}$BOXM/.env.box" \
+  "$(compose_argv)"
+eq 'box: a listed .env keeps the place the list gives it' \
+  "--env-file${NL_}$BOXM/.env.box${NL_}--env-file${NL_}$BOXM/.env" \
+  "$(PROFILE_BOX_ENV_FILES=.env.box:.env compose_argv | tail -n 4)"
+eq 'box: with no envFiles compose reads .env itself, so none is passed' "dev" \
+  "$(PROFILE_BOX_ENV_FILES='' compose_argv | tail -n 1)"
+eq '...but it is still a file whose names box.env leaves alone' "$BOXM/.env" \
+  "$(PROFILE_BOX_ENV_FILES='' wt_box_compose_argv "$BOXM"; printf '%s' "${WT_BOX_ENV_FILES[*]}")"
+rm -f "$BOXM/.env"
+eq 'box: with no .env, only the listed files that exist' "--env-file${NL_}$BOXM/.env.box" \
+  "$(compose_argv | tail -n 2)"
+lacks 'box: no project name is passed' "${NL_}-p${NL_}" "$NL_$(compose_argv)$NL_"
+
+# --- box.env: defaults only where the developer set nothing, never on a command line ---
+box_fresh
+( export KEEP=mine; wt_toolchain_is_box "$BOXWT" ) 2>/dev/null
+eq 'box: a default fills an unset name, yields to the environment and to an env file compose reads' \
+  'APP_MODE=devmode KEEP=mine FROMFILE=unset' "$(cat "$TMP/box/probe.env")"
+lacks '...and no value is on the command line' 'default' "$(cat "$TMP/box/docker.log")"
+lacks '...not even the one it set' 'devmode' "$(cat "$TMP/box/docker.log")"
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+eq '...nor does it reach the hook'"'"'s own environment' unset "${APP_MODE-unset}"
+
+# --- the exec argv ---
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+exec_argv() {  # $1 = command, $2 = directory; prints WT_CMD_ARGV one per line
+  wt_box_exec_argv "$1" "$2" || return
+  printf '%s\n' "${WT_CMD_ARGV[@]}"
+}
+# shellcheck disable=SC2016  # $HOME is for the shell in the box
+out=$(export WT_SLUG=alice_fix_99 WORKTREE_URL=http://localhost:4100 MYSQL_PWD=s3cret-pw
+      exec_argv 'printf "a b"; echo "$HOME"' "$BOXM/with space")
+eq 'box: docker exec, as the developer, in the directory'"'"'s path in the box, a space and all' \
+  "docker${NL_}exec${NL_}-i${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-w${NL_}/srv/app/with space${NL_}-e${NL_}HOME=/tmp" \
+  "$(printf '%s\n' "$out" | head -n 9)"
+contains '...passing a WT_ variable by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$out"
+contains '...a WORKTREE_ one' "${NL_}-e${NL_}WORKTREE_URL${NL_}" "$out"
+contains '...and MYSQL_PWD' "${NL_}-e${NL_}MYSQL_PWD${NL_}" "$out"
+lacks '...never a value' 's3cret-pw' "$out"
+lacks '...nor a variable that is not Pitlane'"'"'s' "${NL_}PATH${NL_}" "$out"
+contains '...then the container, and env clearing runtime.env.vars'"'"' names, a file-scoped one too, and box.clearEnv' \
+  "${NL_}c0ffee12${NL_}env${NL_}-u${NL_}APP_PORT${NL_}-u${NL_}DB_NAME${NL_}-u${NL_}APP_ENV${NL_}sh${NL_}-c${NL_}" "$out"
+# shellcheck disable=SC2016
+eq '...ending in sh -c with the command as one argument' 'printf "a b"; echo "$HOME"' "$(printf '%s\n' "$out" | tail -n 1)"
+eq 'box: the main checkout itself is the mount' '/srv/app' "$(wt_box_path "$BOXM/" "$BOXM")"
+eq 'box: a path that climbs out with .. is not in the box' 1 "$(wt_box_path "$BOXM/../run" "$BOXM" >/dev/null; echo $?)"
+ln -s "$BOXM" "$TMP/box/link"
+eq 'box: a path through a symlink maps by its real path' '/srv/app/with space' "$(wt_box_path "$TMP/box/link/with space" "$BOXM")"
+
+# --- wt_run_in_shell and the toolchain step ---
+box_fresh
+out=$(wt_run_in_shell 'printf in-box' "$BOXWT" 10 2>&1 >/dev/null)
+contains 'box: wt_run_in_shell runs a step through docker exec when the box is selected' 'in-box' "$out"
+contains '...the docker client is what it started' "${NL_}exec${NL_}-i${NL_}" "$(cat "$TMP/box/docker.log")"
+box_fresh
+out=$(PITLANE_TOOLCHAIN=host wt_run_in_shell 'printf "on-host"' "$BOXWT" 10 2>&1 >/dev/null)
+contains 'box: not selected, the step runs as before' 'on-host' "$out"
+lacks '...without docker' 'exec' "$(cat "$TMP/box/docker.log")"
+box_fresh
+rm -f "$TMP/run/box-ran"
+out=$(WT_PATH=$BOXWT wt_run_in_shell 'touch box-ran' "$TMP/run" 10 2>&1 >/dev/null; echo "rc=$?")
+contains 'box: a step whose directory is outside the main checkout fails' 'rc=1' "$out"
+contains '...saying why' "cannot run \"touch box-ran\" in the box: $TMP/run is outside the main checkout" "$out"
+eq '...and runs nowhere' 'no' "$( [ -e "$TMP/run/box-ran" ] && echo yes || echo no)"
+box_fresh
+WT_TOOLCHAIN=''
+out=$(PROFILE_SHELL='env WT_WRAPPED=1' PITLANE_TOOLCHAIN=box wt_toolchain_warm "$BOXWT" "$(( $(date +%s) + 30 ))" 2>&1; printf 'rc=%s %s' "$?" "$WT_TOOLCHAIN")
+contains 'box: the toolchain step takes a running box as ready' 'rc=0 ready' "$out"
+lacks '...without starting the profile'"'"'s shell' 'toolchain: starting' "$out"
+lacks '...or running anything in the box' 'exec' "$(cat "$TMP/box/docker.log")"
+WT_TOOLCHAIN=''
+
+PATH=$REALPATH_
+unset WT_ROOT
+box_fresh
+# shellcheck disable=SC2034
+PROFILE_RAW='' PROFILE_SHELL='' PROFILE_SHELLARGS='' PROFILE_HAS_BOX=0 PROFILE_BOX_SERVICE='' PROFILE_BOX_MOUNT='' \
+  PROFILE_BOX_COMPOSE='' PROFILE_BOX_PROFILES='' PROFILE_BOX_ENV_FILES='' PROFILE_BOX_ENV='' PROFILE_BOX_CLEAR_ENV=''
+
+# ---------------------------------------------------------------------------
 # The resource guard
 # ---------------------------------------------------------------------------
 # Driven through a fake /proc/meminfo and a fake systemd-run that records its argv and then runs
