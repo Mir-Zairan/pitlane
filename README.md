@@ -47,7 +47,8 @@ That's it. When you want the app running, type `/pitlane-serve`.
 
 - **Packages, fast.** Linked from your main checkout when nothing changed, so it takes a second and
   almost no disk. Installed when the branch changed its lockfile.
-- **Its own database and port** for every worktree. Claude is told the address (`WORKTREE_URL`).
+- **Its own database and port** for every worktree. Claude is told the address (`WORKTREE_URL`). A
+  new worktree skips a port something else is already listening on, then keeps its port.
 - **Your settings** (`.env` and other ignored files) copied in and pointed at that worktree's database.
 - **Build output** (such as a front-end bundle) copied from your main checkout, or built if its
   sources changed.
@@ -89,6 +90,21 @@ be a PR too.
 A PR's worktree never shares package files with your main checkout, so nothing done there can change
 your own setup.
 
+## Docker
+
+Some developers run a project only in Docker: no toolchain on their machine, every command inside one
+compose service that mounts the project folder. Setup offers to name that service in the profile
+(the "box"), and then those developers get the same worktrees as everyone else:
+
+- installs, builds and `/pitlane-serve` run in the box, with the app published on the worktree's own
+  port, and the database script runs in your database's own image;
+- Claude is told to run the project's commands as `bash "$PITLANE_BOX" <command>`, which runs them in
+  the box, in the worktree's folder.
+
+Pitlane uses the box when the profile's toolchain (say, Nix) is not installed and the box is running.
+Set `PITLANE_TOOLCHAIN=box` to use it anyway, or `PITLANE_TOOLCHAIN=shell` to never use it. Everyone
+else's setup is unchanged. The box needs Docker with `docker compose`.
+
 ## Good to know
 
 - **Pitlane starts nothing by itself.** The app runs only when you ask, with `/pitlane-serve`.
@@ -103,7 +119,8 @@ your own setup.
 - `bash`, `git`, and `python3` or `jq`, on Linux or macOS.
 - **Package managers:** Composer, npm, pnpm, Yarn, Bun, uv, Poetry, Pipenv, Bundler, Mix, Cargo, Go.
 - **Toolchains:** Nix, direnv, or tools installed on your machine. A teammate without the project's
-  toolchain (say, no Nix) gets its commands run with the tools installed on their machine instead.
+  toolchain (say, no Nix) gets its commands run in the project's Docker box when it has one (see
+  [Docker](#docker)), or with the tools installed on their machine.
 - **Databases:** any. You supply a short script that creates a worktree's database. Pitlane runs it
   with that worktree's name and port.
 

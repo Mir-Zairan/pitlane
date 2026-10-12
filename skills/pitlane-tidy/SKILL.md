@@ -63,7 +63,7 @@ the exact apply command for every applicable item. Anything on stderr is diagnos
 | `delete` | Remove the path. | Yes |
 | `teardown` | Run the repo's own teardown script with the recorded environment (it may drop a database or stop a container), then forget the ledger entry. | Yes — say what the script will release |
 | `forget` | Forget the ledger entry; nothing runs. The entry may be the only record of a database or containers that still exist — forgotten, nothing will ever tear them down. For a `runtime-leftover` whose reason says it is recorded only in a state file, it deletes that state file. For a `server-leftover` it drops the record of a server that has already exited, or whose pid now belongs to another process — nothing is signalled. | Yes — say both in the option's description |
-| `stop` | Stop the app server `/pitlane-serve` started in a worktree that is gone: its process group, proved by the start identity it was recorded with, or the main checkout's approved `runtime.stop` for one that detached. Nothing else is stopped — never by port. | Yes — name the pid and URL from the reason |
+| `stop` | Stop the app server `/pitlane-serve` started in a worktree that is gone: its process group, proved by the start identity it was recorded with, or the main checkout's approved `runtime.stop` for one that detached; a server run in the Docker box also has its container removed, by the name it was recorded with. Nothing else is stopped — never by port. | Yes — name the pid and URL from the reason |
 | `refuse` | Not safe now; the reason says why. | No |
 | `none` | Kept on purpose, listed so the developer sees why (a live worktree holding work). | No |
 
