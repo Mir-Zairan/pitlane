@@ -896,6 +896,46 @@ mirror_put() {  # $1 = file name, $2 = path, $3 = slug, $4 = port, $5 = pid, $6 
     >"$RVM/$1"
 }
 
+# A box serve whose host side died with its group: the container it served in is still there, and
+# ours by the name its record holds. A fake `docker` says it is there while $TMP/pbox/there exists,
+# and `rm -f` removes it.
+NL=$'\n'
+mkdir -p "$TMP/pbox/bin"
+cat >"$TMP/pbox/bin/docker" <<SH
+#!/usr/bin/env bash
+{ printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/pbox/docker.log"
+case \$1 in
+  inspect) [ -e "$TMP/pbox/there" ] && { echo running; exit 0; }; echo "Error: No such object: \$4" >&2; exit 1 ;;
+  rm) rm -f "$TMP/pbox/there" ;;
+esac
+exit 0
+SH
+chmod +x "$TMP/pbox/bin/docker"
+sh -c 'exit 0' &
+bdead=$!
+wait "$bdead"
+VB=$RV/.claude/worktrees/servebox
+box_mirror() {  # writes the box serve's mirror, its pid long gone
+  printf '%s' "wtstate${US}1${RSEP}worktree$US$VB${US}servebox${US}servebox${US}servebox${US}4251${RSEP}serve$US$bdead$US$bdead${US}stat:1${US}ck${US}http://127.0.0.1:1/${US}1${US}signal${US}pitlane-serve-servebox-77$RSEP" \
+    >"$RVM/servebox.$bdead.1"
+}
+box_mirror
+: >"$TMP/pbox/there"
+PATH=$TMP/pbox/bin:$PATH prune "$RV"
+eq 'serve report: a box serve whose container is still there is offered to stop' stop "$(field server-leftover "$VB" 5)"
+contains '...naming the container' 'the container it served in, pitlane-serve-servebox-77, is still there' "$(field server-leftover "$VB" 6)"
+lacks '...without removing anything' "${NL}rm${NL}" "$(cat "$TMP/pbox/docker.log")"
+id_b=$(field server-leftover "$VB" 1)
+PATH=$TMP/pbox/bin:$PATH prune "$RV" --apply "$id_b"
+eq 'serve apply: removing it exits 0' 0 "$(cat "$TMP/rc")"
+contains '...by its recorded name' "CALL${NL}rm${NL}-f${NL}pitlane-serve-servebox-77" "$(cat "$TMP/pbox/docker.log")"
+eq '...which is gone' no "$(exists "$TMP/pbox/there")"
+eq '...and its mirror forgotten' no "$(exists "$RVM/servebox.$bdead.1")"
+box_mirror
+PATH=$TMP/pbox/bin:$PATH prune "$RV"
+eq 'serve report: with its container gone too, it is only forgotten' forget "$(field server-leftover "$VB" 5)"
+rm -f "$RVM/servebox.$bdead.1"
+
 # A daemonized server whose profile names no runtime.stop: nothing can stop it but the developer.
 VN=$RV/.claude/worktrees/servenostop
 mirror_put servenostop.4250.1 "$VN" servenostop "$main_port" 4250 "http://127.0.0.1:$main_port/" command

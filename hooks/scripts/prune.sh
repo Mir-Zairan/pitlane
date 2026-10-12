@@ -748,6 +748,21 @@ wt_prune_judge_server() {  # $1 = mirror file
   fi
   wt_serve_judge
   rc=$?
+  # A box serve's container outlives a host side killed with its group; ours by its recorded name.
+  if [ "$rc" -ne 0 ] && ! wt_serve_group_ours; then
+    wt_serve_container_present
+    case $? in
+      0)
+        WT_PRUNE_VERDICT=stop
+        WT_PRUNE_WHY="$where; its process is gone, but the container it served in, $WT_SERVE_CONTAINER, is still there — stop removes it by that name"
+        return 0
+        ;;
+      2)
+        WT_PRUNE_WHY="$where; its process is gone, and $WT_SERVE_STOP_WHY — check with docker, then run this again"
+        return 0
+        ;;
+    esac
+  fi
   case $rc in
     0)
       WT_PRUNE_VERDICT=stop

@@ -8,7 +8,8 @@ description: Start this worktree's app on its own port and URL, or stop the serv
 A worktree has its own port, and its env files point at it. The repository's own start command often
 hardcodes a port the main checkout's server already holds. Pitlane's profile has the command that serves
 *this* worktree (`runtime.serve`). This command starts it detached, records it, and waits until its URL
-answers.
+answers. When the profile's commands run in its Docker box, the app is served in a container of its own,
+with the worktree's port published on 127.0.0.1.
 
 ## Run it
 

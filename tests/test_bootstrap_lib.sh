@@ -383,8 +383,10 @@ contains '...and still runs the command' 'ok' "$err"
 # process would be, so a step routed to the box visibly runs and a signal to the client does not reach
 # it. `ps -q db` answers with $TMP/box/dbid, an inspect for the image with $TMP/box/dbinspect; a `run`
 # starts what follows its image in a session of its own, recorded under its --name, and waits for it,
-# as a client attached to a container does; `rm -f <name>` kills that session. Real docker is never
-# called.
+# as a client attached to a container does, and so does a `compose … run` with what follows its
+# service; `stop -t <s> <name>` sends that session TERM, `rm -f <name>` kills it, and an inspect of
+# `.State.Status` finds it while it runs (with $TMP/box/inspect-down, docker cannot be reached). Real
+# docker is never called.
 BOXM=$TMP/box-main
 BOXWT=$BOXM/.claude/worktrees/alice-fix-99
 mkdir -p "$TMP/box/bin" "$TMP/box/empty" "$BOXM/.claude"
@@ -409,8 +411,37 @@ if [ "\$1" = run ]; then
   wait "\$!"
   exit
 fi
+if [ "\$1" = compose ]; then
+  all=("\$@")
+  while [ \$# -gt 0 ] && [ "\$1" != run ]; do shift; done
+  if [ "\${1-}" = run ]; then
+    shift
+    name='' entry=()
+    while :; do
+      case \$1 in
+        --rm | --no-deps | -T) shift ;;
+        --name) name=\$2; shift 2 ;;
+        --entrypoint) entry=("\$2"); shift 2 ;;
+        -u | -p | -w | -e) shift 2 ;;
+        *) break ;;
+      esac
+    done
+    shift
+    set -- "\${entry[@]}" "\$@"
+    printf '%s\n' "\$\$" >"$TMP/box/client.pid"
+    if command -v setsid >/dev/null 2>&1; then setsid "\$@" & else "\$@" & fi
+    printf '%s\n' "\$!" >"$TMP/box/run-\$name.pid"
+    wait "\$!"
+    exit
+  fi
+  set -- "\${all[@]}"
+fi
 if [ "\$1" = rm ]; then
   p=\$(cat "$TMP/box/run-\$3.pid" 2>/dev/null) && { kill -KILL -- "-\$p" 2>/dev/null || kill -KILL "\$p" 2>/dev/null; }
+  exit 0
+fi
+if [ "\$1" = stop ]; then
+  p=\$(cat "$TMP/box/run-\$4.pid" 2>/dev/null) && { kill -TERM -- "-\$p" 2>/dev/null || kill -TERM "\$p" 2>/dev/null; }
   exit 0
 fi
 if [ "\$1" = exec ]; then
@@ -427,6 +458,12 @@ if [ "\$1" = exec ]; then
   exec "\$@"
 fi
 case " \$* " in
+  *'.State.Status'*)
+    [ ! -e "$TMP/box/inspect-down" ] || { echo 'Cannot connect to the Docker daemon' >&2; exit 1; }
+    p=\$(cat "$TMP/box/run-\$4.pid" 2>/dev/null) && kill -0 "\$p" 2>/dev/null && { echo running; exit 0; }
+    echo "Error: No such object: \$4" >&2
+    exit 1
+    ;;
   *'.Config.Image'*) cat "$TMP/box/dbinspect" ;;
   *' inspect '*) cat "$TMP/box/memory" ;;
   *' ps -q db '*) printf 'database\n' >>"$TMP/box/dbprobes"; cat "$TMP/box/dbid" 2>/dev/null ;;
@@ -504,7 +541,14 @@ eq 'box: a service that is not running is not used' no "$(box_selected "$BOXWT")
 contains '...and says why, with the compose command Pitlane runs' \
   "it is not running (start it with \`docker compose --project-directory $BOXM -f $BOXM/compose.yaml -f $BOXM/compose.dev.yaml --profile dev --env-file $BOXM/.env.box up -d app\`)" \
   "$(box_selected "$BOXWT"; cat "$TMP/box/err")"
+contains '...running the steps outside it' '— running them outside it' "$(cat "$TMP/box/err")"
+eq '...and says the box was chosen but is down' 1 "$(box_selected "$BOXWT" >/dev/null; printf '%s' "$WT_BOX_DOWN")"
+box_fresh
+wt_toolchain_is_box "$BOXWT" 'not starting the app' 2>"$TMP/box/err"
+contains 'box: a caller names what it does instead' 'up -d app`) — not starting the app' "$(cat "$TMP/box/err")"
 printf 'c0ffee12\n' >"$TMP/box/id"
+eq 'box: a running box is not down' 0 "$(box_selected "$BOXWT" >/dev/null; printf '%s' "$WT_BOX_DOWN")"
+eq '...nor is one never chosen' 0 "$(PITLANE_TOOLCHAIN=shell box_selected "$BOXWT" >/dev/null; printf '%s' "$WT_BOX_DOWN")"
 eq 'box: a worktree outside the main checkout is not used' no "$(box_selected "$TMP/run")"
 contains '...and says why' "$TMP/run is outside the main checkout $BOXM" "$(box_selected "$TMP/run"; cat "$TMP/box/err")"
 eq 'box: the main checkout is found from the worktree when WT_ROOT is unset' "yes $(cd "$BOXM" && pwd -P)" \
@@ -896,6 +940,132 @@ os.execvp(sys.argv[1], sys.argv[1:])' "${WT_CMD_ARGV[@]}" ) </dev/null >/dev/nul
   rm -f "$BOXWT/inner.pid" "$TMP/box"/run-*.pid
 else
   printf 'WARNING: timeout, setsid or python3 absent — stopping a database step NOT verified\n' >&2
+fi
+
+# --- serve in a short-lived container of the box ---
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+serve_argv() {  # $1 = command, $2 = worktree, $3 = name, $4 = port; prints WT_CMD_ARGV and the argv it must be, each element ended by US, the two apart by RS
+  wt_box_serve_argv "$1" "$2" "$3" "$4" || return
+  printf "%s$US_" "${WT_CMD_ARGV[@]}"
+  printf '%s' "$RS_"
+  wt_box_compose_argv "$BOXM"
+  wt_box_pass_argv
+  printf "%s$US_" bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$3" "$(id -u):$(id -g)" '' '' \
+    "${WT_BOX_COMPOSE_ARGV[@]}" run --rm --no-deps -T --name "$3" -u "$(id -u):$(id -g)" \
+    -p "127.0.0.1:$4:$4" -w '/srv/app/with space' "${WT_BOX_PASS[@]}" --entrypoint env app \
+    -u APP_PORT -u DB_NAME -u APP_ENV sh -c "$1"
+}
+out=$(WT_SLUG=alice_fix_99 MYSQL_PWD=s3cret-pw \
+      serve_argv 'bin/serve --port=4123 "a b"' "$BOXM/with space" pitlane-serve-alice_fix_99-77 4123)
+eq 'serve box: the host side stops a container named for the run, by name; compose runs it with the port on loopback, as the developer, in the worktree'"'"'s path in the box, passing and clearing as a step does, the command reaching sh -c whole' \
+  "${out#*"$RS_"}" "${out%%"$RS_"*}"
+contains '...the compose command naming the checkout, files, profiles and env files' \
+  "pitlane-box-step${US_}pitlane-serve-alice_fix_99-77${US_}$(id -u):$(id -g)${US_}${US_}${US_}docker${US_}compose${US_}--project-directory${US_}$BOXM${US_}-f${US_}$BOXM/compose.yaml" "$out"
+contains '...passing a WT_ variable by name' "${US_}-e${US_}WT_SLUG${US_}" "${out%%"$RS_"*}"
+lacks '...never a value' 's3cret-pw' "$out"
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+out=$(wt_box_serve_argv true "$TMP/run" pitlane-serve-x-1 4123 2>&1; echo "rc=$?")
+contains 'serve box: a worktree outside the main checkout is not served' 'rc=1' "$out"
+contains '...saying why' "cannot serve \"true\" in the box: $TMP/run is outside the main checkout" "$out"
+eq 'serve box: the container is named for Pitlane, the slug and this run' "pitlane-serve-alice_fix_99-$$" "$(wt_serve_container_name alice_fix_99)"
+eq '...in only what docker takes in a name' "pitlane-serve-a-b-c.d-$$" "$(wt_serve_container_name 'a b/c.d')"
+eq '...and with no slug, the run alone' "pitlane-serve-$$" "$(wt_serve_container_name '')"
+
+# The record carries the container's name, and nothing that could reach docker as an option.
+rec_fields() {  # $@ = fields after the kind; prints parse's status and container
+  local f out='' first=1
+  for f in "$@"; do
+    if [ "$first" = 1 ]; then out=$f; first=0; else out="$out$US_$f"; fi
+  done
+  wt_serve_record_parse "$out"
+  printf '%s %s' "$?" "$WT_SERVE_CONTAINER"
+}
+eq 'serve record: a container name is read' '0 pitlane-serve-ok_1.2-3' \
+  "$(rec_fields 41 41 stat:1 ck http://localhost:1/ 0 signal pitlane-serve-ok_1.2-3)"
+eq '...a record without one has none' '0 ' "$(rec_fields 41 41 stat:1 ck http://localhost:1/ 0 signal)"
+for bad in -rm pitlane-serve- 'pitlane-serve-a b' 'pitlane-serve-a;rm' other-name; do
+  eq "...a name Pitlane could not have made (\"$bad\") refuses the record" 1 \
+    "$(rec_fields 41 41 stat:1 ck http://localhost:1/ 0 signal "$bad" | cut -d' ' -f1)"
+done
+
+if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  stopped_call() {  # $1 = container name; the docker log's record of stopping it with a grace
+    printf 'CALL%s' "${NL_}stop${NL_}-t${NL_}5${NL_}$1${NL_}"
+  }
+  # The host side, given TERM as a stop of the server's group gives it: the container is stopped by
+  # name, then removed — the client alone would leave it serving.
+  box_fresh
+  rm -f "$BOXWT/inner.pid" "$TMP/box/client.pid"
+  wt_toolchain_is_box "$BOXWT" 2>/dev/null
+  # shellcheck disable=SC2016  # $$ is for the shell the command reaches
+  wt_box_serve_argv 'echo $$ >inner.pid; exec sleep 30' "$BOXWT" pitlane-serve-t-1 4123
+  ( cd "$BOXWT" && exec "${WT_CMD_ARGV[@]}" ) </dev/null >/dev/null 2>&1 &
+  bg=$!
+  i=0
+  while { [ ! -s "$BOXWT/inner.pid" ] || [ ! -s "$TMP/box/client.pid" ]; } && [ "$i" -lt 50 ]; do
+    sleep 0.1; i=$((i + 1))
+  done
+  inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  ne 'serve box: the command started in its container' '' "$inner"
+  kill -TERM "$bg"
+  wait "$bg"
+  eq '...and TERM to the host side ends it with 143' 143 $?
+  log=$(cat "$TMP/box/docker.log")
+  contains '...after stopping the container by name, with a grace' "$(stopped_call pitlane-serve-t-1)" "$log"
+  contains '...then removing it' "$(stopped_call pitlane-serve-t-1)${NL_}CALL${NL_}rm${NL_}-f${NL_}pitlane-serve-t-1" "$log"
+  eq '...which stopped the app' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+
+  # Its host side gone, the container still serving: a stop removes it by its recorded name.
+  box_container() {  # $1 = name; starts a container as compose run would, with no host side; sets inner
+    rm -f "$BOXWT/inner.pid"
+    # shellcheck disable=SC2016
+    ( cd "$BOXWT" && exec docker compose run --rm --no-deps -T --name "$1" app sh -c 'echo $$ >inner.pid; exec sleep 30' ) \
+      </dev/null >/dev/null 2>&1 &
+    i=0
+    while [ ! -s "$BOXWT/inner.pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  }
+  clear_record() { printf 'cleared %s\n' "$1" >>"$TMP/box/cleared"; }
+  sh -c 'exit 0' &
+  dead=$!
+  wait "$dead"
+  stop_judged() {  # $1 = judged code; prints the stop's status
+    : >"$TMP/box/cleared"
+    WT_SERVE_PID=$dead WT_SERVE_PGID=$dead WT_SERVE_IDENTITY=stat:1 WT_SERVE_URL=http://127.0.0.1:1/ \
+      WT_SERVE_STOPBY=signal WT_SERVE_CONTAINER=pitlane-serve-gone-1
+    wt_serve_stop_judged "$1" "$BOXWT" clear_record key 2>/dev/null
+    printf '%s' "$?"
+  }
+  box_fresh
+  box_container pitlane-serve-gone-1
+  ne 'serve stop: a container whose host side is gone is running' '' "$inner"
+  eq '...and a stop finding its process exited reports it stopped' 0 "$(stop_judged 2)"
+  contains '...having removed the container by its recorded name' "CALL${NL_}rm${NL_}-f${NL_}pitlane-serve-gone-1" "$(cat "$TMP/box/docker.log")"
+  eq '...which stopped the app' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  eq '...and cleared the record' 'cleared key' "$(cat "$TMP/box/cleared")"
+  box_fresh
+  eq 'serve stop: with the container gone too, it had already exited' 2 "$(stop_judged 2)"
+  lacks '...removing nothing' "${NL_}rm${NL_}" "$(cat "$TMP/box/docker.log")"
+  eq '...and the record is cleared' 'cleared key' "$(cat "$TMP/box/cleared")"
+  box_container pitlane-serve-gone-1
+  eq 'serve stop: a recycled PID is left alone, but the container is ours by name' 0 "$(stop_judged 3)"
+  eq '...and is removed' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  box_container pitlane-serve-gone-1
+  : >"$TMP/box/inspect-down"
+  eq 'serve stop: docker that cannot say whether the container is there fails the stop' 5 "$(stop_judged 2)"
+  contains '...saying why' 'docker did not say whether its container pitlane-serve-gone-1 is still there' \
+    "$(stop_judged 2 >/dev/null; printf '%s' "$WT_SERVE_STOP_WHY")"
+  eq '...keeping the record' '' "$(cat "$TMP/box/cleared")"
+  rm -f "$TMP/box/inspect-down"
+  docker rm -f pitlane-serve-gone-1
+  box_fresh
+  eq 'serve stop: a record with no container has none there' 1 "$(WT_SERVE_CONTAINER='' wt_serve_container_present; printf '%s' "$?")"
+  eq '...without asking docker' '' "$(cat "$TMP/box/docker.log")"
+  rm -f "$BOXWT/inner.pid" "$TMP/box"/run-*.pid
+else
+  printf 'WARNING: timeout, setsid or python3 absent — stopping a box serve NOT verified\n' >&2
 fi
 
 PATH=$REALPATH_

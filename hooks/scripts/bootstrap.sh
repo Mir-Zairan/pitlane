@@ -202,6 +202,8 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
       0)
         if [ "$WT_SERVE_STOPBY" = command ]; then
           printf 'Pitlane: stopped the server at %s (by runtime.stop).\n' "$WT_SERVE_URL"
+        elif [ -n "$WT_SERVE_CONTAINER" ]; then
+          printf 'Pitlane: stopped the server at %s (container %s).\n' "$WT_SERVE_URL" "$WT_SERVE_CONTAINER"
         else
           printf 'Pitlane: stopped the server at %s (pid %s).\n' "$WT_SERVE_URL" "$WT_SERVE_PID"
         fi
@@ -230,7 +232,8 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
     printf 'Pitlane: not served — there is no usable profile at %s; /pitlane-setup writes one.\n' "$PROFILE_PATH"
     return 1
   fi
-  if [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || [ -z "${PROFILE_RT_SERVE:-}" ]; then
+  # box.serve alone serves only in the box, which wt_serve_start chooses.
+  if [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || [ -z "${PROFILE_RT_SERVE:-}${PROFILE_BOX_SERVE:-}" ]; then
     printf 'Pitlane: not served — the profile names no runtime.serve, so Pitlane does not know how this app starts; /pitlane-setup can add one.\n'
     return 1
   fi

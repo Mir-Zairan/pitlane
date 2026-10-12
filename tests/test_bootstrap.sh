@@ -3192,6 +3192,181 @@ ne '...non-zero' 0 "$SV_RC"
 serve_cli "$WDM" --serve-stop; out=$SV_OUT
 eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server at $DURL (by runtime.stop)." "$out"
 
+# Served in the box: a short-lived container of the box's service, with the worktree's port published.
+# The fake `docker` records each call; `compose … ps -q` answers with $SBXD/id (empty: not running);
+# `compose … run` starts its entrypoint and command here, in the worktree, in a session of its own as
+# a container's process would be, so a signal to the client does not reach it; `stop` and `rm -f`
+# signal that session by its --name, and an inspect of `.State.Status` finds it while it runs.
+SBXD=$TMP/sbox
+mkdir -p "$SBXD/bin"
+cat >"$SBXD/bin/docker" <<SH
+#!/usr/bin/env bash
+{ printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$SBXD/docker.log"
+case \$1 in
+  compose)
+    while [ \$# -gt 0 ] && [ "\$1" != run ] && [ "\$1" != ps ]; do shift; done
+    case \${1-} in
+      ps) cat "$SBXD/id" 2>/dev/null ;;
+      run)
+        shift
+        name='' entry=()
+        while :; do
+          case \$1 in
+            --rm | --no-deps | -T) shift ;;
+            --name) name=\$2; shift 2 ;;
+            --entrypoint) entry=("\$2"); shift 2 ;;
+            -u | -p | -w | -e) shift 2 ;;
+            *) break ;;
+          esac
+        done
+        shift
+        setsid "\${entry[@]}" "\$@" &
+        printf '%s\n' "\$!" >"$SBXD/run-\$name.pid"
+        wait "\$!"
+        exit
+        ;;
+    esac
+    ;;
+  stop) p=\$(cat "$SBXD/run-\$4.pid" 2>/dev/null) && kill -TERM -- "-\$p" 2>/dev/null ;;
+  rm) p=\$(cat "$SBXD/run-\$3.pid" 2>/dev/null) && kill -KILL -- "-\$p" 2>/dev/null ;;
+  inspect)
+    case \$3 in
+      *State.Status*)
+        p=\$(cat "$SBXD/run-\$4.pid" 2>/dev/null) && kill -0 "\$p" 2>/dev/null && { echo running; exit 0; }
+        echo "Error: No such object: \$4" >&2
+        exit 1
+        ;;
+      *) echo 2147483648 ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+chmod +x "$SBXD/bin/docker"
+SBX=$TMP/sbx
+make_rt_repo "$SBX" ',
+    "serve": "touch '"$TMP"'/sbx-rt-ran; exec python3 -m http.server {port} --bind 127.0.0.1",
+    "url": "http://localhost:{port}/"'
+python3 - "$SBX/.claude/worktree-profile.json" "$TMP" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["box"] = {"service": "app", "mount": "/srv/app",
+            "serve": "touch %s/sbx-box-ran; exec python3 -m http.server {port} --bind 127.0.0.1" % sys.argv[2]}
+json.dump(d, open(p, "w"), indent=2)
+PY
+git -C "$SBX" commit -qam box
+WBX=$SBX/.claude/worktrees/boxed
+git -C "$SBX" worktree add -q "$WBX" -b worktree-boxed 2>/dev/null
+start_hook "$WBX" >/dev/null
+BXPORT=$(envval "$WBX" SERVER_PORT)
+BXURL="http://localhost:$BXPORT/"
+ne 'serve box: (fixture) the worktree has its port' '' "$BXPORT"
+box_serve() {  # $1 = mode; serve_cli from the boxed worktree with the fake docker and the box chosen
+  : >"$SBXD/docker.log"
+  rm -f "$TMP/sbx-box-ran" "$TMP/sbx-rt-ran"
+  PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=${BXTOOLCHAIN:-box} serve_cli "$WBX" "$1"
+  local f
+  for f in "$SBXD"/run-*.pid; do [ -e "$f" ] && SV_KILL="$SV_KILL $(cat "$f")"; done
+}
+serve_container() {  # $1 = worktree; the record's container field, or nothing
+  python3 - "$(git -C "$1" rev-parse --absolute-git-dir)/worktree-bootstrap-state" <<'PY'
+import sys
+try:
+    data = open(sys.argv[1], encoding="latin-1").read()
+except OSError:
+    sys.exit(0)
+for rec in data.split("\x1e"):
+    f = rec.split("\x1f")
+    if f[0] == "serve":
+        print("%d %s" % (len(f), f[8] if len(f) > 8 else ""))
+PY
+}
+
+: >"$SBXD/id"
+box_serve --serve
+# shellcheck disable=SC2016  # the backquotes are the line's own
+eq 'serve box: a box that is not running is not served from, in one line' \
+  "Pitlane: not served — the box, compose service app, is not running — start it with \`docker compose --project-directory $SBX up -d app\`, then run /pitlane-serve again" "$SV_OUT"
+ne '...non-zero' 0 "$SV_RC"
+eq '...nothing ran' 'no no' "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+lacks '...not even a container' "${NL_}run${NL_}" "$(cat "$SBXD/docker.log")"
+eq '...and nothing is recorded' '' "$(serve_record "$WBX")"
+contains '...stderr saying it is not starting the app, not that it runs outside the box' '— not starting the app' "$(cat "$TMP/err")"
+
+printf 'c0ffee12\n' >"$SBXD/id"
+box_serve --serve
+eq 'serve box: served in the box, ONE line where it answers' "Pitlane: serving at $BXURL" "$SV_OUT"
+eq '...exit 0' 0 "$SV_RC"
+eq '...running box.serve, not runtime.serve' 'yes no' \
+  "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+BXREC=$(serve_container "$WBX")
+BXNAME=${BXREC#* }
+case $BXNAME in
+  pitlane-serve-boxed-[0-9]*) pass=$((pass + 1)) ;;
+  *) eq 'serve box: the record names the container pitlane-serve-<slug>-<run pid>' 'pitlane-serve-boxed-N' "$BXNAME" ;;
+esac
+eq '...in the field after stopby' 9 "${BXREC%% *}"
+contains 'serve box: compose runs it removed when it ends, without the stack'"'"'s other services, named, as the developer, its port on loopback, in the worktree'"'"'s path in the box' \
+  "${NL_}compose${NL_}--project-directory${NL_}$SBX${NL_}run${NL_}--rm${NL_}--no-deps${NL_}-T${NL_}--name${NL_}$BXNAME${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-p${NL_}127.0.0.1:$BXPORT:$BXPORT${NL_}-w${NL_}/srv/app/.claude/worktrees/boxed${NL_}-e${NL_}HOME=/tmp${NL_}" \
+  "$(cat "$SBXD/docker.log")"
+contains '...through the env entrypoint, clearing runtime.env.vars'"'"' names, the command expanded' \
+  "${NL_}--entrypoint${NL_}env${NL_}app${NL_}-u${NL_}DATABASE_NAME${NL_}-u${NL_}TEST_DATABASE_NAME${NL_}-u${NL_}CI_DATABASE_NAME${NL_}sh${NL_}-c${NL_}touch $TMP/sbx-box-ran; exec python3 -m http.server $BXPORT --bind 127.0.0.1" \
+  "$(cat "$SBXD/docker.log")"
+contains 'serve box: the app answers from the worktree, through the published port' "SERVER_PORT=$BXPORT" \
+  "$(answers "${BXURL}.env.worktree.local")"
+box_serve --serve
+eq 'serve box: a second call reports the running server' "Pitlane: already serving at $BXURL" "$SV_OUT"
+lacks '...starting no second container' "${NL_}run${NL_}" "$(cat "$SBXD/docker.log")"
+
+box_serve --serve-stop
+eq 'serve-stop box: stops it, naming the container' "Pitlane: stopped the server at $BXURL (container $BXNAME)." "$SV_OUT"
+eq '...exit 0' 0 "$SV_RC"
+contains '...its host side stopping the container by name, with a grace, then removing it' \
+  "CALL${NL_}stop${NL_}-t${NL_}5${NL_}$BXNAME${NL_}CALL${NL_}rm${NL_}-f${NL_}$BXNAME${NL_}" "$(cat "$SBXD/docker.log")"
+contains '...the URL no longer answers' 'NO ANSWER' "$(answers "$BXURL")"
+eq '...and the record is cleared' '' "$(serve_record "$WBX")"
+
+# The host side killed with its group — nothing traps a SIGKILL — leaves the container serving; a
+# later --serve-stop removes it by the name its record holds.
+box_serve --serve
+eq 'serve box: served again' "Pitlane: serving at $BXURL" "$SV_OUT"
+BXREC=$(serve_container "$WBX")
+BXNAME=${BXREC#* }
+kill -s KILL -- "-$(serve_pid "$WBX")" 2>/dev/null
+sleep 0.3
+contains '...its host side killed, the container still answers' "SERVER_PORT=$BXPORT" "$(answers "${BXURL}.env.worktree.local")"
+box_serve --serve-stop
+eq 'serve-stop box: the container is removed by its recorded name' "Pitlane: stopped the server at $BXURL (container $BXNAME)." "$SV_OUT"
+eq '...exit 0' 0 "$SV_RC"
+contains '...by docker rm -f' "CALL${NL_}rm${NL_}-f${NL_}$BXNAME" "$(cat "$SBXD/docker.log")"
+for _ in $(seq 1 30); do case $(answers "$BXURL") in 'NO ANSWER'*) break ;; esac; sleep 0.1; done
+contains '...the URL no longer answers' 'NO ANSWER' "$(answers "$BXURL")"
+eq '...and the record is cleared' '' "$(serve_record "$WBX")"
+
+# With no box.serve, the box runs runtime.serve.
+python3 - "$WBX/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+del d["box"]["serve"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+box_serve --serve
+eq 'serve box: with no box.serve, runtime.serve runs in the box' "Pitlane: serving at $BXURL" "$SV_OUT"
+eq '...runtime.serve it is' 'no yes' "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+contains '...in a container' "${NL_}run${NL_}--rm${NL_}" "$(cat "$SBXD/docker.log")"
+box_serve --serve-stop
+contains '...and is stopped' "Pitlane: stopped the server at $BXURL (container" "$SV_OUT"
+
+# Outside box mode box.serve is ignored, and serving is as it was: no docker, a seven-field record.
+git -C "$WBX" checkout -q -- .claude/worktree-profile.json
+BXTOOLCHAIN=shell box_serve --serve
+eq 'serve: the box not chosen, runtime.serve runs as before' "Pitlane: serving at $BXURL" "$SV_OUT"
+eq '...box.serve ignored' 'no yes' "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+eq '...docker never called' '' "$(cat "$SBXD/docker.log")"
+eq '...and the record has its seven fields, no container' '8 ' "$(serve_container "$WBX")"
+BXTOOLCHAIN=shell box_serve --serve-stop
+contains '...stopped by its pid' "Pitlane: stopped the server at $BXURL (pid" "$SV_OUT"
+
 
 # ---------------------------------------------------------------------------
 # Build output: artifacts[] end to end

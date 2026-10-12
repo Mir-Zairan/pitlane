@@ -756,6 +756,7 @@ WT_BOX_ENV_FILES=()   # the env files compose reads, given or by its own default
 WT_BOX_ROOT=''        # the main checkout the box was last selected for
 WT_BOX_CONTAINER=''   # the service's running container, once probed
 WT_BOX_PROBED=''      # the main checkout the probe ran for, set when it found nothing too
+WT_BOX_DOWN=0         # 1 when the last selection chose the box but its service did not answer
 WT_BOX_PROBE_WHY=''   # why it found nothing: paths, slow or stopped
 WT_BOX_PROBE_ID=''    # what the last probe found
 WT_BOX_DATABASE_CONTAINER=''  # the same three for box.database's service
@@ -779,12 +780,20 @@ wt_box_log_once() {  # $1 = reason, $2 = message
   wt_log "$2"
 }
 
+# The compose command that starts service $1, for a line telling the developer to.
+wt_box_up_command() {  # $1 = service
+  printf '%sup -d %s' "$(printf '%q ' "${WT_BOX_COMPOSE_ARGV[@]}")" "$1"
+}
+
 # True when the profile's commands for worktree $1 run in the box; sets WT_BOX_ROOT and
-# WT_BOX_CONTAINER for wt_box_exec_argv.
-wt_toolchain_is_box() {  # $1 = worktree
-  local worktree=${1%/} want=${PITLANE_TOOLCHAIN:-auto} root why limit
+# WT_BOX_CONTAINER for wt_box_exec_argv. WT_BOX_DOWN is 1 when the box is chosen but its service does
+# not answer (WT_BOX_PROBE_WHY says why): a step then runs outside it, while serve, whose command
+# only the box may have, refuses. $2 is what the line saying so ends with.
+wt_toolchain_is_box() {  # $1 = worktree, $2 = what is done instead when the service does not answer
+  local worktree=${1%/} want=${PITLANE_TOOLCHAIN:-auto} instead=${2:-running them outside it} root why limit
   local -a bound=()
   WT_BOX_ROOT=''
+  WT_BOX_DOWN=0
   case $want in
     shell | host) return 1 ;;
     box | auto) ;;
@@ -818,10 +827,11 @@ wt_toolchain_is_box() {  # $1 = worktree
     return 1
   fi
   if ! wt_box_container "$root"; then
+    WT_BOX_DOWN=1
     case $WT_BOX_PROBE_WHY in
-      paths) wt_box_log_once paths "$why, but box.compose or box.envFiles names a path that is not inside the main checkout — running them outside it" ;;
-      slow) wt_box_log_once slow "$why, but docker did not answer within ${WT_BOX_PROBE_SECONDS}s — running them outside it" ;;
-      *) wt_box_log_once stopped "$why, but it is not running (start it with \`$(printf '%q ' "${WT_BOX_COMPOSE_ARGV[@]}")up -d $PROFILE_BOX_SERVICE\`) — running them outside it" ;;
+      paths) wt_box_log_once paths "$why, but box.compose or box.envFiles names a path that is not inside the main checkout — $instead" ;;
+      slow) wt_box_log_once slow "$why, but docker did not answer within ${WT_BOX_PROBE_SECONDS}s — $instead" ;;
+      *) wt_box_log_once stopped "$why, but it is not running (start it with \`$(wt_box_up_command "$PROFILE_BOX_SERVICE")\`) — $instead" ;;
     esac
     return 1
   fi
@@ -991,29 +1001,13 @@ wt_box_pass_argv() {  # sets WT_BOX_PASS
   done <<<"$(compgen -e)"
 }
 
-# Build the argv that runs command $1 in the box, in directory $2, into WT_CMD_ARGV. Fails, with a
-# log line, when $2 is outside the main checkout: the step must not run in some other directory.
-# Only after wt_toolchain_is_box said yes, which sets the box it runs in.
-#
-# The command reaches exactly one shell, as in wt_build_shell_argv. That shell is POSIX `sh -c`, not a
-# login shell: a login shell's profile can reset the PATH the image sets, losing the project's tools.
-#
-# `env -u` clears what the box's compose `environment:` pins but the worktree's env files must decide
-# — runtime.env.vars' names, which hold the worktree's own databases and port, and box.clearEnv: most
-# frameworks rank the process environment above a .env file, so the main checkout's values would win.
-#
-# The docker command is wrapped on both sides by the WT_BOX_STEP_* scripts below, so a step that is
-# stopped stops in the box too; the result is still one argv, for the guard to wrap.
-wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
-  local cmd=${1-} dir=${2-} where name rec body key file
-  local -a cleared=()
-  WT_CMD_ARGV=()
-  if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
-    wt_log "cannot run \"$cmd\" in the box: $dir is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
-    return 1
-  fi
-  [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
-  wt_box_pass_argv
+# `env -u` options into WT_BOX_CLEARED for what the box's compose `environment:` pins but the
+# worktree's env files must decide — runtime.env.vars' names, which hold the worktree's own databases
+# and port, and box.clearEnv: most frameworks rank the process environment above a .env file, so the
+# main checkout's values would win.
+wt_box_cleared_argv() {  # sets WT_BOX_CLEARED
+  local rec body key name
+  WT_BOX_CLEARED=()
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
       3"$WT_US"*) ;;
@@ -1022,17 +1016,68 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
     body=${rec#*"$WT_US"}
     IFS=$WT_US read -r key _ <<<"$body" || true
     # A `<file>:<VAR>` key sets VAR in that one file.
-    cleared+=(-u "${key##*:}")
+    WT_BOX_CLEARED+=(-u "${key##*:}")
   done < <(printf '%s' "${PROFILE_RAW:-}")
   wt_split_list : "${PROFILE_BOX_CLEAR_ENV-}"
   for name in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
-    cleared+=(-u "$name")
+    WT_BOX_CLEARED+=(-u "$name")
   done
+}
+
+# Build the argv that runs command $1 in the box, in directory $2, into WT_CMD_ARGV. Fails, with a
+# log line, when $2 is outside the main checkout: the step must not run in some other directory.
+# Only after wt_toolchain_is_box said yes, which sets the box it runs in.
+#
+# The command reaches exactly one shell, as in wt_build_shell_argv. That shell is POSIX `sh -c`, not a
+# login shell: a login shell's profile can reset the PATH the image sets, losing the project's tools.
+#
+# The docker command is wrapped on both sides by the WT_BOX_STEP_* scripts below, so a step that is
+# stopped stops in the box too; the result is still one argv, for the guard to wrap.
+wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
+  local cmd=${1-} dir=${2-} where file
+  WT_CMD_ARGV=()
+  if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
+    wt_log "cannot run \"$cmd\" in the box: $dir is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
+    return 1
+  fi
+  [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
+  wt_box_pass_argv
+  wt_box_cleared_argv
   file="${WT_BOX_STEP_DIR:-/tmp}/pitlane-step-$$-$RANDOM$RANDOM.pid"
   WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$WT_BOX_CONTAINER" "$WT_BOX_USER" "$file" "$WT_BOX_STEP_STOP"
     docker exec -i -u "$WT_BOX_USER" -w "$where" "${WT_BOX_PASS[@]}" "$WT_BOX_CONTAINER")
-  [ "${#cleared[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${cleared[@]}")
+  [ "${#WT_BOX_CLEARED[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${WT_BOX_CLEARED[@]}")
   WT_CMD_ARGV+=(sh -c "$WT_BOX_STEP_BOX" pitlane-step "$file" "$cmd")
+}
+
+# Build the argv that serves command $1 from worktree $2 into WT_CMD_ARGV: a short-lived container of
+# the box's service named $3, with port $4 published on the host's loopback, as the step user, with
+# what wt_box_exec_argv passes and clears. Fails, with a log line, when $2 is outside the main
+# checkout. Only after wt_toolchain_is_box said yes.
+#
+# A running container cannot publish a port it was not started with, so the app gets a container of
+# its own (`compose run`), not an exec in the box; --no-deps, because the stack is the developer's to
+# start. Docker forwards the published port to the container's own interface, so the command must
+# listen on 0.0.0.0:<port> there: a server bound to 127.0.0.1 inside it is never reached.
+#
+# `compose run` does not pass a signal on to its container (measured), so the host side is
+# WT_BOX_STEP_HOST given the name and no file: a stop of the server stops its container by name.
+wt_box_serve_argv() {  # $1 = command, $2 = worktree, $3 = container name, $4 = port; sets WT_CMD_ARGV
+  local cmd=${1-} wt=${2-} name=${3-} port=${4-} where
+  WT_CMD_ARGV=()
+  if ! where=$(wt_box_path "$wt" "$WT_BOX_ROOT"); then
+    wt_log "cannot serve \"$cmd\" in the box: $wt is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
+    return 1
+  fi
+  wt_box_compose_argv "$WT_BOX_ROOT" || return 1
+  [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
+  wt_box_pass_argv
+  wt_box_cleared_argv
+  WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$name" "$WT_BOX_USER" '' ''
+    "${WT_BOX_COMPOSE_ARGV[@]}" run --rm --no-deps -T --name "$name" -u "$WT_BOX_USER"
+    -p "127.0.0.1:$port:$port" -w "$where" "${WT_BOX_PASS[@]}" --entrypoint env "$PROFILE_BOX_SERVICE")
+  [ "${#WT_BOX_CLEARED[@]}" -eq 0 ] || WT_CMD_ARGV+=("${WT_BOX_CLEARED[@]}")
+  WT_CMD_ARGV+=(sh -c "$cmd")
 }
 
 # Build the argv that runs command $1, in directory $2, in a throwaway container of box.database's
@@ -1058,7 +1103,7 @@ wt_box_database_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
   if ! wt_box_database_container "$WT_BOX_ROOT"; then
     case $WT_BOX_DATABASE_WHY in
       slow) wt_log "cannot run \"$cmd\" in the database image: docker did not answer within ${WT_BOX_PROBE_SECONDS}s" ;;
-      *) wt_log "cannot run \"$cmd\" in the database image: compose service $PROFILE_BOX_DATABASE is not running (start it with \`$(printf '%q ' "${WT_BOX_COMPOSE_ARGV[@]}")up -d $PROFILE_BOX_DATABASE\`)" ;;
+      *) wt_log "cannot run \"$cmd\" in the database image: compose service $PROFILE_BOX_DATABASE is not running (start it with \`$(wt_box_up_command "$PROFILE_BOX_DATABASE")\`)" ;;
     esac
     return 1
   fi
@@ -1111,7 +1156,8 @@ wt_box_database_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
 # end, then kills it, and exits 128 + the signal; `timeout` reports its own 124 regardless. A client that
 # ended by a signal it could not trap (the cap's SIGKILL) has the step stopped in the box as well. The
 # traps are set before the client starts, so no signal falls between the two. With $3 and $4 empty, $1
-# names a throwaway container the docker command runs, and stopping the step removes it.
+# names a throwaway container the docker command runs, and stopping the step stops that container —
+# `docker stop` gives it the same 5 seconds — then removes it.
 #
 # WT_BOX_STEP_DIR exists for the tests: the directory of the file in the box, /tmp by default.
 # shellcheck disable=SC2016  # these are scripts, expanded where they run
@@ -1137,6 +1183,7 @@ WT_BOX_STEP_HOST='box=$1 user=$2 file=$3 stopper=$4 client=""
 shift 4
 stop_in_box() {  # $1 = signal name
   if [ -z "$file" ]; then
+    [ "$1" = KILL ] || docker stop -t 5 "$box" </dev/null >/dev/null 2>&1
     docker rm -f "$box" </dev/null >/dev/null 2>&1
     return
   fi
@@ -5545,13 +5592,13 @@ wt_serve_lockfile() {  # $1 = worktree
   printf '%s/worktree-serve.lock' "${p%/*}"
 }
 
-# Read this worktree's `serve` record into WT_SERVE_PID, _PGID, _IDENTITY, _CKSUM, _URL, _WHEN and
-# _STOPBY (`signal` or `command`). Returns 1, with the PID empty, when there is none — by the state
-# file's no-partial-trust rules.
+# Read this worktree's `serve` record into WT_SERVE_PID, _PGID, _IDENTITY, _CKSUM, _URL, _WHEN,
+# _STOPBY (`signal` or `command`) and _CONTAINER (the container a box serve runs in, or empty).
+# Returns 1, with the PID empty, when there is none — by the state file's no-partial-trust rules.
 wt_serve_record_read() {  # $1 = worktree
   local rest
   WT_SERVE_PID='' WT_SERVE_PGID='' WT_SERVE_IDENTITY='' WT_SERVE_CKSUM='' WT_SERVE_URL='' WT_SERVE_WHEN=''
-  WT_SERVE_STOPBY=''
+  WT_SERVE_STOPBY='' WT_SERVE_CONTAINER=''
   rest=$(wt_serve_record_raw "$1") || return 1
   wt_serve_record_parse "$rest"
 }
@@ -5582,16 +5629,23 @@ wt_serve_record_raw() {  # $1 = worktree
 }
 
 # Load the fields of a `serve` record ($1, after the kind) into WT_SERVE_*. Returns 1, with the PID
-# empty, for a record nothing it names may be signalled from: a non-numeric pid or an unknown stopby.
+# empty, for a record nothing it names may be signalled from: a non-numeric pid, an unknown stopby,
+# or a container name wt_serve_container_name could not have made — it goes where docker reads options.
 wt_serve_record_parse() {  # $1 = the record's fields, US-joined
   # SC2034: _CKSUM and _WHEN are for the reader of the record (teardown), not this file.
   # shellcheck disable=SC2034
   IFS=$WT_US read -r WT_SERVE_PID WT_SERVE_PGID WT_SERVE_IDENTITY WT_SERVE_CKSUM WT_SERVE_URL WT_SERVE_WHEN \
-    WT_SERVE_STOPBY <<<"${1-}" || true
+    WT_SERVE_STOPBY WT_SERVE_CONTAINER <<<"${1-}" || true
   wt_is_posint "$WT_SERVE_PID" || { WT_SERVE_PID=''; return 1; }
   case $WT_SERVE_STOPBY in
     '' | signal) WT_SERVE_STOPBY=signal ;;
     command) ;;
+    *) WT_SERVE_PID=''; return 1 ;;
+  esac
+  case $WT_SERVE_CONTAINER in
+    '') ;;
+    pitlane-serve-*[!A-Za-z0-9_.-]*) WT_SERVE_PID=''; return 1 ;;
+    pitlane-serve-?*) ;;
     *) WT_SERVE_PID=''; return 1 ;;
   esac
   return 0
@@ -5601,12 +5655,13 @@ wt_serve_record_parse() {  # $1 = the record's fields, US-joined
 # cannot interleave with a session's own state write and be lost — a lost record is a server
 # nothing will ever stop. A caller that already holds that lock on fd 8 (teardown) sets
 # WT_STATE_LOCK_HELD=1: taking it again here would reopen fd 8, which drops the caller's lock.
-# The record's mirror (below) follows every successful write.
-wt_serve_record_write() {  # $1 = worktree, $2 = pid ('' removes), $3 = pgid, $4 = identity, $5 = cmdcksum, $6 = url, $7 = stopby (default signal)
+# The record's mirror (below) follows every successful write. The container field is written only
+# when there is one, so a record without stays the seven fields an earlier version reads.
+wt_serve_record_write() {  # $1 = worktree, $2 = pid ('' removes), $3 = pgid, $4 = identity, $5 = cmdcksum, $6 = url, $7 = stopby (default signal), $8 = container
   local wt=${1%/} rec='' held=0 when old rc
   if [ -n "${2-}" ]; then
     when=$(date +%s 2>/dev/null) || when=0
-    wt_state_join serve "$2" "${3-}" "${4-}" "${5-}" "${6-}" "$when" "${7:-signal}"
+    wt_state_join serve "$2" "${3-}" "${4-}" "${5-}" "${6-}" "$when" "${7:-signal}" ${8:+"$8"}
     rec=$WT_STATE_REC
   fi
   if [ "${WT_STATE_LOCK_HELD:-0}" != 1 ]; then
@@ -5697,7 +5752,7 @@ wt_serve_mirror_update() {  # $1 = worktree, $2 = old record's fields or empty, 
 wt_serve_mirror_parse() {  # $1 = mirror file
   local file=${1-} rec kind rest seen=0 have_wt=0 serve=''
   WT_SERVE_MIRROR_PATH='' WT_SERVE_MIRROR_ADMIN='' WT_SERVE_MIRROR_NAME='' WT_SERVE_MIRROR_SLUG=''
-  WT_SERVE_MIRROR_PORT='' WT_SERVE_PID=''
+  WT_SERVE_MIRROR_PORT='' WT_SERVE_PID='' WT_SERVE_CONTAINER=''
   [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r -d "$WT_RS" rec; do
     kind=${rec%%"$WT_US"*}
@@ -5813,14 +5868,16 @@ wt_serve_remains() {
 # Stop the server this plugin recorded for worktree $1, and only it: SIGTERM to its group, then,
 # after PITLANE_SERVE_STOP_SECONDS (default 10), SIGKILL to what is left of the group. A leader that
 # has exited while its group lives on is not "already exited": the group is stopped. A server
-# recorded as stopped by command is stopped by wt_serve_stop_by_command. The record is cleared
-# whenever there is nothing of ours left to stop. Sets WT_SERVE_* from the record.
+# recorded as stopped by command is stopped by wt_serve_stop_by_command. A box serve's container is
+# removed by its recorded name once its group is gone, whatever became of the group. The record is
+# cleared whenever there is nothing of ours left to stop. Sets WT_SERVE_* from the record.
 #   0  stopped
 #   1  nothing is recorded
-#   2  it had already exited, and nothing of its group is left (record cleared)
+#   2  it had already exited, and nothing of its group or container is left (record cleared)
 #   3  its PID now belongs to another process, which is left alone (record cleared)
 #   4  it would not stop (record kept)
-#   5  runtime.stop could not stop it — WT_SERVE_STOP_WHY says why (record kept)
+#   5  runtime.stop, or docker for its container, could not stop it — WT_SERVE_STOP_WHY says why
+#      (record kept)
 wt_serve_stop() {  # $1 = worktree
   local wt=${1%/} rc
   wt_serve_check "$wt"
@@ -5839,11 +5896,17 @@ wt_serve_stop() {  # $1 = worktree
 wt_serve_stop_judged() {  # $1 = judged code, $2 = directory runtime.stop runs in, $3 = clear function, $4 = its first argument
   local rc=$1 rundir=$2 clear=$3 key=$4 grace=${PITLANE_SERVE_STOP_SECONDS:-10} i
   wt_is_seconds "$grace" || grace=10
+  WT_SERVE_STOP_WHY=''
   case $rc in
     0) ;;
     1) return 1 ;;
     2)
       if ! wt_serve_group_ours; then
+        wt_serve_container_remove
+        case $? in
+          0) "$clear" "$key" ''; return 0 ;;
+          2) return 5 ;;
+        esac
         "$clear" "$key" ''
         return 2
       fi
@@ -5853,7 +5916,16 @@ wt_serve_stop_judged() {  # $1 = judged code, $2 = directory runtime.stop runs i
       wt_serve_stop_by_command "$rundir" "$grace" "$clear" "$key"
       return
       ;;
-    *) "$clear" "$key" ''; return "$rc" ;;
+    *)
+      # The PID is another process's, never signalled; a container is ours by its name alone.
+      wt_serve_container_remove
+      case $? in
+        0) "$clear" "$key" ''; return 0 ;;
+        2) return 5 ;;
+      esac
+      "$clear" "$key" ''
+      return "$rc"
+      ;;
   esac
   wt_serve_signal TERM
   i=0
@@ -5872,7 +5944,49 @@ wt_serve_stop_judged() {  # $1 = judged code, $2 = directory runtime.stop runs i
     done
     wt_serve_remains && return 4
   fi
+  wt_serve_container_remove
+  [ $? -ne 2 ] || return 5
   "$clear" "$key" ''
+  return 0
+}
+
+# Is the container the loaded record names (WT_SERVE_CONTAINER) still there, running or not?
+#   0  yes   1  no, or none is named   2  docker could not say — WT_SERVE_STOP_WHY says why
+# Bounded by WT_BOX_PROBE_SECONDS, as every docker question here is.
+wt_serve_container_present() {
+  local out rc=0
+  local -a bound=()
+  [ -n "${WT_SERVE_CONTAINER:-}" ] || return 1
+  if ! command -v docker >/dev/null 2>&1; then
+    WT_SERVE_STOP_WHY="docker is not on PATH, so whether its container $WT_SERVE_CONTAINER is still there cannot be checked"
+    return 2
+  fi
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+  # shellcheck disable=SC2016  # a Go template, for docker
+  out=$(${bound[@]+"${bound[@]}"} docker inspect -f '{{.State.Status}}' "$WT_SERVE_CONTAINER" </dev/null 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  case $out in
+    *'No such'*) return 1 ;;
+  esac
+  WT_SERVE_STOP_WHY="docker did not say whether its container $WT_SERVE_CONTAINER is still there"
+  return 2
+}
+
+# Remove the container the loaded record names, by that name: its host side stops it when the
+# server's group is signalled, but a host side that is gone — killed with the group, or never given
+# the signal — leaves it serving. 0 removed, 1 none there, 2 not removed (WT_SERVE_STOP_WHY says why).
+wt_serve_container_remove() {
+  local rc
+  local -a bound=()
+  wt_serve_container_present
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+  if ! ${bound[@]+"${bound[@]}"} docker rm -f "$WT_SERVE_CONTAINER" </dev/null >/dev/null 2>&1; then
+    WT_SERVE_STOP_WHY="docker rm -f $WT_SERVE_CONTAINER failed"
+    return 2
+  fi
+  wt_log "removed the container the server ran in, $WT_SERVE_CONTAINER"
   return 0
 }
 
@@ -5978,7 +6092,8 @@ wt_serve_probe() {  # $1 = url, $2 = pid or empty, $3 = seconds
   done
 }
 
-# Start the expanded command $2 detached in worktree $1, inside the profile's shell and under the
+# Start the expanded command $2 detached in worktree $1, inside the profile's shell — or, given a
+# container name $4, in a container of the box publishing port $5 (wt_box_serve_argv) — and under the
 # resource guard (ADR-018), output appended to log $3. Sets WT_SERVE_STARTED to its PID, and
 # WT_SERVE_LAUNCHER to the child this shell can `wait` on for its exit status — the same process,
 # unless setsid had to fork.
@@ -5990,8 +6105,8 @@ wt_serve_probe() {  # $1 = url, $2 = pid or empty, $3 = seconds
 # (measured: the scope's process is the command itself, exec'd, and lives on after this script
 # exits). The PID is written by the process itself after setsid, so it is right even where setsid
 # had to fork.
-wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
-  local wt=${1%/} cmd=$2 log=$3 pidf pid='' i detach
+wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file, $4 = container name ('' outside the box), $5 = port
+  local wt=${1%/} cmd=$2 log=$3 container=${4-} port=${5-} pidf pid='' i detach
   WT_SERVE_STARTED='' WT_SERVE_LAUNCHER=''
   if [ "${WT_APPROVAL:-}" = no ]; then
     wt_log "not running \"$cmd\": the profile's commands are not approved"
@@ -6005,7 +6120,9 @@ wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
     wt_log "neither setsid nor python3 is on PATH, so the server cannot be detached from this command"
     return 1
   fi
-  if wt_nix_shell_missing "$wt"; then
+  if [ -n "$container" ]; then
+    wt_box_serve_argv "$cmd" "$wt" "$container" "$port" || return 1
+  elif wt_nix_shell_missing "$wt"; then
     wt_log "the profile's shell is \"$PROFILE_SHELL\" but this branch has no flake.nix/shell.nix — running on the host shell instead"
     WT_CMD_ARGV=(bash -lc "$cmd")
   elif wt_shell_program_missing; then
@@ -6022,6 +6139,7 @@ wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
   # A server inheriting a lock descriptor would hold that lock for as long as it runs.
   ( wt_close_lock_fds
     cd "$wt" 2>/dev/null || exit 1
+    [ -z "$container" ] || wt_box_export_env
     # shellcheck disable=SC2016  # $$, $1 and $@ belong to the inner shell.
     exec "${detach[@]}" bash -c 'printf "%s\n" "$$" >"$1" || exit 1; shift; exec "$@"' pitlane-serve "$pidf" "${WT_CMD_ARGV[@]}"
   ) </dev/null >>"$log" 2>&1 &
@@ -6056,12 +6174,21 @@ wt_serve_missing() {  # $1 = worktree
   WT_SERVE_MISSING=$(wt_visible "$WT_SERVE_MISSING")
 }
 
+# The name of the container a box serve runs in: Pitlane's, the worktree's slug, and this run's pid,
+# so no two runs on this machine make the same one — in only the characters docker takes in a name.
+wt_serve_container_name() {  # $1 = slug
+  local slug=${1//[!A-Za-z0-9_.-]/-}
+  printf 'pitlane-serve-%s%s' "${slug:+$slug-}" "$$"
+}
+
 # `bootstrap.sh --serve`, once the profile is loaded and approved and any background setup has
-# finished: check the pieces, start runtime.serve, record it, probe it. Prints ONE line on stdout —
-# `Pitlane: serving at <url>`, `Pitlane: already serving at <url>`, or `Pitlane: not served — <why>`
-# — and returns 0 only when the app answers (or a server it started already runs).
+# finished: check the pieces, start runtime.serve — in the box, box.serve when the profile sets it —
+# record it, probe it. Prints ONE line on stdout — `Pitlane: serving at <url>`, `Pitlane: already
+# serving at <url>`, or `Pitlane: not served — <why>` — and returns 0 only when the app answers (or
+# a server it started already runs).
 wt_serve_start() {  # $1 = worktree
   local wt=${1%/} port slug cmd why='' url='' log secs rc pid identity pgid held=0 lock started launched
+  local serve=${PROFILE_RT_SERVE:-} servekey=runtime.serve container='' 
   secs=${PITLANE_SERVE_TIMEOUT:-60}
   wt_is_seconds "$secs" || secs=60
   log=$(wt_serve_logfile "$wt")
@@ -6118,7 +6245,8 @@ wt_serve_start() {  # $1 = worktree
       ;;
     3)
       wt_log "pid $WT_SERVE_PID, recorded for the server started here before, now belongs to another process — leaving it alone and starting a new server"
-      wt_serve_record_write "$wt" ''
+      # Clears the record, after removing the container a box serve left, which is ours by its name.
+      wt_serve_stop "$wt"
       ;;
   esac
 
@@ -6130,15 +6258,30 @@ wt_serve_start() {  # $1 = worktree
   export WT_PORT
   wt_serve_missing "$wt"
   [ -z "$slug" ] || { WT_SLUG=$slug; export WT_SLUG; }
+  if wt_toolchain_is_box "$wt" 'not starting the app'; then
+    [ -z "${PROFILE_BOX_SERVE:-}" ] || { serve=$PROFILE_BOX_SERVE servekey=box.serve; }
+    container=$(wt_serve_container_name "${slug:-${WT_SLUG-}}")
+  fi
   if [ -n "$WT_SERVE_MISSING" ]; then
     why="this worktree's setup is not complete — $WT_SERVE_MISSING; run /pitlane-finish first"
+  elif [ "$WT_BOX_DOWN" = 1 ]; then
+    # The box was chosen, so the app's toolchain is likely the box's alone: not served outside it.
+    case $WT_BOX_PROBE_WHY in
+      paths) why='box.compose or box.envFiles names a path that is not inside the main checkout, so the box cannot be used' ;;
+      slow) why="docker did not answer within ${WT_BOX_PROBE_SECONDS}s, so the box (compose service $PROFILE_BOX_SERVICE) cannot be reached" ;;
+      *) why="the box, compose service $PROFILE_BOX_SERVICE, is not running — start it with \`$(wt_box_up_command "$PROFILE_BOX_SERVICE")\`, then run /pitlane-serve again" ;;
+    esac
+  elif [ -z "$serve" ]; then
+    why='the profile names no runtime.serve, and box.serve is used only in the box; /pitlane-setup can add one'
+  elif [ -n "$container" ] && [ -z "$port" ]; then
+    why='the box publishes the app on this worktree'"'"'s port, and it has none yet; run /pitlane-finish first'
   else
-    case $PROFILE_RT_SERVE$PROFILE_RT_URL in
-      *'{port}'*) [ -n "$port" ] || why='runtime.serve or runtime.url uses {port}, but this worktree has no port yet; run /pitlane-finish first' ;;
+    case $serve$PROFILE_RT_URL in
+      *'{port}'*) [ -n "$port" ] || why="$servekey or runtime.url uses {port}, but this worktree has no port yet; run /pitlane-finish first" ;;
     esac
   fi
-  if [ -z "${why:-}" ] && ! cmd=$(wt_runtime_command "$PROFILE_RT_SERVE"); then
-    why="runtime.serve is refused: $cmd"
+  if [ -z "${why:-}" ] && ! cmd=$(wt_runtime_command "$serve"); then
+    why="$servekey is refused: $cmd"
   fi
   if [ -z "${why:-}" ]; then
     if [ -n "${PROFILE_RT_URL:-}" ]; then
@@ -6163,7 +6306,7 @@ wt_serve_start() {  # $1 = worktree
   { printf '%s serving %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$wt" "$(wt_visible "$cmd")"; } >"$log" 2>/dev/null \
     || { [ "$held" -eq 1 ] && wt_lock_release 7; printf 'Pitlane: not served — cannot write its log at %s\n' "$log"; return 1; }
   wt_log "starting the app: $(wt_visible "$cmd") — output in $log"
-  wt_serve_launch "$wt" "$cmd" "$log"
+  wt_serve_launch "$wt" "$cmd" "$log" "$container" "$port"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     [ "$held" -eq 1 ] && wt_lock_release 7
@@ -6191,13 +6334,13 @@ wt_serve_start() {  # $1 = worktree
   fi
   pgid=$(wt_proc_pgrp "$pid") || pgid=''
   [ "$pgid" = "$pid" ] || pgid=''
-  [ -z "$identity" ] || wt_serve_record_write "$wt" "$pid" "$pgid" "$identity" "$(wt_cksum_string "$cmd")" "$url" \
+  [ -z "$identity" ] || wt_serve_record_write "$wt" "$pid" "$pgid" "$identity" "$(wt_cksum_string "$cmd")" "$url" signal "$container" \
     || wt_log "could not record the server (pid $pid) in $(wt_state_path "$wt") — teardown will not know to stop it"
 
   wt_serve_probe "$url" "$pid" "$secs"
   rc=$?
   if [ "$rc" -eq 2 ]; then
-    wt_serve_detached "$wt" "$url" "$pid" "$launched" $((secs - ($(date +%s) - started))) "$cmd" "$log"
+    wt_serve_detached "$wt" "$url" "$pid" "$launched" $((secs - ($(date +%s) - started))) "$cmd" "$log" "$container"
     rc=$?
     [ "$held" -eq 1 ] && wt_lock_release 7
     return "$rc"
@@ -6217,14 +6360,15 @@ wt_serve_start() {  # $1 = worktree
 # runtime.stop). Its exit status tells the two apart when this shell started it; one it cannot wait
 # on counts as 0. After an exit 0 the URL is given the rest of the time limit, asked at least once.
 # A server that answers is recorded as stopped by command when the profile has runtime.stop; with
-# none it is reported as one Pitlane cannot stop. Prints the ONE line and returns wt_serve_start's
-# status.
-wt_serve_detached() {  # $1 = worktree, $2 = url, $3 = pid, $4 = launcher, $5 = seconds left, $6 = expanded command, $7 = log
-  local wt=$1 url=$2 pid=$3 launched=$4 left=$5 cmd=$6 log=$7 status=0
+# none it is reported as one Pitlane cannot stop. A serve in the box's container ($8) cannot have
+# daemonized: what it started ended with the container. Prints the ONE line and returns
+# wt_serve_start's status.
+wt_serve_detached() {  # $1 = worktree, $2 = url, $3 = pid, $4 = launcher, $5 = seconds left, $6 = expanded command, $7 = log, $8 = container
+  local wt=$1 url=$2 pid=$3 launched=$4 left=$5 cmd=$6 log=$7 container=${8-} status=0
   if [ -n "$launched" ] && [ "$launched" = "$pid" ]; then
     wait "$launched" 2>/dev/null || status=$?
   fi
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] || [ -n "$container" ]; then
     wt_serve_record_write "$wt" ''
     printf 'Pitlane: not served — the server exited before %s answered (log: %s)\n' "$url" "$log"
     return 1
