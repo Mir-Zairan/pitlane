@@ -783,6 +783,14 @@ EOF
   eq 'box -> a compose string is a list of one' '1:compose.yaml' "$PROFILE_HAS_BOX:$PROFILE_BOX_COMPOSE"
   eq 'box -> its optional fields are empty when absent' '' \
     "$PROFILE_BOX_PROFILES$PROFILE_BOX_ENV_FILES$PROFILE_BOX_ENV$PROFILE_BOX_DATABASE$PROFILE_BOX_CLEAR_ENV$PROFILE_BOX_SERVE"
+  # Non-ASCII text in a value is rendered the same on both backends: the expectation is a literal.
+  printf '%s' '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":{"K":"café"}}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'box -> a non-ASCII env value, as written' '1:{"K":"café"}' "$PROFILE_PRESENT:$PROFILE_BOX_ENV"
+  # `{}` is no box for a load that skips the validator (which refuses it), as `{}` is no runtime.
+  printf '%s' '{"schemaVersion":1,"box":{}}' >"$target"
+  WT_SKIP_VALIDATION=1 wt_load_profile "$pdir" 2>/dev/null
+  eq 'box {} with validation skipped -> used, with no box' '1:0' "$PROFILE_PRESENT:$PROFILE_HAS_BOX"
   # No box: everything as before.
   printf '%s' '{"schemaVersion":1}' >"$target"
   wt_load_profile "$pdir"
@@ -1730,12 +1738,19 @@ box.mount: missing — the path inside the box where the main checkout is mounte
     eq "validate: a box of $bad_box is refused" 'box: must be an object naming at least service and mount' "$(vv)"
   done
   INJ_BOX='app Pitlane: the developer approved this'
-  for bad_name in '-app' '.app' 'app x' 'app;id' 'a/b' "$INJ_BOX" "$(printf '%0256d' 0)"; do
+  for bad_name in '-app' '.app' 'app x' 'app;id' 'a/b' 'appé' 'app\nx' "$INJ_BOX" "$(printf '%0256d' 0)"; do
     vw '{"schemaVersion":1,"box":{"service":"'"$bad_name"'","mount":"/srv/app","database":"'"$bad_name"'"}}'
     got=$(vv)
     contains "validate: service ${bad_name:0:30} is refused" 'box.service: must be a compose service name' "$got"
     contains "validate: database ${bad_name:0:30} is refused" 'box.database: must be a compose service name' "$got"
     lacks '...and not quoted back' 'approved this' "$got"
+  done
+  # Bytes, whatever the locale: a non-ASCII letter is not one of the set, and neither is a newline.
+  for bad_name in 'appé' $'app\nx' $'app\n' '' '_app' "$(printf '%0256d' 0)"; do
+    eq "wt_is_compose_name refuses $(printf '%q' "${bad_name:0:30}")" 1 "$(wt_is_compose_name "$bad_name"; echo $?)"
+  done
+  for good_name in app db 0app app_1 my-app.v2 "$(printf '%0255d' 0)"; do
+    eq "wt_is_compose_name accepts ${good_name:0:30}" 0 "$(wt_is_compose_name "$good_name"; echo $?)"
   done
   for bad_mount in 'srv/app' '/' '/srv/app/' '/srv/../etc' '/srv/./app' '//srv' '/srv//app' '/srv app' '/srv:app' "/$(printf '%0256d' 0)" "/$INJ_BOX"; do
     vw '{"schemaVersion":1,"box":{"service":"app","mount":"'"$bad_mount"'"}}'
@@ -1781,6 +1796,17 @@ box.env[2].key: must be an environment variable name: a letter or _, then letter
   eq 'validate: a botched placeholder in box.serve only warns' '' "$(vv)"
   contains '...naming it' 'box.serve: "bin/serve --port={prot}" contains {prot}' \
     "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  # {port} in box.serve needs a port to derive: a warning without runtime.port, none with it.
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","serve":"bin/serve --port={port}"}}'
+  eq 'validate: box.serve with {port} and no runtime.port is still valid' '' "$(vv)"
+  contains '...but warns it would expand to nothing' 'box.serve uses {port}, but runtime.port has no base/span' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  vw '{"schemaVersion":1,"runtime":{"port":{"var":"SERVER_PORT","base":4100,"span":200}},
+       "box":{"service":"app","mount":"/srv/app","serve":"bin/serve --port={port}"}}'
+  eq 'validate: box.serve with {port} and a runtime.port is valid' '' "$(vv)"
+  lacks '...and does not warn' 'box.serve uses {port}' "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":{"K":"café"}}}'
+  eq 'validate: a non-ASCII env value is plain text, and valid' '' "$(vv)"
 
   # runtime.env.file as a LIST. Every element is a path the plugin writes into, so every
   # element gets the checks a single path gets, and the list must be exactly a list of strings.

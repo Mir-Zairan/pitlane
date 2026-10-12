@@ -1198,13 +1198,14 @@ wt_profile_scan() {  # $1 = profile path
 # refuses `:` in an env file path, which is what makes the join unambiguous. WT_PS_ENVFILE stays the
 # raw scalar — compact JSON for a list — because that is how the validator tells the two shapes apart.
 # The box lists are derived the same way, each into a WT_PS_BOX_*_LIST beside its raw scalar, from
-# groups 7, 8, 9 and 11 (wt_profile_joined_list).
+# groups 7, 8, 9 and 11 (wt_profile_joined_list), in the same walk of the records.
 #
 # SC2034: every WT_PS_* looks unused here because they ARE this function's return value; the
 # readers are its two callers.
 # shellcheck disable=SC2034
 wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   local raw=${1-} rec body
+  local -a envfiles=() compose=() profiles=() boxenvfiles=() clearenv=()
   # The stream is split into its records once, and they are published as WT_PS_RECS for the callers'
   # own walks. Not cut with ${raw%%"$WT_RS"*}, which bash tries at every offset — quadratic in a stream
   # whose length the branch decides (5s for a 200 KB note) — nor read record by record from a pipe,
@@ -1224,45 +1225,52 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_BOX WT_PS_BOX_SERVICE WT_PS_BOX_MOUNT WT_PS_BOX_COMPOSE WT_PS_BOX_PROFILES \
     WT_PS_BOX_ENV_FILES WT_PS_BOX_ENV WT_PS_BOX_DATABASE WT_PS_BOX_CLEAR_ENV WT_PS_BOX_SERVE \
     <<<"$body" || true
-  wt_profile_joined_list 4 "$WT_PS_ENVFILE"
+  # The elements of every list that may arrive as one, gathered in ONE walk of the records: a walk per
+  # list cost the whole stream five times over on the session-start path. A group has records only
+  # when its field is a list, so the walk is skipped when none of them is.
+  case $WT_PS_ENVFILE$WT_US$WT_PS_BOX_COMPOSE$WT_US$WT_PS_BOX_PROFILES$WT_US$WT_PS_BOX_ENV_FILES$WT_US$WT_PS_BOX_CLEAR_ENV in
+    '['* | *"${WT_US}["*)
+      for rec in "${WT_PS_RECS[@]}"; do
+        case $rec in
+          4"$WT_US"*) envfiles[${#envfiles[@]}]=${rec#*"$WT_US"} ;;
+          7"$WT_US"*) compose[${#compose[@]}]=${rec#*"$WT_US"} ;;
+          8"$WT_US"*) profiles[${#profiles[@]}]=${rec#*"$WT_US"} ;;
+          9"$WT_US"*) boxenvfiles[${#boxenvfiles[@]}]=${rec#*"$WT_US"} ;;
+          11"$WT_US"*) clearenv[${#clearenv[@]}]=${rec#*"$WT_US"} ;;
+        esac
+      done
+      ;;
+  esac
+  wt_profile_joined_list "$WT_PS_ENVFILE" ${envfiles[@]+"${envfiles[@]}"}
   WT_PS_ENVFILES=$WT_PS_JOINED
-  wt_profile_joined_list 7 "$WT_PS_BOX_COMPOSE"
+  wt_profile_joined_list "$WT_PS_BOX_COMPOSE" ${compose[@]+"${compose[@]}"}
   WT_PS_BOX_COMPOSE_LIST=$WT_PS_JOINED
-  wt_profile_joined_list 8 "$WT_PS_BOX_PROFILES"
+  wt_profile_joined_list "$WT_PS_BOX_PROFILES" ${profiles[@]+"${profiles[@]}"}
   WT_PS_BOX_PROFILES_LIST=$WT_PS_JOINED
-  wt_profile_joined_list 9 "$WT_PS_BOX_ENV_FILES"
+  wt_profile_joined_list "$WT_PS_BOX_ENV_FILES" ${boxenvfiles[@]+"${boxenvfiles[@]}"}
   WT_PS_BOX_ENV_FILES_LIST=$WT_PS_JOINED
-  wt_profile_joined_list 11 "$WT_PS_BOX_CLEAR_ENV"
+  wt_profile_joined_list "$WT_PS_BOX_CLEAR_ENV" ${clearenv[@]+"${clearenv[@]}"}
   WT_PS_BOX_CLEAR_ENV_LIST=$WT_PS_JOINED
   return 0
 }
 
-# The list field rendered as $2 joined with `:` into WT_PS_JOINED: a list is its group-$1 elements
-# from WT_PS_RECS, in order; anything else — a string, which is a list of one — is the value itself.
-# Gathered, then joined once: appending to the joined string per element costs its length each time.
-# An empty element before the first is dropped, as runtime.env.file's join always did; the validator
-# refuses an empty element anyway. Only a list walks the records, so an absent field costs nothing.
-wt_profile_joined_list() {  # $1 = group tag, $2 = the field's rendered value
-  local rec
-  local -a items=()
+# The list field rendered as $1 joined with `:` into WT_PS_JOINED: a list is its elements, the rest of
+# the arguments, in order; anything else — a string, which is a list of one — is the value itself.
+# Joined once rather than appended to per element, which costs the joined string's length each time.
+# Empty elements before the first are dropped, as runtime.env.file's join always did; the validator
+# refuses an empty element anyway.
+wt_profile_joined_list() {  # $1 = the field's rendered value, $@ = its elements
+  local value=${1-}
+  shift
   WT_PS_JOINED=''
-  case ${2-} in
+  case $value in
     '['*) ;;
-    *) WT_PS_JOINED=${2-}; return 0 ;;
+    *) WT_PS_JOINED=$value; return 0 ;;
   esac
-  for rec in "${WT_PS_RECS[@]}"; do
-    case $rec in
-      "$1$WT_US"*) ;;
-      *) continue ;;
-    esac
-    rec=${rec#*"$WT_US"}
-    [ -n "$rec" ] || [ "${#items[@]}" -gt 0 ] || continue
-    items[${#items[@]}]=$rec
-  done
-  if [ "${#items[@]}" -gt 0 ]; then
-    printf -v WT_PS_JOINED '%s:' "${items[@]}"
-    WT_PS_JOINED=${WT_PS_JOINED%:}
-  fi
+  while [ "$#" -gt 0 ] && [ -z "$1" ]; do shift; done
+  [ "$#" -gt 0 ] || return 0
+  printf -v WT_PS_JOINED '%s:' "$@"
+  WT_PS_JOINED=${WT_PS_JOINED%:}
   return 0
 }
 
@@ -1307,11 +1315,12 @@ wt_is_compose_name() {  # $1 = candidate
 }
 
 # True if $1 is acceptable as box.mount, the absolute path inside the box where the main checkout is
-# mounted: `/` and then what wt_is_dep_path and wt_is_artifact_dir both accept — the plain path
-# characters, at most 255 bytes, no `..`, `.` or empty segment and no trailing slash — so a
+# mounted: at most 255 bytes in all, `/` and then what wt_is_dep_path and wt_is_artifact_dir both
+# accept — the plain path characters, no `..`, `.` or empty segment and no trailing slash — so a
 # worktree's path inside the box is the mount, a `/` and its path in the checkout, with one spelling.
 wt_is_box_mount() {  # $1 = candidate
-  local p=${1-}
+  local LC_ALL=C p=${1-}
+  [ "${#p}" -le 255 ] || return 1
   case $p in
     /?*) ;;
     *) return 1 ;;
@@ -2456,9 +2465,9 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
 
   # --- box ------------------------------------------------------------------
   # Optional: the long-running compose service a developer without the toolchain runs the project in.
-  # Every field becomes part of a `docker compose` or `docker exec` invocation, or is shown before the
-  # profile is approved, so all of it is held to plain names and paths and nothing has a fallback:
-  # each problem is fatal. A refused name or path is not quoted back, as a dependency dir is not.
+  # Every field is shown before the profile is approved and is meant for a `docker compose` or
+  # `docker exec` command line (the box-mode tasks wire that), so all of it is held to plain names and
+  # paths now, and nothing has a fallback: each problem is fatal. A refused name or path is not quoted back, as a dependency dir is not.
   # Keys the plugin does not read are ignored here, as they are everywhere else in the profile.
   case $WT_PS_BOX in
     '') ;;
@@ -2526,7 +2535,9 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
           bad=1
           ;;
       esac
-      # A command, run in the box, so the placeholder warnings runtime.serve gets.
+      # A command, so the placeholder warnings runtime.serve gets. As the box-mode tasks are to use it:
+      # in box mode box.serve is run when it is set, and runtime.serve otherwise; outside box mode
+      # box.serve is ignored.
       if [ -n "$WT_PS_BOX_SERVE" ]; then
         unk=$(wt_unknown_placeholders "$WT_PS_BOX_SERVE") \
           || wt_log "box.serve: \"$WT_PS_BOX_SERVE\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"

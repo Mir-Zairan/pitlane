@@ -411,9 +411,10 @@ wt_approval_still() {  # $1 = run directory
 # True when the loaded profile names anything that would be executed: an install or verify
 # command, a seed or a teardown script, a serve or stop command, an artifact's build (which every
 # artifact has: the validator requires it), or a box. `shell` alone runs nothing — it only
-# wraps those. A box is not a wrapper of the same kind: with nothing else in the profile, Pitlane still
-# runs compose on the files it names — which choose the images, mounts and commands of containers
-# started as the developer — and its serve command, so the box itself is commands. A profile that
+# wraps those. A box counts as commands for what it is for: the box-mode tasks are to run compose on
+# the files it names — which choose the images, mounts and commands of containers started as the
+# developer — and its serve command in it, with nothing else in the profile. It is held from the first
+# profile that can carry one, so approval is in place before any of that is wired. A profile that
 # runs nothing (config copies, hardlinks, ports, env overrides, a URL) needs no approval.
 wt_profile_runs_commands() {
   local rec body dir lock strategy install verify _cksum _copy
@@ -527,14 +528,15 @@ wt_approval_describe() {  # $1 = run directory
   printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
   printf 'Everything below is text from the branch, shown with control characters as ?:\n'
   [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
-  # The box: which containers run, with what compose reads and what is set or cleared in them. The
-  # lists are `:`-joined (wt_load_profile), shown comma-separated; env pairs are group 10 of the scan.
+  # The box, field by field as the profile names them: what each one drives is the box-mode tasks'
+  # to say. The lists are `:`-joined (wt_load_profile), shown comma-separated; env pairs are group 10
+  # of the scan.
   if [ "${PROFILE_HAS_BOX:-0}" = 1 ]; then
-    printf '  box: compose service %s, main checkout mounted at %s\n' \
-      "$(wt_visible "${PROFILE_BOX_SERVICE:-?}")" "$(wt_visible "${PROFILE_BOX_MOUNT:-?}")"
-    [ -n "${PROFILE_BOX_COMPOSE:-}" ] && printf '  box compose files: %s\n' "$(wt_visible "${PROFILE_BOX_COMPOSE//:/, }")"
-    [ -n "${PROFILE_BOX_PROFILES:-}" ] && printf '  box compose profiles: %s\n' "$(wt_visible "${PROFILE_BOX_PROFILES//:/, }")"
-    [ -n "${PROFILE_BOX_ENV_FILES:-}" ] && printf '  box env files (read by compose): %s\n' "$(wt_visible "${PROFILE_BOX_ENV_FILES//:/, }")"
+    printf '  box.service: %s\n' "$(wt_visible "${PROFILE_BOX_SERVICE:-?}")"
+    printf '  box.mount: %s\n' "$(wt_visible "${PROFILE_BOX_MOUNT:-?}")"
+    [ -n "${PROFILE_BOX_COMPOSE:-}" ] && printf '  box.compose: %s\n' "$(wt_visible "${PROFILE_BOX_COMPOSE//:/, }")"
+    [ -n "${PROFILE_BOX_PROFILES:-}" ] && printf '  box.profiles: %s\n' "$(wt_visible "${PROFILE_BOX_PROFILES//:/, }")"
+    [ -n "${PROFILE_BOX_ENV_FILES:-}" ] && printf '  box.envFiles: %s\n' "$(wt_visible "${PROFILE_BOX_ENV_FILES//:/, }")"
     while IFS= read -r -d "$WT_RS" rec; do
       case $rec in
         10"$WT_US"*) ;;
@@ -542,11 +544,11 @@ wt_approval_describe() {  # $1 = run directory
       esac
       body=${rec#*"$WT_US"}
       IFS=$WT_US read -r env_name env_value <<<"$body" || true
-      printf '  box env default: %s=%s\n' "$(wt_visible "$env_name")" "$(wt_visible "$env_value")"
+      printf '  box.env: %s=%s\n' "$(wt_visible "$env_name")" "$(wt_visible "$env_value")"
     done < <(printf '%s' "${PROFILE_RAW:-}")
-    [ -n "${PROFILE_BOX_DATABASE:-}" ] && printf '  box database service (its image runs the seed and teardown): %s\n' "$(wt_visible "$PROFILE_BOX_DATABASE")"
-    [ -n "${PROFILE_BOX_CLEAR_ENV:-}" ] && printf '  box clears: %s\n' "$(wt_visible "${PROFILE_BOX_CLEAR_ENV//:/, }")"
-    [ -n "${PROFILE_BOX_SERVE:-}" ] && printf '  box serve: %s\n' "$(wt_visible "$PROFILE_BOX_SERVE")"
+    [ -n "${PROFILE_BOX_DATABASE:-}" ] && printf '  box.database: %s\n' "$(wt_visible "$PROFILE_BOX_DATABASE")"
+    [ -n "${PROFILE_BOX_CLEAR_ENV:-}" ] && printf '  box.clearEnv: %s\n' "$(wt_visible "${PROFILE_BOX_CLEAR_ENV//:/, }")"
+    [ -n "${PROFILE_BOX_SERVE:-}" ] && printf '  box.serve: %s\n' "$(wt_visible "$PROFILE_BOX_SERVE")"
   fi
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in

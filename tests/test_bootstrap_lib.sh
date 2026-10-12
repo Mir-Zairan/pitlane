@@ -6224,18 +6224,19 @@ box_profile() {  # $1 = box service
   printf '%s' "$WT_APPROVAL" ) >"$TMP/box-approval"
 eq 'box review: the profile loads with its box' '1:1' "$(cat "$TMP/box-loaded")"
 out=$(cat "$TMP/box-review")
-contains 'box review: the service and mount' '  box: compose service app, main checkout mounted at /srv/app' "$out"
-contains 'box review: the compose files' '  box compose files: compose.yaml, compose.dev.yaml' "$out"
-contains 'box review: the compose profiles' '  box compose profiles: dev' "$out"
-contains 'box review: the env files compose reads' '  box env files (read by compose): .env' "$out"
-contains 'box review: each env default, the empty one too' "  box env default: PRIVATE_KEY_BASE64=$NL_" "$out"
-contains '...and the next' '  box env default: APP_MODE=dev' "$out"
-contains 'box review: the database service' '  box database service (its image runs the seed and teardown): db' "$out"
-contains 'box review: what it clears' '  box clears: APP_ENV, APP_DEBUG' "$out"
-contains 'box review: the serve command' '  box serve: bin/serve --port={port}' "$out"
+contains 'box review: the service' '  box.service: app' "$out"
+contains 'box review: the mount' '  box.mount: /srv/app' "$out"
+contains 'box review: the compose files' '  box.compose: compose.yaml, compose.dev.yaml' "$out"
+contains 'box review: the compose profiles' '  box.profiles: dev' "$out"
+contains 'box review: the env files' '  box.envFiles: .env' "$out"
+contains 'box review: each env pair, the empty one too' "  box.env: PRIVATE_KEY_BASE64=$NL_" "$out"
+contains '...and the next' '  box.env: APP_MODE=dev' "$out"
+contains 'box review: the database service' '  box.database: db' "$out"
+contains 'box review: what it clears' '  box.clearEnv: APP_ENV, APP_DEBUG' "$out"
+contains 'box review: the serve command' '  box.serve: bin/serve --port={port}' "$out"
 # Branch text, so shown with control characters made visible, as every other line of the review.
 out=$(cat "$TMP/box-review-cc")
-contains 'box review: a control character in the box is shown as ?' '  box serve: bin/serve??[2Kx' "$out"
+contains 'box review: a control character in the box is shown as ?' '  box.serve: bin/serve??[2Kx' "$out"
 lacks '...no escape reaches the screen' $'\033' "$out"
 eq 'box approval: held, approved once recorded, held again once only the box changes, approved again once it is back' \
   'no yes no yes' "$(cat "$TMP/box-approval")"
@@ -6250,6 +6251,10 @@ git -C "$BOXO" init -q -b main
     wt_load_profile "$BOXO" 2>/dev/null
     wt_profile_runs_commands && printf 'runs ' || printf 'runs-nothing '
     wt_profile_needs_approval && printf 'needs ' || printf 'needs-nothing '
+    case $only_box in
+      *serve*) ;;
+      *) wt_approval_describe "$BOXO" >"$TMP/box-only-review" ;;
+    esac
     wt_approval_check "$BOXO" 2>/dev/null
     printf '%s ' "$WT_APPROVAL"
     wt_approval_record "$WT_APPROVAL_FP" "$BOXO"
@@ -6261,6 +6266,10 @@ git -C "$BOXO" init -q -b main
   wt_profile_needs_approval && printf 'needs' || printf 'needs-nothing' ) >"$TMP/box-only"
 eq 'box approval: a box alone runs commands, needs approval and is held until approved, with or without serve' \
   'runs needs no yes|runs needs no yes|needs-nothing' "$(cat "$TMP/box-only")"
+out=$(cat "$TMP/box-only-review")
+contains 'box review: a box of service and mount alone lists the service' '  box.service: app' "$out"
+lacks '...and no compose files' '  box.compose:' "$out"
+lacks '...and no serve command' '  box.serve:' "$out"
 
 # --- the approval record: a fingerprint matches only itself, compared as a string -----------------
 # Two different digests of the form 0e<digits> are both the number 0 to awk; an approval of one must
