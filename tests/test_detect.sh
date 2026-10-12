@@ -905,9 +905,9 @@ EOF
     'box|compose.yml|node|/work||pg|NODE_ENV|' "$(det "$r" | grep '^box|')"
   # A secret read from the environment needs its variable as much as an interpolation does.
   r=$(mkrepo boxsecret composer.lock)
-  printf 'services:\n  app:\n    image: php:8\n    volumes: [".:/app"]\n    secrets: [key]\nsecrets:\n  key:\n    environment: "KEY_B64"  # set by hand\n  cert:\n    file: ./cert.pem\n' >"$r/compose.yml"
+  printf 'services:\n  app:\n    image: php:8\n    volumes: [".:/app"]\n    labels:\n      environment: production\n    secrets: [key]\nsecrets:\n  key:\n    environment: "KEY_B64"  # set by hand\n  cert:\n    file: ./cert.pem\n' >"$r/compose.yml"
   commit_all "$r"
-  eq 'box: a variable a secret is read from is required' \
+  eq 'box: a variable a secret is read from is required, a label of that name is not' \
     'box|compose.yml|app|/app||||KEY_B64' "$(det "$r" | grep '^box|')"
   # Every spelling of the project directory, a flow sequence, block profiles, a flow-map environment,
   # an interpolated target with a mode, and which variables count as required.

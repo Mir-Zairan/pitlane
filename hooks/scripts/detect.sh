@@ -1013,10 +1013,9 @@ fi
 COMMITTED_ENV_NAMES=" $COMMITTED_ENV_NAMES "
 
 # One `box` record per candidate service. <required vars> are those interpolated with no default
-# (`${NAME}`, `$NAME`, `${NAME:?…}`) anywhere in the file, and those a secret is read from
-# (`environment: NAME` on a line of its own, the only form that key takes as a scalar) — compose fails
-# or substitutes "" without them, so each is a box.env candidate. PWD and HOME are left out: every
-# shell exports them.
+# (`${NAME}`, `$NAME`, `${NAME:?…}`) anywhere in the file, and those a top-level secret is read from
+# (`environment: NAME`) — compose fails or substitutes "" without them, so each is a box.env
+# candidate. PWD and HOME are left out: every shell exports them.
 emit_box_candidates() {  # $1 = repo-relative compose file
   local f=$1 tag name img mnt profiles envs base databases='' oneshot=' ' clear n required
   local services
@@ -1036,8 +1035,10 @@ emit_box_candidates() {  # $1 = repo-relative compose file
     sed '/^[[:space:]]*#/d; s/[[:space:]]#.*$//; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
       | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*' \
       | sed 's/^\${\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/'
-    sed -n 's/^[[:space:]]*environment:[[:space:]]*["'"'"']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)["'"'"']\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1/p' \
-      "$ROOT/$f" 2>/dev/null
+    # Inside the top-level `secrets:` block only: a label or build arg may be named `environment` too.
+    awk '/^[^[:space:]#]/ { in_secrets = /^secrets:[[:space:]]*(#.*)?$/; next }
+      in_secrets && /^[[:space:]]+environment:/ { print }' "$ROOT/$f" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*environment:[[:space:]]*["'"'"']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)["'"'"']\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1/p'
   } | grep -vxE 'PWD|HOME' | LC_ALL=C sort -u | paste -sd, -)
   while IFS=$WT_US read -r tag name img mnt profiles envs; do
     [ "$tag" = S ] && [ -n "$mnt" ] || continue
