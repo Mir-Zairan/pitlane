@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mir-Zairan/pitlane/releases"><img src="https://img.shields.io/badge/version-0.8.2-blue" alt="Version 0.8.2"></a>
+  <a href="https://github.com/Mir-Zairan/pitlane/releases"><img src="https://img.shields.io/badge/version-0.8.3-blue" alt="Version 0.8.3"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/Claude%20Code-plugin-d97757" alt="Claude Code plugin">
 </p>
