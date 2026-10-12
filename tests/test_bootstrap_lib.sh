@@ -3191,7 +3191,8 @@ if [ "$(id -u)" != 0 ]; then
   out=$(wt_hardlink_dep "$DREPO" "$DWT" vendor/bundle composer.lock 2>&1)
   rc=$?
   chmod u+w "$DWT/vendor"
-  eq 'hardlink: a copy that fails falls back to an install' 1 "$rc"
+  eq 'hardlink: a link of main'"'"'s tree that fails hands over to a copy of it' 3 "$rc"
+  contains '...said so' 'copying the main checkout'"'"'s instead' "$out"
   contains '...and the log says what cp said' 'Permission denied' "$out"
   lacks '...not a guess at the filesystem' 'different filesystem' "$out"
 fi
@@ -4536,6 +4537,9 @@ eq '...not for a worktree that installs as such' 1 "$(wt_dep_is_done "$DWT" vend
   "$(wt_cksum_string "$RINSTALL")" install 0; echo $?)"
 eq '...nor for another lockfile' 1 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_string other)" \
   "$(wt_cksum_string "$RINSTALL")" install 1; echo $?)"
+# A `hardlink` dep copies main's tree where the link was refused, and that copy is its tree.
+eq '...current for a hardlink dep too' 0 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+  "$(wt_cksum_string "$RINSTALL")" hardlink 0 "$DREPO" composer.lock; echo $?)"
 # A record spelled `copy`, as the first version wrote it, is read the same.
 wt_state_set "$DWT" vendor copy "$(wt_cksum_file "$DWT/composer.lock")" "$(wt_cksum_string "$RINSTALL")" 'done'
 eq '...a record spelled copy is current too' 0 "$(wt_dep_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \

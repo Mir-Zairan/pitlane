@@ -2842,7 +2842,8 @@ wt_budget_left() {  # $1 = deadline, epoch seconds
 # vendor/ is near-instant and costs almost no disk, but it is only VALID when the two
 # checkouts want the same dependencies — which is what comparing the lockfiles establishes — and
 # it is not always possible: a worktree on another filesystem cannot hardlink at all.
-#   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done.
+#   0 = linked, 1 = fall back to a real install, 2 = already present, nothing done, 3 = main's tree
+#   could not be linked although its lockfile matches: the caller copies it instead (wt_own_copy_from_main).
 # $5 is deps[].copy as rendered: the paths inside the dir made real copies after the link. $6-$9
 # are what a donor is judged by; without $6 and $7 only the main checkout is linked from. On 0,
 # WT_LINK_DONOR is the worktree linked from ('' = the main checkout) and WT_LINK_WHY why main was not.
@@ -2927,9 +2928,16 @@ wt_hardlink_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = copy,
   # Once linked, every file outside the copy paths is one inode in both trees, so an in-place write
   # from either side shows in the other (ADR-023 says who may take part). The donor's lock is held for
   # the copy alone: it keeps the donor's own setup from rewriting its tree mid-copy.
+  # A tree of main's that cannot be linked is still the one this lockfile wants, and a copy of it
+  # needs no network: what is not ours cannot be hardlinked (Linux's protected_hardlinks), and a
+  # container that installs as root leaves main's tree root's.
   if ! err=$(cp -al "$src" "$dest" 2>&1); then
-    [ -z "$WT_LINK_DONOR" ] || wt_lock_release 6
     rm -rf "$dest" 2>/dev/null
+    if [ -z "$WT_LINK_DONOR" ]; then
+      wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — copying the main checkout's instead"
+      return 3
+    fi
+    wt_lock_release 6
     wt_log "  $dir: could not hardlink (${err%%"$WT_NL"*}) — installing instead"
     return 1
   fi
@@ -3986,6 +3994,7 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
 
 # wt_state_is_done for dependency $2, where a pull request's own copy ($6 = 1) recorded `own-copy`
 # counts as current for its `install` too: either made a private tree for this lockfile and command.
+# So does one for a `hardlink` dep, made where main's tree could not be linked.
 # `copy` is the spelling the first version of this wrote, read the same.
 #
 # AND THE DIR HAS NOT BEEN EMPTIED SINCE: a record says what an earlier run made, and an `rm -rf
@@ -3998,15 +4007,18 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
 # as it was then. WT_DEP_GONE is 1 when an emptied dir is why it is not done, for the log.
 WT_DEP_GONE=0
 wt_dep_is_done() {  # $1 = worktree, $2 = dir, $3 = lock cksum, $4 = install cksum, $5 = strategy, $6 = 1 for a PR's own copy, $7 = main checkout, $8 = lock
+  local linked=1
   WT_DEP_GONE=0
   if ! wt_state_is_done "$1" "$2" "$3" "$4" "$5"; then
-    [ "${6-}" = 1 ] || return 1
+    # A `hardlink` dep's copy too: what a link main's tree refused becomes (wt_hardlink_dep's 3).
+    { [ "${6-}" = 1 ] || [ "$5" = hardlink ]; } || return 1
     wt_state_is_done "$1" "$2" "$3" "$4" own-copy || wt_state_is_done "$1" "$2" "$3" "$4" copy || return 1
+    linked=0
   fi
   if wt_dep_has_content "${1%/}/$2"; then
     # Recorded as linked, but missing what it was linked from has: what an interrupted removal of
     # the worktree leaves (measured: 61 of 113 packages and no autoload.php, kept as "up to date").
-    if [ "$5" = hardlink ] && [ "${6-}" != 1 ] && [ -n "${7-}" ] && wt_dep_incomplete "$7" "$1" "$2" "${8-}"; then
+    if [ "$5" = hardlink ] && [ "$linked" = 1 ] && [ "${6-}" != 1 ] && [ -n "${7-}" ] && wt_dep_incomplete "$7" "$1" "$2" "${8-}"; then
       WT_DEP_GONE=2
       return 1
     fi
@@ -4071,7 +4083,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
   local rec body dir lock strategy install verify _cksum dcopy n=-1
   local lckhash ickhash status left rc lockpath held effective started elapsed bad
   local stands stood_rc stood_reason capture reason outcome vrc tracked_before tracking
-  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits content
+  local verify_tpl linked_from lock_rc own_copy clear_why own_linked lck_before own_fits content link_copy
   local admin_copying
   WT_OWN_COPY=''
 
@@ -4314,15 +4326,18 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
     # branch that touched its lockfile.
     effective=$strategy
     if [ "$strategy" = hardlink ]; then
+      link_copy=0
       wt_hardlink_dep "$root" "$worktree" "$dir" "$lock" "$dcopy" "$lckhash" "$ickhash" "$verify_tpl" "$deadline"
       case $? in
         0) effective=hardlink linked_from=$WT_LINK_DONOR ;;
         2) effective=present
            # Not over an interrupted link another process may still be finishing.
            [ "$status" = doing ] || wt_repair_shared_copy_paths "$root" "$worktree" "$dir" "$dcopy" "$linked_from" ;;
+        3) effective=install linked_from='' link_copy=1 ;;
         *) effective=install linked_from='' ;;
       esac
-      if [ "$effective" = install ] && [ "$stands" -eq 1 ]; then
+      # Not a failure that stands: copying main's tree runs no install.
+      if [ "$effective" = install ] && [ "$stands" -eq 1 ] && [ "$link_copy" = 0 ]; then
         wt_dep_log_failure_stands "$dir" "$lock" "$stood_rc" "$stood_reason"
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" failed "$stood_rc" "$stood_reason" || true
         [ "$held" -eq 1 ] && wt_lock_release 9
@@ -4331,19 +4346,23 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
       # A hardlink that has to fall back to an install is as slow as any install, so it is deferred
       # too. `dirty`, not `doing`: nothing was started that a later run should clear away.
       if [ "$effective" = install ] && [ "${WT_DEFER:-0}" = 1 ]; then
-        wt_log "  $dir: to be installed in the background"
+        if [ "$link_copy" = 1 ]; then
+          wt_log "  $dir: to be copied from the main checkout in the background"
+        else
+          wt_log "  $dir: to be installed in the background"
+        fi
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
     else
-      linked_from=''
+      linked_from='' link_copy=0
     fi
 
     # A pull request's worktree copies what main has for the same lockfile, after the clearing an
-    # install gets and within the same budget. Re-judged here, under the lock. Not deferred past
-    # this point: a deferred copy waited above, like an install.
-    if [ "$own_copy" = 1 ] && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
+    # install gets and within the same budget, and so does a link main's tree refused. Re-judged
+    # here, under the lock. Not deferred past this point: a deferred copy waited above, like an install.
+    if { [ "$own_copy" = 1 ] || [ "$link_copy" = 1 ]; } && wt_own_copy_source_fits "$root" "$worktree" "$dir" "$lock"; then
       left=$(wt_budget_left "$deadline")
       if [ "$left" -le 0 ]; then
         wt_log "  $dir: the budget ran out before the copy could start — leaving it for the next session"
@@ -4352,7 +4371,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
-      if ! wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc" \
+      if [ "$own_copy" = 1 ] && ! wt_clear_linked_dep "$root" "$worktree" "$dir" "$lock" "$lock_rc" \
         "it was linked, and a pull request's worktree keeps its own copy" copy; then
         wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" dirty || true
         [ "$held" -eq 1 ] && wt_lock_release 9
@@ -4997,7 +5016,8 @@ wt_bootstrap_pending() {  # $1 = worktree
     if wt_state_dep_read "$worktree" "$dir" && wt_dep_lock_matches "$lckhash" "$WT_DEP_LCK" "$WT_DEP_LCK_BEFORE" \
       && [ "$WT_DEP_ICK" = "$ickhash" ] \
       && { [ "$WT_DEP_STRATEGY" = "$strategy" ] \
-        || { [ "$own" = 1 ] && { [ "$WT_DEP_STRATEGY" = own-copy ] || [ "$WT_DEP_STRATEGY" = copy ]; }; }; }; then
+        || { { [ "$own" = 1 ] || [ "$strategy" = hardlink ]; } \
+          && { [ "$WT_DEP_STRATEGY" = own-copy ] || [ "$WT_DEP_STRATEGY" = copy ]; }; }; }; then
       current=1
     fi
     # Done or warn over a dir that held something then and nothing now is missing, as wt_dep_is_done

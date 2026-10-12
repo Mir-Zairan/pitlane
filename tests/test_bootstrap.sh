@@ -652,7 +652,9 @@ out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\"
 err=$(cat "$TMP/err")
 eq 'a hardlink that cannot be made does not fail the session' "$READY_VENDOR" "$out"
 contains '...it says the link was not possible' 'could not hardlink' "$err"
-eq '...and installs instead, so the worktree still works' 'fellback' "$(cat "$WX/vendor/m" 2>/dev/null)"
+eq '...and copies the main checkout'"'"'s instead, with no install' 'src' "$(cat "$WX/vendor/pkg/f" 2>/dev/null)"
+eq '...the install not run' '' "$(cat "$WX/vendor/m" 2>/dev/null)"
+eq '...the copy its own file, not a link to main'"'"'s' 1 "$(stat -c %h "$WX/vendor/pkg/f" 2>/dev/null || stat -f %l "$WX/vendor/pkg/f")"
 eq '...having first cleared the debris the failed copy left' '' \
   "$([ -e "$WX/vendor/pkg/partial" ] && echo debris)"
 # And the state that debris would otherwise poison: a second run must not decide the leftover
@@ -661,6 +663,22 @@ out=$( cd "$WX" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\"
        | bash "$HOOK" 2>"$TMP/err" )
 contains '...and the next run sees a finished dependency, not a frozen partial one' \
   'already up to date' "$(cat "$TMP/err")"
+
+# Neither a link nor a copy: the install is what is left.
+git -C "$RX" worktree add -q "$RX/.claude/worktrees/ny" -b worktree-ny 2>/dev/null
+WY=$RX/.claude/worktrees/ny
+cat > "$TMP/stub/cp" <<STUB
+#!/bin/sh
+case " \$* " in
+  *" -al "* | *" -a "*) echo "cp: cannot create hard link: Operation not permitted" >&2; exit 1 ;;
+esac
+exec "$REAL_CP" "\$@"
+STUB
+chmod +x "$TMP/stub/cp"
+out=$( cd "$WY" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WY\"}" \
+       | PATH="$TMP/stub:$PATH" bash "$HOOK" 2>"$TMP/err" )
+contains 'a link and a copy that both fail' 'could not copy it from the main checkout' "$(cat "$TMP/err")"
+eq '...install instead' 'fellback' "$(cat "$WY/vendor/m" 2>/dev/null)"
 
 # ---------------------------------------------------------------------------
 # Layer 3 — runtime isolation's acceptance criteria, end to end through the hook
