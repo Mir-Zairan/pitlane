@@ -848,6 +848,62 @@ for r in json.load(open(sys.argv[1]))["deps"]:
   printf 'COMPOSE_PROJECT_NAME=x\n' >"$r/.env.local"
   has 'compose: .env.local is not where compose looks' 'compose|compose.yml|directory|0' "$(det "$r")"
 
+  # --- BOX: a long-running service that bind-mounts the project directory -------
+  hasnt 'box: a stack that mounts nothing of the project offers no box' 'box|' "$(det "$TMP/$BACKEND/composedir")"
+  r=$(mkrepo boxblock composer.lock)
+  cat >"$r/compose.yaml" <<'EOF'
+services:
+    app:
+        image: "registry.example/app-php:8.3"
+        user: "${UID}:${GID:-1000}"
+        profiles: [dev, tools]
+        volumes:
+            - ./:/srv/app:cached   # the checkout
+            - data:/var/lib/app
+        environment:
+            - APP_ENV=dev
+            - DB_HOST=db
+            - API_TOKEN=${TOKEN:?set it}
+            - ONLY_HERE=1
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+    migrate:
+        image: registry.example/app-php:8.3
+        volumes:
+            - .:/srv/app
+    db:
+        image: docker.io/library/mysql:8.4@sha256:00
+        environment: {MYSQL_ROOT_PASSWORD: "${DB_ROOT}", MYSQL_DATABASE: app}
+    cache:
+        image: bitnami/redis
+    tool:
+        image: busybox
+        volumes: ["/:/host", "$$HOME:/h"]
+        # ${COMMENTED_OUT}
+volumes:
+  data:
+EOF
+  printf 'APP_ENV=prod\nexport DB_HOST=127.0.0.1\n' >"$r/.env.dist"
+  printf 'ONLY_HERE=1\n' >"$r/.env.local"
+  commit_all "$r"
+  out=$(det "$r")
+  eq 'box: one record, every field from the file' \
+    'box|compose.yaml|app|/srv/app|dev,tools|db,cache|APP_ENV,DB_HOST|DB_ROOT,TOKEN,UID' \
+    "$(printf '%s\n' "$out" | grep '^box|')"
+  hasnt 'box: a service another waits on to complete is one-shot, never a box' 'box|compose.yaml|migrate' "$out"
+  hasnt 'box: the host root is not the project directory' 'box|compose.yaml|tool' "$out"
+
+  # Long syntax, a map environment and two-space indentation; .env is committed here.
+  r=$(mkrepo boxlong composer.lock)
+  # shellcheck disable=SC2016  # compose interpolation under test
+  printf 'services:\n  node:\n    image: node:22\n    volumes:\n      - type: bind\n        source: .\n        target: /work\n    environment:\n      NODE_ENV: development\n      PORT: "${PORT-3000}"\n  pg:\n    image: postgres:16\n' >"$r/compose.yml"
+  printf 'NODE_ENV=production\n' >"$r/.env"
+  git -C "$r" add -f .env >/dev/null 2>&1
+  commit_all "$r"
+  eq 'box: long-syntax bind, map environment, a default-bearing variable is not required' \
+    'box|compose.yml|node|/work||pg|NODE_ENV|' "$(det "$r" | grep '^box|')"
+
   # A nested JS tree in a repo that declares a workspace is the root install's to populate.
   r=$(mkrepo nestedws package.json pnpm-lock.yaml pnpm-workspace.yaml packages/a/package.json packages/a/package-lock.json)
   mkdir -p "$r/packages/a/node_modules"

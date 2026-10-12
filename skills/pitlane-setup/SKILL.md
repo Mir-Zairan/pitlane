@@ -61,6 +61,7 @@ human-readable companion to the table the script used.
 | `config` | Gitignored config a fresh checkout would miss. |
 | `hint` | Layer-3 candidates. **Hints beside a question, never defaults.** |
 | `compose` | What names each compose project, and how many host ports it publishes. Raise it in step 5. |
+| `box` | A long-running compose service that bind-mounts the project: its file, service, mount path, profiles, candidate database services, `environment:` names a committed `.env` file also sets, and variables the file needs with no default (lists comma-joined). Raise it in step 5's *A Docker box*. |
 | `assign` | A `NAME=value` for a hinted variable in the repo's own docs or scripts — *possibly* an inline pin. Read the line: a command prefix, an `export`, or a `-e NAME=…` passed to a container sets the process environment and beats every env file; a code block showing `.env` contents does not. A real pin of a database or port variable **stops setup** — see *Inline pins* in step 5. |
 | `env` | An environment the repo runs in (`.env.<name>` file, or a selector such as `APP_ENV`/`NODE_ENV` set to it in a script or config). Every one is isolated or recorded as shared — see *Every environment* in step 5. |
 | `testConfig` | A test or e2e runner config. Read it: the environment, database and port it runs against are part of *Every environment*, and one that starts its own server or pins a database is an inline pin. |
@@ -430,6 +431,42 @@ command every session will run on request, so show the developer the **whole** p
 exactly as it will be written, and write it only on their explicit yes — never a summary of it, and
 never a command assembled from repo text they have not seen.
 
+### A Docker box, when there is a `box` record
+
+Some developers run a project only in Docker: no toolchain on their machine, every command inside one
+long-running compose service that mounts the checkout. Pitlane can work for them too. It runs the
+installs, builds, seed, teardown and `/pitlane-serve` in that service, and tells their sessions to run
+the project's commands as `bash "$PITLANE_BOX" <command>`. It does that only for a developer whose
+`shell` program is not installed (or who sets `PITLANE_TOOLCHAIN=box`) while the service is running;
+for everyone else nothing changes. Say that in plain words, then ask whether anyone on this project
+works only in Docker. No is the default, and writes no `box`.
+
+On a yes, propose the block from the record and confirm **each field** with the developer:
+
+- `service`, `mount` — the record's. `mount` is the literal path inside the container; when the
+  record shows a `${…}` there, ask for the path it resolves to.
+- `compose`, `profiles` — the record's file and profiles, plus any override file their
+  `docker compose` command reads.
+- `database` — one of the record's candidates, or none. The seed and teardown run in that service's
+  image, because an app image's database client may not match the server (MariaDB's `mysqldump`
+  cannot copy a MySQL 8 database). With none, they run in the box like any step.
+- `clearEnv` — the record's candidates: names the service's `environment:` pins that the app's env
+  files set too. A pin beats the worktree's env file, so it would point the worktree at shared state.
+  Names already in `runtime.env.vars` are cleared anyway.
+- `env`, `envFiles` — for the record's required variables that nothing the developer has sets. **The
+  `env` values are committed and shown in the review**, so a secret-bearing key gets only `""`, and
+  its real value comes from the developer's environment or a gitignored file listed in `envFiles`.
+- `serve` — only when the box needs another command than `runtime.serve`; in the box it wins. Either
+  way, the command run in the box must listen on `0.0.0.0:{port}`: a server on `127.0.0.1` inside the
+  container never answers on the published port. Show it whole, as for `runtime.serve`.
+
+The seed and teardown in the database image reach the server by its service name, passed as
+`WT_DB_HOST`. So the scripts take the host from it, then the box's own host variable, and only then
+`127.0.0.1` — `host=${WT_DB_HOST:-${DB_HOST:-127.0.0.1}}` — never a fixed one. A `runtime.env.vars`
+value that names the database host can reference the box's variable with a default,
+`${DB_HOST:-127.0.0.1}`, so one value works inside the box and outside it, when the app's env loader
+expands `${…}`; check it does.
+
 ### Rules for this step, and they are not negotiable
 
 - **Write no `runtime` block the developer did not explicitly confirm.** Omitting it is valid and
@@ -488,7 +525,8 @@ found:
 **Not what Pitlane already tells the session**: Pitlane's own start-up line says whether setup is
 still running, what is missing, or that the worktree is fully set up — naming the dependency and
 build-output dirs in place and, when this start pointed the worktree at them, its own databases,
-port and URL — and when to use `/pitlane-finish` and `/pitlane-serve`. Nor
+port and URL — and when to use `/pitlane-finish` and `/pitlane-serve`, and, in the box, to run commands
+through `"$PITLANE_BOX"`. Nor
 anything true in the main checkout as well — that belongs in the repo's own instructions, how to
 create a worktree above all (*The worktree-creation line*, step 6).
 
@@ -538,6 +576,7 @@ Fill in `${CLAUDE_PLUGIN_ROOT}/reference/profile.template.json`'s shape and writ
 - `timeouts` — the two must **sum** to less than the hook's own timeout (600s), because both run
   inside one hook invocation. Setting each to 600 means the platform kills the hook before either
   guard fires.
+- `box` — from step 5's *A Docker box*, only on the developer's yes; every field confirmed.
 - `agentNote` — the lines from step 5's *The agent note*, exactly as the developer accepted them; leave
   it out when there are none.
 - No `_comment` keys in the file you write. Those are the template's annotations, not schema.

@@ -55,6 +55,9 @@
 #   hint             port|db|service <name> <where it was seen>
 #   compose          <file> explicit:<name>|env|directory <published host ports>
 #                    (`directory`: each worktree gets its own stack, and its host ports collide)
+#   box              <file> <service> <mount> <profiles> <databases> <clearEnv> <required vars>
+#                    (a long-running service that bind-mounts the project directory: a candidate
+#                    for the profile's `box`, every field a proposal; lists comma-joined)
 #   assign           <name> <file> <count> <first line:text>   (an inline NAME=value for a hinted
 #                    variable: it beats every env file, so it bypasses the overrides)
 #   start            <file> scripts.<name>|<process>|line <n> <port literal or flag, or ""> <command>
@@ -870,6 +873,170 @@ HINT_NAMES=' '
 scan_hints port "$(wt_json_get runtimeHints.portVarPattern <"$WT_DETECTION_JSON")" runtimeHints.portSources
 scan_hints db   "$(wt_json_get runtimeHints.dbVarPattern   <"$WT_DETECTION_JSON")" runtimeHints.portSources
 
+# ---------------------------------------------------------------------------
+# Docker box candidates
+# ---------------------------------------------------------------------------
+# A developer without the toolchain can still run the project's commands in a long-running compose
+# service that bind-mounts the project directory: the profile's `box`. Whether any developer works
+# that way is setup's question; these records only gather what each field would be.
+
+# The database servers whose image can run a seed or teardown: matched on the image's own name, so
+# `docker.io/library/mysql:8.4` and `bitnami/postgresql` count and an app image that merely carries
+# a database client does not.
+BOX_DATABASE_IMAGES=' mysql mariadb postgres postgresql mongo redis '
+
+# One `S` line per service in the order written, fields joined by WT_US — name, image, bind-mount
+# target of the project directory, profiles and environment names (both comma-joined) — and one `O`
+# line per service another waits on with `service_completed_successfully`, which is a one-shot job and
+# never a box. A line reader, not a YAML parser: the block and flow shapes compose files are written
+# in, at any indentation.
+compose_services() {  # $1 = compose file
+  awk '
+    function indent(l) { match(l, /^ */); return RLENGTH }
+    function unq(s) {
+      gsub(/^[ \t]+|[ \t]+$/, "", s)
+      if (length(s) > 1 && (substr(s, 1, 1) == "\"" || substr(s, 1, 1) == q) && substr(s, length(s)) == substr(s, 1, 1))
+        s = substr(s, 2, length(s) - 2)
+      return s
+    }
+    # `$PWD` is where compose was started from, which for the main checkout is its root.
+    function is_project_dir(s) {
+      return s == "." || s == "./" || s == "$PWD" || s == "$PWD/" || s == "${PWD}" || s == "${PWD}/"
+    }
+    function add(list, v) {
+      if (v == "" || index("," list ",", "," v ",")) return list
+      return list == "" ? v : list "," v
+    }
+    function bind(target) {
+      sub(/:.*/, "", target)
+      if (target != "" && mount[svc] == "") mount[svc] = target
+    }
+    function short_volume(v,   src, rest, i) {
+      v = unq(v)
+      i = substr(v, 1, 2) == "${" ? index(v, "}") : index(v, ":") - 1
+      if (i <= 0) return
+      src = substr(v, 1, i); rest = substr(v, i + 1)
+      if (substr(rest, 1, 1) == ":" && is_project_dir(src)) bind(substr(rest, 2))
+    }
+    function long_field(b,   k, v) {
+      k = b; sub(/:.*/, "", k)
+      v = b; sub(/^[^:]*:/, "", v); v = unq(v)
+      if (k == "source") lsrc = v
+      if (k == "target") ltgt = v
+    }
+    function end_long() {
+      if (inlong && is_project_dir(lsrc)) bind(ltgt)
+      inlong = 0; lsrc = ""; ltgt = ""
+    }
+    function env_name(b) {
+      sub(/^-[ ]*/, "", b); b = unq(b)
+      if (match(b, /^[A-Za-z_][A-Za-z0-9_]*/)) envs[svc] = add(envs[svc], substr(b, 1, RLENGTH))
+    }
+    # The items of a one-line flow list or map: `[dev, tools]`, `{A: 1}`, `[".:/srv/app"]`.
+    function flow(v, field,   n, items, i) {
+      sub(/^[ \t]*[[{]/, "", v); sub(/[]}][ \t]*$/, "", v)
+      n = split(v, items, ",")
+      for (i = 1; i <= n; i++) {
+        if (field == "environment") env_name(items[i])
+        else if (field == "profiles") profiles[svc] = add(profiles[svc], unq(items[i]))
+        else if (field == "volumes") short_volume(items[i])
+      }
+    }
+    function end_key() { if (key == "volumes") end_long(); key = "" }
+    BEGIN { q = sprintf("%c", 39); sind = -1 }
+    { sub(/\r$/, "") }
+    /^[ \t]*#/ || /^[ \t]*$/ { next }
+    {
+      line = $0
+      sub(/[ \t]+#.*$/, "", line)
+      ind = indent(line)
+      body = substr(line, ind + 1)
+    }
+    ind == 0 { end_key(); svc = ""; inservices = body ~ /^services:[ ]*$/; sind = -1; next }
+    !inservices { next }
+    sind < 0 { sind = ind }
+    ind <= sind {
+      end_key(); svc = ""
+      if (body ~ /^[A-Za-z0-9_.-]+:[ ]*$/) { svc = body; sub(/:.*/, "", svc); order[++n] = svc; kind_ind = -1 }
+      next
+    }
+    svc == "" { next }
+    kind_ind < 0 { kind_ind = ind }
+    ind <= kind_ind {
+      end_key()
+      key = body; sub(/:.*/, "", key)
+      val = body; if (!sub(/^[^:]*:[ ]*/, "", val)) val = ""
+      if (key == "image") image[svc] = unq(val)
+      else if (val ~ /^[\[{]/) flow(val, key)
+      next
+    }
+    key == "volumes" && body ~ /^-/ {
+      end_long()
+      item = body; sub(/^-[ ]*/, "", item)
+      if (item ~ /^[A-Za-z_]+:([ ]|$)/) { inlong = 1; long_field(item) } else short_volume(item)
+      next
+    }
+    key == "volumes" && inlong { long_field(body); next }
+    key == "environment" { env_name(body); next }
+    key == "profiles" && body ~ /^-/ { sub(/^-[ ]*/, "", body); profiles[svc] = add(profiles[svc], unq(body)); next }
+    key == "depends_on" && body ~ /^[A-Za-z0-9_.-]+:[ ]*$/ { dep = body; sub(/:.*/, "", dep); next }
+    key == "depends_on" && body ~ /^condition:[ ]*["\047]?service_completed_successfully/ { oneshot[dep] = 1; next }
+    END {
+      end_key()
+      for (i = 1; i <= n; i++) {
+        s = order[i]
+        printf "S\037%s\037%s\037%s\037%s\037%s\n", s, image[s], mount[s], profiles[s], envs[s]
+      }
+      for (s in oneshot) printf "O\037%s\n", s
+    }' "$1" 2>/dev/null
+}
+
+# The variable names the repo's committed .env files set, read for names and never values: a name the
+# box's compose `environment:` pins as well is a clearEnv candidate, since the pin would beat the
+# value a worktree's own env file carries.
+COMMITTED_ENV_NAMES=''
+if [ "$IS_GIT" = 1 ]; then
+  while IFS= read -r f; do
+    case $f in '' | */*) continue ;; esac
+    is_repo_file "$f" || continue
+    COMMITTED_ENV_NAMES="$COMMITTED_ENV_NAMES$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' "$ROOT/$f" | tr '\n' ' ')"
+  done < <(wt_git "$ROOT" ls-files -- .env '.env.*' 2>/dev/null)
+fi
+COMMITTED_ENV_NAMES=" $COMMITTED_ENV_NAMES "
+
+# One `box` record per candidate service. <required vars> are those interpolated with no default
+# (`${NAME}`, `$NAME`, `${NAME:?…}`) anywhere in the file — compose fails or substitutes "" without
+# them, so each is a box.env candidate. PWD and HOME are left out: every shell exports them.
+emit_box_candidates() {  # $1 = repo-relative compose file
+  local f=$1 tag name img mnt profiles envs base databases='' oneshot=' ' clear n required
+  local services
+  services=$(compose_services "$ROOT/$f")
+  while IFS=$WT_US read -r tag name img _; do
+    case $tag in
+      O) oneshot="$oneshot$name " ;;
+      S)
+        base=${img##*/}; base=${base%%@*}; base=${base%%:*}
+        claimed "$BOX_DATABASE_IMAGES" "$base" && databases="$databases${databases:+,}$name"
+        ;;
+    esac
+  done <<<"$services"
+  # SC2016: `$$` and `${` are compose syntax being matched, not shell expansion.
+  # shellcheck disable=SC2016
+  required=$(sed '/^[[:space:]]*#/d; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
+    | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*' \
+    | sed 's/^\${\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/' | grep -vxE 'PWD|HOME' \
+    | LC_ALL=C sort -u | paste -sd, -)
+  while IFS=$WT_US read -r tag name img mnt profiles envs; do
+    [ "$tag" = S ] && [ -n "$mnt" ] || continue
+    claimed "$oneshot" "$name" && continue
+    clear=''
+    for n in ${envs//,/ }; do
+      claimed "$COMMITTED_ENV_NAMES" "$n" && clear="$clear${clear:+,}$n"
+    done
+    emit box "$f" "$name" "$mnt" "$profiles" "$databases" "$clear" "$required"
+  done <<<"$services"
+}
+
 # Service names from a compose file, which is usually where a port collision lives.
 while IFS= read -r f; do
   [ -n "$f" ] || continue
@@ -916,6 +1083,7 @@ while IFS= read -r f; do
     inblock && /^[ ]*(- )?published:/ { n++ }
     END { print n + 0 }' "$ROOT/$f" 2>/dev/null)
   emit compose "$f" "$project" "${published:-0}"
+  emit_box_candidates "$f"
 done < <(json_array_items "$(wt_json_get runtimeHints.serviceSources <"$WT_DETECTION_JSON")")
 
 # ---------------------------------------------------------------------------
