@@ -750,14 +750,20 @@ WT_BOX_ENV_FILES=()   # the env files compose reads, given or by its own default
 WT_BOX_ROOT=''        # the main checkout the box was last selected for
 WT_BOX_CONTAINER=''   # the service's running container, once probed
 WT_BOX_PROBED=''      # the main checkout the probe ran for, set when it found nothing too
+WT_BOX_PROBE_WHY=''   # why it found nothing: paths, slow or stopped
 WT_BOX_USER=''        # uid:gid, so what a step writes in the worktree is the developer's, not root's
 WT_BOX_LOGGED=''      # the reasons said this run, one per line
 WT_BOX_PROBE_SECONDS=20
 
-wt_box_log_once() {  # $1 = reason, $2 = message
+wt_box_logged() {  # $1 = reason
   case $WT_NL$WT_BOX_LOGGED in
     *"$WT_NL$1$WT_NL"*) return 0 ;;
   esac
+  return 1
+}
+
+wt_box_log_once() {  # $1 = reason, $2 = message
+  ! wt_box_logged "$1" || return 0
   WT_BOX_LOGGED=$WT_BOX_LOGGED$1$WT_NL
   wt_log "$2"
 }
@@ -765,7 +771,8 @@ wt_box_log_once() {  # $1 = reason, $2 = message
 # True when the profile's commands for worktree $1 run in the box; sets WT_BOX_ROOT and
 # WT_BOX_CONTAINER for wt_box_exec_argv.
 wt_toolchain_is_box() {  # $1 = worktree
-  local worktree=${1%/} want=${PITLANE_TOOLCHAIN:-auto} root why
+  local worktree=${1%/} want=${PITLANE_TOOLCHAIN:-auto} root why limit
+  local -a bound=()
   WT_BOX_ROOT=''
   case $want in
     shell | host) return 1 ;;
@@ -800,11 +807,23 @@ wt_toolchain_is_box() {  # $1 = worktree
     return 1
   fi
   if ! wt_box_container "$root"; then
-    wt_box_log_once stopped "$why, but it is not running (start it with \`docker compose up -d $PROFILE_BOX_SERVICE\`) — running them outside it"
+    case $WT_BOX_PROBE_WHY in
+      paths) wt_box_log_once paths "$why, but box.compose or box.envFiles names a path that is not inside the main checkout — running them outside it" ;;
+      slow) wt_box_log_once slow "$why, but docker did not answer within ${WT_BOX_PROBE_SECONDS}s — running them outside it" ;;
+      *) wt_box_log_once stopped "$why, but it is not running (start it with \`$(printf '%q ' "${WT_BOX_COMPOSE_ARGV[@]}")up -d $PROFILE_BOX_SERVICE\`) — running them outside it" ;;
+    esac
     return 1
   fi
   WT_BOX_ROOT=$root
-  wt_box_log_once selected "running the profile's commands in the box: compose service $PROFILE_BOX_SERVICE, where this worktree is under $PROFILE_BOX_MOUNT (PITLANE_TOOLCHAIN=shell runs them as the profile's shell says)"
+  wt_box_logged selected && return 0
+  # The resource guard's memory cap holds the docker client only: a step's memory is the container's,
+  # in the container's cgroup, so the box's own limit is the only one it has.
+  wt_box_log_once selected "running the profile's commands in the box: compose service $PROFILE_BOX_SERVICE, where this worktree is under $PROFILE_BOX_MOUNT; their memory is the box's, beyond the reach of the memory cap Pitlane sets (PITLANE_TOOLCHAIN=shell runs them as the profile's shell says)"
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+  limit=$(${bound[@]+"${bound[@]}"} docker inspect -f '{{.HostConfig.Memory}}' "$WT_BOX_CONTAINER" </dev/null 2>/dev/null) || limit=''
+  if [ "$limit" = 0 ]; then
+    wt_box_log_once nolimit "the box has no memory limit, so a step in it can use all of this machine's memory — give compose service $PROFILE_BOX_SERVICE one (mem_limit) to keep a heavy step from crowding out the desktop"
+  fi
   return 0
 }
 
@@ -836,10 +855,21 @@ wt_box_path() {  # $1 = host path, $2 = main checkout; prints the path in the bo
 # files, `.env` goes first (unless listed itself, where the list places it) to keep what a bare
 # `docker compose` in the checkout would see. A listed file that does not exist is left out rather
 # than failing every compose call: it is usually a gitignored file this developer has not made.
+#
+# Fails, leaving both empty, when a compose or env file is not a path inside the checkout, by the rule
+# the profile was validated with: checked again where it is joined to the root, as every path from the
+# branch is, so no other route to this function can hand compose a file from elsewhere.
 wt_box_compose_argv() {  # $1 = main checkout; sets WT_BOX_COMPOSE_ARGV and WT_BOX_ENV_FILES
-  local root=${1%/} f
-  WT_BOX_COMPOSE_ARGV=(docker compose --project-directory "$root")
+  local root=${1%/} f list
+  WT_BOX_COMPOSE_ARGV=()
   WT_BOX_ENV_FILES=()
+  for list in "${PROFILE_BOX_COMPOSE-}" "${PROFILE_BOX_ENV_FILES-}"; do
+    wt_split_list : "$list"
+    for f in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
+      wt_is_safe_envfile "$f" || return 1
+    done
+  done
+  WT_BOX_COMPOSE_ARGV=(docker compose --project-directory "$root")
   wt_split_list : "${PROFILE_BOX_COMPOSE-}"
   for f in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
     WT_BOX_COMPOSE_ARGV+=(-f "$root/$f")
@@ -889,22 +919,28 @@ wt_box_export_env() {
 }
 
 # Probe, once per process and main checkout, for the box service's running container: sets
-# WT_BOX_CONTAINER and fails when there is none. `ps` lists running containers only. Bounded, because
-# a docker daemon that does not answer must not hold a session start.
+# WT_BOX_CONTAINER, or fails with WT_BOX_PROBE_WHY saying why there is none. `ps` lists running
+# containers only. Bounded by WT_BOX_PROBE_SECONDS, because a docker daemon that does not answer must
+# not hold a session start.
 wt_box_container() {  # $1 = main checkout
-  local root=${1%/} out=''
+  local root=${1%/} out='' rc=0
   local -a bound=()
   if [ "$WT_BOX_PROBED" != "$root" ]; then
     WT_BOX_PROBED=$root
-    wt_box_compose_argv "$root"
+    WT_BOX_CONTAINER=''
+    WT_BOX_PROBE_WHY=paths
+    wt_box_compose_argv "$root" || return 1
     command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
     out=$( wt_box_export_env
-           exec ${bound[@]+"${bound[@]}"} "${WT_BOX_COMPOSE_ARGV[@]}" ps -q "$PROFILE_BOX_SERVICE" </dev/null 2>/dev/null ) || out=''
+           exec ${bound[@]+"${bound[@]}"} "${WT_BOX_COMPOSE_ARGV[@]}" ps -q "$PROFILE_BOX_SERVICE" </dev/null 2>/dev/null ) || rc=$?
     WT_BOX_CONTAINER=${out%%"$WT_NL"*}
+    [ "$rc" -eq 0 ] || WT_BOX_CONTAINER=''
     # An id goes where docker reads options, so anything but one is no container.
     case $WT_BOX_CONTAINER in
-      '' | *[!0-9a-f]*) WT_BOX_CONTAINER='' ;;
+      *[!0-9a-f]*) WT_BOX_CONTAINER='' ;;
     esac
+    WT_BOX_PROBE_WHY=stopped
+    [ "$rc" -ne 124 ] || WT_BOX_PROBE_WHY=slow
   fi
   [ -n "$WT_BOX_CONTAINER" ]
 }
@@ -955,7 +991,7 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
     cleared+=(-u "$name")
   done
   file="${WT_BOX_STEP_DIR:-/tmp}/pitlane-step-$$-$RANDOM$RANDOM.pid"
-  WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$WT_BOX_CONTAINER" "$file" "$WT_BOX_STEP_STOP"
+  WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$WT_BOX_CONTAINER" "$WT_BOX_USER" "$file" "$WT_BOX_STEP_STOP"
     docker exec -i -u "$WT_BOX_USER" -w "$where" "${pass[@]}" "$WT_BOX_CONTAINER")
   [ "${#cleared[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${cleared[@]}")
   WT_CMD_ARGV+=(sh -c "$WT_BOX_STEP_BOX" pitlane-step "$file" "$cmd")
@@ -972,12 +1008,13 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
 # removes $1 once the command ends, passing on its exit status. The command reaches one shell.
 #
 # WT_BOX_STEP_STOP runs in the box too ($1 = that file, $2 = a signal name) and signals the group the
-# file names. Nothing to do once the file is gone, so it is safe to run when the step has ended. A
-# group is named `kill -TERM -<id>` first: dash takes `-s TERM -<id>` for an option and busybox refuses
-# `--`.
+# file names. Nothing to do once the file is gone, so it is safe to run when the step has ended. It
+# runs as the step's own user, never root, and takes only an id above 1: the file is in the box's
+# shared /tmp, and `kill -TERM -1` there would signal every process that user may. A group is named
+# `kill -TERM -<id>` first: dash takes `-s TERM -<id>` for an option and busybox refuses `--`.
 #
-# WT_BOX_STEP_HOST runs on the host (bash; $1 = container, $2 = the file, $3 = WT_BOX_STEP_STOP, the
-# rest = the docker command). On TERM, INT or HUP it stops the step in the box, gives it 5 seconds to
+# WT_BOX_STEP_HOST runs on the host (bash; $1 = container, $2 = uid:gid, $3 = the file,
+# $4 = WT_BOX_STEP_STOP, the rest = the docker command). On TERM, INT or HUP it stops the step in the box, gives it 5 seconds to
 # end, then kills it, and exits 128 + the signal; `timeout` reports its own 124 regardless. A client that
 # ended by a signal it could not trap (the cap's SIGKILL) has the step stopped in the box as well. The
 # traps are set before the client starts, so no signal falls between the two.
@@ -997,14 +1034,15 @@ rm -f "$f"
 exit "$rc"'
 # shellcheck disable=SC2016
 WT_BOX_STEP_STOP='p=$(cat "$1" 2>/dev/null) || exit 0
-case $p in "" | *[!0-9]*) exit 0 ;; esac
+case $p in "" | 0* | *[!0-9]*) exit 0 ;; esac
+[ "$p" -gt 1 ] || exit 0
 kill -"$2" -"$p" 2>/dev/null || kill -s "$2" -- "-$p" 2>/dev/null || kill -"$2" "$p" 2>/dev/null
 exit 0'
 # shellcheck disable=SC2016
-WT_BOX_STEP_HOST='box=$1 file=$2 stopper=$3 client=""
-shift 3
+WT_BOX_STEP_HOST='box=$1 user=$2 file=$3 stopper=$4 client=""
+shift 4
 stop_in_box() {  # $1 = signal name
-  docker exec "$box" sh -c "$stopper" sh "$file" "$1" </dev/null >/dev/null 2>&1
+  docker exec -u "$user" "$box" sh -c "$stopper" sh "$file" "$1" </dev/null >/dev/null 2>&1
 }
 stop() {  # $1 = exit status
   trap "" TERM INT HUP
@@ -1053,7 +1091,9 @@ exit "$rc"'
 # The cap is min(half of RAM, free memory minus a reserve for the desktop). PITLANE_MEMORY_MAX
 # overrides it: a size systemd accepts (`6G`, `40%`), or `off` to switch the cap and the refusal off.
 # Where none of the mechanisms exist (macOS, no user systemd) the step runs as before, only niced.
-# Builds a nix daemon performs run in the daemon's own cgroup and are outside any cap set here.
+# Builds a nix daemon performs run in the daemon's own cgroup and are outside any cap set here, and so
+# does a step run in the box: the cap holds its docker client, while the step's memory is the
+# container's; only the pre-flight refusal applies to it.
 #
 # WT_MEMINFO and WT_SYSTEMD_RUN exist for the tests: a fake /proc/meminfo, and a forced answer to
 # "can this host make a capped scope" ('' = no).
@@ -3072,16 +3112,22 @@ wt_clear_linked_dep() {  # $1 = root, $2 = worktree, $3 = dir, $4 = lock, $5 = w
 WT_TOOLCHAIN=''
 
 wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0 when the shell is usable
-  local worktree=${1%/} deadline=${2-} left started rc elapsed
+  local worktree=${1%/} deadline=${2-} left started rc elapsed probe
   [ -n "${PROFILE_SHELL:-}" ] || return 0
   case $WT_TOOLCHAIN in
     ready) return 0 ;;
     broken | lowmem) return 1 ;;
   esac
-  # A box the selection found running is ready: a step in it starts nothing.
-  if wt_toolchain_is_box "$worktree"; then
-    WT_TOOLCHAIN=ready
-    return 0
+  left=$(wt_budget_left "$deadline")
+  # A box the selection found running is ready: a step in it starts nothing. Its probe has only the
+  # budget that is left.
+  if [ "$left" -gt 0 ]; then
+    probe=$WT_BOX_PROBE_SECONDS
+    [ "$left" -ge "$probe" ] || probe=$left
+    if WT_BOX_PROBE_SECONDS=$probe wt_toolchain_is_box "$worktree"; then
+      WT_TOOLCHAIN=ready
+      return 0
+    fi
   fi
   # Nothing to start: every step runs on the host shell (wt_run_in_shell).
   if wt_shell_program_missing; then
@@ -3089,7 +3135,6 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
     WT_TOOLCHAIN=ready
     return 0
   fi
-  left=$(wt_budget_left "$deadline")
   if [ "$left" -le 0 ]; then
     return 1
   fi

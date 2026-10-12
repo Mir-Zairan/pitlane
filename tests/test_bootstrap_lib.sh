@@ -392,7 +392,7 @@ if [ "\$1" = exec ]; then
   shift
   while :; do
     case \$1 in
-      -i) shift ;;
+      -i) printf '%s\n' "\$\$" >"$TMP/box/client.pid"; shift ;;
       -u | -w | -e) shift 2 ;;
       *) break ;;
     esac
@@ -402,8 +402,10 @@ if [ "\$1" = exec ]; then
   exec "\$@"
 fi
 case " \$* " in
+  *' inspect '*) cat "$TMP/box/memory" ;;
   *' ps -q '*)
     printf 'probe\n' >>"$TMP/box/probes"
+    [ ! -e "$TMP/box/slow" ] || sleep 30
     printf 'APP_MODE=%s KEEP=%s FROMFILE=%s\n' "\${APP_MODE-unset}" "\${KEEP-unset}" "\${FROMFILE-unset}" >"$TMP/box/probe.env"
     cat "$TMP/box/id" 2>/dev/null
     ;;
@@ -411,6 +413,7 @@ esac
 SH
 chmod +x "$TMP/box/bin/docker"
 printf 'c0ffee12\n' >"$TMP/box/id"
+printf '2147483648\n' >"$TMP/box/memory"
 git -C "$BOXM" init -q -b main
 git -C "$BOXM" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 git -C "$BOXM" worktree add -q "$BOXWT" -b alice/fix-99 2>/dev/null
@@ -468,7 +471,9 @@ contains '...and says why' 'docker is not installed here' "$(PATH=$TMP/box/empty
 : >"$TMP/box/id"
 eq 'box: a service that is not running is not used' no "$(box_selected "$BOXWT")"
 # shellcheck disable=SC2016  # the backquotes are the message's own
-contains '...and says why' 'it is not running (start it with `docker compose up -d app`)' "$(box_selected "$BOXWT"; cat "$TMP/box/err")"
+contains '...and says why, with the compose command Pitlane runs' \
+  "it is not running (start it with \`docker compose --project-directory $BOXM -f $BOXM/compose.yaml -f $BOXM/compose.dev.yaml --profile dev --env-file $BOXM/.env.box up -d app\`)" \
+  "$(box_selected "$BOXWT"; cat "$TMP/box/err")"
 printf 'c0ffee12\n' >"$TMP/box/id"
 eq 'box: a worktree outside the main checkout is not used' no "$(box_selected "$TMP/run")"
 contains '...and says why' "$TMP/run is outside the main checkout $BOXM" "$(box_selected "$TMP/run"; cat "$TMP/box/err")"
@@ -486,6 +491,31 @@ wt_run_in_shell 'true' "$BOXWT" 10 >/dev/null 2>&1
 wt_run_in_shell 'true' "$BOXWT" 10 >/dev/null 2>&1
 eq 'box: compose ps runs once per process, however many steps ask' 1 "$(grep -c probe "$TMP/box/probes")"
 eq '...and the container it found is kept' c0ffee12 "$WT_BOX_CONTAINER"
+wt_box_container "$TMP/run"
+eq '...while another main checkout is probed for itself' 2 "$(grep -c probe "$TMP/box/probes")"
+box_fresh
+err=$( { wt_toolchain_is_box "$BOXWT"; wt_toolchain_is_box "$BOXWT"
+         wt_run_in_shell 'true' "$BOXWT" 10; wt_run_in_shell 'true' "$BOXWT" 10; } 2>&1 >/dev/null)
+eq 'box: the selection is said once across selections and steps' 1 \
+  "$(printf '%s\n' "$err" | grep -c "running the profile's commands in the box")"
+contains '...saying the memory cap does not reach the box' 'beyond the reach of the memory cap' "$err"
+lacks '...and a box with a memory limit is not warned about' 'no memory limit' "$err"
+printf '0\n' >"$TMP/box/memory"
+contains 'box: a box with no memory limit is warned about' 'the box has no memory limit' \
+  "$(box_selected "$BOXWT"; cat "$TMP/box/err")"
+printf '2147483648\n' >"$TMP/box/memory"
+if command -v timeout >/dev/null 2>&1; then
+  : >"$TMP/box/slow"
+  t0=$SECONDS
+  eq 'box: a docker that does not answer the probe is not used' no "$(WT_BOX_PROBE_SECONDS=1 box_selected "$BOXWT")"
+  eq '...within a few seconds' yes "$([ $((SECONDS - t0)) -lt 5 ] && echo yes || echo "$((SECONDS - t0))s")"
+  contains '...and says why' 'docker did not answer within 1s' "$(cat "$TMP/box/err")"
+  rm -f "$TMP/box/slow"
+fi
+eq 'box: a compose file outside the checkout refuses the box' no "$(PROFILE_BOX_COMPOSE=compose.yaml:../elsewhere.yaml box_selected "$BOXWT")"
+contains '...saying so without quoting it' 'names a path that is not inside the main checkout' "$(cat "$TMP/box/err")"
+eq '...and an absolute env file too' no "$(PROFILE_BOX_ENV_FILES=/etc/elsewhere box_selected "$BOXWT")"
+eq '...without running compose' '' "$(cat "$TMP/box/probes")"
 
 # --- the compose argv ---
 compose_argv() {  # prints WT_BOX_COMPOSE_ARGV one per line
@@ -518,6 +548,13 @@ lacks '...not even the one it set' 'devmode' "$(cat "$TMP/box/docker.log")"
 box_fresh
 wt_toolchain_is_box "$BOXWT" 2>/dev/null
 eq '...nor does it reach the hook'"'"'s own environment' unset "${APP_MODE-unset}"
+printf '  export EXPORTED=fromfile\n' >"$TMP/box/exported.env"
+out=$( WT_BOX_ENV_FILES=("$TMP/box/exported.env")
+       PROFILE_RAW="10${US_}BAD-KEY${US_}x${RS_}10${US_}EXPORTED${US_}default${RS_}10${US_}FRESH${US_}set${RS_}"
+       unset EXPORTED FRESH
+       wt_box_export_env
+       printf '%s %s' "${EXPORTED-unset}" "${FRESH-unset}" ) 2>&1
+eq 'box: box.env skips an unsafe key quietly, and a name an env file sets with export' 'unset set' "$out"
 
 # --- the exec argv ---
 box_fresh
@@ -532,16 +569,16 @@ out=$(export WT_SLUG=alice_fix_99 WORKTREE_URL=http://localhost:4100 MYSQL_PWD=s
 got=()
 IFS=$US_ read -r -d '' -a got < <(printf '%s' "$out")
 eq 'box: the host side wraps it, given the container, a file of its own in the box and the stop script' \
-  "bash|-c|$WT_BOX_STEP_HOST|pitlane-box-step|c0ffee12" "$(IFS='|'; printf '%s' "${got[*]:0:5}")"
-step_file=${got[5]}
+  "bash|-c|$WT_BOX_STEP_HOST|pitlane-box-step|c0ffee12|$(id -u):$(id -g)" "$(IFS='|'; printf '%s' "${got[*]:0:6}")"
+step_file=${got[6]}
 case $step_file in
   /tmp/pitlane-step-$$-*.pid) pass=$((pass + 1)) ;;
   *) eq '...the file is /tmp/pitlane-step-<hook pid>-<random>.pid' "/tmp/pitlane-step-$$-N.pid" "$step_file" ;;
 esac
-eq '...then the stop script' "$WT_BOX_STEP_STOP" "${got[6]}"
+eq '...then the stop script' "$WT_BOX_STEP_STOP" "${got[7]}"
 eq 'box: docker exec, as the developer, in the directory'"'"'s path in the box, a space and all' \
-  "docker|exec|-i|-u|$(id -u):$(id -g)|-w|/srv/app/with space|-e|HOME=/tmp" "$(IFS='|'; printf '%s' "${got[*]:7:9}")"
-out=$(printf '%s\n' "${got[@]:7}")
+  "docker|exec|-i|-u|$(id -u):$(id -g)|-w|/srv/app/with space|-e|HOME=/tmp" "$(IFS='|'; printf '%s' "${got[*]:8:9}")"
+out=$(printf '%s\n' "${got[@]:8}")
 contains '...passing a WT_ variable by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$out"
 contains '...a WORKTREE_ one' "${NL_}-e${NL_}WORKTREE_URL${NL_}" "$out"
 contains '...and MYSQL_PWD' "${NL_}-e${NL_}MYSQL_PWD${NL_}" "$out"
@@ -554,6 +591,9 @@ eq '...which runs the box side with the same file, then the command as one argum
 # shellcheck disable=SC2016
 eq '...ending in sh -c with the command as one argument' 'printf "a b"; echo "$HOME"' "$(printf '%s\n' "$out" | tail -n 1)"
 eq 'box: the main checkout itself is the mount' '/srv/app' "$(wt_box_path "$BOXM/" "$BOXM")"
+mkdir -p "$BOXM-sibling/x"
+eq 'box: a sibling whose name starts with the checkout'"'"'s is not in the box' 1 \
+  "$(wt_box_path "$BOXM-sibling/x" "$BOXM" >/dev/null; echo $?)"
 eq 'box: a path that climbs out with .. is not in the box' 1 "$(wt_box_path "$BOXM/../run" "$BOXM" >/dev/null; echo $?)"
 ln -s "$BOXM" "$TMP/box/link"
 eq 'box: a path through a symlink maps by its real path' '/srv/app/with space' "$(wt_box_path "$TMP/box/link/with space" "$BOXM")"
@@ -580,24 +620,93 @@ eq '...and its file in the box is gone once it ends' '' "$(ls -A "$TMP/box/steps
 wt_run_in_shell 'printf "x\n" >> "$PWD/evalcount"' "$BOXWT" 10 >/dev/null 2>&1
 eq 'box: the command reaches exactly one shell, so it is evaluated once' 1 "$(wc -l <"$BOXWT/evalcount" | tr -d ' ')"
 rm -f "$BOXWT/evalcount"
-if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1; then
+if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   box_fresh
   rm -f "$BOXWT/inner.pid"
-  wt_run_in_shell 'echo $$ >inner.pid; exec sleep 30' "$BOXWT" 1 >/dev/null 2>&1
+  # Three seconds, so the command has certainly started in the box before the timeout stops it.
+  wt_run_in_shell 'echo $$ >inner.pid; exec sleep 30' "$BOXWT" 3 >/dev/null 2>&1
   eq 'box: a step that outruns its timeout reports 124' 124 $?
+  inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  ne '...having started in the box' '' "$inner"
   log=$(cat "$TMP/box/docker.log")
-  contains '...after the host side ran the stop script in the box' \
-    "CALL${NL_}exec${NL_}c0ffee12${NL_}sh${NL_}-c${NL_}$WT_BOX_STEP_STOP${NL_}sh${NL_}$TMP/box/steps/pitlane-step-" "$log"
+  contains '...after the host side ran the stop script in the box, as the step'"'"'s user' \
+    "CALL${NL_}exec${NL_}-u${NL_}$(id -u):$(id -g)${NL_}c0ffee12${NL_}sh${NL_}-c${NL_}$WT_BOX_STEP_STOP${NL_}sh${NL_}$TMP/box/steps/pitlane-step-" "$log"
   eq '...on the step'"'"'s own file, with TERM' "TERM" \
     "$(printf '%s\n' "$log" | grep -A1 -x "$TMP/box/steps/pitlane-step-$$-[0-9]*\.pid" | tail -n 1)"
-  inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
   eq '...which stopped the command in the box, not only the client' gone \
-    "$( [ -n "$inner" ] && kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+    "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
   eq '...and its file is gone' '' "$(ls -A "$TMP/box/steps")"
   rm -f "$BOXWT/inner.pid"
+
+  # Signals other than the timeout's: the step's argv is started as wt_run_in_shell starts it, but in
+  # the background, with SIGINT at its default (a background job of a script starts with it ignored,
+  # which no trap can undo), so the test can signal the host side itself.
+  box_step_bg() {  # $1 = command; sets bg, step_file and inner
+    box_fresh
+    rm -f "$BOXWT/inner.pid" "$TMP/box/client.pid" "$TMP/box/steps"/*
+    wt_toolchain_is_box "$BOXWT" 2>/dev/null
+    wt_box_exec_argv "$1" "$BOXWT"
+    step_file=${WT_CMD_ARGV[6]}
+    ( cd "$BOXWT" && exec python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' "${WT_CMD_ARGV[@]}" ) </dev/null >/dev/null 2>&1 &
+    bg=$!
+    i=0
+    while { [ ! -s "$BOXWT/inner.pid" ] || [ ! -s "$step_file" ]; } && [ "$i" -lt 50 ]; do
+      sleep 0.1; i=$((i + 1))
+    done
+    inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  }
+  stop_call() {  # $1 = signal name; the stop call for the current step, as the docker log records it
+    printf 'CALL%s' "${NL_}exec${NL_}-u${NL_}$(id -u):$(id -g)${NL_}c0ffee12${NL_}sh${NL_}-c${NL_}$WT_BOX_STEP_STOP${NL_}sh${NL_}$step_file${NL_}$1${NL_}"
+  }
+  for sig in INT:130 HUP:129; do
+    box_step_bg 'echo $$ >inner.pid; exec sleep 30'
+    ne "box: $sig: the step started in the box" '' "$inner"
+    kill -"${sig%:*}" "$bg"
+    wait "$bg"
+    eq "...and ${sig%:*} to the host side ends it with ${sig#*:}" "${sig#*:}" $?
+    contains '...after stopping it in the box' "$(stop_call TERM)" "$(cat "$TMP/box/docker.log")"
+    eq '...which it did' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  done
+  # A command that ignores TERM is killed after the grace.
+  box_step_bg 'trap "" TERM; echo $$ >inner.pid; while :; do sleep 1; done'
+  ne 'box: a step ignoring TERM started in the box' '' "$inner"
+  t0=$SECONDS
+  kill -TERM "$bg"
+  wait "$bg"
+  eq '...and TERM to the host side ends it with 143' 143 $?
+  eq '...after the 5s grace' yes "$([ $((SECONDS - t0)) -ge 4 ] && echo yes || echo "$((SECONDS - t0))s")"
+  contains '...stopping it in the box with TERM' "$(stop_call TERM)" "$(cat "$TMP/box/docker.log")"
+  contains '...then with KILL' "$(stop_call KILL)" "$(cat "$TMP/box/docker.log")"
+  eq '...which it did' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  # A client killed by a signal nothing can trap (the cap's SIGKILL) has the step stopped in the box.
+  box_step_bg 'echo $$ >inner.pid; exec sleep 30'
+  ne 'box: a step whose client is killed started in the box' '' "$inner"
+  kill -KILL "$(cat "$TMP/box/client.pid")"
+  wait "$bg"
+  eq '...and the host side passes the client'"'"'s 137 on' 137 $?
+  contains '...after stopping the step in the box' "$(stop_call TERM)" "$(cat "$TMP/box/docker.log")"
+  eq '...which it did' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  rm -f "$BOXWT/inner.pid" "$TMP/box/steps"/*
 else
-  printf 'WARNING: timeout or setsid absent — stopping a box step NOT verified\n' >&2
+  printf 'WARNING: timeout, setsid or python3 absent — stopping a box step NOT verified\n' >&2
 fi
+# The stop script signals only an id above 1, read from its file: `kill` is replaced by a function that
+# says what it would do, and the refusals are run only once that is shown to work.
+stop_would() {  # $1 = the file's content
+  printf '%s' "$1" >"$TMP/box/stop.pid"
+  sh -c 'kill() { printf "kill %s" "$*"; }
+'"$WT_BOX_STEP_STOP" sh "$TMP/box/stop.pid" TERM
+}
+eq 'box: the stop script signals the group its file names' 'kill -TERM -4242' "$(stop_would 4242)"
+if [ "$(stop_would 4242)" = 'kill -TERM -4242' ]; then
+  for bad in 1 0 01 '' -5 '4242 1' abc; do
+    eq "...and nothing for \"$bad\"" '' "$(stop_would "$bad")"
+  done
+fi
+eq '...nor for a file that is not there' '' "$(rm -f "$TMP/box/stop.pid"; sh -c 'kill() { printf "kill %s" "$*"; }
+'"$WT_BOX_STEP_STOP" sh "$TMP/box/stop.pid" TERM)"
 unset WT_BOX_STEP_DIR
 box_fresh
 rm -f "$TMP/run/box-ran"
@@ -4094,6 +4203,23 @@ wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
 eq 'a passing verify records the dependency as done' 0 \
   "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
        "$(wt_cksum_string 'mkdir -p vendor && printf x > vendor/autoload.php')" install; echo $?)"
+
+# With the box, the install runs in it and its verify, a cheap check by contract, stays on the host.
+rm -rf "$DWT/vendor"
+: >"$TMP/box/docker.log"
+# shellcheck disable=SC2034
+PROFILE_RAW=$(dep_raw vendor composer.lock install 'mkdir -p vendor && printf x > vendor/autoload.php' 'test -r vendor/autoload.php # box-verify')
+# shellcheck disable=SC2034
+PROFILE_HAS_BOX=1 PROFILE_BOX_SERVICE=app PROFILE_BOX_MOUNT=/srv/app WT_BOX_PROBED='' WT_BOX_LOGGED=''
+PATH=$TMP/box/bin:$PATH PITLANE_TOOLCHAIN=box WT_BOX_STEP_DIR=$TMP/box/steps \
+  wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>/dev/null
+contains 'box: the install runs in the box' "${NL_}exec${NL_}-i${NL_}" "$(cat "$TMP/box/docker.log")"
+lacks '...and its verify does not' 'box-verify' "$(cat "$TMP/box/docker.log")"
+eq '...which passed on the host' 0 \
+  "$(wt_state_is_done "$DWT" vendor "$(wt_cksum_file "$DWT/composer.lock")" \
+       "$(wt_cksum_string 'mkdir -p vendor && printf x > vendor/autoload.php')" install; echo $?)"
+# shellcheck disable=SC2034
+PROFILE_HAS_BOX=0 PROFILE_BOX_SERVICE='' PROFILE_BOX_MOUNT='' WT_BOX_PROBED='' WT_BOX_LOGGED=''
 
 # --- an interrupted run leaves a partial tree that must be cleared ---------
 rm -rf "$DWT/vendor"; mkdir -p "$DWT/vendor"; printf 'PARTIAL\n' > "$DWT/vendor/half.txt"
