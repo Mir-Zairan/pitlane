@@ -425,6 +425,47 @@ eq 'no script: the entry is forgotten' no "$(exists "$RN/.git/worktree-ledger/no
 eq 'no script: and nothing was run' yes "$(exists "$DB/noscript")"
 
 # ---------------------------------------------------------------------------
+# Box mode with a database: the teardown runs in a throwaway container of the database's image
+# ---------------------------------------------------------------------------
+# A fake docker records each call one argument per line and runs a container's command on the host.
+mkdir -p "$TMP/box-bin"
+cat >"$TMP/box-bin/docker" <<SH
+#!/usr/bin/env bash
+{ printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/docker.log"
+case \$1 in
+  run) while [ "\$1" != mysql:8.4 ]; do shift; done; shift; exec "\$@" ;;
+  inspect) case " \$* " in *.Config.Image*) printf 'mysql:8.4\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
+  compose) printf 'c0ffee12\n' ;;
+esac
+SH
+chmod +x "$TMP/box-bin/docker"
+RX=$TMP/repo-box
+make_repo "$RX"
+XW=$(create "$RX" boxed)
+git -C "$RX" worktree remove --force "$XW"
+python3 - "$RX/.claude/worktree-profile.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["box"] = {"service": "app", "mount": "/srv/app", "database": "db"}
+json.dump(d, open(p, "w"))
+PY
+prune "$RX"
+eq 'box: reported as teardown' teardown "$(field runtime-leftover "$XW" 5)"
+: >"$TMP/docker.log"
+PATH=$TMP/box-bin:$PATH PITLANE_TOOLCHAIN=box prune "$RX" --apply "$(field runtime-leftover "$XW" 1)"
+eq 'box: applied' 0 "$(cat "$TMP/rc")"
+eq '...the teardown ran' no "$(exists "$DB/boxed")"
+contains '...from the main checkout' "PWD=$RX" "$(cat "$LOGS/boxed.log")"
+log=$(cat "$TMP/docker.log")
+contains '...through docker run, removed when it ends and named' "CALL"$'\n'"run"$'\n'"--rm"$'\n'"-i"$'\n'"--name"$'\n'"pitlane-db-" "$log"
+contains '...on the database'"'"'s network, the main checkout at the mount, in its path there' \
+  $'\n'"--network"$'\n'"stack_default"$'\n'"-u"$'\n'"$(id -u):$(id -g)"$'\n'"-v"$'\n'"$RX:/srv/app"$'\n'"-w"$'\n'"/srv/app"$'\n' "$log"
+contains '...ending in the database'"'"'s image and the script through sh -c' \
+  $'\n'"-e"$'\n'"WT_DB_HOST=db"$'\n'"--entrypoint"$'\n'"env"$'\n'"mysql:8.4"$'\n'"sh"$'\n'"-c"$'\n'"./'.claude/worktree-teardown.sh'" "$log"
+lacks '...not in the box' "CALL"$'\n'"exec"$'\n' "$log"
+
+# ---------------------------------------------------------------------------
 # A main checkout moved since creation: nothing can be proven, so nothing is done
 # ---------------------------------------------------------------------------
 

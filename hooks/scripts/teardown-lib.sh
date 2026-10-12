@@ -968,7 +968,7 @@ wt_run_teardown_script() {  # $1 = directory to run in, $2 = worktree path, $3 =
     WT_ENV_FILE=${WT_TD_ENVFILE%%:*}
     WT_ENV_FILES=${WT_TD_ENVFILE//:/$WT_NL}
     export WT_NAME WT_SLUG WT_PORT WT_PATH WT_ROOT WT_ENV_FILE WT_ENV_FILES
-    wt_run_in_shell "./'$esc'" "$rundir" "$secs"
+    WT_BOX_TARGET=database wt_run_in_shell "./'$esc'" "$rundir" "$secs"
   )
   rc=$?
   case $rc in

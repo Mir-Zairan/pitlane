@@ -749,6 +749,35 @@ eq '...seeing the seed'"'"'s name, slug, port and path' "bob/fix 7|bob_fix_7|391
   "$(cat "$T/ran" 2>/dev/null)"
 rm -f "$T/ran"
 
+# In box mode with box.database, the script runs in a throwaway container of the database's image.
+# A fake docker records each call one argument per line and runs a container's command on the host.
+mkdir -p "$SCRATCH/box-bin"
+cat >"$SCRATCH/box-bin/docker" <<SH
+#!/usr/bin/env bash
+{ printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$SCRATCH/docker.log"
+case \$1 in
+  run) while [ "\$1" != mysql:8.4 ]; do shift; done; shift; exec "\$@" ;;
+  inspect) case " \$* " in *.Config.Image*) printf 'mysql:8.4\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
+  compose) printf 'c0ffee12\n' ;;
+esac
+SH
+chmod +x "$SCRATCH/box-bin/docker"
+: >"$SCRATCH/docker.log"
+PATH=$SCRATCH/box-bin:$PATH PITLANE_TOOLCHAIN=box \
+  PROFILE_HAS_BOX=1 PROFILE_BOX_SERVICE=app PROFILE_BOX_MOUNT=/srv/app PROFILE_BOX_DATABASE=db \
+  wt_run_teardown_script "$T" "$TW" "$T" '' 2>/dev/null
+eq 'teardown script: in box mode with a database it runs' "done" "$WT_TD_STATUS"
+eq '...seeing the recorded environment' "bob/fix 7|bob_fix_7|3911|$TW" "$(cat "$T/ran" 2>/dev/null)"
+log=$(cat "$SCRATCH/docker.log")
+contains '...through docker run, removed when it ends and named' "CALL${WT_NL}run${WT_NL}--rm${WT_NL}-i${WT_NL}--name${WT_NL}pitlane-db-$$-" "$log"
+contains '...on the database'"'"'s network, as the developer, the main checkout at the mount, in its path there' \
+  "${WT_NL}--network${WT_NL}stack_default${WT_NL}-u${WT_NL}$(id -u):$(id -g)${WT_NL}-v${WT_NL}$T:/srv/app${WT_NL}-w${WT_NL}/srv/app${WT_NL}-e${WT_NL}HOME=/tmp${WT_NL}" "$log"
+contains '...passing the recorded environment by name' "${WT_NL}-e${WT_NL}WT_SLUG${WT_NL}" "$log"
+contains '...ending in the database'"'"'s image and the script through sh -c' \
+  "${WT_NL}-e${WT_NL}WT_DB_HOST=db${WT_NL}--entrypoint${WT_NL}env${WT_NL}mysql:8.4${WT_NL}sh${WT_NL}-c${WT_NL}./'down.sh'" "$log"
+lacks '...not in the box' "CALL${WT_NL}exec${WT_NL}" "$log"
+rm -f "$T/ran"
+
 WT_TD_STATUS=failed
 wt_settle_ledger_entry "$T" "$TENTRY" 1 2>/dev/null
 eq 'ledger: a failed teardown keeps the entry' kept "$WT_TD_LEDGER"

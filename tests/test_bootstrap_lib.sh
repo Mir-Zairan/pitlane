@@ -381,13 +381,38 @@ contains '...and still runs the command' 'ok' "$err"
 # line, answers `compose … ps -q <service>` with $TMP/box/id (empty: the service is not running) and
 # runs what an `exec` names after its container itself, in a session of its own as a container's
 # process would be, so a step routed to the box visibly runs and a signal to the client does not reach
-# it. Real docker is never called.
+# it. `ps -q db` answers with $TMP/box/dbid, an inspect for the image with $TMP/box/dbinspect; a `run`
+# starts what follows its image in a session of its own, recorded under its --name, and waits for it,
+# as a client attached to a container does; `rm -f <name>` kills that session. Real docker is never
+# called.
 BOXM=$TMP/box-main
 BOXWT=$BOXM/.claude/worktrees/alice-fix-99
 mkdir -p "$TMP/box/bin" "$TMP/box/empty" "$BOXM/.claude"
 cat >"$TMP/box/bin/docker" <<SH
 #!/usr/bin/env bash
 { printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/box/docker.log"
+if [ "\$1" = run ]; then
+  shift
+  name=''
+  while :; do
+    case \$1 in
+      --rm | -i) shift ;;
+      --name) name=\$2; shift 2 ;;
+      --network | -u | -v | -w | -e | --entrypoint) shift 2 ;;
+      *) break ;;
+    esac
+  done
+  shift
+  printf '%s\n' "\$\$" >"$TMP/box/client.pid"
+  if command -v setsid >/dev/null 2>&1; then setsid "\$@" & else "\$@" & fi
+  printf '%s\n' "\$!" >"$TMP/box/run-\$name.pid"
+  wait "\$!"
+  exit
+fi
+if [ "\$1" = rm ]; then
+  p=\$(cat "$TMP/box/run-\$3.pid" 2>/dev/null) && { kill -KILL -- "-\$p" 2>/dev/null || kill -KILL "\$p" 2>/dev/null; }
+  exit 0
+fi
 if [ "\$1" = exec ]; then
   shift
   while :; do
@@ -402,7 +427,9 @@ if [ "\$1" = exec ]; then
   exec "\$@"
 fi
 case " \$* " in
+  *'.Config.Image'*) cat "$TMP/box/dbinspect" ;;
   *' inspect '*) cat "$TMP/box/memory" ;;
+  *' ps -q db '*) printf 'database\n' >>"$TMP/box/dbprobes"; cat "$TMP/box/dbid" 2>/dev/null ;;
   *' ps -q '*)
     printf 'probe\n' >>"$TMP/box/probes"
     [ ! -e "$TMP/box/slow" ] || sleep 30
@@ -414,6 +441,8 @@ SH
 chmod +x "$TMP/box/bin/docker"
 printf 'c0ffee12\n' >"$TMP/box/id"
 printf '2147483648\n' >"$TMP/box/memory"
+printf 'd0d0cafe\n' >"$TMP/box/dbid"
+printf 'mysql:8.4\napp_default\n' >"$TMP/box/dbinspect"
 git -C "$BOXM" init -q -b main
 git -C "$BOXM" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 git -C "$BOXM" worktree add -q "$BOXWT" -b alice/fix-99 2>/dev/null
@@ -441,8 +470,9 @@ unset PITLANE_TOOLCHAIN WT_PATH
 WT_ROOT=$BOXM
 box_fresh() {  # forget this process's probe and what it said
   # shellcheck disable=SC2034  # read by the sourced engine
-  WT_BOX_PROBED='' WT_BOX_CONTAINER='' WT_BOX_LOGGED='' WT_SHELL_PROGRAM_WARNED=''
-  : >"$TMP/box/docker.log"; : >"$TMP/box/probes"
+  WT_BOX_PROBED='' WT_BOX_CONTAINER='' WT_BOX_LOGGED='' WT_SHELL_PROGRAM_WARNED='' \
+    WT_BOX_DATABASE_PROBED='' WT_BOX_DATABASE_CONTAINER=''
+  : >"$TMP/box/docker.log"; : >"$TMP/box/probes"; : >"$TMP/box/dbprobes"
 }
 box_selected() {  # $1 = worktree; prints yes or no, and what was said on stderr
   box_fresh
@@ -721,6 +751,152 @@ contains 'box: the toolchain step takes a running box as ready' 'rc=0 ready' "$o
 lacks '...without starting the profile'"'"'s shell' 'toolchain: starting' "$out"
 lacks '...or running anything in the box' 'exec' "$(cat "$TMP/box/docker.log")"
 WT_TOOLCHAIN=''
+
+# --- the seed and teardown in the database image ---
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+db_argv() {  # $1 = command, $2 = directory; prints WT_CMD_ARGV, each element ended by US
+  PROFILE_BOX_DATABASE=db wt_box_database_argv "$1" "$2" || return
+  printf "%s$US_" "${WT_CMD_ARGV[@]}"
+}
+out=$(unset WT_DB_HOST
+      WT_SLUG=alice_fix_99 WORKTREE_URL=http://localhost:4100 MYSQL_PWD=s3cret-pw \
+        db_argv "./'.claude/seed.sh'" "$BOXM/with space")
+got=()
+IFS=$US_ read -r -d '' -a got < <(printf '%s' "$out")
+db_name=${got[4]-}
+case $db_name in
+  pitlane-db-$$-[0-9]*) pass=$((pass + 1)) ;;
+  *) eq 'db: the container is named pitlane-db-<hook pid>-<random>' "pitlane-db-$$-N" "$db_name" ;;
+esac
+eq 'db: the host side wraps it, given the container'"'"'s name, the step user, and no file or stop script' \
+  "bash|-c|$WT_BOX_STEP_HOST|pitlane-box-step|$db_name|$(id -u):$(id -g)||" "$(IFS='|'; printf '%s' "${got[*]:0:8}")"
+eq 'db: docker run, removed when it ends, named, on the database container'"'"'s network, as the developer, with the main checkout at the mount, in the directory'"'"'s path there' \
+  "docker|run|--rm|-i|--name|$db_name|--network|app_default|-u|$(id -u):$(id -g)|-v|$BOXM:/srv/app|-w|/srv/app/with space|-e|HOME=/tmp" \
+  "$(IFS='|'; printf '%s' "${got[*]:8:16}")"
+out=$(printf '%s\n' "${got[@]:8}")
+contains '...passing a WT_ variable by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$out"
+contains '...a WORKTREE_ one' "${NL_}-e${NL_}WORKTREE_URL${NL_}" "$out"
+contains '...and MYSQL_PWD' "${NL_}-e${NL_}MYSQL_PWD${NL_}" "$out"
+lacks '...never a value' 's3cret-pw' "$out"
+lacks '...clearing nothing, the image having none of the box'"'"'s pins' "${NL_}env${NL_}-u${NL_}" "$out"
+eq '...ending with WT_DB_HOST naming the database service, the env entrypoint, the database'"'"'s image and the command through sh -c' \
+  "-e|WT_DB_HOST=db|--entrypoint|env|mysql:8.4|sh|-c|./'.claude/seed.sh'" \
+  "$(IFS='|'; n=${#got[@]}; printf '%s' "${got[*]:$((n - 8)):8}")"
+eq '...one shell only' 1 "$(printf '%s\n' "$out" | grep -cx sh)"
+out=$(export WT_DB_HOST=db.example; db_argv true "$BOXWT")
+out=${out//$US_/$NL_}
+contains 'db: a WT_DB_HOST the developer set is passed by name' "${NL_}-e${NL_}WT_DB_HOST${NL_}" "$out"
+lacks '...not replaced' 'WT_DB_HOST=db' "$out"
+box_fresh
+PROFILE_BOX_DATABASE=db wt_box_database_container "$BOXM"
+PROFILE_BOX_DATABASE=db wt_box_database_container "$BOXM"
+eq 'db: its compose ps runs once per process' 1 "$(grep -c database "$TMP/box/dbprobes")"
+eq '...and finds its container' d0d0cafe "$WT_BOX_DATABASE_CONTAINER"
+box_fresh
+: >"$TMP/box/dbid"
+WT_BOX_PROBE_WHY=sentinel
+PROFILE_BOX_DATABASE=db wt_box_database_container "$BOXM"
+eq 'db: a database probe leaves the box service'"'"'s reason alone' 'sentinel stopped' "$WT_BOX_PROBE_WHY $WT_BOX_DATABASE_WHY"
+printf 'd0d0cafe\n' >"$TMP/box/dbid"
+
+box_fresh
+out=$(PROFILE_BOX_DATABASE=db WT_BOX_TARGET=database wt_run_in_shell 'printf in-db' "$BOXWT" 10 2>&1 >/dev/null)
+contains 'db: WT_BOX_TARGET=database runs the step in the database image' 'in-db' "$out"
+contains '...through docker run' "CALL${NL_}run${NL_}--rm${NL_}" "$(cat "$TMP/box/docker.log")"
+lacks '...not in the box' "CALL${NL_}exec${NL_}" "$(cat "$TMP/box/docker.log")"
+box_fresh
+out=$(PROFILE_BOX_DATABASE=db wt_run_in_shell 'printf in-box' "$BOXWT" 10 2>&1 >/dev/null)
+contains 'db: an install, which does not ask for it, still runs in the box' 'in-box' "$out"
+contains '...through docker exec' "CALL${NL_}exec${NL_}-i${NL_}" "$(cat "$TMP/box/docker.log")"
+lacks '...not docker run' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
+box_fresh
+out=$(PROFILE_BOX_DATABASE='' WT_BOX_TARGET=database wt_run_in_shell 'printf in-box' "$BOXWT" 10 2>&1 >/dev/null)
+contains 'db: with no box.database, the seed and teardown run in the box' "CALL${NL_}exec${NL_}-i${NL_}" "$(cat "$TMP/box/docker.log")"
+lacks '...not docker run' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
+box_fresh
+: >"$BOXWT/evalcount"
+# shellcheck disable=SC2016  # $PWD is for the shell the command reaches
+PROFILE_BOX_DATABASE=db WT_BOX_TARGET=database wt_run_in_shell 'printf "x\n" >> "$PWD/evalcount"; exit 3' "$BOXWT" 10 >/dev/null 2>&1
+eq 'db: a step'"'"'s exit status comes back' 3 $?
+eq '...its command evaluated once' 1 "$(wc -l <"$BOXWT/evalcount" | tr -d ' ')"
+rm -f "$BOXWT/evalcount"
+box_fresh
+: >"$TMP/box/dbid"
+out=$(PROFILE_BOX_DATABASE=db WT_BOX_TARGET=database wt_run_in_shell 'touch db-ran' "$BOXWT" 10 2>&1 >/dev/null; echo "rc=$?")
+contains 'db: a database service that is not running fails the step' 'rc=1' "$out"
+# shellcheck disable=SC2016  # the backquotes are the message's own
+contains '...saying so, with the compose command that starts it' \
+  "compose service db is not running (start it with \`docker compose --project-directory $BOXM -f $BOXM/compose.yaml -f $BOXM/compose.dev.yaml --profile dev --env-file $BOXM/.env.box up -d db\`)" "$out"
+eq '...in one line' 1 "$(printf '%s\n' "$out" | grep -c 'database image')"
+lacks '...running nothing' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
+eq '...anywhere' no "$( [ -e "$BOXWT/db-ran" ] && echo yes || echo no)"
+printf 'd0d0cafe\n' >"$TMP/box/dbid"
+for bad in '-oops\napp_default' 'mysql:8.4'; do
+  box_fresh
+  # shellcheck disable=SC2059  # the \n in the fixture is the point
+  printf "$bad\n" >"$TMP/box/dbinspect"
+  out=$(PROFILE_BOX_DATABASE=db WT_BOX_TARGET=database wt_run_in_shell 'touch db-ran' "$BOXWT" 10 2>&1 >/dev/null; echo "rc=$?")
+  contains "db: an inspect answering \"$bad\" fails the step" 'rc=1' "$out"
+  contains '...saying docker did not name an image and network' 'did not say which image and network' "$out"
+  lacks '...running nothing' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
+done
+printf 'mysql:8.4\napp_default\n' >"$TMP/box/dbinspect"
+
+if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  db_removed() {  # $1 = container name; the docker log's record of removing it
+    printf 'CALL%s' "${NL_}rm${NL_}-f${NL_}$1${NL_}"
+  }
+  box_fresh
+  rm -f "$BOXWT/inner.pid"
+  # shellcheck disable=SC2016  # $$ is for the shell the command reaches
+  PROFILE_BOX_DATABASE=db WT_BOX_TARGET=database wt_run_in_shell 'echo $$ >inner.pid; exec sleep 30' "$BOXWT" 3 >/dev/null 2>&1
+  eq 'db: a database step that outruns its timeout reports 124' 124 $?
+  inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  ne '...having started' '' "$inner"
+  log=$(cat "$TMP/box/docker.log")
+  db_name=$(printf '%s\n' "$log" | grep -A1 -x -- --name | tail -n 1)
+  contains '...after the host side removed its container by name' "$(db_removed "$db_name")" "$log"
+  eq '...which stopped the job' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+
+  db_step_bg() {  # $1 = command; sets bg, db_name and inner
+    box_fresh
+    rm -f "$BOXWT/inner.pid" "$TMP/box/client.pid"
+    wt_toolchain_is_box "$BOXWT" 2>/dev/null
+    PROFILE_BOX_DATABASE=db wt_box_database_argv "$1" "$BOXWT"
+    db_name=${WT_CMD_ARGV[4]}
+    ( cd "$BOXWT" && exec python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' "${WT_CMD_ARGV[@]}" ) </dev/null >/dev/null 2>&1 &
+    bg=$!
+    i=0
+    while { [ ! -s "$BOXWT/inner.pid" ] || [ ! -s "$TMP/box/client.pid" ]; } && [ "$i" -lt 50 ]; do
+      sleep 0.1; i=$((i + 1))
+    done
+    inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  }
+  for sig in TERM:143 INT:130 HUP:129; do
+    # shellcheck disable=SC2016
+    db_step_bg 'echo $$ >inner.pid; exec sleep 30'
+    ne "db: $sig: the step started" '' "$inner"
+    kill -"${sig%:*}" "$bg"
+    wait "$bg"
+    eq "...and ${sig%:*} to the host side ends it with ${sig#*:}" "${sig#*:}" $?
+    contains '...after removing its container by name' "$(db_removed "$db_name")" "$(cat "$TMP/box/docker.log")"
+    eq '...which stopped the job' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  done
+  # shellcheck disable=SC2016
+  db_step_bg 'echo $$ >inner.pid; exec sleep 30'
+  ne 'db: a step whose client is killed started' '' "$inner"
+  kill -KILL "$(cat "$TMP/box/client.pid")"
+  wait "$bg"
+  eq '...and the host side passes the client'"'"'s 137 on' 137 $?
+  contains '...after removing its container by name' "$(db_removed "$db_name")" "$(cat "$TMP/box/docker.log")"
+  eq '...which stopped the job' gone "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  rm -f "$BOXWT/inner.pid" "$TMP/box"/run-*.pid
+else
+  printf 'WARNING: timeout, setsid or python3 absent — stopping a database step NOT verified\n' >&2
+fi
 
 PATH=$REALPATH_
 unset WT_ROOT
@@ -6104,6 +6280,26 @@ eq 'and it runs with the WORKTREE as its working directory' "cwd=$SW" \
   "$(grep '^cwd=' "$SW/seed-saw.txt")"
 eq 'the outcome is recorded in the state file' 'done' "$(wt_runtime_state_get "$SW" seedstatus)"
 ne 'along with a fingerprint of the script' '' "$(wt_runtime_state_get "$SW" seedcksum)"
+
+# --- in box mode with box.database, in a throwaway container of the database's image ---
+# Through the fake docker of the box section, which runs the container's command on the host.
+reset_seed_state
+rm -f "$SW/seed-saw.txt"
+( box_fresh
+  PATH=$TMP/box/bin:$PATH PITLANE_TOOLCHAIN=box \
+    PROFILE_HAS_BOX=1 PROFILE_BOX_SERVICE=app PROFILE_BOX_MOUNT=/srv/app PROFILE_BOX_DATABASE=db \
+    wt_runtime_seed "$SREPO2" "$SW" seed_slug 3812 .env.worktree.local ours "$SEEDREL" "$(seed_deadline)" 2>/dev/null
+  printf '%s' "$WT_SEED_STATUS" >"$TMP/box/seed-status" )
+eq 'box: the seed runs' 'done' "$(cat "$TMP/box/seed-status")"
+eq '...with the contract'"'"'s variables' 'slug=seed_slug' "$(grep '^slug=' "$SW/seed-saw.txt" 2>/dev/null)"
+log=$(cat "$TMP/box/docker.log")
+contains '...through docker run, removed when it ends and named' "CALL${NL_}run${NL_}--rm${NL_}-i${NL_}--name${NL_}pitlane-db-$$-" "$log"
+contains '...on the database'"'"'s network, as the developer, the main checkout at the mount, in the worktree'"'"'s path there' \
+  "${NL_}--network${NL_}app_default${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-v${NL_}$SREPO2:/srv/app${NL_}-w${NL_}/srv/app/.claude/worktrees/sw${NL_}-e${NL_}HOME=/tmp${NL_}" "$log"
+contains '...passing the contract by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$log"
+contains '...ending in the database'"'"'s image and the seed through sh -c' \
+  "${NL_}-e${NL_}WT_DB_HOST=db${NL_}--entrypoint${NL_}env${NL_}mysql:8.4${NL_}sh${NL_}-c${NL_}./'$SEEDREL'" "$log"
+lacks '...not in the box' "CALL${NL_}exec${NL_}-i${NL_}" "$log"
 
 # --- SKIP when nothing has changed, RETRY when the script does -------------------------------
 rm -f "$SW/seed-saw.txt"

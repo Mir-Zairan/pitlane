@@ -741,6 +741,12 @@ wt_shell_program_warn() {
 # the main checkout. A box that is wanted but cannot be used is said once, and the step runs as it
 # would with no box.
 #
+# THE TARGET. A step runs in the box service, except one whose caller sets WT_BOX_TARGET=database (the
+# seed and the teardown script) when the profile names box.database: that runs in a throwaway
+# container of the database service's own image, on its network. An app image often carries a
+# different database client than the server's, and MariaDB's mysqldump cannot copy a MySQL 8
+# database.
+#
 # The `compose ps` probe costs about half a second, so it runs once per process; everything else in
 # the selection is a variable or a PATH lookup and is decided again for each step, because a caller
 # may narrow it for one call (a verify, which runs on the host by contract, passes
@@ -751,6 +757,11 @@ WT_BOX_ROOT=''        # the main checkout the box was last selected for
 WT_BOX_CONTAINER=''   # the service's running container, once probed
 WT_BOX_PROBED=''      # the main checkout the probe ran for, set when it found nothing too
 WT_BOX_PROBE_WHY=''   # why it found nothing: paths, slow or stopped
+WT_BOX_PROBE_ID=''    # what the last probe found
+WT_BOX_DATABASE_CONTAINER=''  # the same three for box.database's service
+WT_BOX_DATABASE_PROBED=''
+WT_BOX_DATABASE_WHY=''
+WT_BOX_PASS=()        # the docker options that pass Pitlane's variables into a container
 WT_BOX_USER=''        # uid:gid, so what a step writes in the worktree is the developer's, not root's
 WT_BOX_LOGGED=''      # the reasons said this run, one per line
 WT_BOX_PROBE_SECONDS=20
@@ -918,31 +929,66 @@ wt_box_export_env() {
   done < <(printf '%s' "${PROFILE_RAW:-}")
 }
 
-# Probe, once per process and main checkout, for the box service's running container: sets
-# WT_BOX_CONTAINER, or fails with WT_BOX_PROBE_WHY saying why there is none. `ps` lists running
-# containers only. Bounded by WT_BOX_PROBE_SECONDS, because a docker daemon that does not answer must
-# not hold a session start.
-wt_box_container() {  # $1 = main checkout
+# The running container of compose service $2 in main checkout $1: sets WT_BOX_PROBE_ID, or fails with
+# WT_BOX_PROBE_WHY saying why there is none. `ps` lists running containers only. Bounded by
+# WT_BOX_PROBE_SECONDS, because a docker daemon that does not answer must not hold a session start.
+wt_box_probe() {  # $1 = main checkout, $2 = service
   local root=${1%/} out='' rc=0
   local -a bound=()
+  WT_BOX_PROBE_ID=''
+  WT_BOX_PROBE_WHY=paths
+  wt_box_compose_argv "$root" || return 1
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+  out=$( wt_box_export_env
+         exec ${bound[@]+"${bound[@]}"} "${WT_BOX_COMPOSE_ARGV[@]}" ps -q "$2" </dev/null 2>/dev/null ) || rc=$?
+  WT_BOX_PROBE_ID=${out%%"$WT_NL"*}
+  [ "$rc" -eq 0 ] || WT_BOX_PROBE_ID=''
+  # An id goes where docker reads options, so anything but one is no container.
+  case $WT_BOX_PROBE_ID in
+    *[!0-9a-f]*) WT_BOX_PROBE_ID='' ;;
+  esac
+  WT_BOX_PROBE_WHY=stopped
+  [ "$rc" -ne 124 ] || WT_BOX_PROBE_WHY=slow
+  [ -n "$WT_BOX_PROBE_ID" ]
+}
+
+# The box service's running container, probed once per process and main checkout: sets
+# WT_BOX_CONTAINER, or fails with WT_BOX_PROBE_WHY saying why there is none.
+wt_box_container() {  # $1 = main checkout
+  local root=${1%/}
   if [ "$WT_BOX_PROBED" != "$root" ]; then
     WT_BOX_PROBED=$root
-    WT_BOX_CONTAINER=''
-    WT_BOX_PROBE_WHY=paths
-    wt_box_compose_argv "$root" || return 1
-    command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
-    out=$( wt_box_export_env
-           exec ${bound[@]+"${bound[@]}"} "${WT_BOX_COMPOSE_ARGV[@]}" ps -q "$PROFILE_BOX_SERVICE" </dev/null 2>/dev/null ) || rc=$?
-    WT_BOX_CONTAINER=${out%%"$WT_NL"*}
-    [ "$rc" -eq 0 ] || WT_BOX_CONTAINER=''
-    # An id goes where docker reads options, so anything but one is no container.
-    case $WT_BOX_CONTAINER in
-      *[!0-9a-f]*) WT_BOX_CONTAINER='' ;;
-    esac
-    WT_BOX_PROBE_WHY=stopped
-    [ "$rc" -ne 124 ] || WT_BOX_PROBE_WHY=slow
+    wt_box_probe "$root" "$PROFILE_BOX_SERVICE" || true
+    WT_BOX_CONTAINER=$WT_BOX_PROBE_ID
   fi
   [ -n "$WT_BOX_CONTAINER" ]
+}
+
+# The same for box.database's service: sets WT_BOX_DATABASE_CONTAINER, or fails with
+# WT_BOX_DATABASE_WHY. WT_BOX_PROBE_WHY stays the box service's, which the selection reports.
+wt_box_database_container() {  # $1 = main checkout
+  local root=${1%/} WT_BOX_PROBE_WHY=''
+  if [ "$WT_BOX_DATABASE_PROBED" != "$root" ]; then
+    WT_BOX_DATABASE_PROBED=$root
+    wt_box_probe "$root" "$PROFILE_BOX_DATABASE" || true
+    WT_BOX_DATABASE_CONTAINER=$WT_BOX_PROBE_ID
+    WT_BOX_DATABASE_WHY=$WT_BOX_PROBE_WHY
+  fi
+  [ -n "$WT_BOX_DATABASE_CONTAINER" ]
+}
+
+# Pitlane's own variables (WT_*, WORKTREE_*, MYSQL_PWD), into WT_BOX_PASS as docker options. Passed by
+# NAME only, so docker reads their values from its own environment and none appears in `ps`.
+# HOME=/tmp because the developer's uid usually has no home in the image, and the tools write their
+# caches under HOME.
+wt_box_pass_argv() {  # sets WT_BOX_PASS
+  local name
+  WT_BOX_PASS=(-e HOME=/tmp)
+  while IFS= read -r name; do
+    case $name in
+      WT_* | WORKTREE_* | MYSQL_PWD) WT_BOX_PASS+=(-e "$name") ;;
+    esac
+  done <<<"$(compgen -e)"
 }
 
 # Build the argv that runs command $1 in the box, in directory $2, into WT_CMD_ARGV. Fails, with a
@@ -952,10 +998,6 @@ wt_box_container() {  # $1 = main checkout
 # The command reaches exactly one shell, as in wt_build_shell_argv. That shell is POSIX `sh -c`, not a
 # login shell: a login shell's profile can reset the PATH the image sets, losing the project's tools.
 #
-# Pitlane's own variables (WT_*, WORKTREE_*, MYSQL_PWD) are passed by NAME only, so docker reads their
-# values from its own environment and none appears in `ps`. HOME=/tmp because the developer's uid
-# usually has no home in the image, and the tools write their caches under HOME.
-#
 # `env -u` clears what the box's compose `environment:` pins but the worktree's env files must decide
 # — runtime.env.vars' names, which hold the worktree's own databases and port, and box.clearEnv: most
 # frameworks rank the process environment above a .env file, so the main checkout's values would win.
@@ -964,18 +1006,14 @@ wt_box_container() {  # $1 = main checkout
 # stopped stops in the box too; the result is still one argv, for the guard to wrap.
 wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
   local cmd=${1-} dir=${2-} where name rec body key file
-  local -a pass=(-e HOME=/tmp) cleared=()
+  local -a cleared=()
   WT_CMD_ARGV=()
   if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
     wt_log "cannot run \"$cmd\" in the box: $dir is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
     return 1
   fi
   [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
-  while IFS= read -r name; do
-    case $name in
-      WT_* | WORKTREE_* | MYSQL_PWD) pass+=(-e "$name") ;;
-    esac
-  done <<<"$(compgen -e)"
+  wt_box_pass_argv
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
       3"$WT_US"*) ;;
@@ -992,9 +1030,64 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
   done
   file="${WT_BOX_STEP_DIR:-/tmp}/pitlane-step-$$-$RANDOM$RANDOM.pid"
   WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$WT_BOX_CONTAINER" "$WT_BOX_USER" "$file" "$WT_BOX_STEP_STOP"
-    docker exec -i -u "$WT_BOX_USER" -w "$where" "${pass[@]}" "$WT_BOX_CONTAINER")
+    docker exec -i -u "$WT_BOX_USER" -w "$where" "${WT_BOX_PASS[@]}" "$WT_BOX_CONTAINER")
   [ "${#cleared[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${cleared[@]}")
   WT_CMD_ARGV+=(sh -c "$WT_BOX_STEP_BOX" pitlane-step "$file" "$cmd")
+}
+
+# Build the argv that runs command $1, in directory $2, in a throwaway container of box.database's
+# image into WT_CMD_ARGV: on that service's network, with the main checkout at the mount, as the step
+# user. Fails, with a log line, when the database service is not running or $2 is outside the main
+# checkout. Only after wt_toolchain_is_box said yes.
+#
+# The image's own environment holds none of what compose pins in the box, so nothing is cleared.
+# WT_DB_HOST names the database service, the host the stack's network knows it by, unless the
+# developer's environment sets it. `--entrypoint env` keeps the image's entrypoint, a server's
+# start-up script, from running.
+#
+# The container is named, and a step stopped on the host removes it by that name: nothing in it
+# outlives the step, so no stopping inside it is needed and the command reaches `sh -c` directly.
+wt_box_database_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
+  local cmd=${1-} dir=${2-} where name out image network host=1
+  local -a bound=()
+  WT_CMD_ARGV=()
+  if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
+    wt_log "cannot run \"$cmd\" in the database image: $dir is outside the main checkout $WT_BOX_ROOT, the only part of this machine the box sees"
+    return 1
+  fi
+  if ! wt_box_database_container "$WT_BOX_ROOT"; then
+    case $WT_BOX_DATABASE_WHY in
+      slow) wt_log "cannot run \"$cmd\" in the database image: docker did not answer within ${WT_BOX_PROBE_SECONDS}s" ;;
+      *) wt_log "cannot run \"$cmd\" in the database image: compose service $PROFILE_BOX_DATABASE is not running (start it with \`$(printf '%q ' "${WT_BOX_COMPOSE_ARGV[@]}")up -d $PROFILE_BOX_DATABASE\`)" ;;
+    esac
+    return 1
+  fi
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
+  # shellcheck disable=SC2016  # a Go template, for docker
+  out=$(${bound[@]+"${bound[@]}"} docker inspect -f '{{.Config.Image}}{{"\n"}}{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' \
+    "$WT_BOX_DATABASE_CONTAINER" </dev/null 2>/dev/null) || out=''
+  image=${out%%"$WT_NL"*}
+  network=${out#*"$WT_NL"}
+  network=${network%%"$WT_NL"*}
+  # The image goes where docker reads options.
+  case $image in
+    '' | -* | *[[:space:]]*) image='' ;;
+  esac
+  if [ -z "$image" ] || [ -z "$network" ] || [ "$out" = "$image" ]; then
+    wt_log "cannot run \"$cmd\" in the database image: docker did not say which image and network compose service $PROFILE_BOX_DATABASE's container has"
+    return 1
+  fi
+  [ -n "$WT_BOX_USER" ] || WT_BOX_USER="$(id -u):$(id -g)"
+  wt_box_pass_argv
+  for name in "${WT_BOX_PASS[@]}"; do
+    [ "$name" != WT_DB_HOST ] || host=0
+  done
+  [ "$host" -eq 0 ] || WT_BOX_PASS+=(-e "WT_DB_HOST=$PROFILE_BOX_DATABASE")
+  name="pitlane-db-$$-$RANDOM$RANDOM"
+  WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$name" "$WT_BOX_USER" '' ''
+    docker run --rm -i --name "$name" --network "$network" -u "$WT_BOX_USER"
+    -v "$WT_BOX_ROOT:$PROFILE_BOX_MOUNT" -w "$where" "${WT_BOX_PASS[@]}" --entrypoint env "$image"
+    sh -c "$cmd")
 }
 
 # A step in the box has to be stopped IN the box: stopping the docker client — which is all a timeout,
@@ -1017,7 +1110,8 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
 # $4 = WT_BOX_STEP_STOP, the rest = the docker command). On TERM, INT or HUP it stops the step in the box, gives it 5 seconds to
 # end, then kills it, and exits 128 + the signal; `timeout` reports its own 124 regardless. A client that
 # ended by a signal it could not trap (the cap's SIGKILL) has the step stopped in the box as well. The
-# traps are set before the client starts, so no signal falls between the two.
+# traps are set before the client starts, so no signal falls between the two. With $3 and $4 empty, $1
+# names a throwaway container the docker command runs, and stopping the step removes it.
 #
 # WT_BOX_STEP_DIR exists for the tests: the directory of the file in the box, /tmp by default.
 # shellcheck disable=SC2016  # these are scripts, expanded where they run
@@ -1042,6 +1136,10 @@ exit 0'
 WT_BOX_STEP_HOST='box=$1 user=$2 file=$3 stopper=$4 client=""
 shift 4
 stop_in_box() {  # $1 = signal name
+  if [ -z "$file" ]; then
+    docker rm -f "$box" </dev/null >/dev/null 2>&1
+    return
+  fi
   docker exec -u "$user" "$box" sh -c "$stopper" sh "$file" "$1" </dev/null >/dev/null 2>&1
 }
 stop() {  # $1 = exit status
@@ -1224,7 +1322,9 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
     host=1
   fi
 
-  if [ "$box" -eq 1 ]; then
+  if [ "$box" -eq 1 ] && [ "${WT_BOX_TARGET:-app}" = database ] && [ -n "${PROFILE_BOX_DATABASE:-}" ]; then
+    wt_box_database_argv "$cmd" "$dir" || return 1
+  elif [ "$box" -eq 1 ]; then
     wt_box_exec_argv "$cmd" "$dir" || return 1
   elif [ "$host" -eq 1 ]; then
     WT_CMD_ARGV=(bash -lc "$cmd")
@@ -7393,7 +7493,7 @@ EOF
     WT_ROOT=$root
     WT_ENV_FILE=${envrel%%:*}
     WT_ENV_FILES=${envrel//:/$WT_NL}
-    wt_run_in_shell "./'$esc'" "$worktree" "$secs"
+    WT_BOX_TARGET=database wt_run_in_shell "./'$esc'" "$worktree" "$secs"
   )
   rc=$?
   elapsed=''
