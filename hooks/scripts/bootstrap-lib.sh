@@ -520,9 +520,31 @@ wt_approval_record() {  # $1 = fingerprint, $2 = any directory inside the reposi
 # /pitlane-finish, never by a hook.
 wt_approval_describe() {  # $1 = run directory
   local dir=${1%/} rec body ddir lock strategy install verify _cksum _copy _inputs build _link line
+  local env_name env_value
   printf 'Profile: %s\n' "$(wt_visible "$PROFILE_PATH")"
   printf 'Everything below is text from the branch, shown with control characters as ?:\n'
   [ -n "${PROFILE_SHELL:-}" ] && printf '  toolchain wrapper (shell): %s\n' "$(wt_visible "$PROFILE_SHELL")"
+  # The box: which containers run, with what compose reads and what is set or cleared in them. The
+  # lists are `:`-joined (wt_load_profile), shown comma-separated; env pairs are group 10 of the scan.
+  if [ "${PROFILE_HAS_BOX:-0}" = 1 ]; then
+    printf '  box: compose service %s, main checkout mounted at %s\n' \
+      "$(wt_visible "${PROFILE_BOX_SERVICE:-?}")" "$(wt_visible "${PROFILE_BOX_MOUNT:-?}")"
+    [ -n "${PROFILE_BOX_COMPOSE:-}" ] && printf '  box compose files: %s\n' "$(wt_visible "${PROFILE_BOX_COMPOSE//:/, }")"
+    [ -n "${PROFILE_BOX_PROFILES:-}" ] && printf '  box compose profiles: %s\n' "$(wt_visible "${PROFILE_BOX_PROFILES//:/, }")"
+    [ -n "${PROFILE_BOX_ENV_FILES:-}" ] && printf '  box env files (read by compose): %s\n' "$(wt_visible "${PROFILE_BOX_ENV_FILES//:/, }")"
+    while IFS= read -r -d "$WT_RS" rec; do
+      case $rec in
+        10"$WT_US"*) ;;
+        *) continue ;;
+      esac
+      body=${rec#*"$WT_US"}
+      IFS=$WT_US read -r env_name env_value <<<"$body" || true
+      printf '  box env default: %s=%s\n' "$(wt_visible "$env_name")" "$(wt_visible "$env_value")"
+    done < <(printf '%s' "${PROFILE_RAW:-}")
+    [ -n "${PROFILE_BOX_DATABASE:-}" ] && printf '  box database service (its image runs the seed and teardown): %s\n' "$(wt_visible "$PROFILE_BOX_DATABASE")"
+    [ -n "${PROFILE_BOX_CLEAR_ENV:-}" ] && printf '  box clears: %s\n' "$(wt_visible "${PROFILE_BOX_CLEAR_ENV//:/, }")"
+    [ -n "${PROFILE_BOX_SERVE:-}" ] && printf '  box serve: %s\n' "$(wt_visible "$PROFILE_BOX_SERVE")"
+  fi
   while IFS= read -r -d "$WT_RS" rec; do
     case $rec in
       1"$WT_US"*) ;;

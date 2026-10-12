@@ -6187,6 +6187,59 @@ contains 'review: shows the stop command' 'stop (run by teardown): bin/server --
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_RT_SERVE='' PROFILE_RT_STOP=''
 
+# --- the box: listed in the review, and covered by the approval of the whole profile --------------
+BOXR=$TMP/box-repo
+mkdir -p "$BOXR/.claude"
+git -C "$BOXR" init -q -b main
+: >"$BOXR/composer.lock"
+box_profile() {  # $1 = box service
+  printf '%s' '{"schemaVersion":1,
+    "deps":[{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"composer install"}],
+    "box":{"service":"'"$1"'","mount":"/srv/app","compose":["compose.yaml","compose.dev.yaml"],
+           "profiles":["dev"],"envFiles":[".env"],"env":{"PRIVATE_KEY_BASE64":"","APP_MODE":"dev"},
+           "database":"db","clearEnv":["APP_ENV","APP_DEBUG"],"serve":"bin/serve --port={port}"}}' \
+    >"$BOXR/.claude/worktree-profile.json"
+}
+# In a subshell, so the loads leave the profile state the rest of this file set up alone.
+( unset PITLANE_TRUST_PROFILES
+  box_profile app
+  wt_load_profile "$BOXR" 2>/dev/null
+  printf '%s:%s\n' "$PROFILE_PRESENT" "$PROFILE_HAS_BOX" >"$TMP/box-loaded"
+  wt_approval_describe "$BOXR" >"$TMP/box-review"
+  # shellcheck disable=SC2034  # read by the sourced engine.
+  ( PROFILE_BOX_SERVE=$'bin/serve\r\033[2Kx'; wt_approval_describe "$BOXR" ) >"$TMP/box-review-cc"
+  # The fingerprint hashes the whole profile file, so an edit to the box alone asks again.
+  wt_approval_check "$BOXR" 2>/dev/null
+  printf '%s ' "$WT_APPROVAL"
+  wt_approval_record "$WT_APPROVAL_FP" "$BOXR"
+  wt_approval_check "$BOXR" 2>/dev/null
+  printf '%s ' "$WT_APPROVAL"
+  box_profile app2
+  wt_load_profile "$BOXR" 2>/dev/null
+  wt_approval_check "$BOXR" 2>/dev/null
+  printf '%s ' "$WT_APPROVAL"
+  box_profile app
+  wt_load_profile "$BOXR" 2>/dev/null
+  wt_approval_check "$BOXR" 2>/dev/null
+  printf '%s' "$WT_APPROVAL" ) >"$TMP/box-approval"
+eq 'box review: the profile loads with its box' '1:1' "$(cat "$TMP/box-loaded")"
+out=$(cat "$TMP/box-review")
+contains 'box review: the service and mount' '  box: compose service app, main checkout mounted at /srv/app' "$out"
+contains 'box review: the compose files' '  box compose files: compose.yaml, compose.dev.yaml' "$out"
+contains 'box review: the compose profiles' '  box compose profiles: dev' "$out"
+contains 'box review: the env files compose reads' '  box env files (read by compose): .env' "$out"
+contains 'box review: each env default, the empty one too' "  box env default: PRIVATE_KEY_BASE64=$NL_" "$out"
+contains '...and the next' '  box env default: APP_MODE=dev' "$out"
+contains 'box review: the database service' '  box database service (its image runs the seed and teardown): db' "$out"
+contains 'box review: what it clears' '  box clears: APP_ENV, APP_DEBUG' "$out"
+contains 'box review: the serve command' '  box serve: bin/serve --port={port}' "$out"
+# Branch text, so shown with control characters made visible, as every other line of the review.
+out=$(cat "$TMP/box-review-cc")
+contains 'box review: a control character in the box is shown as ?' '  box serve: bin/serve??[2Kx' "$out"
+lacks '...no escape reaches the screen' $'\033' "$out"
+eq 'box approval: held, approved once recorded, held again once only the box changes, approved again once it is back' \
+  'no yes no yes' "$(cat "$TMP/box-approval")"
+
 # --- the approval record: a fingerprint matches only itself, compared as a string -----------------
 # Two different digests of the form 0e<digits> are both the number 0 to awk; an approval of one must
 # not approve the other.

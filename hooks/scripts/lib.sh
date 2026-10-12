@@ -1125,6 +1125,10 @@ wt_expand_url() {  # $1 = template
 #  20 runtime.port
 #  21 runtime.serve  22 runtime.stop                23 runtime.url
 #  24 artifacts     25 agentNote
+#  26 box            27 box.service                 28 box.mount
+#  29 box.compose    30 box.profiles                31 box.envFiles
+#  32 box.env        33 box.database                34 box.clearEnv
+#  35 box.serve
 # A new field goes on the END, never in the middle: wt_profile_scalars reads positionally, so an
 # insertion would hand every later field to the wrong variable.
 # Then group 1 = deps[] (dir, lock, strategy, install, verify, lockChecksum, copy — compact JSON,
@@ -1132,8 +1136,10 @@ wt_expand_url() {  # $1 = template
 # group 3 = runtime.env.vars as key/value pairs, group 4 = runtime.env.file's elements when it is a
 # list. A plain string yields no group-4 records; the scalar carries it. Group 5 = artifacts[] (dir,
 # inputs, build, verify, link); `inputs` arrives as compact JSON, split by wt_artifact_inputs.
-# Group 6 = agentNote[], one record per line. A new group, like a new scalar, goes on the END: the
-# consumers match records by tag, so an insertion would renumber every later group.
+# Group 6 = agentNote[], one record per line. Groups 7, 8 and 9 = the elements of box.compose (when it
+# is a list, as group 4 is for runtime.env.file), box.profiles and box.envFiles; group 10 = box.env as
+# key/value pairs; group 11 = box.clearEnv's elements. A new group, like a new scalar, goes on the END:
+# the consumers match records by tag, so an insertion would renumber every later group.
 #
 # `deps` and `copy` appear BOTH as scalars and as groups on purpose: the scalar renders as
 # compact JSON, which is how a caller tells "absent" from "[]" from "not an array at all" —
@@ -1150,12 +1156,19 @@ WT_PROFILE_SCAN=(schemaVersion shell shellArgs deps runtime
   runtime.slug runtime.env.vars copy evidence.shellMarker
   runtime.port.var runtime.port.base runtime.port.span runtime.port
   runtime.serve runtime.stop runtime.url artifacts agentNote
+  box box.service box.mount box.compose box.profiles box.envFiles
+  box.env box.database box.clearEnv box.serve
   -- deps dir lock strategy install verify lockChecksum copy
   -- copy .
   --kv runtime.env.vars
   -- runtime.env.file .
   -- artifacts dir inputs build verify link
-  -- agentNote .)
+  -- agentNote .
+  -- box.compose .
+  -- box.profiles .
+  -- box.envFiles .
+  --kv box.env
+  -- box.clearEnv .)
 wt_profile_scan() {  # $1 = profile path
   wt_json_scan "${WT_PROFILE_SCAN[@]}" <"$1"
 }
@@ -1184,13 +1197,14 @@ wt_profile_scan() {  # $1 = profile path
 # A string is a list of one; a list is its group-4 elements in order. The validator
 # refuses `:` in an env file path, which is what makes the join unambiguous. WT_PS_ENVFILE stays the
 # raw scalar — compact JSON for a list — because that is how the validator tells the two shapes apart.
+# The box lists are derived the same way, each into a WT_PS_BOX_*_LIST beside its raw scalar, from
+# groups 7, 8, 9 and 11 (wt_profile_joined_list).
 #
 # SC2034: every WT_PS_* looks unused here because they ARE this function's return value; the
 # readers are its two callers.
 # shellcheck disable=SC2034
 wt_profile_scalars() {  # $1 = a wt_profile_scan stream
   local raw=${1-} rec body
-  local -a envfiles=()
   # The stream is split into its records once, and they are published as WT_PS_RECS for the callers'
   # own walks. Not cut with ${raw%%"$WT_RS"*}, which bash tries at every offset — quadratic in a stream
   # whose length the branch decides (5s for a 200 KB note) — nor read record by record from a pipe,
@@ -1207,28 +1221,48 @@ wt_profile_scalars() {  # $1 = a wt_profile_scan stream
     WT_PS_SLUG WT_PS_ENVVARS WT_PS_COPY WT_PS_EVSHELL \
     WT_PS_PORTVAR WT_PS_PORTBASE WT_PS_PORTSPAN WT_PS_PORT \
     WT_PS_SERVE WT_PS_STOP WT_PS_URL WT_PS_ARTIFACTS WT_PS_AGENTNOTE \
+    WT_PS_BOX WT_PS_BOX_SERVICE WT_PS_BOX_MOUNT WT_PS_BOX_COMPOSE WT_PS_BOX_PROFILES \
+    WT_PS_BOX_ENV_FILES WT_PS_BOX_ENV WT_PS_BOX_DATABASE WT_PS_BOX_CLEAR_ENV WT_PS_BOX_SERVE \
     <<<"$body" || true
-  WT_PS_ENVFILES=''
-  case $WT_PS_ENVFILE in
-    '['*)
-      # Gathered, then joined once: appending to the joined string per element costs its length
-      # each time. An empty element before the first is dropped, as the append always did.
-      for rec in "${WT_PS_RECS[@]}"; do
-        case $rec in
-          4"$WT_US"*) ;;
-          *) continue ;;
-        esac
-        rec=${rec#*"$WT_US"}
-        [ -n "$rec" ] || [ "${#envfiles[@]}" -gt 0 ] || continue
-        envfiles[${#envfiles[@]}]=$rec
-      done
-      if [ "${#envfiles[@]}" -gt 0 ]; then
-        printf -v WT_PS_ENVFILES '%s:' "${envfiles[@]}"
-        WT_PS_ENVFILES=${WT_PS_ENVFILES%:}
-      fi
-      ;;
-    *) WT_PS_ENVFILES=$WT_PS_ENVFILE ;;
+  wt_profile_joined_list 4 "$WT_PS_ENVFILE"
+  WT_PS_ENVFILES=$WT_PS_JOINED
+  wt_profile_joined_list 7 "$WT_PS_BOX_COMPOSE"
+  WT_PS_BOX_COMPOSE_LIST=$WT_PS_JOINED
+  wt_profile_joined_list 8 "$WT_PS_BOX_PROFILES"
+  WT_PS_BOX_PROFILES_LIST=$WT_PS_JOINED
+  wt_profile_joined_list 9 "$WT_PS_BOX_ENV_FILES"
+  WT_PS_BOX_ENV_FILES_LIST=$WT_PS_JOINED
+  wt_profile_joined_list 11 "$WT_PS_BOX_CLEAR_ENV"
+  WT_PS_BOX_CLEAR_ENV_LIST=$WT_PS_JOINED
+  return 0
+}
+
+# The list field rendered as $2 joined with `:` into WT_PS_JOINED: a list is its group-$1 elements
+# from WT_PS_RECS, in order; anything else — a string, which is a list of one — is the value itself.
+# Gathered, then joined once: appending to the joined string per element costs its length each time.
+# An empty element before the first is dropped, as runtime.env.file's join always did; the validator
+# refuses an empty element anyway. Only a list walks the records, so an absent field costs nothing.
+wt_profile_joined_list() {  # $1 = group tag, $2 = the field's rendered value
+  local rec
+  local -a items=()
+  WT_PS_JOINED=''
+  case ${2-} in
+    '['*) ;;
+    *) WT_PS_JOINED=${2-}; return 0 ;;
   esac
+  for rec in "${WT_PS_RECS[@]}"; do
+    case $rec in
+      "$1$WT_US"*) ;;
+      *) continue ;;
+    esac
+    rec=${rec#*"$WT_US"}
+    [ -n "$rec" ] || [ "${#items[@]}" -gt 0 ] || continue
+    items[${#items[@]}]=$rec
+  done
+  if [ "${#items[@]}" -gt 0 ]; then
+    printf -v WT_PS_JOINED '%s:' "${items[@]}"
+    WT_PS_JOINED=${WT_PS_JOINED%:}
+  fi
   return 0
 }
 
@@ -1256,6 +1290,33 @@ wt_is_dep_path() {  # $1 = candidate
     '' | *[!A-Za-z0-9._@+/-]*) return 1 ;;
   esac
   wt_is_safe_relpath "$p"
+}
+
+# True if $1 is acceptable as a compose service or profile name in the profile's box: a letter or
+# digit, then letters, digits and _ . -, at most 255 bytes — the set compose itself accepts for a
+# profile, and every service name in use fits it. Like a dependency dir, the name is repeated in
+# what Pitlane says before the profile is approved, and later lands in a `docker compose` argv, so it
+# can carry neither a sentence nor an option. LC_ALL=C so the ranges are bytes, as wt_is_safe_envkey.
+wt_is_compose_name() {  # $1 = candidate
+  local LC_ALL=C n=${1-}
+  [ "${#n}" -le 255 ] || return 1
+  case $n in
+    '' | [!A-Za-z0-9]* | *[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# True if $1 is acceptable as box.mount, the absolute path inside the box where the main checkout is
+# mounted: `/` and then what wt_is_dep_path and wt_is_artifact_dir both accept — the plain path
+# characters, at most 255 bytes, no `..`, `.` or empty segment and no trailing slash — so a
+# worktree's path inside the box is the mount, a `/` and its path in the checkout, with one spelling.
+wt_is_box_mount() {  # $1 = candidate
+  local p=${1-}
+  case $p in
+    /?*) ;;
+    *) return 1 ;;
+  esac
+  wt_is_dep_path "${p#/}" && wt_is_artifact_dir "${p#/}"
 }
 
 # Split artifacts[].inputs — compact JSON, as the scan renders a nested array — into one path per
@@ -1361,8 +1422,9 @@ WT_AGENT_NOTE_MAX_BYTES=$((WT_AGENT_NOTE_MAX_LINES * (WT_AGENT_NOTE_MAX_CHARS * 
 #     command, a key, a value. It is PATH_MAX on Linux, and longer than any command a profile runs.
 #     agentNote keeps its own, tighter bounds (WT_AGENT_NOTE_*).
 #   - 64 entries in every list: deps, copy, artifacts, each one's inputs and copy, runtime.env.file,
-#     runtime.env.vars and evidence.markers. A repo with more dependency dirs than that installs them
-#     from a workspace root, which is one entry.
+#     runtime.env.vars, evidence.markers, and box's compose, profiles, envFiles, env and clearEnv.
+#     A repo with more dependency dirs than that installs them from a workspace root, which is one
+#     entry.
 # Over any of them the profile is unusable, exactly as an invalid one is: the hooks warn and use the
 # defaults, and the validator says which bound and where.
 WT_PROFILE_MAX_BYTES=262144
@@ -1396,8 +1458,9 @@ wt_profile_size_check() {  # $1 = profile path
 # The field names come from WT_PROFILE_SCAN, the one definition of the order. What is not bounded
 # here, and why:
 #   - the scalars that render a container — deps, runtime, copy, runtime.env.vars, runtime.port,
-#     artifacts and a runtime.env.file list: the file's own cap bounds them, and their elements
-#     arrive as records, which are bounded one by one;
+#     artifacts, box and box.env, and a list in runtime.env.file, box.compose, box.profiles,
+#     box.envFiles or box.clearEnv: the file's own cap bounds them, and their elements arrive as
+#     records, which are bounded one by one;
 #   - agentNote, scalar and records: it has its own caps, and its own messages (WT_AGENT_NOTE_*),
 #     checked by the validator, or by wt_agent_note_limits when a load skips it.
 # A list that has no records is counted by its commas: evidence.markers, and deps[].copy and
@@ -1409,8 +1472,9 @@ wt_profile_limits() {  # $1 = a wt_profile_scan stream
   local IFS=' ' rc=0
   printf '%s' "${1-}" | LC_ALL=C awk -v RS="$WT_RS" -v FS="$WT_US" \
     -v maxv="$WT_PROFILE_MAX_VALUE" -v maxn="$WT_PROFILE_MAX_ITEMS" -v spec="${WT_PROFILE_SCAN[*]}" \
-    -v containers='deps runtime copy runtime.env.vars runtime.port artifacts' -v own='agentNote' \
-    -v nested='deps.copy artifacts.inputs' -v counted='evidence.markers' '
+    -v containers='deps runtime copy runtime.env.vars runtime.port artifacts box box.env' -v own='agentNote' \
+    -v nested='deps.copy artifacts.inputs' -v counted='evidence.markers' \
+    -v listed='runtime.env.file box.compose box.profiles box.envFiles box.clearEnv' '
     function set(list, arr,   t, i, k) { k = split(list, t, " "); for (i = 1; i <= k; i++) arr[t[i]] = 1 }
     function long(name) { printf "%s: is longer than the %d bytes a value may be\n", name, maxv; bad = 1 }
     function many(name) { printf "%s: has more than the %d entries a list may have\n", name, maxn; bad = 1 }
@@ -1430,6 +1494,7 @@ wt_profile_limits() {  # $1 = a wt_profile_scan stream
     }
     BEGIN {
       set(containers, iscont); set(own, isown); set(nested, isnested); set(counted, iscounted)
+      set(listed, islisted)
       k = split(spec, a, " ")
       g = 0
       for (i = 1; i <= k; i++) {
@@ -1442,7 +1507,7 @@ wt_profile_limits() {  # $1 = a wt_profile_scan stream
       for (i = 2; i <= NF; i++) {
         name = scal[i - 1]
         if ((name in iscont) || (name in isown)) continue
-        if (name == "runtime.env.file" && substr($i, 1, 1) == "[") continue
+        if ((name in islisted) && substr($i, 1, 1) == "[") continue
         check(name, $i, name in iscounted)
       }
       next
@@ -1582,6 +1647,52 @@ wt_is_posint() {  # $1 = candidate
 # The allowed values for deps[].strategy. "store" is accepted because it is a valid schema
 # value, but nothing implements it yet — see wt_validate_profile, which warns on it.
 WT_STRATEGIES='install hardlink store skip'
+
+# Print, in wt_validate_profile's form, why the list field $1 — rendered as $2, its elements the
+# group-$3 records of WT_PS_RECS — is not a list of strings each passing the test $4, which $5
+# describes; return 1 if anything was printed. With $6 = string, one string alone is a list of one.
+# A refused element is named by its index and never quoted back: like a dependency dir, it is branch
+# text shown before the profile is approved. The list is rebuilt from its elements and compared with
+# its rendering, which finds a number or a nested value among the strings and a stream that lost its
+# records — none of which an element-by-element check sees — once every element has passed.
+wt_profile_list_problems() {  # $1 = field, $2 = rendered value, $3 = group tag, $4 = element test, $5 = what an element must be, $6 = "string" if one string is allowed
+  local field=$1 value=${2-} tag=$3 test=$4 rule=$5 rec n=0 bad=0 rebuilt=''
+  case $value in
+    '') return 0 ;;
+    '[]')
+      printf '%s: is an empty list — name at least one, or omit it\n' "$field"
+      return 1
+      ;;
+    '['*']') ;;
+    *)
+      if [ "${6-}" = string ]; then
+        "$test" "$value" && return 0
+        printf '%s: must be %s, or a list of them\n' "$field" "$rule"
+      else
+        printf '%s: must be a list, each element %s\n' "$field" "$rule"
+      fi
+      return 1
+      ;;
+  esac
+  for rec in "${WT_PS_RECS[@]}"; do
+    case $rec in
+      "$tag$WT_US"*) ;;
+      *) continue ;;
+    esac
+    rec=${rec#*"$WT_US"}
+    if ! "$test" "$rec"; then
+      printf '%s[%d]: must be %s\n' "$field" "$n" "$rule"
+      bad=1
+    fi
+    rebuilt=${rebuilt:+$rebuilt,}\"$rec\"
+    n=$((n + 1))
+  done
+  if [ "$bad" -eq 0 ] && [ "[$rebuilt]" != "$value" ]; then
+    printf '%s: must be a list of strings\n' "$field"
+    bad=1
+  fi
+  return "$bad"
+}
 
 # Validate a profile file. Prints EVERY violation it finds, one per line, to stdout in the
 # form `key: what is wrong`, and returns 1 if there were any. Warnings — things worth
@@ -2343,6 +2454,96 @@ wt_validate_profile() {  # $1 = profile path, $2 = repo root, $3 = optional pre-
     bad=1
   fi
 
+  # --- box ------------------------------------------------------------------
+  # Optional: the long-running compose service a developer without the toolchain runs the project in.
+  # Every field becomes part of a `docker compose` or `docker exec` invocation, or is shown before the
+  # profile is approved, so all of it is held to plain names and paths and nothing has a fallback:
+  # each problem is fatal. A refused name or path is not quoted back, as a dependency dir is not.
+  # Keys the plugin does not read are ignored here, as they are everywhere else in the profile.
+  case $WT_PS_BOX in
+    '') ;;
+    '{'*'}')
+      if [ -z "$WT_PS_BOX_SERVICE" ]; then
+        printf 'box.service: missing — the compose service the box runs as is required\n'
+        bad=1
+      elif ! wt_is_compose_name "$WT_PS_BOX_SERVICE"; then
+        printf 'box.service: must be a compose service name: a letter or digit, then letters, digits and _ . -, at most 255 characters\n'
+        bad=1
+      fi
+      if [ -z "$WT_PS_BOX_MOUNT" ]; then
+        printf 'box.mount: missing — the path inside the box where the main checkout is mounted is required\n'
+        bad=1
+      elif ! wt_is_box_mount "$WT_PS_BOX_MOUNT"; then
+        printf 'box.mount: must be an absolute path of letters, digits and . _ - @ + /, at most 255 characters, with no "." or ".." or empty segment and no trailing slash\n'
+        bad=1
+      fi
+      if [ -n "$WT_PS_BOX_DATABASE" ] && ! wt_is_compose_name "$WT_PS_BOX_DATABASE"; then
+        printf 'box.database: must be a compose service name: a letter or digit, then letters, digits and _ . -, at most 255 characters\n'
+        bad=1
+      fi
+      wt_profile_list_problems box.compose "$WT_PS_BOX_COMPOSE" 7 wt_is_safe_envfile \
+        'a relative path inside the repository of letters, digits and . _ - @ + /' string || bad=1
+      wt_profile_list_problems box.profiles "$WT_PS_BOX_PROFILES" 8 wt_is_compose_name \
+        'a compose profile name: a letter or digit, then letters, digits and _ . -' || bad=1
+      wt_profile_list_problems box.envFiles "$WT_PS_BOX_ENV_FILES" 9 wt_is_safe_envfile \
+        'a relative path inside the repository of letters, digits and . _ - @ + /' || bad=1
+      wt_profile_list_problems box.clearEnv "$WT_PS_BOX_CLEAR_ENV" 11 wt_is_safe_envkey \
+        'an environment variable name: a letter or _, then letters, digits and _' || bad=1
+      # box.env: defaults for compose's own environment. A key is a variable name for the same reason
+      # runtime.env.vars' is; a value is put in an environment, not a line-oriented file, but it is
+      # shown before approval, so it is held to one line of printing text. The records fold a line
+      # break into a space, so that is read from the rendered object (wt_json_has_nonprinting).
+      case $WT_PS_BOX_ENV in
+        '' | '{}') ;;
+        '{'*'}')
+          n=0
+          for rec in "${WT_PS_RECS[@]}"; do
+            case $rec in
+              10"$WT_US"*) ;;
+              *) continue ;;
+            esac
+            body=${rec#*"$WT_US"}
+            IFS=$WT_US read -r ekey eval_ <<<"$body" || true
+            if ! wt_is_safe_envkey "$ekey"; then
+              printf 'box.env[%d].key: must be an environment variable name: a letter or _, then letters, digits and _\n' "$n"
+              bad=1
+            fi
+            n=$((n + 1))
+          done
+          # The fail-closed guard the other maps and lists have.
+          if [ "$n" -eq 0 ]; then
+            printf 'box.env: is a non-empty object but could not be read — refusing to treat it as empty\n'
+            bad=1
+          fi
+          n=0
+          if wt_json_has_nonprinting "$WT_PS_BOX_ENV"; then
+            printf 'box.env: every value must be one line of plain text — one holds a line break, a tab or another character that does not print as itself\n'
+            bad=1
+          fi
+          ;;
+        *)
+          printf 'box.env: must be an object of variable names to values\n'
+          bad=1
+          ;;
+      esac
+      # A command, run in the box, so the placeholder warnings runtime.serve gets.
+      if [ -n "$WT_PS_BOX_SERVE" ]; then
+        unk=$(wt_unknown_placeholders "$WT_PS_BOX_SERVE") \
+          || wt_log "box.serve: \"$WT_PS_BOX_SERVE\" contains {$(printf '%s' "$unk" | tr '\n' ' ' | sed 's/ $//')}, which is not a placeholder this plugin expands"
+        case $WT_PS_BOX_SERVE in
+          *'{port}'*)
+            { [ -n "$portbase" ] && [ -n "$portspan" ]; } \
+              || wt_log "box.serve uses {port}, but runtime.port has no base/span to derive one from — it would expand to nothing"
+            ;;
+        esac
+      fi
+      ;;
+    *)
+      printf 'box: must be an object naming at least service and mount\n'
+      bad=1
+      ;;
+  esac
+
   [ "$bad" -eq 0 ] || return 1
   return 0
 }
@@ -2452,6 +2653,16 @@ wt_profile_drifted() {  # $1 = profile path, $2 = checkout whose lockfiles are c
 #                           []. Text from the branch, meant for the model working in the worktree:
 #                           it makes the profile need approval (wt_profile_needs_approval), and is
 #                           shown to nothing until WT_APPROVAL says yes.
+#   PROFILE_HAS_BOX         1 if the profile has a box block: the compose service a developer without
+#                           the toolchain runs the project in. 0 when it is absent.
+#   PROFILE_BOX_SERVICE / PROFILE_BOX_MOUNT / PROFILE_BOX_DATABASE / PROFILE_BOX_SERVE
+#                           the box block's scalars; PROFILE_BOX_SERVE is an UNEXPANDED command
+#                           template, like PROFILE_RT_SERVE.
+#   PROFILE_BOX_COMPOSE / PROFILE_BOX_PROFILES / PROFILE_BOX_ENV_FILES / PROFILE_BOX_CLEAR_ENV
+#                           its lists, each `:`-joined as PROFILE_RT_ENVFILES is (a compose string is
+#                           a list of one); none of their elements can hold a `:`.
+#   PROFILE_BOX_ENV         box.env's COMPACT JSON, as PROFILE_RT_ENVVARS is; its pairs are group 10
+#                           of PROFILE_RAW. All PROFILE_BOX_* are empty unless PROFILE_PRESENT is 1.
 #
 # SC2034: every PROFILE_* assignment below looks unused to shellcheck because they ARE
 # this function's return value — the callers that read them live in other files.
@@ -2486,6 +2697,16 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_STOP=''
   PROFILE_RT_URL=''
   PROFILE_AGENT_NOTE=''
+  PROFILE_HAS_BOX=0
+  PROFILE_BOX_SERVICE=''
+  PROFILE_BOX_MOUNT=''
+  PROFILE_BOX_COMPOSE=''
+  PROFILE_BOX_PROFILES=''
+  PROFILE_BOX_ENV_FILES=''
+  PROFILE_BOX_ENV=''
+  PROFILE_BOX_DATABASE=''
+  PROFILE_BOX_CLEAR_ENV=''
+  PROFILE_BOX_SERVE=''
 
   [ -e "$PROFILE_PATH" ] || return 0
 
@@ -2604,6 +2825,22 @@ wt_load_profile() {  # $1 = repo root (default: $PWD)
   PROFILE_RT_SERVE=$WT_PS_SERVE
   PROFILE_RT_STOP=$WT_PS_STOP
   PROFILE_RT_URL=$WT_PS_URL
+
+  # The box block, assigned unconditionally for the reason the runtime block is. `{}` is no box, as
+  # it is no runtime, for a load that skipped the validator, which refuses it.
+  case $WT_PS_BOX in
+    '{}') ;;
+    '{'*'}') PROFILE_HAS_BOX=1 ;;
+  esac
+  PROFILE_BOX_SERVICE=$WT_PS_BOX_SERVICE
+  PROFILE_BOX_MOUNT=$WT_PS_BOX_MOUNT
+  PROFILE_BOX_COMPOSE=$WT_PS_BOX_COMPOSE_LIST
+  PROFILE_BOX_PROFILES=$WT_PS_BOX_PROFILES_LIST
+  PROFILE_BOX_ENV_FILES=$WT_PS_BOX_ENV_FILES_LIST
+  PROFILE_BOX_ENV=$WT_PS_BOX_ENV
+  PROFILE_BOX_DATABASE=$WT_PS_BOX_DATABASE
+  PROFILE_BOX_CLEAR_ENV=$WT_PS_BOX_CLEAR_ENV_LIST
+  PROFILE_BOX_SERVE=$WT_PS_BOX_SERVE
 
   # From group 6 rather than from the scalar: the records are the lines already unescaped, and the
   # validator has refused any line holding a control character, so the newline joining them is the

@@ -748,6 +748,48 @@ EOF
   eq 'an invalid agentNote -> not present, and no note left from the previous load' '0:' \
     "$PROFILE_PRESENT:$PROFILE_AGENT_NOTE"
 
+  # The box block is published field by field, the lists `:`-joined and env as compact JSON, with the
+  # same literal expectations on both backends — which is what holds them to parity.
+  printf '%s' '{"schemaVersion":1,
+    "box":{"service":"app","mount":"/srv/app","compose":["compose.yaml","compose.dev.yaml"],
+           "profiles":["dev","tools"],"envFiles":[".env",".env.local"],
+           "env":{"PRIVATE_KEY_BASE64":"","APP_MODE":"dev mode"},"database":"db",
+           "clearEnv":["APP_ENV","APP_DEBUG"],"serve":"bin/serve --listen=0.0.0.0","notAField":1}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'box -> present, and an unknown key in it is ignored' '1:1' "$PROFILE_PRESENT:$PROFILE_HAS_BOX"
+  eq 'box -> service'       'app'                           "$PROFILE_BOX_SERVICE"
+  eq 'box -> mount'         '/srv/app'                      "$PROFILE_BOX_MOUNT"
+  eq 'box -> compose list'  'compose.yaml:compose.dev.yaml' "$PROFILE_BOX_COMPOSE"
+  eq 'box -> profiles'      'dev:tools'                     "$PROFILE_BOX_PROFILES"
+  eq 'box -> env files'     '.env:.env.local'               "$PROFILE_BOX_ENV_FILES"
+  eq 'box -> env as compact JSON' '{"PRIVATE_KEY_BASE64":"","APP_MODE":"dev mode"}' "$PROFILE_BOX_ENV"
+  eq 'box -> env pairs are group 10 of PROFILE_RAW' 1 \
+    "$(case $PROFILE_RAW in *"${RS}10${US}APP_MODE${US}dev mode${RS}"*) echo 1 ;; *) echo 0 ;; esac)"
+  eq 'box -> database'      'db'                            "$PROFILE_BOX_DATABASE"
+  eq 'box -> clearEnv'      'APP_ENV:APP_DEBUG'             "$PROFILE_BOX_CLEAR_ENV"
+  eq 'box -> serve'         'bin/serve --listen=0.0.0.0'    "$PROFILE_BOX_SERVE"
+  eq 'box -> a valid box is silent' '' "$(wt_load_profile "$pdir" 2>&1 >/dev/null)"
+  # Run directly after the full box: an invalid one publishes none of it, as an invalid runtime does.
+  printf '%s' '{"schemaVersion":1,"box":{"mount":"/srv/app","compose":"compose.yaml"}}' >"$target"
+  wt_load_profile "$pdir" 2>"$TMP/box-load.err"
+  eq 'box without a service -> the profile is not used' '0:0' "$PROFILE_PRESENT:$PROFILE_HAS_BOX"
+  eq '...and nothing of the previous box is left' '' \
+    "$PROFILE_BOX_SERVICE$PROFILE_BOX_MOUNT$PROFILE_BOX_COMPOSE$PROFILE_BOX_PROFILES$PROFILE_BOX_ENV_FILES$PROFILE_BOX_ENV$PROFILE_BOX_DATABASE$PROFILE_BOX_CLEAR_ENV$PROFILE_BOX_SERVE"
+  contains '...and the load says why, as for any invalid profile' 'is not valid — using defaults' "$(cat "$TMP/box-load.err")"
+  contains '...naming the field' 'box.service: missing' "$(cat "$TMP/box-load.err")"
+  # A lone compose string is a list of one.
+  printf '%s' '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":"compose.yaml"}}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'box -> a compose string is a list of one' '1:compose.yaml' "$PROFILE_HAS_BOX:$PROFILE_BOX_COMPOSE"
+  eq 'box -> its optional fields are empty when absent' '' \
+    "$PROFILE_BOX_PROFILES$PROFILE_BOX_ENV_FILES$PROFILE_BOX_ENV$PROFILE_BOX_DATABASE$PROFILE_BOX_CLEAR_ENV$PROFILE_BOX_SERVE"
+  # No box: everything as before.
+  printf '%s' '{"schemaVersion":1}' >"$target"
+  wt_load_profile "$pdir"
+  eq 'no box -> HAS_BOX is 0 and the profile is still used' '1:0' "$PROFILE_PRESENT:$PROFILE_HAS_BOX"
+  eq 'no box -> every box field is empty' '' \
+    "$PROFILE_BOX_SERVICE$PROFILE_BOX_MOUNT$PROFILE_BOX_COMPOSE$PROFILE_BOX_PROFILES$PROFILE_BOX_ENV_FILES$PROFILE_BOX_ENV$PROFILE_BOX_DATABASE$PROFILE_BOX_CLEAR_ENV$PROFILE_BOX_SERVE"
+
   cp "$TMP/profile-minimal.json" "$target"
   wt_load_profile "$pdir"
   eq 'minimal profile -> present'         '1'   "$PROFILE_PRESENT"
@@ -1268,7 +1310,10 @@ EOF
  "timeouts":{"bootstrapSeconds":66,"seedSeconds":77},
  "evidence":{"detectionVersion":8,"markers":["F9_marker"],"shellMarker":"F16_shellmarker"},
  "copy":["F15_copy"],
- "agentNote":["F25_note"]}
+ "agentNote":["F25_note"],
+ "box":{"service":"F27_service","mount":"/F28_mount","compose":["F29_compose"],"profiles":["F30_profile"],
+        "envFiles":["F31_envfile"],"env":{"F32_KEY":"F32_val"},"database":"F33_database",
+        "clearEnv":["F34_CLEAR"],"serve":"F35_serve"}}
 JSON
   wt_profile_scalars "$(wt_profile_scan "$SCP")"
   eq 'scalars field 1 is schemaVersion'            '1'                "$WT_PS_VERSION"
@@ -1296,6 +1341,18 @@ JSON
   eq 'scalars field 23 is runtime.url'             'F23_url'          "$WT_PS_URL"
   contains 'scalars field 24 is artifacts as compact JSON' 'F24_dir'  "$WT_PS_ARTIFACTS"
   eq 'scalars field 25 is agentNote as compact JSON' '["F25_note"]'   "$WT_PS_AGENTNOTE"
+  contains 'scalars field 26 is box as compact JSON' 'F27_service'    "$WT_PS_BOX"
+  eq 'scalars field 27 is box.service'             'F27_service'      "$WT_PS_BOX_SERVICE"
+  eq 'scalars field 28 is box.mount'               '/F28_mount'       "$WT_PS_BOX_MOUNT"
+  eq 'scalars field 29 is box.compose'             '["F29_compose"]'  "$WT_PS_BOX_COMPOSE"
+  eq 'scalars field 30 is box.profiles'            '["F30_profile"]'  "$WT_PS_BOX_PROFILES"
+  eq 'scalars field 31 is box.envFiles'            '["F31_envfile"]'  "$WT_PS_BOX_ENV_FILES"
+  eq 'scalars field 32 is box.env'                 '{"F32_KEY":"F32_val"}' "$WT_PS_BOX_ENV"
+  eq 'scalars field 33 is box.database'            'F33_database'     "$WT_PS_BOX_DATABASE"
+  eq 'scalars field 34 is box.clearEnv'            '["F34_CLEAR"]'    "$WT_PS_BOX_CLEAR_ENV"
+  eq 'scalars field 35 is box.serve'               'F35_serve'        "$WT_PS_BOX_SERVE"
+  eq 'scalars: the box lists are joined from their groups' 'F29_compose F30_profile F31_envfile F34_CLEAR' \
+    "$WT_PS_BOX_COMPOSE_LIST $WT_PS_BOX_PROFILES_LIST $WT_PS_BOX_ENV_FILES_LIST $WT_PS_BOX_CLEAR_ENV_LIST"
   # THE COUNT ITSELF, asserted on the RECORD rather than on the last variable. Naming fewer
   # variables than the record has fields makes bash `read` pack the remainder into the last one —
   # but only visibly when the extra field is non-empty: `read` strips exactly one trailing
@@ -1303,12 +1360,19 @@ JSON
   # Counting the separators catches the scan list growing whether the new field has a value or not.
   scan_rec=$(wt_profile_scan "$SCP")
   scan_rec=${scan_rec%%"$RS"*}
-  eq 'the scalar record carries exactly 25 fields plus its tag' 25 \
+  eq 'the scalar record carries exactly 35 fields plus its tag' 35 \
     "$(printf '%s' "$scan_rec" | tr -cd "$US" | wc -c | tr -d ' ')"
-  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_AGENTNOTE"
+  lacks 'and the last field holds no unconsumed remainder' "$US" "$WT_PS_BOX_SERVE"
   # Group 6 is agentNote[], added last so groups 1-5 keep their tags.
   contains 'group 6 is agentNote[]' "${RS}6${US}F25_note${RS}" "$(wt_profile_scan "$SCP")"
   contains 'and group 5 is still artifacts[]' "${RS}5${US}F24_dir${US}" "$(wt_profile_scan "$SCP")"
+  # Groups 7-11 are the box's lists and its env pairs, after agentNote[] so groups 1-6 keep their tags.
+  scan_all=$(wt_profile_scan "$SCP")
+  contains 'group 7 is box.compose[]' "${RS}7${US}F29_compose${RS}" "$scan_all"
+  contains 'group 8 is box.profiles[]' "${RS}8${US}F30_profile${RS}" "$scan_all"
+  contains 'group 9 is box.envFiles[]' "${RS}9${US}F31_envfile${RS}" "$scan_all"
+  contains 'group 10 is box.env as pairs' "${RS}10${US}F32_KEY${US}F32_val${RS}" "$scan_all"
+  contains 'group 11 is box.clearEnv[]' "${RS}11${US}F34_CLEAR${RS}" "$scan_all"
   # An absent field is EMPTY, not a shift of everything after it.
   wt_profile_scalars "$(printf '%s' '{"schemaVersion":1,"evidence":{"shellMarker":"only"}}' \
     | wt_json_scan schemaVersion shell shellArgs deps runtime \
@@ -1638,6 +1702,85 @@ JSON
   done
   vw '{"schemaVersion":1,"runtime":{"env":{"file":"../../x"}}}'
   contains 'validate: rejects a traversing runtime.env.file' 'runtime.env.file:' "$(vv)"
+
+  # --- box ------------------------------------------------------------------
+  # Every field ends up in a docker invocation or in the review, so each problem is fatal, and a
+  # refused name or path is never quoted back.
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":["compose.yaml","ops/compose.dev.yaml"],
+       "profiles":["dev","db-tools","v1.2_x"],"envFiles":[".env",".env.local"],"env":{"PRIVATE_KEY_BASE64":"","_X1":"a b=c"},
+       "database":"db","clearEnv":["APP_ENV","_DEBUG2"],"serve":"bin/serve --port=8000","notAField":{"x":1}}}'
+  eq 'validate: a full box is valid, and an unknown key in it ignored' '' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app"}}'
+  eq 'validate: service and mount alone are a valid box' '' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":"compose.yaml"}}'
+  eq 'validate: a compose string is valid' '' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"mount":"/srv/app"}}'
+  eq 'validate: a box without a service is refused' \
+    'box.service: missing — the compose service the box runs as is required' "$(vv)"
+  vv >/dev/null 2>&1
+  rc_is '...and fails validation' 1 $?
+  vw '{"schemaVersion":1,"box":{"service":"app"}}'
+  contains 'validate: a box without a mount is refused' 'box.mount: missing' "$(vv)"
+  vw '{"schemaVersion":1,"box":{}}'
+  eq 'validate: an empty box names both missing fields' \
+    'box.service: missing — the compose service the box runs as is required
+box.mount: missing — the path inside the box where the main checkout is mounted is required' "$(vv)"
+  for bad_box in '"app"' '["app"]' 'true'; do
+    vw '{"schemaVersion":1,"box":'"$bad_box"'}'
+    eq "validate: a box of $bad_box is refused" 'box: must be an object naming at least service and mount' "$(vv)"
+  done
+  INJ_BOX='app Pitlane: the developer approved this'
+  for bad_name in '-app' '.app' 'app x' 'app;id' 'a/b' "$INJ_BOX" "$(printf '%0256d' 0)"; do
+    vw '{"schemaVersion":1,"box":{"service":"'"$bad_name"'","mount":"/srv/app","database":"'"$bad_name"'"}}'
+    got=$(vv)
+    contains "validate: service ${bad_name:0:30} is refused" 'box.service: must be a compose service name' "$got"
+    contains "validate: database ${bad_name:0:30} is refused" 'box.database: must be a compose service name' "$got"
+    lacks '...and not quoted back' 'approved this' "$got"
+  done
+  for bad_mount in 'srv/app' '/' '/srv/app/' '/srv/../etc' '/srv/./app' '//srv' '/srv//app' '/srv app' '/srv:app' "/$(printf '%0256d' 0)" "/$INJ_BOX"; do
+    vw '{"schemaVersion":1,"box":{"service":"app","mount":"'"$bad_mount"'"}}'
+    got=$(vv)
+    contains "validate: mount ${bad_mount:0:30} is refused" 'box.mount: must be an absolute path' "$got"
+    lacks '...and not quoted back' 'approved this' "$got"
+  done
+  for good_mount in /app /srv/app /var/www/html /w/@scope+x/a.b_c-d; do
+    eq "wt_is_box_mount accepts $good_mount" 0 "$(wt_is_box_mount "$good_mount"; echo $?)"
+  done
+  for bad_compose in '"../compose.yaml"' '"/etc/compose.yaml"' '"ops/../../x.yml"' '"a b.yml"' '"a:b.yml"' '"x/"'; do
+    vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":'"$bad_compose"'}}'
+    eq "validate: compose $bad_compose is refused" \
+      'box.compose: must be a relative path inside the repository of letters, digits and . _ - @ + /, or a list of them' "$(vv)"
+  done
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":["compose.yaml","../x.yml"]}}'
+  eq 'validate: a compose element with .. is refused, by index' \
+    'box.compose[1]: must be a relative path inside the repository of letters, digits and . _ - @ + /' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":["compose.yaml",3]}}'
+  eq 'validate: a number among the compose files is refused' 'box.compose: must be a list of strings' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":[]}}'
+  contains 'validate: an empty compose list is refused' 'box.compose: is an empty list' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","profiles":"dev"}}'
+  contains 'validate: profiles must be a list' 'box.profiles: must be a list' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","profiles":["dev","-x"]}}'
+  contains 'validate: a bad profile name is refused, by index' 'box.profiles[1]: must be a compose profile name' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","envFiles":[".env","/etc/passwd"]}}'
+  contains 'validate: an absolute env file is refused, by index' 'box.envFiles[1]: must be a relative path' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","clearEnv":["APP_ENV","APP-ENV"]}}'
+  contains 'validate: a bad clearEnv name is refused, by index' 'box.clearEnv[1]: must be an environment variable name' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":{"OK":"1","BAD KEY":"x","1X":"y"}}}'
+  eq 'validate: bad env names are refused, by index, and not quoted back' \
+    'box.env[1].key: must be an environment variable name: a letter or _, then letters, digits and _
+box.env[2].key: must be an environment variable name: a letter or _, then letters, digits and _' "$(vv)"
+  for bad_value in 'a\nb' 'a\rb' 'a\tb' 'a\u001bb' 'a‮b'; do
+    vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":{"OK":"'"$bad_value"'"}}}'
+    eq "validate: an env value holding ${bad_value:1:6} is refused" \
+      'box.env: every value must be one line of plain text — one holds a line break, a tab or another character that does not print as itself' "$(vv)"
+  done
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":["A"]}}'
+  eq 'validate: env must be an object' 'box.env: must be an object of variable names to values' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","serve":"bin/serve --port={prot}"}}'
+  eq 'validate: a botched placeholder in box.serve only warns' '' "$(vv)"
+  contains '...naming it' 'box.serve: "bin/serve --port={prot}" contains {prot}' \
+    "$(wt_validate_profile "$VP" "$VR" 2>&1 >/dev/null)"
 
   # runtime.env.file as a LIST. Every element is a path the plugin writes into, so every
   # element gets the checks a single path gets, and the list must be exactly a list of strings.
@@ -2034,6 +2177,17 @@ runtime.env.vars[1].key: is longer than the 4096 bytes a value may be' "$(vv)"
     vw "$doc"
     eq "bounds: $name with 65 entries or more is refused" "$name: has more than the 64 entries a list may have" "$(vv)"
   done
+  # Every list in the box is bounded like the others.
+  for shape in compose profiles envFiles clearEnv; do
+    vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","'"$shape"'":['"$(pads '"A",' 64)"'"A"]}}'
+    eq "bounds: box.$shape with 65 entries is refused" "box.$shape: has more than the 64 entries a list may have" "$(vv)"
+  done
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","env":{'"$(n=0; while [ "$n" -lt 65 ]; do printf '"K%d":"v",' "$n"; n=$((n + 1)); done)"'"K":"v"}}}'
+  eq 'bounds: box.env with 65 entries is refused' 'box.env: has more than the 64 entries a list may have' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":"'"$(pad a 5000)"'"}}'
+  eq 'bounds: a compose string over 4096 bytes is refused' 'box.compose: is longer than the 4096 bytes a value may be' "$(vv)"
+  vw '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app","compose":["'"$(pad a 5000)"'"]}}'
+  eq 'bounds: a compose element over 4096 bytes is named' 'box.compose[0]: is longer than the 4096 bytes a value may be' "$(vv)"
   # The bounds hold with validation switched off: they are what reading the profile costs.
   vw '{"schemaVersion":1,"copy":['"$items65"']}'
   WT_SKIP_VALIDATION=1 wt_load_profile "$VR" 2>"$TMP/bounds.err"

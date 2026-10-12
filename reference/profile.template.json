@@ -296,6 +296,31 @@
     "Query this worktree's database with `psql app_wt_{slug}_dev`, never `psql app`."
   ],
 
+  "_comment_box": [
+    "OPTIONAL, and absent here: most repos have none. For a team where some developers run the project",
+    "only in Docker: one long-running compose service bind-mounts the main checkout, and worktrees live",
+    "inside the main checkout so the service sees each of them under its mount. Shape:",
+    "  \"box\": { \"service\": \"app\", \"mount\": \"/srv/app\", \"compose\": [\"compose.yaml\"],",
+    "           \"profiles\": [\"dev\"], \"envFiles\": [\".env\"], \"env\": { \"PRIVATE_KEY_BASE64\": \"\" },",
+    "           \"database\": \"db\", \"clearEnv\": [\"APP_ENV\"], \"serve\": \"bin/serve --port={port}\" }",
+    "  service   REQUIRED. The compose service that is the box: a letter or digit, then letters, digits",
+    "            and _ . -, at most 255 characters. `database` and each of `profiles` the same.",
+    "  mount     REQUIRED. Where the main checkout is mounted inside the box: absolute, letters, digits and",
+    "            . _ - @ + /, no `.`, `..` or empty segment, no trailing slash, at most 255 characters.",
+    "  compose   A path or a list of paths to compose files, relative to the main checkout and inside it",
+    "            (letters, digits and . _ - @ + /). Absent: compose's own default.",
+    "  envFiles  Paths, as compose, handed to compose as --env-file. Compose reads them; Pitlane never does.",
+    "  env       NAME: value defaults for compose's own environment when the developer's has none. NAME",
+    "            as a runtime.env.vars key; a value one line of printing text.",
+    "  database  The compose service of the database server, whose image runs the seed and teardown.",
+    "  clearEnv  Variable names cleared inside the box for Pitlane's and the session's commands, beyond",
+    "            runtime.env.vars' names.",
+    "  serve     The command the box serves the app with; placeholders as runtime.serve.",
+    "Every problem here is fatal, and a refused name or path is not quoted back: each field reaches a",
+    "docker command line or the review before the profile is approved. Editing the box edits the",
+    "profile, so a profile that was approved has to be approved again."
+  ],
+
   "_comment_timeouts": [
     "Bounds on the WORK, in seconds.",
     "",
