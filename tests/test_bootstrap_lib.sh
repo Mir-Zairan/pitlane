@@ -381,10 +381,12 @@ contains '...and still runs the command' 'ok' "$err"
 # line, answers `compose … ps -q <service>` with $TMP/box/id (empty: the service is not running) and
 # runs what an `exec` names after its container itself, in a session of its own as a container's
 # process would be, so a step routed to the box visibly runs and a signal to the client does not reach
-# it. `ps -q db` answers with $TMP/box/dbid, an inspect for the image with $TMP/box/dbinspect; a `run`
+# it (with $TMP/box/slow, after 30s). `ps -q db` answers with $TMP/box/dbid, likewise slowed, and an
+# inspect for the image with $TMP/box/dbinspect; a `run`
 # starts what follows its image in a session of its own, recorded under its --name, and waits for it,
 # as a client attached to a container does, and so does a `compose … run` with what follows its
-# service; `stop -t <s> <name>` sends that session TERM, `rm -f <name>` kills it, and an inspect of
+# service; `stop -t <s> <name>` sends that session TERM, `rm -f <name>` kills it (with
+# $TMP/box/rm-fail, it fails and kills nothing), and an inspect of
 # `.State.Status` finds it while it runs (with $TMP/box/inspect-down, docker cannot be reached). Real
 # docker is never called.
 BOXM=$TMP/box-main
@@ -437,6 +439,7 @@ if [ "\$1" = compose ]; then
   set -- "\${all[@]}"
 fi
 if [ "\$1" = rm ]; then
+  [ ! -e "$TMP/box/rm-fail" ] || { echo 'Error response from daemon: could not remove' >&2; exit 1; }
   p=\$(cat "$TMP/box/run-\$3.pid" 2>/dev/null) && { kill -KILL -- "-\$p" 2>/dev/null || kill -KILL "\$p" 2>/dev/null; }
   exit 0
 fi
@@ -464,9 +467,13 @@ case " \$* " in
     echo "Error: No such object: \$4" >&2
     exit 1
     ;;
-  *'.Config.Image'*) cat "$TMP/box/dbinspect" ;;
+  *'{{.Image}}'*) cat "$TMP/box/dbinspect" ;;
   *' inspect '*) cat "$TMP/box/memory" ;;
-  *' ps -q db '*) printf 'database\n' >>"$TMP/box/dbprobes"; cat "$TMP/box/dbid" 2>/dev/null ;;
+  *' ps -q db '*)
+    printf 'database\n' >>"$TMP/box/dbprobes"
+    [ ! -e "$TMP/box/slow" ] || sleep 30
+    cat "$TMP/box/dbid" 2>/dev/null
+    ;;
   *' ps -q '*)
     printf 'probe\n' >>"$TMP/box/probes"
     [ ! -e "$TMP/box/slow" ] || sleep 30
@@ -479,7 +486,7 @@ chmod +x "$TMP/box/bin/docker"
 printf 'c0ffee12\n' >"$TMP/box/id"
 printf '2147483648\n' >"$TMP/box/memory"
 printf 'd0d0cafe\n' >"$TMP/box/dbid"
-printf 'mysql:8.4\napp_default\n' >"$TMP/box/dbinspect"
+printf 'sha256:5eed0b0e\napp_default\n' >"$TMP/box/dbinspect"
 git -C "$BOXM" init -q -b main
 git -C "$BOXM" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 git -C "$BOXM" worktree add -q "$BOXWT" -b alice/fix-99 2>/dev/null
@@ -872,7 +879,7 @@ contains '...and MYSQL_PWD' "${NL_}-e${NL_}MYSQL_PWD${NL_}" "$out"
 lacks '...never a value' 's3cret-pw' "$out"
 lacks '...clearing nothing, the image having none of the box'"'"'s pins' "${NL_}env${NL_}-u${NL_}" "$out"
 eq '...ending with WT_DB_HOST naming the database service, the env entrypoint, the database'"'"'s image and the command through sh -c' \
-  "-e|WT_DB_HOST=db|--entrypoint|env|mysql:8.4|sh|-c|./'.claude/seed.sh'" \
+  "-e|WT_DB_HOST=db|--entrypoint|env|sha256:5eed0b0e|sh|-c|./'.claude/seed.sh'" \
   "$(IFS='|'; n=${#got[@]}; printf '%s' "${got[*]:$((n - 8)):8}")"
 eq '...one shell only' 1 "$(printf '%s\n' "$out" | grep -cx sh)"
 out=$(export WT_DB_HOST=db.example; db_argv true "$BOXWT")
@@ -923,7 +930,7 @@ eq '...in one line' 1 "$(printf '%s\n' "$out" | grep -c 'database image')"
 lacks '...running nothing' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
 eq '...anywhere' no "$( [ -e "$BOXWT/db-ran" ] && echo yes || echo no)"
 printf 'd0d0cafe\n' >"$TMP/box/dbid"
-for bad in '-oops\napp_default' 'mysql:8.4'; do
+for bad in '-oops\napp_default' 'sha256:5eed0b0e'; do
   box_fresh
   # shellcheck disable=SC2059  # the \n in the fixture is the point
   printf "$bad\n" >"$TMP/box/dbinspect"
@@ -932,7 +939,19 @@ for bad in '-oops\napp_default' 'mysql:8.4'; do
   contains '...saying docker did not name an image and network' 'did not say which image and network' "$out"
   lacks '...running nothing' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
 done
-printf 'mysql:8.4\napp_default\n' >"$TMP/box/dbinspect"
+printf 'sha256:5eed0b0e\napp_default\n' >"$TMP/box/dbinspect"
+if command -v timeout >/dev/null 2>&1; then
+  box_fresh
+  wt_toolchain_is_box "$BOXWT" 2>/dev/null
+  : >"$TMP/box/slow"
+  t0=$SECONDS
+  out=$(WT_BOX_PROBE_SECONDS=1 db_argv true "$BOXWT" 2>&1; echo "rc=$?")
+  rm -f "$TMP/box/slow"
+  contains 'db: a database probe docker does not answer fails the step' 'rc=1' "$out"
+  contains '...saying docker did not answer' 'cannot run "true" in the database image: docker did not answer within 1s' "$out"
+  eq '...within a few seconds' yes "$([ $((SECONDS - t0)) -lt 5 ] && echo yes || echo "$((SECONDS - t0))s")"
+  lacks '...running nothing' "CALL${NL_}run${NL_}" "$(cat "$TMP/box/docker.log")"
+fi
 
 if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   db_removed() {  # $1 = container name; the docker log's record of removing it
@@ -1106,6 +1125,13 @@ if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && co
     "$(stop_judged 2 >/dev/null; printf '%s' "$WT_SERVE_STOP_WHY")"
   eq '...keeping the record' '' "$(cat "$TMP/box/cleared")"
   rm -f "$TMP/box/inspect-down"
+  : >"$TMP/box/rm-fail"
+  eq 'serve stop: docker failing to remove the container fails the stop' 5 "$(stop_judged 2)"
+  eq '...saying so' 'docker rm -f pitlane-serve-gone-1 failed' \
+    "$(stop_judged 2 >/dev/null; printf '%s' "$WT_SERVE_STOP_WHY")"
+  eq '...keeping the record' '' "$(cat "$TMP/box/cleared")"
+  eq '...and the app' running "$(kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  rm -f "$TMP/box/rm-fail"
   docker rm -f pitlane-serve-gone-1
   box_fresh
   eq 'serve stop: a record with no container has none there' 1 "$(WT_SERVE_CONTAINER='' wt_serve_container_present; printf '%s' "$?")"
@@ -1114,6 +1140,14 @@ if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && co
 else
   printf 'WARNING: timeout, setsid or python3 absent — stopping a box serve NOT verified\n' >&2
 fi
+# A loaded profile never holds such a path — the validator applies the same test — so the refusal is
+# driven here, with the list set directly.
+box_fresh
+out=$(PITLANE_TOOLCHAIN=box PROFILE_BOX_COMPOSE=../outside.yaml PROFILE_RT_SERVE='touch served' wt_serve_start "$BOXWT" 2>/dev/null; echo "rc=$?")
+eq 'serve box: a compose file outside the main checkout is refused, in one line' \
+  "Pitlane: not served — box.compose or box.envFiles names a path that is not inside the main checkout, so the box cannot be used${NL_}rc=1" "$out"
+eq '...nothing ran' no "$([ -e "$BOXWT/served" ] && echo yes || echo no)"
+eq '...and nothing is recorded' 1 "$(wt_serve_record_read "$BOXWT" >/dev/null 2>&1; echo $?)"
 
 PATH=$REALPATH_
 unset WT_ROOT
@@ -6050,7 +6084,54 @@ wt_runtime_state_set "$PB" beta_slug 4150 derived .e ours none ''
 out=$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)
 ne 'a ledger port a live sibling now claims is not reused' 4150 "$(wt_runtime_state_get "$PA" port)"
 contains '...and the move is explained' 'which this worktree had before' "$out"
+# Its replacement is a port chosen anew, so a busy one is stepped past as at a first allocation.
+unclaim_pa
+wt_runtime_state_set "$PA" alpha_slug 4150 derived .e ours none ''
+rm -f "$(wt_state_path "$PA")"
+free=$(wt_port_candidates alpha_slug 4100 200 | grep -vx -e 4150 -e "$want" | sed -n 1p)
+out=$(
+  # SC2329: invoked INDIRECTLY — it shadows the real probe for this subshell.
+  # shellcheck disable=SC2329
+  wt_port_in_use() { [ "$1" = "$want" ]; }
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null
+)
+eq 'the replacement for a ledger port a sibling claims steps past a busy port too' "$free" \
+  "$(wt_runtime_state_get "$PA" port)"
+contains '...saying it was busy' "port $want is busy" "$out"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
+
+# The ledger entry a re-entry reads is the one teardown would release for the path: under another
+# slug it is another allocation, and the port is derived afresh.
+other=4150
+[ "$want" != "$other" ] || other=4151
+unclaim_pa
+wt_runtime_state_set "$PA" other_slug "$other" probed .e ours none ''
+rm -f "$(wt_state_path "$PA")"
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
+eq 'a ledger entry under another slug is not reused' "$want" "$WT_PORT"
+eq '...the port derived' derived "$WT_PORT_SOURCE"
+# With no entry under the worktree's own id, the most recent set-aside one is chosen, wherever it
+# falls in the directory's order.
+unclaim_pa
+wt_runtime_state_set "$PA" alpha_slug 4150 derived .e ours none ''
+rm -f "$(wt_state_path "$PA")"
+wt_ledger_locate "$PA"
+wt_ledger_parse "$WT_LEDGER_DIR/$WT_LEDGER_ID"
+set_aside() {  # $1 = entry name, $2 = port, $3 = portsource, $4 = when
+  { printf 'wtstate%s%s%s' "$US_" "$WT_STATE_VERSION" "$RS_"
+    wt_state_join worktree "$WT_LEDGER_PATH" "$WT_LEDGER_ID" "$WT_LEDGER_NAME"
+    printf '%s%s' "$WT_STATE_REC" "$RS_"
+    wt_state_join rt alpha_slug "$2" "$3" .e ours none '' "$4"
+    printf '%s%s' "$WT_STATE_REC" "$RS_"
+  } >"$WT_LEDGER_DIR/$1"
+}
+set_aside "$WT_LEDGER_ID.1000" 4160 derived 100
+set_aside "$WT_LEDGER_ID.2000" 4170 probed 200
+set_aside "$WT_LEDGER_ID.3000" 4180 derived 150
+rm -f "$WT_LEDGER_DIR/$WT_LEDGER_ID"
+wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
+eq 'with only set-aside entries, the newest one'"'"'s port is reused' 4170 "$WT_PORT"
+eq '...with its source' probed "$WT_PORT_SOURCE"
 
 # THE PROBING IS CAPPED. With every port busy it stops after WT_PORT_BUSY_MAX probes and keeps the
 # port the sibling claims alone give — here the derived one — with a warning.
@@ -6615,7 +6696,7 @@ contains '...on the database'"'"'s network, as the developer, the main checkout 
   "${NL_}--network${NL_}app_default${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-v${NL_}$SREPO2:/srv/app${NL_}-w${NL_}/srv/app/.claude/worktrees/sw${NL_}-e${NL_}HOME=/tmp${NL_}" "$log"
 contains '...passing the contract by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$log"
 contains '...ending in the database'"'"'s image and the seed through sh -c' \
-  "${NL_}-e${NL_}WT_DB_HOST=db${NL_}--entrypoint${NL_}env${NL_}mysql:8.4${NL_}sh${NL_}-c${NL_}./'$SEEDREL'" "$log"
+  "${NL_}-e${NL_}WT_DB_HOST=db${NL_}--entrypoint${NL_}env${NL_}sha256:5eed0b0e${NL_}sh${NL_}-c${NL_}./'$SEEDREL'" "$log"
 lacks '...not in the box' "CALL${NL_}exec${NL_}-i${NL_}" "$log"
 
 # --- SKIP when nothing has changed, RETRY when the script does -------------------------------

@@ -1089,7 +1089,9 @@ wt_box_serve_argv() {  # $1 = command, $2 = worktree, $3 = container name, $4 = 
 # The image's own environment holds none of what compose pins in the box, so nothing is cleared.
 # WT_DB_HOST names the database service, the host the stack's network knows it by, unless the
 # developer's environment sets it. `--entrypoint env` keeps the image's entrypoint, a server's
-# start-up script, from running.
+# start-up script, from running. The image is the one the database container runs, by its ID: a
+# tag can name a newer pull than the server's, and a tag the daemon lacks would be pulled inside a
+# hook.
 #
 # The container is named, and a step stopped on the host removes it by that name: nothing in it
 # outlives the step, so no stopping inside it is needed and the command reaches `sh -c` directly.
@@ -1110,7 +1112,7 @@ wt_box_database_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
   fi
   command -v timeout >/dev/null 2>&1 && bound=(timeout "$WT_BOX_PROBE_SECONDS")
   # shellcheck disable=SC2016  # a Go template, for docker
-  out=$(${bound[@]+"${bound[@]}"} docker inspect -f '{{.Config.Image}}{{"\n"}}{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' \
+  out=$(${bound[@]+"${bound[@]}"} docker inspect -f '{{.Image}}{{"\n"}}{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' \
     "$WT_BOX_DATABASE_CONTAINER" </dev/null 2>/dev/null) || out=''
   image=${out%%"$WT_NL"*}
   network=${out#*"$WT_NL"}
@@ -2262,7 +2264,6 @@ wt_runtime_state_get() {  # $1 = worktree, $2 = field name
 # as refusing it.
 wt_runtime_state_read() {  # $1 = state file, $2 = field name
   local file=${1-} want=${2-} rec kind rest seen=0
-  local rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen
 
   [ -r "$file" ] || return 1
 
@@ -2276,24 +2277,33 @@ wt_runtime_state_read() {  # $1 = state file, $2 = field name
         ;;
       rt)
         [ "$seen" = 1 ] || return 1       # a record before any header: not our file
-        IFS=$WT_US read -r rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen \
-          <<<"$rest" || true
-        case $want in
-          slug)       printf '%s' "$rslug" ;;
-          port)       printf '%s' "$rport" ;;
-          portsource) printf '%s' "$rpsrc" ;;
-          envfile)    printf '%s' "$renvfile" ;;
-          envstate)   printf '%s' "$renvstate" ;;
-          seedstatus) printf '%s' "$rsstatus" ;;
-          seedcksum)  printf '%s' "$rscksum" ;;
-          when)       printf '%s' "$rwhen" ;;
-          *)          return 2 ;;          # a CALLER error, and distinct from "no record" (1)
-        esac
+        wt_rt_field "$rest" "$want" || return 2   # a CALLER error, distinct from "no record" (1)
+        printf '%s' "$WT_RT_FIELD"
         return 0
         ;;
     esac
   done <"$file"
   return 1
+}
+
+# One field of an `rt` record — its fields as $1, US-joined, without the kind — by NAME, into
+# WT_RT_FIELD; returns 2 for a name the record has no field for. The one place that knows the
+# fields' order. Sets a global rather than printing so a loop over ledger entries costs no fork.
+wt_rt_field() {  # $1 = the rt record's fields, $2 = field name
+  local rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen
+  WT_RT_FIELD=''
+  IFS=$WT_US read -r rslug rport rpsrc renvfile renvstate rsstatus rscksum rwhen <<<"${1-}" || true
+  case ${2-} in
+    slug)       WT_RT_FIELD=$rslug ;;
+    port)       WT_RT_FIELD=$rport ;;
+    portsource) WT_RT_FIELD=$rpsrc ;;
+    envfile)    WT_RT_FIELD=$renvfile ;;
+    envstate)   WT_RT_FIELD=$renvstate ;;
+    seedstatus) WT_RT_FIELD=$rsstatus ;;
+    seedcksum)  WT_RT_FIELD=$rscksum ;;
+    when)       WT_RT_FIELD=$rwhen ;;
+    *)          return 2 ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -2389,36 +2399,56 @@ wt_ledger_locate() {  # $1 = worktree
   WT_LEDGER_DIR=${common%/*}/$WT_LEDGER_DIRNAME
 }
 
-# The port the ledger recorded for the worktree at $1 under the slug $2, as WT_LEDGER_PORT and
-# WT_LEDGER_PORTSOURCE; returns 1 when it recorded none. This is how a worktree removed without a
-# teardown that released its allocation, then made again by the same name, finds the port it had:
-# its state file went with the old admin directory, the ledger entry did not. Several entries can
-# match, one set aside per reuse of the id; the one still named after its own admin id wins, else
-# the most recent — wt_ledger_entry_for's rule.
-wt_ledger_recorded_port() {  # $1 = worktree, $2 = slug
-  local wt=${1%/} slug=${2-} file entry recorded_wt rslug rport rpsrc rest when best_when=-1
-  WT_LEDGER_PORT='' WT_LEDGER_PORTSOURCE=''
-  wt_ledger_locate "$wt" || return 1
-  [ -d "$WT_LEDGER_DIR" ] || return 1
-  wt_state_join "$wt"
-  recorded_wt=$WT_STATE_REC
-  for file in "$WT_LEDGER_DIR"/*; do
+# The ledger entry in directory $1 recording the worktree at $2 (the path as the record holds it), or
+# the admin id $3, as WT_LEDGER_CHOSEN; returns 1 when none match. Several can match: an entry is set
+# aside as `<id>.<when>` rather than overwritten (see wt_ledger_write), so one path can own the live
+# entry and older ones. The live entry is the one still named after its own admin id; failing that,
+# the most recent. Teardown, /pitlane-tidy and a re-entered worktree's port all choose through this,
+# so none can settle on an entry another would not.
+wt_ledger_choose() {  # $1 = ledger directory, $2 = worktree path or empty, $3 = admin id or empty
+  local ledger=${1-} want_path=${2-} want_admin=${3-} file entry when best='' best_when=-1
+  WT_LEDGER_CHOSEN=''
+  [ -d "$ledger" ] || return 1
+  for file in "$ledger"/*; do
     entry=${file##*/}
     wt_ledger_is_entry_name "$entry" || continue
     wt_ledger_parse "$file" || continue
-    [ "$WT_LEDGER_PATH" = "$recorded_wt" ] || continue
-    IFS=$WT_US read -r rslug rport rpsrc rest <<<"$WT_LEDGER_RT" || true
-    [ "$rslug" = "$slug" ] && [ -n "$rport" ] || continue
-    when=${rest##*"$WT_US"}
-    case $when in '' | *[!0-9]*) when=0 ;; esac
+    [ -z "$want_path" ] || [ "$WT_LEDGER_PATH" = "$want_path" ] || continue
+    [ -z "$want_admin" ] || [ "$WT_LEDGER_ADMIN" = "$want_admin" ] || continue
     if [ "$entry" = "$WT_LEDGER_ADMIN" ]; then
-      WT_LEDGER_PORT=$rport WT_LEDGER_PORTSOURCE=$rpsrc
-      return 0
+      best=$entry
+      break
     fi
+    wt_rt_field "$WT_LEDGER_RT" when
+    when=$WT_RT_FIELD
+    case $when in '' | *[!0-9]*) when=0 ;; esac
     if [ "$when" -gt "$best_when" ]; then
-      WT_LEDGER_PORT=$rport WT_LEDGER_PORTSOURCE=$rpsrc best_when=$when
+      best=$entry
+      best_when=$when
     fi
   done
+  [ -n "$best" ] || return 1
+  WT_LEDGER_CHOSEN=$best
+}
+
+# The port the ledger recorded for the worktree at $1 under the slug $2, as WT_LEDGER_PORT and
+# WT_LEDGER_PORTSOURCE; returns 1 when it recorded none. This is how a worktree removed without a
+# teardown that released its allocation, then made again by the same name, finds the port it had:
+# its state file went with the old admin directory, the ledger entry did not. The entry is the one
+# teardown would release for this path; one recorded under another slug is another allocation.
+wt_ledger_recorded_port() {  # $1 = worktree, $2 = slug
+  local wt=${1%/} slug=${2-}
+  WT_LEDGER_PORT='' WT_LEDGER_PORTSOURCE=''
+  wt_ledger_locate "$wt" || return 1
+  wt_state_join "$wt"
+  wt_ledger_choose "$WT_LEDGER_DIR" "$WT_STATE_REC" '' || return 1
+  wt_ledger_parse "$WT_LEDGER_DIR/$WT_LEDGER_CHOSEN" || return 1
+  wt_rt_field "$WT_LEDGER_RT" slug
+  [ "$WT_RT_FIELD" = "$slug" ] || return 1
+  wt_rt_field "$WT_LEDGER_RT" port
+  WT_LEDGER_PORT=$WT_RT_FIELD
+  wt_rt_field "$WT_LEDGER_RT" portsource
+  WT_LEDGER_PORTSOURCE=$WT_RT_FIELD
   [ -n "$WT_LEDGER_PORT" ]
 }
 
@@ -6345,21 +6375,30 @@ wt_serve_start() {  # $1 = worktree
       ;;
     2)
       wt_log "the server started here before (pid $WT_SERVE_PID) has exited — starting it again"
-      # What its group left behind (a child still holding the port) is stopped first; a group that
-      # would not stop holds the port, so nothing new is started beside it.
-      wt_serve_stop "$wt"
-      if [ $? -eq 4 ]; then
-        [ "$held" -eq 1 ] && wt_lock_release 7
-        printf 'Pitlane: not served — what is left of the server started here before (process group %s) would not stop, even on SIGKILL\n' "$WT_SERVE_PGID"
-        return 1
-      fi
       ;;
     3)
       wt_log "pid $WT_SERVE_PID, recorded for the server started here before, now belongs to another process — leaving it alone and starting a new server"
-      # Clears the record, after removing the container a box serve left, which is ours by its name.
-      wt_serve_stop "$wt"
       ;;
   esac
+  # What the old server left behind — a child still holding the port, or the container a box serve
+  # ran in, which is ours by its name — is stopped and its record cleared first. A group that would
+  # not stop holds the port, and a record docker could not settle still names a container, so
+  # nothing new is started beside either.
+  if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
+    wt_serve_stop "$wt"
+    case $? in
+      4)
+        [ "$held" -eq 1 ] && wt_lock_release 7
+        printf 'Pitlane: not served — what is left of the server started here before (process group %s) would not stop, even on SIGKILL\n' "$WT_SERVE_PGID"
+        return 1
+        ;;
+      5)
+        [ "$held" -eq 1 ] && wt_lock_release 7
+        printf 'Pitlane: not served — %s\n' "$WT_SERVE_STOP_WHY"
+        return 1
+        ;;
+    esac
+  fi
 
   # The pieces the app needs. The slug and port are the ones the runtime recorded, which is what the
   # env files say: re-deriving them could pick another port than the app's config reads.
@@ -6417,6 +6456,11 @@ wt_serve_start() {  # $1 = worktree
   { printf '%s serving %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$wt" "$(wt_visible "$cmd")"; } >"$log" 2>/dev/null \
     || { [ "$held" -eq 1 ] && wt_lock_release 7; printf 'Pitlane: not served — cannot write its log at %s\n' "$log"; return 1; }
   wt_log "starting the app: $(wt_visible "$cmd") — output in $log"
+  # runtime.serve is usually written for the host, where localhost is enough; in the container it is
+  # not (wt_box_serve_argv).
+  if [ -n "$container" ] && [ "$servekey" = runtime.serve ]; then
+    wt_log "runtime.serve runs in a container of the box here, so it must listen on 0.0.0.0:$port inside it — a server bound to localhost there is never reached; box.serve is the profile's command for serving in the box"
+  fi
   wt_serve_launch "$wt" "$cmd" "$log" "$container" "$port"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -6968,19 +7012,20 @@ WT_PORT_BUSY_MAX=10
 #      usable than a derived one would be.
 #   2. A worktree made again under a removed one's path, whose state file went with the old admin
 #      directory, tries the port the ledger recorded for it — unless a live sibling claimed it since.
-#   3. Otherwise derive from the slug, then step forward past ports live siblings have claimed and,
-#      on a FIRST allocation only, past ports something else is listening on.
+#   3. Otherwise derive from the slug, then step forward past ports live siblings have claimed and
+#      past ports something else is listening on.
 #   4. If every candidate is claimed, keep the derived one and warn.
 #
-# A LISTENER MOVES ONLY A FIRST ALLOCATION — one with no port recorded for this worktree and slug in
-# the state file or the ledger. Another clone of the repository, or any other program, can hold the
-# derived port, and a new worktree has no URL anyone has bookmarked yet. Once a port is recorded it
-# is the worktree's address, and a listener on it earns a warning, never a move.
+# A LISTENER NEVER MOVES A RECORDED PORT — one recorded for this worktree and slug in the state file
+# or the ledger. Another clone of the repository, or any other program, can hold a port, and a port
+# chosen anew — a first allocation, or the replacement for a ledger port a sibling has claimed since
+# — has no URL anyone has bookmarked yet. A recorded port is the worktree's address, and a listener
+# on it earns a warning, never a move.
 wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 = span
   local root=${1%/} worktree=${2%/} slug=${3-} base=${4-} span=${5-}
   local recslug recport recsource chosen derived source='derived' lockpath held=0
   local cand skip sslug sport oenvfile oenvstate oseed ocksum
-  local first=1 known='' knownsource='' fallback='' passed='' passedwhy='' busy=0
+  local known='' knownsource='' fallback='' passed='' passedwhy='' busy=0 busyat='' probed=0
 
   # SC2034: the function's two results; wt_runtime_handoff reads them.
   # shellcheck disable=SC2034
@@ -7003,7 +7048,6 @@ wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 
     return 0
   fi
   if wt_ledger_recorded_port "$worktree" "$slug" && wt_port_is_usable "$WT_LEDGER_PORT"; then
-    first=0
     known=$((10#$WT_LEDGER_PORT))
     knownsource=${WT_LEDGER_PORTSOURCE:-derived}
   fi
@@ -7041,15 +7085,17 @@ EOF
       [ -n "$passed" ] || { passed=$cand; passedwhy=sibling; }
       continue
     fi
-    if [ "$first" = 1 ]; then
+    if [ "$cand" != "$known" ]; then
       [ -n "$fallback" ] || fallback=$cand
       [ "$busy" -lt "$WT_PORT_BUSY_MAX" ] || break
       # Without the lock's descriptor, so a probe child that outlived its timeout cannot hold it.
       if wt_port_in_use "$cand" 7>&-; then
         busy=$((busy + 1))
+        [ -n "$busyat" ] || busyat=$cand
         [ -n "$passed" ] || { passed=$cand; passedwhy=busy; }
         continue
       fi
+      probed=1
     fi
     chosen=$cand
     break
@@ -7060,6 +7106,7 @@ EOF
 
   if [ -z "$chosen" ] && [ -n "$fallback" ]; then
     chosen=$fallback
+    probed=1
     wt_log "  runtime: the first $busy ports from $derived that no other worktree claims all have something listening on them — using $chosen anyway, which may fail to bind"
   elif [ -z "$chosen" ]; then
     chosen=$derived
@@ -7068,6 +7115,7 @@ EOF
     wt_log "  runtime: port $passed is busy — something that is not one of this repository's worktrees is listening on it — using $chosen instead, and keeping it"
   elif [ -n "$passed" ] && [ "$passed" = "$known" ]; then
     wt_log "  runtime: port $passed, which this worktree had before, is now taken by another worktree — using $chosen instead"
+    [ -z "$busyat" ] || wt_log "  runtime: port $busyat is busy — something that is not one of this repository's worktrees is listening on it — so it was passed over too"
   elif [ -n "$passed" ]; then
     wt_log "  runtime: port $passed is taken by another worktree — using $chosen instead"
   fi
@@ -7098,7 +7146,7 @@ EOF
   # A port the decision did not probe — one the ledger recorded, or the derived port of a span every
   # sibling has claimed — is not moved for a listener, only warned about, and a warning is not worth
   # holding the lock for: it is probed here, after the release.
-  if { [ "$first" = 0 ] || [ -z "$fallback" ]; } && wt_port_in_use "$chosen"; then
+  if [ "$probed" = 0 ] && wt_port_in_use "$chosen"; then
     wt_log "  runtime: something is already listening on port $chosen that is not one of this repository's worktrees — leaving the port as it is; the app may fail to bind"
   fi
 

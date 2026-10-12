@@ -110,28 +110,13 @@ wt_read_git_pointer() {  # $1 = pointer file, $2 = directory it is relative to
   printf '%s' "$(wt_collapse_dotdot "$target")"
 }
 
-# The ledger entry recording the worktree at $2, or the admin id $3, in the repository of $1.
-# Several can match: an entry is set aside as `<id>.<when>` rather than overwritten (see
-# wt_ledger_write), so one path can own the live entry and older ones. The live entry is the one
-# still named after its own admin id; failing that, the most recent. Returns 1 when none match.
+# The ledger entry recording the worktree at $2, or the admin id $3, in the repository of $1 —
+# wt_ledger_choose's choice. Returns 1 when none match.
 wt_ledger_entry_for() {  # $1 = main checkout, $2 = worktree path or empty, $3 = admin id or empty
-  local want_path=${2-} want_admin=${3-} entry path admin rest when best='' best_when=-1
-  while IFS=$WT_US read -r -d "$WT_RS" entry path admin rest; do
-    [ -z "$want_path" ] || [ "$path" = "$want_path" ] || continue
-    [ -z "$want_admin" ] || [ "$admin" = "$want_admin" ] || continue
-    if [ "$entry" = "$admin" ]; then
-      best=$entry
-      break
-    fi
-    when=${rest##*"$WT_US"}
-    case $when in '' | *[!0-9]*) when=0 ;; esac
-    if [ "$when" -gt "$best_when" ]; then
-      best=$entry
-      best_when=$when
-    fi
-  done < <(wt_ledger_entries "$1" 2>/dev/null)
-  [ -n "$best" ] || return 1
-  printf '%s' "$best"
+  local ledger
+  ledger=$(wt_ledger_dir "$1" 2>/dev/null) || return 1
+  wt_ledger_choose "$ledger" "${2-}" "${3-}" || return 1
+  printf '%s' "$WT_LEDGER_CHOSEN"
 }
 
 # Accept $1 as a LIVE linked worktree, or refuse it. $2, when given, is the admin dir the caller

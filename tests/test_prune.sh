@@ -433,8 +433,8 @@ cat >"$TMP/box-bin/docker" <<SH
 #!/usr/bin/env bash
 { printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/docker.log"
 case \$1 in
-  run) while [ "\$1" != mysql:8.4 ]; do shift; done; shift; exec "\$@" ;;
-  inspect) case " \$* " in *.Config.Image*) printf 'mysql:8.4\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
+  run) while [ \$# -gt 0 ] && [ "\$1" != sha256:5eed0b0e ]; do shift; done; [ \$# -gt 0 ] || exit 125; shift; exec "\$@" ;;
+  inspect) case " \$* " in *'{{.Image}}'*) printf 'sha256:5eed0b0e\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
   compose) printf 'c0ffee12\n' ;;
 esac
 SH
@@ -462,7 +462,7 @@ contains '...through docker run, removed when it ends and named' "CALL"$'\n'"run
 contains '...on the database'"'"'s network, the main checkout at the mount, in its path there' \
   $'\n'"--network"$'\n'"stack_default"$'\n'"-u"$'\n'"$(id -u):$(id -g)"$'\n'"-v"$'\n'"$RX:/srv/app"$'\n'"-w"$'\n'"/srv/app"$'\n' "$log"
 contains '...ending in the database'"'"'s image and the script through sh -c' \
-  $'\n'"-e"$'\n'"WT_DB_HOST=db"$'\n'"--entrypoint"$'\n'"env"$'\n'"mysql:8.4"$'\n'"sh"$'\n'"-c"$'\n'"./'.claude/worktree-teardown.sh'" "$log"
+  $'\n'"-e"$'\n'"WT_DB_HOST=db"$'\n'"--entrypoint"$'\n'"env"$'\n'"sha256:5eed0b0e"$'\n'"sh"$'\n'"-c"$'\n'"./'.claude/worktree-teardown.sh'" "$log"
 lacks '...not in the box' "CALL"$'\n'"exec"$'\n' "$log"
 
 # ---------------------------------------------------------------------------
@@ -898,14 +898,19 @@ mirror_put() {  # $1 = file name, $2 = path, $3 = slug, $4 = port, $5 = pid, $6 
 
 # A box serve whose host side died with its group: the container it served in is still there, and
 # ours by the name its record holds. A fake `docker` says it is there while $TMP/pbox/there exists,
-# and `rm -f` removes it.
+# cannot be reached while $TMP/pbox/down exists, and `rm -f` removes it.
 NL=$'\n'
 mkdir -p "$TMP/pbox/bin"
 cat >"$TMP/pbox/bin/docker" <<SH
 #!/usr/bin/env bash
 { printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/pbox/docker.log"
 case \$1 in
-  inspect) [ -e "$TMP/pbox/there" ] && { echo running; exit 0; }; echo "Error: No such object: \$4" >&2; exit 1 ;;
+  inspect)
+    [ ! -e "$TMP/pbox/down" ] || { echo 'Cannot connect to the Docker daemon' >&2; exit 1; }
+    [ -e "$TMP/pbox/there" ] && { echo running; exit 0; }
+    echo "Error: No such object: \$4" >&2
+    exit 1
+    ;;
   rm) rm -f "$TMP/pbox/there" ;;
 esac
 exit 0
@@ -934,7 +939,16 @@ eq '...and its mirror forgotten' no "$(exists "$RVM/servebox.$bdead.1")"
 box_mirror
 PATH=$TMP/pbox/bin:$PATH prune "$RV"
 eq 'serve report: with its container gone too, it is only forgotten' forget "$(field server-leftover "$VB" 5)"
-rm -f "$RVM/servebox.$bdead.1"
+: >"$TMP/pbox/there"
+: >"$TMP/pbox/down"
+: >"$TMP/pbox/docker.log"
+PATH=$TMP/pbox/bin:$PATH prune "$RV"
+eq 'serve report: when docker cannot say whether the container is there, it is neither stopped nor forgotten' \
+  refuse "$(field server-leftover "$VB" 5)"
+contains '...saying to check with docker' 'check with docker' "$(field server-leftover "$VB" 6)"
+lacks '...removing nothing' "${NL}rm${NL}" "$(cat "$TMP/pbox/docker.log")"
+eq '...and its mirror is kept' yes "$(exists "$RVM/servebox.$bdead.1")"
+rm -f "$TMP/pbox/down" "$TMP/pbox/there" "$RVM/servebox.$bdead.1"
 
 # A daemonized server whose profile names no runtime.stop: nothing can stop it but the developer.
 VN=$RV/.claude/worktrees/servenostop

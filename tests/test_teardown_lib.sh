@@ -756,8 +756,8 @@ cat >"$SCRATCH/box-bin/docker" <<SH
 #!/usr/bin/env bash
 { printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$SCRATCH/docker.log"
 case \$1 in
-  run) while [ "\$1" != mysql:8.4 ]; do shift; done; shift; exec "\$@" ;;
-  inspect) case " \$* " in *.Config.Image*) printf 'mysql:8.4\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
+  run) while [ \$# -gt 0 ] && [ "\$1" != sha256:5eed0b0e ]; do shift; done; [ \$# -gt 0 ] || exit 125; shift; exec "\$@" ;;
+  inspect) case " \$* " in *'{{.Image}}'*) printf 'sha256:5eed0b0e\nstack_default\n' ;; *) printf '1\n' ;; esac ;;
   compose) printf 'c0ffee12\n' ;;
 esac
 SH
@@ -774,7 +774,7 @@ contains '...on the database'"'"'s network, as the developer, the main checkout 
   "${WT_NL}--network${WT_NL}stack_default${WT_NL}-u${WT_NL}$(id -u):$(id -g)${WT_NL}-v${WT_NL}$T:/srv/app${WT_NL}-w${WT_NL}/srv/app${WT_NL}-e${WT_NL}HOME=/tmp${WT_NL}" "$log"
 contains '...passing the recorded environment by name' "${WT_NL}-e${WT_NL}WT_SLUG${WT_NL}" "$log"
 contains '...ending in the database'"'"'s image and the script through sh -c' \
-  "${WT_NL}-e${WT_NL}WT_DB_HOST=db${WT_NL}--entrypoint${WT_NL}env${WT_NL}mysql:8.4${WT_NL}sh${WT_NL}-c${WT_NL}./'down.sh'" "$log"
+  "${WT_NL}-e${WT_NL}WT_DB_HOST=db${WT_NL}--entrypoint${WT_NL}env${WT_NL}sha256:5eed0b0e${WT_NL}sh${WT_NL}-c${WT_NL}./'down.sh'" "$log"
 lacks '...not in the box' "CALL${WT_NL}exec${WT_NL}" "$log"
 rm -f "$T/ran"
 

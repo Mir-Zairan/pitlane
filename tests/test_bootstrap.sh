@@ -3197,7 +3197,8 @@ eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server a
 # `exec` runs its command here, in the caller's directory, in a session of its own as in the box;
 # `compose … run` starts its entrypoint and command here, in the worktree, in a session of its own as
 # a container's process would be, so a signal to the client does not reach it; `stop` and `rm -f`
-# signal that session by its --name, and an inspect of `.State.Status` finds it while it runs.
+# signal that session by its --name, and an inspect of `.State.Status` finds it while it runs (with
+# $SBXD/inspect-down, docker cannot be reached).
 SBXD=$TMP/sbox
 mkdir -p "$SBXD/bin"
 cat >"$SBXD/bin/docker" <<SH
@@ -3248,6 +3249,7 @@ case \$1 in
   inspect)
     case \$3 in
       *State.Status*)
+        [ ! -e "$SBXD/inspect-down" ] || { echo 'Cannot connect to the Docker daemon' >&2; exit 1; }
         p=\$(cat "$SBXD/run-\$4.pid" 2>/dev/null) && kill -0 "\$p" 2>/dev/null && { echo running; exit 0; }
         echo "Error: No such object: \$4" >&2
         exit 1
@@ -3315,6 +3317,7 @@ eq 'serve box: served in the box, ONE line where it answers' "Pitlane: serving a
 eq '...exit 0' 0 "$SV_RC"
 eq '...running box.serve, not runtime.serve' 'yes no' \
   "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+lacks '...with no word about where runtime.serve must listen' '0.0.0.0' "$(cat "$TMP/err")"
 BXREC=$(serve_container "$WBX")
 BXNAME=${BXREC#* }
 case $BXNAME in
@@ -3359,6 +3362,24 @@ for _ in $(seq 1 30); do case $(answers "$BXURL") in 'NO ANSWER'*) break ;; esac
 contains '...the URL no longer answers' 'NO ANSWER' "$(answers "$BXURL")"
 eq '...and the record is cleared' '' "$(serve_record "$WBX")"
 
+# Its host side gone and docker unable to say whether its container is: no second server is started
+# over a record that still names one.
+box_serve --serve
+BXREC=$(serve_container "$WBX")
+BXNAME=${BXREC#* }
+kill -s KILL -- "-$(serve_pid "$WBX")" 2>/dev/null
+sleep 0.3
+: >"$SBXD/inspect-down"
+box_serve --serve
+rm -f "$SBXD/inspect-down"
+eq 'serve box: docker unable to say whether the old container is there refuses, in one line' \
+  "Pitlane: not served — docker did not say whether its container $BXNAME is still there" "$SV_OUT"
+ne '...non-zero' 0 "$SV_RC"
+lacks '...starting no second container' "${NL_}run${NL_}" "$(cat "$SBXD/docker.log")"
+eq '...the record kept' "$BXREC" "$(serve_container "$WBX")"
+box_serve --serve-stop
+eq '...which a later stop settles' "Pitlane: stopped the server at $BXURL (container $BXNAME)." "$SV_OUT"
+
 # With no box.serve, the box runs runtime.serve.
 python3 - "$WBX/.claude/worktree-profile.json" <<'PY'
 import json, sys
@@ -3369,6 +3390,8 @@ PY
 box_serve --serve
 eq 'serve box: with no box.serve, runtime.serve runs in the box' "Pitlane: serving at $BXURL" "$SV_OUT"
 eq '...runtime.serve it is' 'no yes' "$([ -e "$TMP/sbx-box-ran" ] && echo yes || echo no) $([ -e "$TMP/sbx-rt-ran" ] && echo yes || echo no)"
+eq '...warning once that it must listen on 0.0.0.0 in the container, and that box.serve exists for this' 1 \
+  "$(grep -c "must listen on 0.0.0.0:$BXPORT inside it.*box.serve" "$TMP/err")"
 contains '...in a container' "${NL_}run${NL_}--rm${NL_}" "$(cat "$SBXD/docker.log")"
 box_serve --serve-stop
 contains '...and is stopped' "Pitlane: stopped the server at $BXURL (container" "$SV_OUT"
@@ -3382,6 +3405,57 @@ eq '...docker never called' '' "$(cat "$SBXD/docker.log")"
 eq '...and the record has its seven fields, no container' '8 ' "$(serve_container "$WBX")"
 BXTOOLCHAIN=shell box_serve --serve-stop
 contains '...stopped by its pid' "Pitlane: stopped the server at $BXURL (pid" "$SV_OUT"
+
+# Refusals: each ONE line, non-zero, nothing recorded.
+box_refuses() {  # $1 = what the test is, $2 = the reason the line must give
+  eq "$1" "Pitlane: not served — $2" "$SV_OUT"
+  ne '...non-zero' 0 "$SV_RC"
+  eq '...nothing recorded' '' "$(serve_record "$WBX")"
+}
+box_profile_set() {  # $1 = a python statement on the boxed worktree's profile, d
+  python3 -c 'import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+exec(sys.argv[2])
+json.dump(d, open(p, "w"), indent=2)' "$WBX/.claude/worktree-profile.json" "$1"
+}
+box_profile_set 'del d["runtime"]["serve"]'
+BXTOOLCHAIN=shell box_serve --serve
+box_refuses 'serve: only box.serve, the box not chosen, is refused' \
+  'the profile names no runtime.serve, and box.serve is used only in the box; /pitlane-setup can add one'
+git -C "$WBX" checkout -q -- .claude/worktree-profile.json
+
+BXSTATE=$(git -C "$WBX" rev-parse --absolute-git-dir)/worktree-bootstrap-state
+cp "$BXSTATE" "$TMP/sbx-state"
+python3 - "$BXSTATE" <<'PY'
+import sys
+p = sys.argv[1]
+recs = open(p, encoding="latin-1").read().split("\x1e")
+for i, rec in enumerate(recs):
+    f = rec.split("\x1f")
+    if f[0] == "rt":
+        f[2] = ""
+        recs[i] = "\x1f".join(f)
+open(p, "w", encoding="latin-1").write("\x1e".join(recs))
+PY
+box_serve --serve
+box_refuses 'serve box: a worktree with no port is refused' \
+  "the box publishes the app on this worktree's port, and it has none yet; run /pitlane-finish first"
+lacks '...starting no container' "${NL_}run${NL_}" "$(cat "$SBXD/docker.log")"
+cp "$TMP/sbx-state" "$BXSTATE"
+
+if command -v timeout >/dev/null 2>&1; then
+  : >"$SBXD/slow"
+  WT_BOX_PROBE_SECONDS=1 box_serve --serve
+  rm -f "$SBXD/slow"
+  box_refuses 'serve box: a docker that does not answer is refused' \
+    'docker did not answer within 1s, so the box (compose service app) cannot be reached'
+fi
+
+box_profile_set 'd["box"]["serve"] = "exit 0"'
+box_serve --serve
+box_refuses 'serve box: a box.serve that exits at once, even 0, is refused' \
+  "the server exited before $BXURL answered (log: $(git -C "$WBX" rev-parse --absolute-git-dir)/worktree-serve.log)"
+git -C "$WBX" checkout -q -- .claude/worktree-profile.json
 
 # ---------------------------------------------------------------------------
 # box.sh: the session's own commands, run in the box as a step is
@@ -3397,12 +3471,6 @@ box_cli() {  # $1 = directory, then the arguments; stdin is the caller's. Sets B
   BX_OUT=$(cd "$dir" && PATH=${BXPATH:-$SBXD/bin:$PATH} PITLANE_TOOLCHAIN=${BXTOOLCHAIN-box} WT_BOX_STEP_DIR=$SBXD/steps \
     bash "$BOXCLI" "$@" 2>"$TMP/err")
   BX_RC=$?
-}
-box_profile_set() {  # $1 = a python statement on the boxed worktree's profile, d
-  python3 -c 'import json, sys
-p = sys.argv[1]; d = json.load(open(p))
-exec(sys.argv[2])
-json.dump(d, open(p, "w"), indent=2)' "$WBX/.claude/worktree-profile.json" "$1"
 }
 eq 'box.sh: (fixture) it is executable' yes "$([ -x "$BOXCLI" ] && echo yes || echo no)"
 
