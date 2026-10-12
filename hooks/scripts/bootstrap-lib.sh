@@ -665,6 +665,37 @@ wt_nix_shell_missing() {  # $1 = directory the command will run in
   esac
 }
 
+# True if the program the profile's shell starts with is not installed here; sets WT_SHELL_PROGRAM.
+#
+# The profile is shared, so its `shell` is one developer's toolchain, and a teammate who works
+# without it (PHP and Node installed on the machine instead of a nix dev shell) got "command not
+# found" from every install, the seed and the server. Their own tools are what they run the project
+# with, so those steps run on the host shell instead, with a warning, as for a branch with no flake.
+# Checked against the hook's own PATH, because that is the PATH the wrapper is started with.
+WT_SHELL_PROGRAM=''
+WT_SHELL_PROGRAM_WARNED=''
+
+wt_shell_program_missing() {
+  local shell=${PROFILE_SHELL-} oldglob=1
+  WT_SHELL_PROGRAM=''
+  [ -n "$shell" ] || return 1
+  case $- in *f*) oldglob=0 ;; esac
+  set -f
+  # shellcheck disable=SC2086  # split into words on purpose, as wt_build_shell_argv does
+  set -- $shell
+  [ "$oldglob" -eq 1 ] && set +f
+  [ "$#" -gt 0 ] || return 1
+  WT_SHELL_PROGRAM=$1
+  ! command -v -- "$WT_SHELL_PROGRAM" >/dev/null 2>&1
+}
+
+# Log, once per run, that the profile's shell program is missing and the host shell is used.
+wt_shell_program_warn() {
+  [ -z "$WT_SHELL_PROGRAM_WARNED" ] || return 0
+  WT_SHELL_PROGRAM_WARNED=1
+  wt_log "the profile's shell is \"$PROFILE_SHELL\" but $WT_SHELL_PROGRAM is not installed here — running its commands on the host shell instead, with the tools installed on this machine"
+}
+
 # ---------------------------------------------------------------------------
 # The resource guard — a setup step must never take the desktop down with it
 # ---------------------------------------------------------------------------
@@ -809,6 +840,9 @@ wt_run_in_shell() {  # $1 = command, $2 = directory, $3 = timeout seconds
 
   if wt_nix_shell_missing "$dir"; then
     wt_log "the profile's shell is \"$PROFILE_SHELL\" but this branch has no flake.nix/shell.nix — running on the host shell instead, which may not have the project's toolchain"
+    host=1
+  elif wt_shell_program_missing; then
+    wt_shell_program_warn
     host=1
   fi
 
@@ -2704,6 +2738,12 @@ wt_toolchain_warm() {  # $1 = worktree, $2 = deadline (epoch seconds); returns 0
     ready) return 0 ;;
     broken | lowmem) return 1 ;;
   esac
+  # Nothing to start: every step runs on the host shell (wt_run_in_shell).
+  if wt_shell_program_missing; then
+    wt_shell_program_warn
+    WT_TOOLCHAIN=ready
+    return 0
+  fi
   left=$(wt_budget_left "$deadline")
   if [ "$left" -le 0 ]; then
     return 1
@@ -5477,6 +5517,9 @@ wt_serve_launch() {  # $1 = worktree, $2 = expanded command, $3 = log file
   fi
   if wt_nix_shell_missing "$wt"; then
     wt_log "the profile's shell is \"$PROFILE_SHELL\" but this branch has no flake.nix/shell.nix — running on the host shell instead"
+    WT_CMD_ARGV=(bash -lc "$cmd")
+  elif wt_shell_program_missing; then
+    wt_shell_program_warn
     WT_CMD_ARGV=(bash -lc "$cmd")
   else
     wt_build_shell_argv "$cmd"

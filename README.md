@@ -102,7 +102,8 @@ your own setup.
 
 - `bash`, `git`, and `python3` or `jq`, on Linux or macOS.
 - **Package managers:** Composer, npm, pnpm, Yarn, Bun, uv, Poetry, Pipenv, Bundler, Mix, Cargo, Go.
-- **Toolchains:** Nix, direnv, or tools installed on your machine.
+- **Toolchains:** Nix, direnv, or tools installed on your machine. A teammate without the project's
+  toolchain (say, no Nix) gets its commands run with the tools installed on their machine instead.
 - **Databases:** any. You supply a short script that creates a worktree's database. Pitlane runs it
   with that worktree's name and port.
 

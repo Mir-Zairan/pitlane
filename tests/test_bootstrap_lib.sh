@@ -297,10 +297,37 @@ err=$(wt_run_in_shell 'printf ok' "$TMP/noflake" 10 2>&1 >/dev/null)
 contains 'a nix wrapper with no flake warns' 'no flake.nix/shell.nix' "$err"
 out=$(wt_run_in_shell 'printf ok' "$TMP/noflake" 10 2>&1 >/dev/null)
 contains '...and still runs the command on the host' 'ok' "$out"
+
+# The program fallback: a teammate without the profile's wrapper installed runs on the host shell.
+PROFILE_SHELL='pitlane-no-such-wrapper --command' PROFILE_SHELLARGS='argv'
+wt_shell_program_missing; eq 'a wrapper whose program is not on PATH is reported missing' 0 $?
+eq '...naming that program' 'pitlane-no-such-wrapper' "$WT_SHELL_PROGRAM"
+WT_SHELL_PROGRAM_WARNED=''
+err=$(wt_run_in_shell 'printf ok' "$TMP/run" 10 2>&1 >/dev/null)
+contains 'running with a missing wrapper program warns' 'pitlane-no-such-wrapper is not installed here' "$err"
+contains '...and still runs the command on the host' 'ok' "$err"
+err=$( { wt_run_in_shell 'printf a' "$TMP/run" 10; wt_run_in_shell 'printf b' "$TMP/run" 10; } 2>&1 >/dev/null)
+eq '...warning once per run, not once per command' 1 \
+  "$(printf '%s\n' "$err" | grep -c 'is not installed here')"
+WT_SHELL_PROGRAM_WARNED='' WT_TOOLCHAIN=''
+err=$(wt_toolchain_warm "$TMP/run" "$(( $(date +%s) + 30 ))" 2>&1; printf 'rc=%s %s' "$?" "$WT_TOOLCHAIN")
+contains '...and the toolchain step does not try to start it' 'rc=0 ready' "$err"
+case $err in *'toolchain: starting'*) eq '...nor says it is starting it' 'no start line' "$err" ;; esac
+WT_TOOLCHAIN=''
+PROFILE_SHELL='env WT_WRAPPED=1'
+wt_shell_program_missing; eq 'a wrapper whose program is installed is not' 1 $?
+PROFILE_SHELL='   '
+wt_shell_program_missing; eq 'a blank wrapper names no program to miss' 1 $?
+PROFILE_SHELL='/nonexistent/pitlane/bin/nix develop --command'
+wt_shell_program_missing; eq 'a wrapper given by a path that does not exist is missing' 0 $?
+# A glob in the wrapper must not expand against the current directory while it is split.
+eq 'the wrapper is split with globbing off' 'pitlane-glob-*' \
+  "$(cd "$TMP/run" && touch pitlane-glob-hit && PROFILE_SHELL='pitlane-glob-*' && wt_shell_program_missing; printf '%s' "$WT_SHELL_PROGRAM")"
+rm -f "$TMP/run/pitlane-glob-hit"
 # SC2034: these are read by the SOURCED library, not by this file — restoring them to the default
-# matters because the assertions below must not inherit the nix wrapper set just above.
+# matters because the assertions below must not inherit the wrapper set just above.
 # shellcheck disable=SC2034
-PROFILE_SHELL='' PROFILE_SHELLARGS=''
+PROFILE_SHELL='' PROFILE_SHELLARGS='' WT_SHELL_PROGRAM_WARNED=''
 
 # An invalid timeout must not become `timeout 0`, which to timeout(1) means NO timeout at all —
 # the one guard against a hanging bootstrap turning into a hung session.
