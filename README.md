@@ -102,8 +102,9 @@ compose service that mounts the project folder. Setup offers to name that servic
   the box, in the worktree's folder.
 
 Pitlane uses the box when the profile's toolchain (say, Nix) is not installed and the box is running.
-Set `PITLANE_TOOLCHAIN=box` to use it anyway, or `PITLANE_TOOLCHAIN=shell` to never use it. Everyone
-else's setup is unchanged. The box needs Docker with `docker compose`.
+Set `PITLANE_TOOLCHAIN=box` to use it anyway, or `PITLANE_TOOLCHAIN=shell` to never use it. If the
+profile names no toolchain, the box is used only with `PITLANE_TOOLCHAIN=box`. Everyone else's setup
+is unchanged. The box needs Docker with `docker compose`.
 
 ## Good to know
 

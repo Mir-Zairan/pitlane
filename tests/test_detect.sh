@@ -903,12 +903,69 @@ EOF
   commit_all "$r"
   eq 'box: long-syntax bind, map environment, a default-bearing variable is not required' \
     'box|compose.yml|node|/work||pg|NODE_ENV|' "$(det "$r" | grep '^box|')"
+  # Every spelling of the project directory, a flow sequence, block profiles, a flow-map environment,
+  # an interpolated target with a mode, and which variables count as required.
+  r=$(mkrepo boxspell composer.lock)
+  cat >"$r/compose.yaml" <<'EOF'
+services:
+  a:
+    image: busybox  # reads ${TRAILING}
+    command: sh -c "echo $FOO ${HOME}"
+    volumes:
+      - ${PWD}:/app-a
+  b:
+    image: busybox
+    volumes:
+      - "$PWD/:/app-b"
+  c:
+    image: busybox
+    volumes:
+      - type: bind
+        source: ${PWD}
+        target: /app-c
+  d:
+    image: busybox
+    volumes: [".:/srv/flow", "data:/d"]
+  e:
+    image: busybox
+    profiles:
+      - dev
+      - tools
+    environment: {APP_ENV: dev, OTHER: "1"}
+    volumes:
+      - .:${APP_DIR:-/srv/app}:cached
+  db:
+    image: mariadb:11
+EOF
+  printf 'APP_ENV=prod\n' >"$r/.env.dist"
+  commit_all "$r"
+  # shellcheck disable=SC2016  # compose interpolation under test
+  eq 'box: ${PWD}, "$PWD/", long ${PWD}, a flow sequence, block profiles, a flow-map environment, an interpolated target' \
+    "$(printf '%s\n' 'box|compose.yaml|a|/app-a||db||FOO' 'box|compose.yaml|b|/app-b||db||FOO' \
+         'box|compose.yaml|c|/app-c||db||FOO' 'box|compose.yaml|d|/srv/flow||db||FOO' \
+         'box|compose.yaml|e|${APP_DIR:-/srv/app}|dev,tools|db|APP_ENV|FOO')" \
+    "$(det "$r" | grep '^box|')"
+
+  # A compact sequence sits at its key's own indentation; a CRLF file and a nested .env change nothing.
+  r=$(mkrepo boxcompact composer.lock)
+  printf 'services:\n  app:\n    image: php\n    volumes:\n    - .:/srv/compact:ro\n    - data:/d\n    profiles:\n    - dev\n    environment:\n    - APP_ENV=dev\n    - KEEP=1\n    depends_on:\n      db:\n        condition: service_started\n  db:\n    image: postgres:16\n' >"$r/compose.yml"
+  printf 'APP_ENV=prod\n' >"$r/.env.dist"
+  commit_all "$r"
+  want='box|compose.yml|app|/srv/compact|dev|db|APP_ENV|'
+  eq 'box: a compact sequence is read as the items of its key' "$want" "$(det "$r" | grep '^box|')"
+  mkdir -p "$r/sub" && printf 'KEEP=1\n' >"$r/sub/.env"
+  git -C "$r" add -f sub/.env >/dev/null 2>&1
+  commit_all "$r"
+  eq "box: a nested committed .env is not the project's" "$want" "$(det "$r" | grep '^box|')"
+  sed 's/$/\r/' "$r/compose.yml" >"$r/c.tmp" && mv "$r/c.tmp" "$r/compose.yml"
+  eq 'box: a CRLF compose file reads the same' "$want" "$(det "$r" | grep '^box|')"
+
   # The database images are the table's, not the script's.
   python3 -c 'import json, sys
 t = json.load(open(sys.argv[1])); t["boxCandidates"]["databaseImages"] = ["node"]
 json.dump(t, open(sys.argv[2], "w"))' "$TABLE" "$TMP/$BACKEND/boxtable.json"
   eq 'box: database candidates come from detection.json' 'box|compose.yml|node|/work||node|NODE_ENV|' \
-    "$(WT_DETECTION_JSON="$TMP/$BACKEND/boxtable.json" det "$r" | grep '^box|')"
+    "$(WT_DETECTION_JSON="$TMP/$BACKEND/boxtable.json" det "$TMP/$BACKEND/boxlong" | grep '^box|')"
 
   # A nested JS tree in a repo that declares a workspace is the root install's to populate.
   r=$(mkrepo nestedws package.json pnpm-lock.yaml pnpm-workspace.yaml packages/a/package.json packages/a/package-lock.json)

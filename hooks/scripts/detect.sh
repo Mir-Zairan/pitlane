@@ -887,8 +887,8 @@ BOX_DATABASE_IMAGES=" $(json_array_items "$(wt_json_get boxCandidates.databaseIm
 # One `S` line per service in the order written, fields joined by WT_US — name, image, bind-mount
 # target of the project directory, profiles and environment names (both comma-joined) — and one `O`
 # line per service another waits on with `service_completed_successfully`, which is a one-shot job and
-# never a box. A line reader, not a YAML parser: the block and flow shapes compose files are written
-# in, at any indentation.
+# never a box. A line reader, not a YAML parser: the block, compact (`- item` at its key's own
+# indentation) and one-line flow shapes compose files are written in, at any indentation.
 compose_services() {  # $1 = compose file
   awk '
     function indent(l) { match(l, /^ */); return RLENGTH }
@@ -906,8 +906,17 @@ compose_services() {  # $1 = compose file
       if (v == "" || index("," list ",", "," v ",")) return list
       return list == "" ? v : list "," v
     }
-    function bind(target) {
-      sub(/:.*/, "", target)
+    # The target ends at the first colon outside a `${…}` group, so `${APP_DIR:-/srv/app}` stays
+    # whole; what follows it is the mode (`:ro`, `:cached`, `:ro,z`).
+    function bind(target,   i, c, depth) {
+      depth = 0
+      for (i = 1; i <= length(target); i++) {
+        c = substr(target, i, 1)
+        if (c == "$" && substr(target, i + 1, 1) == "{") { depth++; i++ }
+        else if (c == "}" && depth > 0) depth--
+        else if (c == ":" && depth == 0) break
+      }
+      target = substr(target, 1, i - 1)
       if (target != "" && mount[svc] == "") mount[svc] = target
     }
     function short_volume(v,   src, rest, i) {
@@ -961,7 +970,7 @@ compose_services() {  # $1 = compose file
     }
     svc == "" { next }
     kind_ind < 0 { kind_ind = ind }
-    ind <= kind_ind {
+    ind <= kind_ind && !(ind == kind_ind && key != "" && body ~ /^-([ ]|$)/) {
       end_key()
       key = body; sub(/:.*/, "", key)
       val = body; if (!sub(/^[^:]*:[ ]*/, "", val)) val = ""
@@ -1021,7 +1030,7 @@ emit_box_candidates() {  # $1 = repo-relative compose file
   done <<<"$services"
   # SC2016: `$$` and `${` are compose syntax being matched, not shell expansion.
   # shellcheck disable=SC2016
-  required=$(sed '/^[[:space:]]*#/d; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
+  required=$(sed '/^[[:space:]]*#/d; s/[[:space:]]#.*$//; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
     | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*' \
     | sed 's/^\${\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/' | grep -vxE 'PWD|HOME' \
     | LC_ALL=C sort -u | paste -sd, -)

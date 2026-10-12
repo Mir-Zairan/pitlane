@@ -438,8 +438,12 @@ long-running compose service that mounts the checkout. Pitlane can work for them
 installs, builds, seed, teardown and `/pitlane-serve` in that service, and tells their sessions to run
 the project's commands as `bash "$PITLANE_BOX" <command>`. It does that only for a developer whose
 `shell` program is not installed (or who sets `PITLANE_TOOLCHAIN=box`) while the service is running;
-for everyone else nothing changes. Say that in plain words, then ask whether anyone on this project
-works only in Docker. No is the default, and writes no `box`.
+for everyone else nothing changes. A profile with no `shell` has no program to miss, so its box is used
+only by a developer who sets `PITLANE_TOOLCHAIN=box`. Say that in plain words, then ask whether anyone
+on this project works only in Docker. No is the default, and writes no `box`.
+
+When you write a `box` and no `shell`, tell the developer so: each Docker-only developer must set
+`PITLANE_TOOLCHAIN=box` in their own environment (their shell profile, say), or nothing runs in the box.
 
 On a yes, propose the block from the record and confirm **each field** with the developer:
 
