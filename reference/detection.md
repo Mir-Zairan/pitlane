@@ -444,6 +444,29 @@ does not produce a broken worktree. It corrupts a colleague's data.
   (`.claude/worktrees/`, `.claude/worktree-no-runtime`) is gitignored. An untracked one is work to the
   teardown guard, so the worktree it sits in is never torn down.
 
+## A Docker box
+
+For a developer who runs the project only in Docker, the profile's `box` names one long-running compose
+service that bind-mounts the main checkout; Pitlane runs that developer's commands in it. Detection
+reports a **`box`** record for each service in a root compose file that bind-mounts the project
+directory (`.`, `./`, `$PWD`) and that no other service waits on with
+`condition: service_completed_successfully` — a one-shot job, never a box. Beside the file and service:
+
+- the **mount** path inside the container, as written (a `${…}` there is the developer's to resolve);
+- the compose **profiles** the service belongs to;
+- **database candidates** — services whose image is a database server (`detection.json`'s
+  `boxCandidates.databaseImages`: mysql, mariadb, postgres, postgresql, mongo, redis), matched on the
+  image's own name with registry, namespace, tag and digest stripped. The seed and teardown run in that
+  image, because an app image's database client may not match the server;
+- **clearEnv candidates** — names in the service's `environment:` that a committed root `.env` or
+  `.env.*` file also sets (names only, never values). A pin in the container's environment beats the
+  value a worktree's env file carries;
+- **required variables** — interpolated anywhere in the file with no default (`${NAME}`, `$NAME`,
+  `${NAME:?…}`), which compose fails on or substitutes `""` for; `PWD` and `HOME` are left out. Each is
+  a `box.env` candidate.
+
+Whether anyone works only in Docker is setup's question; no is the default.
+
 ## Drift, and what the profile records about itself
 
 The profile carries an `evidence` block: the `detectionVersion` it was written against, the sorted list

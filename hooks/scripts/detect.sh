@@ -880,10 +880,9 @@ scan_hints db   "$(wt_json_get runtimeHints.dbVarPattern   <"$WT_DETECTION_JSON"
 # service that bind-mounts the project directory: the profile's `box`. Whether any developer works
 # that way is setup's question; these records only gather what each field would be.
 
-# The database servers whose image can run a seed or teardown: matched on the image's own name, so
-# `docker.io/library/mysql:8.4` and `bitnami/postgresql` count and an app image that merely carries
-# a database client does not.
-BOX_DATABASE_IMAGES=' mysql mariadb postgres postgresql mongo redis '
+# Matched on the image's own name, so `docker.io/library/mysql:8.4` counts and an app image that
+# merely carries a database client does not.
+BOX_DATABASE_IMAGES=" $(json_array_items "$(wt_json_get boxCandidates.databaseImages <"$WT_DETECTION_JSON")" | tr '\n' ' ')"
 
 # One `S` line per service in the order written, fields joined by WT_US — name, image, bind-mount
 # target of the project directory, profiles and environment names (both comma-joined) — and one `O`

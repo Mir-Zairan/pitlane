@@ -555,6 +555,20 @@
       ]
     }
   },
+  "boxCandidates": {
+    "_comment": [
+      "For the `box` record: a long-running compose service that bind-mounts the project directory, which",
+      "a developer who runs the project only in Docker can run its commands in. Every field is a proposal",
+      "setup confirms with the developer, never a decision.",
+      "",
+      "databaseImages are the database servers whose image can run the seed and teardown, matched on the",
+      "image's own name with registry, namespace, tag and digest stripped: `docker.io/library/mysql:8.4`",
+      "and `bitnami/postgresql` match, an app image that merely carries a database client does not. That",
+      "client may not match the server (MariaDB's mysqldump cannot copy a MySQL 8 database), which is why",
+      "the seed runs in the server's own image at all."
+    ],
+    "databaseImages": ["mysql", "mariadb", "postgres", "postgresql", "mongo", "redis"]
+  },
   "artifactCandidates": {
     "_comment": [
       "Well-known directories a build writes, offered as artifacts[] HINTS. A candidate is reported",

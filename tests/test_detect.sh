@@ -903,6 +903,12 @@ EOF
   commit_all "$r"
   eq 'box: long-syntax bind, map environment, a default-bearing variable is not required' \
     'box|compose.yml|node|/work||pg|NODE_ENV|' "$(det "$r" | grep '^box|')"
+  # The database images are the table's, not the script's.
+  python3 -c 'import json, sys
+t = json.load(open(sys.argv[1])); t["boxCandidates"]["databaseImages"] = ["node"]
+json.dump(t, open(sys.argv[2], "w"))' "$TABLE" "$TMP/$BACKEND/boxtable.json"
+  eq 'box: database candidates come from detection.json' 'box|compose.yml|node|/work||node|NODE_ENV|' \
+    "$(WT_DETECTION_JSON="$TMP/$BACKEND/boxtable.json" det "$r" | grep '^box|')"
 
   # A nested JS tree in a repo that declares a workspace is the root install's to populate.
   r=$(mkrepo nestedws package.json pnpm-lock.yaml pnpm-workspace.yaml packages/a/package.json packages/a/package-lock.json)
