@@ -1013,8 +1013,10 @@ fi
 COMMITTED_ENV_NAMES=" $COMMITTED_ENV_NAMES "
 
 # One `box` record per candidate service. <required vars> are those interpolated with no default
-# (`${NAME}`, `$NAME`, `${NAME:?…}`) anywhere in the file — compose fails or substitutes "" without
-# them, so each is a box.env candidate. PWD and HOME are left out: every shell exports them.
+# (`${NAME}`, `$NAME`, `${NAME:?…}`) anywhere in the file, and those a secret is read from
+# (`environment: NAME` on a line of its own, the only form that key takes as a scalar) — compose fails
+# or substitutes "" without them, so each is a box.env candidate. PWD and HOME are left out: every
+# shell exports them.
 emit_box_candidates() {  # $1 = repo-relative compose file
   local f=$1 tag name img mnt profiles envs base databases='' oneshot=' ' clear n required
   local services
@@ -1030,10 +1032,13 @@ emit_box_candidates() {  # $1 = repo-relative compose file
   done <<<"$services"
   # SC2016: `$$` and `${` are compose syntax being matched, not shell expansion.
   # shellcheck disable=SC2016
-  required=$(sed '/^[[:space:]]*#/d; s/[[:space:]]#.*$//; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
-    | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*' \
-    | sed 's/^\${\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/' | grep -vxE 'PWD|HOME' \
-    | LC_ALL=C sort -u | paste -sd, -)
+  required=$( {
+    sed '/^[[:space:]]*#/d; s/[[:space:]]#.*$//; s/\$\$//g' "$ROOT/$f" 2>/dev/null \
+      | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*' \
+      | sed 's/^\${\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/'
+    sed -n 's/^[[:space:]]*environment:[[:space:]]*["'"'"']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)["'"'"']\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1/p' \
+      "$ROOT/$f" 2>/dev/null
+  } | grep -vxE 'PWD|HOME' | LC_ALL=C sort -u | paste -sd, -)
   while IFS=$WT_US read -r tag name img mnt profiles envs; do
     [ "$tag" = S ] && [ -n "$mnt" ] || continue
     claimed "$oneshot" "$name" && continue
