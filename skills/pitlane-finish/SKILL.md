@@ -22,6 +22,9 @@ Run it **in the background** (`run_in_background: true`) and wait for it to fini
 background setup, download a toolchain or clone databases, which can take many minutes, longer than a
 foreground command may run. Work that needs none of the missing pieces can go on meanwhile.
 
+When the worktree's tools run in the Docker box, a line before the status line says so (`Pitlane: this
+worktree runs its tools in the Docker box …`): from then on, run the project's commands as it says.
+
 It prints progress on stderr and one status line on stdout as its last word. The line names each
 imperfect piece by its state — `<name> missing (<why>)` or `<name> ready with warnings (<why>)`, the
 first three and then "and N more" — and, when an install changed tracked files, how many:

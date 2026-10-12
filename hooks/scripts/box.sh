@@ -94,8 +94,7 @@ wt_worktree_guard "$PWD" 2>/dev/null \
 worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
 # What a step is given: the slug the runtime recorded, which the worktree's env files are named after.
 WT_NAME=$(wt_name_from_path "$worktree")
-WT_SLUG=$(wt_runtime_state_get "$worktree" slug 2>/dev/null) || WT_SLUG=''
-[ -n "$WT_SLUG" ] || WT_SLUG=$(wt_slugify "$WT_NAME") || WT_SLUG=''
+WT_SLUG=$(wt_worktree_slug "$worktree" "$WT_NAME")
 WT_PATH=$worktree
 WT_ROOT=$root
 export WT_NAME WT_SLUG WT_PATH WT_ROOT

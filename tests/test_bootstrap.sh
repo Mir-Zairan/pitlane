@@ -3207,7 +3207,10 @@ case \$1 in
   compose)
     while [ \$# -gt 0 ] && [ "\$1" != run ] && [ "\$1" != ps ]; do shift; done
     case \${1-} in
-      ps) cat "$SBXD/id" 2>/dev/null ;;
+      ps)
+        [ ! -e "$SBXD/slow" ] || sleep 30
+        cat "$SBXD/id" 2>/dev/null
+        ;;
       run)
         shift
         name='' entry=()
@@ -3387,10 +3390,11 @@ BOXCLI=$(cd "${HOOK%/*}" && pwd -P)/box.sh
 mkdir -p "$SBXD/steps" "$WBX/sub dir"
 printf 'c0ffee12\n' >"$SBXD/id"
 box_cli() {  # $1 = directory, then the arguments; stdin is the caller's. Sets BX_OUT and BX_RC, stderr to $TMP/err
+  # BXPATH replaces the PATH, fake docker and all.
   local dir=$1
   shift
   : >"$SBXD/docker.log"
-  BX_OUT=$(cd "$dir" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=${BXTOOLCHAIN-box} WT_BOX_STEP_DIR=$SBXD/steps \
+  BX_OUT=$(cd "$dir" && PATH=${BXPATH:-$SBXD/bin:$PATH} PITLANE_TOOLCHAIN=${BXTOOLCHAIN-box} WT_BOX_STEP_DIR=$SBXD/steps \
     bash "$BOXCLI" "$@" 2>"$TMP/err")
   BX_RC=$?
 }
@@ -3403,9 +3407,9 @@ json.dump(d, open(p, "w"), indent=2)' "$WBX/.claude/worktree-profile.json" "$1"
 eq 'box.sh: (fixture) it is executable' yes "$([ -x "$BOXCLI" ] && echo yes || echo no)"
 
 # shellcheck disable=SC2016  # the $HOME is the argument, kept literal
-box_cli "$WBX/sub dir" printf '[%s]\n' 'a b' "it's" '$HOME' '"q"' '*' '' </dev/null
+box_cli "$WBX/sub dir" printf '[%s]\n' 'a b' "it's" '$HOME' '"q"' '*' '' "one${NL_}two" ';' "a''b" "x'" '-n' </dev/null
 eq 'box.sh: each argument reaches the command as one, evaluated once' \
-  "[a b]${NL_}[it's]${NL_}[\$HOME]${NL_}[\"q\"]${NL_}[*]${NL_}[]" "$BX_OUT"
+  "[a b]${NL_}[it's]${NL_}[\$HOME]${NL_}[\"q\"]${NL_}[*]${NL_}[]${NL_}[one${NL_}two]${NL_}[;]${NL_}[a''b]${NL_}[x']${NL_}[-n]" "$BX_OUT"
 eq '...exit 0' 0 "$BX_RC"
 eq '...nothing on stderr' '' "$(cat "$TMP/err")"
 BXLOG=$(cat "$SBXD/docker.log")
@@ -3466,6 +3470,39 @@ BXTOOLCHAIN='' box_cli "$WBX" printf x </dev/null
 bx_refused 'box.sh: the toolchain installed here, it is refused, saying to run it directly' \
   "Pitlane: not run — the profile's toolchain, env, is installed here, so the box is not used — run the command directly."
 git -C "$WBX" checkout -q -- .claude/worktree-profile.json
+BXTOOLCHAIN=host box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: PITLANE_TOOLCHAIN=host is refused, saying to run it directly' \
+  "Pitlane: not run — PITLANE_TOOLCHAIN=host keeps the profile's commands out of the box — run the command directly."
+mv "$WBX/.claude/worktree-profile.json" "$TMP/bx-wt-profile"
+mv "$SBX/.claude/worktree-profile.json" "$TMP/bx-main-profile"
+box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: with no profile it is refused, pointing to /pitlane-setup' \
+  "Pitlane: not run — there is no usable profile at $SBX/.claude/worktree-profile.json, so this worktree has no box; /pitlane-setup writes one."
+mv "$TMP/bx-wt-profile" "$WBX/.claude/worktree-profile.json"
+mv "$TMP/bx-main-profile" "$SBX/.claude/worktree-profile.json"
+# Every program on PATH but docker, so box.sh itself still runs.
+mkdir -p "$TMP/nodocker"
+IFS=: read -r -a bxdirs <<<"$PATH"
+for d in "${bxdirs[@]}"; do
+  for f in "$d"/*; do
+    n=${f##*/}
+    [ "$n" != docker ] && [ -x "$f" ] && [ ! -e "$TMP/nodocker/$n" ] && ln -s "$f" "$TMP/nodocker/$n"
+  done
+done 2>/dev/null
+BXPATH=$TMP/nodocker box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: with no docker it is refused' \
+  'Pitlane: not run — docker is not installed here, so the box cannot be used.'
+if command -v timeout >/dev/null 2>&1; then
+  : >"$SBXD/slow"
+  t0=$SECONDS
+  WT_BOX_PROBE_SECONDS=1 box_cli "$WBX" printf x </dev/null
+  rm -f "$SBXD/slow"
+  bx_refused 'box.sh: a docker that does not answer the probe is refused' \
+    'Pitlane: not run — docker did not answer within 1s, so the box (compose service app) cannot be reached.'
+  eq '...within a few seconds' yes "$([ $((SECONDS - t0)) -lt 5 ] && echo yes || echo "$((SECONDS - t0))s")"
+else
+  printf 'WARNING: timeout absent — box.sh against a slow docker NOT verified\n' >&2
+fi
 (unset PITLANE_TRUST_PROFILES; box_cli "$WBX" printf x </dev/null
  bx_refused 'box.sh: an unapproved profile is refused, pointing to /pitlane-finish' \
    "Pitlane: not run — this worktree's profile is not approved in its current form, so nothing runs in its box; run /pitlane-finish to review it."
@@ -3522,6 +3559,32 @@ out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=shell subagent_hook "$WBX" "" | sa_
 lacks 'box subagent: not when the box is not selected' 'Docker box' "$out"
 out=$( (unset PITLANE_TRUST_PROFILES; PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box subagent_hook "$WBX" "" | sa_context) )
 lacks '...nor when the profile is not approved' 'Docker box' "$out"
+
+# A boxed profile with no runtime and no agent note: no port to load it for, so only its `box` key does.
+SBN=$TMP/sbn
+make_repo "$SBN" '{"dir":"vendor","lock":"composer.lock","strategy":"install","install":"mkdir -p vendor"}'
+python3 -c 'import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["box"] = {"service": "app", "mount": "/srv/app"}
+json.dump(d, open(p, "w"), indent=2)' "$SBN/.claude/worktree-profile.json"
+git -C "$SBN" commit -qam box
+WBN=$SBN/.claude/worktrees/plain-box
+git -C "$SBN" worktree add -q "$WBN" -b worktree-plain-box 2>/dev/null
+out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box subagent_hook "$WBN" "" | sa_context)
+eq 'box subagent: a boxed profile with no port and no note still tells it, without databases' \
+  "Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project's commands (tests, console, package tools) as bash '$BOXCLI' <command> [args…], not directly; it runs them in the box, in the current folder of this worktree." "$out"
+
+# /pitlane-finish tells the model too: a profile approved mid-session never reaches PITLANE_BOX.
+outF=$( (cd "$WBX" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box bash "$HOOK" --finish 2>/dev/null) )
+contains 'box --finish: the box line, by its path, first' \
+  "Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project's commands (tests, console, package tools) as bash '$BOXCLI' <command>" \
+  "$(printf '%s\n' "$outF" | head -n 1)"
+contains '...the status line still its last word' 'Pitlane: this worktree' "$(printf '%s\n' "$outF" | tail -n 1)"
+lacks '...which is not the box line' 'Docker box' "$(printf '%s\n' "$outF" | tail -n 1)"
+outF=$( (cd "$WBX" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=shell bash "$HOOK" --finish 2>/dev/null) )
+lacks 'box --finish: not when the box is not selected' 'Docker box' "$outF"
+outF=$( (unset PITLANE_TRUST_PROFILES; cd "$WBX" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box bash "$HOOK" --finish 2>/dev/null) )
+lacks '...nor while the profile is held' 'Docker box' "$outF"
 
 
 # ---------------------------------------------------------------------------

@@ -294,7 +294,7 @@ wt_status_after_reset() {  # $1 = the session's directory
   fi
   WT_STATE_READ_ONLY=1 wt_bootstrap_status_line "$worktree" start "$how" ''
   # By its path: whether this session's environment has PITLANE_BOX is not known here.
-  if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$worktree" "$WT_BOX_PROBE_SECONDS"; then
+  if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$worktree" $((WT_BOX_PROBE_SECONDS * 2)); then
     wt_box_context_line "bash '$box_cli'"
   fi
   if wt_agent_note_is_approved; then
@@ -447,6 +447,8 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   fi
   # Published for the start-up status line, whose git status must fit the same budget.
   WT_BOOTSTRAP_DEADLINE=$deadline
+  # And the hook's own, which what the session is told after the bootstrap must fit as well.
+  WT_BOOTSTRAP_HOOK_DEADLINE=$hook_deadline
 
   # A second lock, scoped to THIS worktree, so two sessions entering the same worktree at once do
   # not both walk the whole sequence. The per-dependency locks are for contention BETWEEN
@@ -778,15 +780,22 @@ case $event in
     wt_bootstrap_pending "$worktree"
     pending=$WT_PENDING
     if [ "${WT_FINISH:-}" = 1 ]; then
+      # A profile approved mid-session never reaches the session's PITLANE_BOX, which Claude Code reads
+      # at start-up only: this line, before the status line /pitlane-finish ends on, is how the model
+      # learns to run its commands in the box. Not from the background run, whose stdout is its log.
+      if [ "${WT_BACKGROUND:-}" != 1 ] && box_cli=$(wt_box_cli_path) \
+         && wt_session_uses_box "$worktree" $((WT_BOX_PROBE_SECONDS * 2)) 2>/dev/null; then
+        wt_box_context_line "bash '$box_cli'"
+      fi
       wt_bootstrap_status_line "$worktree" finish "$([ "${WT_APPROVAL:-}" = no ] && echo approval)"
       exit 0
     fi
     # The session's own environment gets WORKTREE_PORT and WORKTREE_URL (ADR-021), and PITLANE_BOX when
     # its commands run in the box — from the start-up hook only, since Claude Code reads
     # CLAUDE_ENV_FILE once, when this hook exits. The steps above may not have probed the box: the
-    # probe gets what is left of the budget.
+    # probe then gets what is left of the hook's own time, not of the bootstrap's budget.
     box_cli=''
-    if wt_session_uses_box "$worktree" "$(wt_budget_left "${WT_BOOTSTRAP_DEADLINE:-}")"; then
+    if wt_session_uses_box "$worktree" "$(wt_budget_left "${WT_BOOTSTRAP_HOOK_DEADLINE:-}")"; then
       box_cli=$(wt_box_cli_path) || box_cli=''
     fi
     wt_session_env_export "${CLAUDE_ENV_FILE:-}" "$box_cli"

@@ -707,9 +707,40 @@ eq '...and a step given /dev/null reads nothing' 'rc=0' \
 eq 'box: the context line names the service and how box.sh is invoked' \
   'Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project'"'"'s commands (tests, console, package tools) as bash "$PITLANE_BOX" <command> [args…], not directly; it runs them in the box, in the current folder of this worktree.' \
   "$(PROFILE_HAS_RUNTIME=0 wt_box_context_line 'bash "$PITLANE_BOX"')"
-contains '...and, with a runtime, that it runs against this worktree'"'"'s databases' \
+contains '...and, with runtime.env variables, that it runs against this worktree'"'"'s databases' \
   "in the current folder of this worktree, against this worktree's own databases." \
-  "$(PROFILE_HAS_RUNTIME=1 wt_box_context_line x)"
+  "$(PROFILE_HAS_RUNTIME=1 PROFILE_RT_ENVVARS='{"DB_NAME":"app_{slug}"}' wt_box_context_line x)"
+lacks '...but not for a runtime with only a port' 'databases' \
+  "$(PROFILE_HAS_RUNTIME=1 PROFILE_RT_ENVVARS='' wt_box_context_line x; PROFILE_HAS_RUNTIME=1 PROFILE_RT_ENVVARS='{}' wt_box_context_line x)"
+# wt_session_uses_box: the probe and the memory inspect share the window, half each, capped at
+# WT_BOX_PROBE_SECONDS; once probed, the answer costs nothing. A `timeout` wrapper records what each
+# docker call was given.
+if command -v timeout >/dev/null 2>&1; then
+  mkdir -p "$TMP/box/tbin"
+  # shellcheck disable=SC2016  # the wrapper's own $1 and $@
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >>"%s"\nexec "%s" "$@"\n' "$TMP/box/timeouts" "$(command -v timeout)" \
+    >"$TMP/box/tbin/timeout"
+  chmod +x "$TMP/box/tbin/timeout"
+  uses_box() {  # $1 = window; prints yes or no, then the seconds each docker call was given
+    local ans=no
+    box_fresh
+    : >"$TMP/box/timeouts"
+    PATH=$TMP/box/tbin:$PATH WT_APPROVAL=${BX_APPROVAL:-yes} wt_session_uses_box "$BOXWT" "$1" 2>/dev/null && ans=yes
+    printf '%s:%s' "$ans" "$(paste -sd, "$TMP/box/timeouts")"
+  }
+  eq 'box session: a wide window gives the probe and the inspect WT_BOX_PROBE_SECONDS each' 'yes:20,20' "$(uses_box 100)"
+  eq '...a narrow one half of it each' 'yes:5,5' "$(uses_box 10)"
+  eq '...one too narrow to halve probes nothing' 'no:' "$(uses_box 1)"
+  eq '...nor does no window' 'no:' "$(uses_box '')"
+  eq '...nor a window of 0' 'no:' "$(uses_box 0)"
+  eq '...nor a held profile, however wide' 'no:' "$(BX_APPROVAL=no uses_box 100)"
+  eq 'box session: once probed, no time left still answers, without docker' 'yes:' \
+    "$(box_fresh; wt_toolchain_is_box "$BOXWT" 2>/dev/null; : >"$TMP/box/timeouts"
+       ans=no; PATH=$TMP/box/tbin:$PATH WT_APPROVAL=yes wt_session_uses_box "$BOXWT" 0 2>/dev/null && ans=yes
+       printf '%s:%s' "$ans" "$(paste -sd, "$TMP/box/timeouts")")"
+else
+  printf 'WARNING: timeout absent — the session probe window NOT verified\n' >&2
+fi
 if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   box_fresh
   rm -f "$BOXWT/inner.pid"
@@ -7289,10 +7320,26 @@ t0=$SECONDS
 wt_profile_may_carry_agent_note "$PCW" "$PCR"
 eq '...a profile over the size bound is a yes, left for the load to refuse' "0 fast" \
   "$? $([ $((SECONDS - t0)) -lt 4 ] && echo fast || echo slow)"
+# The same test for `box`, which SubagentStart makes for a worktree with no port and no note.
+rm -f "$PCW/.claude/worktree-profile.json" "$PCR/.claude/worktree-profile.json"
+wt_profile_may_spell "$PCW" "$PCR" box
+eq 'box pre-check: no profile anywhere is a no' 1 $?
+printf '{"schemaVersion":1,"box":{"service":"app","mount":"/srv/app"}}\n' >"$PCW/.claude/worktree-profile.json"
+wt_profile_may_spell "$PCW" "$PCR" box
+eq '...a profile with a box is a yes' 0 $?
+printf '{"schemaVersion":1,"boxes":1,"copy":["box file"]}\n' >"$PCW/.claude/worktree-profile.json"
+wt_profile_may_spell "$PCW" "$PCR" box
+eq '...one that never spells the key is a no' 1 $?
+printf '{"schemaVersion":1,"bo\\u0078":{"service":"app","mount":"/srv/app"}}\n' >"$PCW/.claude/worktree-profile.json"
+wt_profile_may_spell "$PCW" "$PCR" box
+eq '...a key spelt with a \u escape is a yes' 0 $?
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_AGENT_NOTE=''
 # shellcheck disable=SC2034
 PROFILE_PRESENT=0 PROFILE_HAS_RUNTIME=0
+
+# The slug a worktree is known by: its runtime record's, else its slugified name.
+eq 'worktree slug: with no runtime record, the slugified name' alice_fix_99 "$(wt_worktree_slug "$PCW" alice/fix-99)"
 
 eq 'runtime command: placeholders expand' 'bin/server --port=4123 --name=feat_x' \
   "$(WT_PORT=4123 WT_SLUG=feat_x wt_runtime_command 'bin/server --port={port} --name={slug}')"

@@ -49,7 +49,7 @@ wt_subagent_json_escape() {  # $1 = text, $2 = lines or empty
 # note, in WT_SUBAGENT_AGENT_NOTE, when the subagent works in a worktree whose profile carries one
 # approved for it — empty otherwise, so a held note is never shown.
 wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the parent session started in
-  local here=${1-} parent=${2-} name url='' inherited='' parent_name='' slug box_cli
+  local here=${1-} parent=${2-} name url='' inherited='' parent_name='' box_cli
   WT_SUBAGENT_NOTE='' WT_SUBAGENT_AGENT_NOTE='' WT_SUBAGENT_BOX=''
   # What the parent session exported (wt_session_env_export): a port, if it started in a Pitlane
   # worktree that has one. Read from the hook's own environment too, should a release pass it on.
@@ -74,15 +74,12 @@ wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the pa
         wt_approval_check "$WT_SA_WORKTREE" 2>/dev/null
       fi
       if wt_agent_note_is_approved; then
-        # The slug the runtime named this worktree's state after, as start-up uses it; with no
-        # runtime record, the slugified name start-up would use.
-        slug=$(wt_runtime_state_get "$WT_SA_WORKTREE" slug 2>/dev/null) || slug=''
-        [ -n "$slug" ] || slug=$(wt_slugify "$name") || slug=''
-        WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block "$slug")
+        WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block "$(wt_worktree_slug "$WT_SA_WORKTREE" "$name")")
       fi
       # By its path, not PITLANE_BOX: the subagent inherits the parent session's environment, which
-      # has it only when the parent's own worktree runs in the box. Within the hook's 30 seconds.
-      if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$WT_SA_WORKTREE" 15 2>/dev/null; then
+      # has it only when the parent's own worktree runs in the box. The probe and the inspect within
+      # 16 of the hook's 30 seconds.
+      if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$WT_SA_WORKTREE" 16 2>/dev/null; then
         WT_SUBAGENT_BOX=$(wt_box_context_line "bash '$box_cli'")
       fi
     fi

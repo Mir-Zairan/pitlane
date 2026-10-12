@@ -765,7 +765,8 @@ WT_BOX_DATABASE_WHY=''
 WT_BOX_PASS=()        # the docker options that pass Pitlane's variables into a container
 WT_BOX_USER=''        # uid:gid, so what a step writes in the worktree is the developer's, not root's
 WT_BOX_LOGGED=''      # the reasons said this run, one per line
-WT_BOX_PROBE_SECONDS=20
+# The environment's, which the tests use to make a slow docker fail fast; 20 otherwise.
+wt_is_posint "${WT_BOX_PROBE_SECONDS-}" || WT_BOX_PROBE_SECONDS=20
 
 wt_box_logged() {  # $1 = reason
   case $WT_NL$WT_BOX_LOGGED in
@@ -1236,14 +1237,29 @@ wt_box_cli_path() {
   printf '%s' "$path"
 }
 
+# The slug worktree $1, named $2, is known by: the one its runtime record holds — what its env files
+# and databases are named after — or, with none, the slugified name, as start-up derives it.
+wt_worktree_slug() {  # $1 = worktree, $2 = its name
+  local slug
+  slug=$(wt_runtime_state_get "$1" slug 2>/dev/null) || slug=''
+  [ -n "$slug" ] || slug=$(wt_slugify "${2-}") || slug=''
+  printf '%s' "$slug"
+}
+
 # True when the session in worktree $1 runs its commands in the box, through box.sh: the box is
-# selected, and the profile is not held back, which box.sh would refuse. The probe, when this process
-# has not made it yet, takes at most $2 seconds, so it fits what the caller has left.
-wt_session_uses_box() {  # $1 = worktree, $2 = seconds the probe may take
-  local secs=${2-}
+# selected, and the profile is not held back, which box.sh would refuse. When this process has not
+# probed the main checkout WT_ROOT names yet, the probe and the memory inspect a first selection makes
+# share a window of $2 seconds, half each, so the pair fits what the caller has left; once probed, the
+# answer is known and costs nothing, whatever is left.
+wt_session_uses_box() {  # $1 = worktree, $2 = seconds the probe and the inspect may take together
+  local secs=$WT_BOX_PROBE_SECONDS root=${WT_ROOT:-}
   [ "${PROFILE_HAS_BOX:-0}" = 1 ] && [ "${WT_APPROVAL:-}" != no ] || return 1
-  wt_is_posint "$secs" || return 1
-  [ "$secs" -le "$WT_BOX_PROBE_SECONDS" ] || secs=$WT_BOX_PROBE_SECONDS
+  if [ -z "$root" ] || [ "$WT_BOX_PROBED" != "${root%/}" ]; then
+    wt_is_posint "${2-}" || return 1
+    secs=$((10#$2 / 2))
+    [ "$secs" -ge 1 ] || return 1
+    [ "$secs" -le "$WT_BOX_PROBE_SECONDS" ] || secs=$WT_BOX_PROBE_SECONDS
+  fi
   WT_BOX_PROBE_SECONDS=$secs wt_toolchain_is_box "$1"
 }
 
@@ -1252,7 +1268,11 @@ wt_session_uses_box() {  # $1 = worktree, $2 = seconds the probe may take
 # compose name.
 wt_box_context_line() {  # $1 = how box.sh is invoked
   local databases=''
-  [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || databases=", against this worktree's own databases"
+  # Only runtime.env's variables point a worktree at databases of its own; a port alone does not.
+  case ${PROFILE_HAS_RUNTIME:-0}:${PROFILE_RT_ENVVARS:-} in
+    1: | 1:'{}' | 0:*) ;;
+    *) databases=", against this worktree's own databases" ;;
+  esac
   printf 'Pitlane: this worktree runs its tools in the Docker box, compose service %s — run the project'"'"'s commands (tests, console, package tools) as %s <command> [args…], not directly; it runs them in the box, in the current folder of this worktree%s.\n' \
     "$PROFILE_BOX_SERVICE" "$1" "$databases"
 }
