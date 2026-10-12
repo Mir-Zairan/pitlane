@@ -3912,11 +3912,13 @@ wt_copy_link_leaves() {  # $1 = tree
 # recorded it `doing`: `cp -a` (`--reflink=auto` where cp takes it) into a temp of its own name
 # (wt_copying_dep_admin_dir) on the dir's device, its symlinks checked there (wt_copy_link_leaves),
 # and only then renamed into place: the dir is never a half copy, nor one with a link out of it. The
-# copy is stopped after $4 seconds. Its size is logged, within what is left of them.
+# copy is stopped after $4 seconds. Its size is logged, within what is left of them. With $5 = 1 (a
+# worktree main's tree could not be linked into) a link leaving the dir is kept, as `cp -al` keeps it:
+# the containment is a pull request's rule.
 #   0 = in place, 1 = install instead (said why), 2 = ran out of time (nothing left; the next run tries
 #   again).
-wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
-  local root=${1%/} worktree=${2%/} dir=${3-} secs=${4-} dest tmp admin err rc=0 started elapsed left size note=''
+wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds, $5 = 1 to keep links leaving it
+  local root=${1%/} worktree=${2%/} dir=${3-} secs=${4-} keep_links=${5-0} dest tmp admin err rc=0 started elapsed left size note=''
   local -a flags=(-a) bound=() mvt=()
   dest=$worktree/$dir
   if [ -e "$dest" ] || [ -L "$dest" ]; then
@@ -3955,8 +3957,8 @@ wt_own_copy_from_main() {  # $1 = root, $2 = worktree, $3 = dir, $4 = seconds
   # Judged in the temp, before the dir exists: a link out of the tree, copied, would still lead the
   # PR's writes to whatever main's tree points at. What `rm` cannot finish is the temp's own name,
   # never the dir's, and the next run's sweep takes it.
-  wt_copy_link_leaves "$tmp"
-  case $? in
+  if [ "$keep_links" = 1 ]; then rc=1; else wt_copy_link_leaves "$tmp"; rc=$?; fi
+  case $rc in
     1) ;;
     0) rm -rf -- "$tmp" 2>/dev/null
        wt_log "  $dir: the main checkout's copy has a link leaving the folder ($WT_COPY_ESCAPE) — installing instead"
@@ -4344,8 +4346,9 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         continue
       fi
       # A hardlink that has to fall back to an install is as slow as any install, so it is deferred
-      # too. `dirty`, not `doing`: nothing was started that a later run should clear away.
-      if [ "$effective" = install ] && [ "${WT_DEFER:-0}" = 1 ]; then
+      # too. `dirty`, not `doing`: nothing was started that a later run should clear away. Not a copy
+      # over a failure that stands: no background run starts for one, so it is copied now or never.
+      if [ "$effective" = install ] && [ "${WT_DEFER:-0}" = 1 ] && { [ "$link_copy" = 0 ] || [ "$stands" -eq 0 ]; }; then
         if [ "$link_copy" = 1 ]; then
           wt_log "  $dir: to be copied from the main checkout in the background"
         else
@@ -4377,7 +4380,7 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
         [ "$held" -eq 1 ] && wt_lock_release 9
         continue
       fi
-      wt_own_copy_from_main "$root" "$worktree" "$dir" "$left"
+      wt_own_copy_from_main "$root" "$worktree" "$dir" "$left" "$link_copy"
       rc=$?
       # Its staging dir in the admin dir, once nothing is left in it: kept, it is a stray directory
       # in every pull request's git admin dir. `rmdir` takes only an empty one, so a copy another run
@@ -4389,6 +4392,14 @@ wt_bootstrap_deps() {  # $1 = root, $2 = worktree, $3 = deadline
            [ "$held" -eq 1 ] && wt_lock_release 9
            continue ;;
       esac
+    fi
+
+    # The install a copy would have spared is still the one that failed.
+    if [ "$link_copy" = 1 ] && [ "$effective" = install ] && [ "$stands" -eq 1 ]; then
+      wt_dep_log_failure_stands "$dir" "$lock" "$stood_rc" "$stood_reason"
+      wt_state_set "$worktree" "$dir" "$strategy" "$lckhash" "$ickhash" failed "$stood_rc" "$stood_reason" || true
+      [ "$held" -eq 1 ] && wt_lock_release 9
+      continue
     fi
 
     rc=0 reason=''

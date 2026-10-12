@@ -624,6 +624,8 @@ eq '...with the bytes they had' FIRST "$(cat "$WD2/vendor/composer/installed.php
 RX=$TMP/nohardlink
 make_repo "$RX" '{"dir":"vendor","lock":"composer.lock","strategy":"hardlink","install":"mkdir -p vendor && printf fellback > vendor/m"}'
 mkdir -p "$RX/vendor/pkg"; printf 'src\n' > "$RX/vendor/pkg/f"
+# A relative link out of the dir, as a path repository's: `cp -al` keeps it, and so must the copy.
+ln -s ../../composer.lock "$RX/vendor/pkg/lock"
 WX=$RX/.claude/worktrees/nx
 git -C "$RX" worktree add -q "$WX" -b worktree-nx 2>/dev/null
 
@@ -654,6 +656,7 @@ eq 'a hardlink that cannot be made does not fail the session' "$READY_VENDOR" "$
 contains '...it says the link was not possible' 'could not hardlink' "$err"
 eq '...and copies the main checkout'"'"'s instead, with no install' 'src' "$(cat "$WX/vendor/pkg/f" 2>/dev/null)"
 eq '...the install not run' '' "$(cat "$WX/vendor/m" 2>/dev/null)"
+eq '...a link leaving the dir kept, as the link would have kept it' ../../composer.lock "$(readlink "$WX/vendor/pkg/lock")"
 eq '...the copy its own file, not a link to main'"'"'s' 1 "$(stat -c %h "$WX/vendor/pkg/f" 2>/dev/null || stat -f %l "$WX/vendor/pkg/f")"
 eq '...having first cleared the debris the failed copy left' '' \
   "$([ -e "$WX/vendor/pkg/partial" ] && echo debris)"
@@ -679,6 +682,19 @@ out=$( cd "$WY" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\"
        | PATH="$TMP/stub:$PATH" bash "$HOOK" 2>"$TMP/err" )
 contains 'a link and a copy that both fail' 'could not copy it from the main checkout' "$(cat "$TMP/err")"
 eq '...install instead' 'fellback' "$(cat "$WY/vendor/m" 2>/dev/null)"
+
+# And an install that failed so stays failed: a copy that cannot stand in does not retry it.
+RZ=$TMP/repo-nolink-fail
+make_repo "$RZ" "{\"dir\":\"vendor\",\"lock\":\"composer.lock\",\"strategy\":\"hardlink\",\"install\":\"printf x >> '$TMP/zruns'; exit 7\"}"
+mkdir -p "$RZ/vendor/pkg"; printf 'src\n' > "$RZ/vendor/pkg/f"
+WZ=$RZ/.claude/worktrees/nz
+git -C "$RZ" worktree add -q "$WZ" -b worktree-nz 2>/dev/null
+for _ in 1 2; do
+  ( cd "$WZ" && printf '%s' "{\"hook_event_name\":\"SessionStart\",\"source\":\"startup\",\"cwd\":\"$WZ\"}" \
+      | PATH="$TMP/stub:$PATH" bash "$HOOK" >/dev/null 2>"$TMP/err" )
+done
+eq 'a refused link and copy over a failed install: the install ran once' x "$(cat "$TMP/zruns" 2>/dev/null)"
+contains '...the failure stands' 'the recorded failure stands (exit 7' "$(cat "$TMP/err")"
 
 # ---------------------------------------------------------------------------
 # Layer 3 — runtime isolation's acceptance criteria, end to end through the hook
