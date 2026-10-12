@@ -379,21 +379,34 @@ contains '...and still runs the command' 'ok' "$err"
 # ---------------------------------------------------------------------------
 # Driven through a fake `docker` that records each call's argv, one argument per line after a CALL
 # line, answers `compose … ps -q <service>` with $TMP/box/id (empty: the service is not running) and
-# runs an `exec`'s final `sh -c` command itself, so a step routed to the box visibly runs. Real docker
-# is never called.
+# runs what an `exec` names after its container itself, in a session of its own as a container's
+# process would be, so a step routed to the box visibly runs and a signal to the client does not reach
+# it. Real docker is never called.
 BOXM=$TMP/box-main
 BOXWT=$BOXM/.claude/worktrees/alice-fix-99
 mkdir -p "$TMP/box/bin" "$TMP/box/empty" "$BOXM/.claude"
 cat >"$TMP/box/bin/docker" <<SH
 #!/usr/bin/env bash
 { printf 'CALL\n'; printf '%s\n' "\$@"; } >>"$TMP/box/docker.log"
+if [ "\$1" = exec ]; then
+  shift
+  while :; do
+    case \$1 in
+      -i) shift ;;
+      -u | -w | -e) shift 2 ;;
+      *) break ;;
+    esac
+  done
+  shift
+  command -v setsid >/dev/null 2>&1 && exec setsid "\$@"
+  exec "\$@"
+fi
 case " \$* " in
   *' ps -q '*)
     printf 'probe\n' >>"$TMP/box/probes"
     printf 'APP_MODE=%s KEEP=%s FROMFILE=%s\n' "\${APP_MODE-unset}" "\${KEEP-unset}" "\${FROMFILE-unset}" >"$TMP/box/probe.env"
     cat "$TMP/box/id" 2>/dev/null
     ;;
-  *' exec '*) exec sh -c "\${@: -1}" ;;
 esac
 SH
 chmod +x "$TMP/box/bin/docker"
@@ -509,16 +522,26 @@ eq '...nor does it reach the hook'"'"'s own environment' unset "${APP_MODE-unset
 # --- the exec argv ---
 box_fresh
 wt_toolchain_is_box "$BOXWT" 2>/dev/null
-exec_argv() {  # $1 = command, $2 = directory; prints WT_CMD_ARGV one per line
+exec_argv() {  # $1 = command, $2 = directory; prints WT_CMD_ARGV, each element ended by US
   wt_box_exec_argv "$1" "$2" || return
-  printf '%s\n' "${WT_CMD_ARGV[@]}"
+  printf "%s$US_" "${WT_CMD_ARGV[@]}"
 }
 # shellcheck disable=SC2016  # $HOME is for the shell in the box
 out=$(export WT_SLUG=alice_fix_99 WORKTREE_URL=http://localhost:4100 MYSQL_PWD=s3cret-pw
       exec_argv 'printf "a b"; echo "$HOME"' "$BOXM/with space")
+got=()
+IFS=$US_ read -r -d '' -a got < <(printf '%s' "$out")
+eq 'box: the host side wraps it, given the container, a file of its own in the box and the stop script' \
+  "bash|-c|$WT_BOX_STEP_HOST|pitlane-box-step|c0ffee12" "$(IFS='|'; printf '%s' "${got[*]:0:5}")"
+step_file=${got[5]}
+case $step_file in
+  /tmp/pitlane-step-$$-*.pid) pass=$((pass + 1)) ;;
+  *) eq '...the file is /tmp/pitlane-step-<hook pid>-<random>.pid' "/tmp/pitlane-step-$$-N.pid" "$step_file" ;;
+esac
+eq '...then the stop script' "$WT_BOX_STEP_STOP" "${got[6]}"
 eq 'box: docker exec, as the developer, in the directory'"'"'s path in the box, a space and all' \
-  "docker${NL_}exec${NL_}-i${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-w${NL_}/srv/app/with space${NL_}-e${NL_}HOME=/tmp" \
-  "$(printf '%s\n' "$out" | head -n 9)"
+  "docker|exec|-i|-u|$(id -u):$(id -g)|-w|/srv/app/with space|-e|HOME=/tmp" "$(IFS='|'; printf '%s' "${got[*]:7:9}")"
+out=$(printf '%s\n' "${got[@]:7}")
 contains '...passing a WT_ variable by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$out"
 contains '...a WORKTREE_ one' "${NL_}-e${NL_}WORKTREE_URL${NL_}" "$out"
 contains '...and MYSQL_PWD' "${NL_}-e${NL_}MYSQL_PWD${NL_}" "$out"
@@ -526,6 +549,8 @@ lacks '...never a value' 's3cret-pw' "$out"
 lacks '...nor a variable that is not Pitlane'"'"'s' "${NL_}PATH${NL_}" "$out"
 contains '...then the container, and env clearing runtime.env.vars'"'"' names, a file-scoped one too, and box.clearEnv' \
   "${NL_}c0ffee12${NL_}env${NL_}-u${NL_}APP_PORT${NL_}-u${NL_}DB_NAME${NL_}-u${NL_}APP_ENV${NL_}sh${NL_}-c${NL_}" "$out"
+eq '...which runs the box side with the same file, then the command as one argument' \
+  "sh|-c|$WT_BOX_STEP_BOX|pitlane-step|$step_file" "$(IFS='|'; n=${#got[@]}; printf '%s' "${got[*]:$((n - 6)):5}")"
 # shellcheck disable=SC2016
 eq '...ending in sh -c with the command as one argument' 'printf "a b"; echo "$HOME"' "$(printf '%s\n' "$out" | tail -n 1)"
 eq 'box: the main checkout itself is the mount' '/srv/app' "$(wt_box_path "$BOXM/" "$BOXM")"
@@ -542,6 +567,38 @@ box_fresh
 out=$(PITLANE_TOOLCHAIN=host wt_run_in_shell 'printf "on-host"' "$BOXWT" 10 2>&1 >/dev/null)
 contains 'box: not selected, the step runs as before' 'on-host' "$out"
 lacks '...without docker' 'exec' "$(cat "$TMP/box/docker.log")"
+
+# --- a step stopped on the host is stopped in the box ---
+mkdir -p "$TMP/box/steps"
+export WT_BOX_STEP_DIR=$TMP/box/steps
+box_fresh
+wt_run_in_shell 'exit 3' "$BOXWT" 10 >/dev/null 2>&1
+eq 'box: a step'"'"'s exit status comes back through both wrappers' 3 $?
+eq '...and its file in the box is gone once it ends' '' "$(ls -A "$TMP/box/steps")"
+: >"$BOXWT/evalcount"
+# shellcheck disable=SC2016  # $PWD is for the shell the command reaches
+wt_run_in_shell 'printf "x\n" >> "$PWD/evalcount"' "$BOXWT" 10 >/dev/null 2>&1
+eq 'box: the command reaches exactly one shell, so it is evaluated once' 1 "$(wc -l <"$BOXWT/evalcount" | tr -d ' ')"
+rm -f "$BOXWT/evalcount"
+if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1; then
+  box_fresh
+  rm -f "$BOXWT/inner.pid"
+  wt_run_in_shell 'echo $$ >inner.pid; exec sleep 30' "$BOXWT" 1 >/dev/null 2>&1
+  eq 'box: a step that outruns its timeout reports 124' 124 $?
+  log=$(cat "$TMP/box/docker.log")
+  contains '...after the host side ran the stop script in the box' \
+    "CALL${NL_}exec${NL_}c0ffee12${NL_}sh${NL_}-c${NL_}$WT_BOX_STEP_STOP${NL_}sh${NL_}$TMP/box/steps/pitlane-step-" "$log"
+  eq '...on the step'"'"'s own file, with TERM' "TERM" \
+    "$(printf '%s\n' "$log" | grep -A1 -x "$TMP/box/steps/pitlane-step-$$-[0-9]*\.pid" | tail -n 1)"
+  inner=$(cat "$BOXWT/inner.pid" 2>/dev/null)
+  eq '...which stopped the command in the box, not only the client' gone \
+    "$( [ -n "$inner" ] && kill -0 "$inner" 2>/dev/null && echo running || echo gone)"
+  eq '...and its file is gone' '' "$(ls -A "$TMP/box/steps")"
+  rm -f "$BOXWT/inner.pid"
+else
+  printf 'WARNING: timeout or setsid absent — stopping a box step NOT verified\n' >&2
+fi
+unset WT_BOX_STEP_DIR
 box_fresh
 rm -f "$TMP/run/box-ran"
 out=$(WT_PATH=$BOXWT wt_run_in_shell 'touch box-ran' "$TMP/run" 10 2>&1 >/dev/null; echo "rc=$?")

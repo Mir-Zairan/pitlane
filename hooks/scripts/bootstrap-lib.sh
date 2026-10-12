@@ -924,9 +924,10 @@ wt_box_container() {  # $1 = main checkout
 # — runtime.env.vars' names, which hold the worktree's own databases and port, and box.clearEnv: most
 # frameworks rank the process environment above a .env file, so the main checkout's values would win.
 #
-# A step stopped by its timeout stops the docker client only; what it started in the box runs on.
+# The docker command is wrapped on both sides by the WT_BOX_STEP_* scripts below, so a step that is
+# stopped stops in the box too; the result is still one argv, for the guard to wrap.
 wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
-  local cmd=${1-} dir=${2-} where name rec body key
+  local cmd=${1-} dir=${2-} where name rec body key file
   local -a pass=(-e HOME=/tmp) cleared=()
   WT_CMD_ARGV=()
   if ! where=$(wt_box_path "$dir" "$WT_BOX_ROOT"); then
@@ -953,10 +954,82 @@ wt_box_exec_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
   for name in ${WT_SPLIT[@]+"${WT_SPLIT[@]}"}; do
     cleared+=(-u "$name")
   done
-  WT_CMD_ARGV=(docker exec -i -u "$WT_BOX_USER" -w "$where" "${pass[@]}" "$WT_BOX_CONTAINER")
+  file="${WT_BOX_STEP_DIR:-/tmp}/pitlane-step-$$-$RANDOM$RANDOM.pid"
+  WT_CMD_ARGV=(bash -c "$WT_BOX_STEP_HOST" pitlane-box-step "$WT_BOX_CONTAINER" "$file" "$WT_BOX_STEP_STOP"
+    docker exec -i -u "$WT_BOX_USER" -w "$where" "${pass[@]}" "$WT_BOX_CONTAINER")
   [ "${#cleared[@]}" -eq 0 ] || WT_CMD_ARGV+=(env "${cleared[@]}")
-  WT_CMD_ARGV+=(sh -c "$cmd")
+  WT_CMD_ARGV+=(sh -c "$WT_BOX_STEP_BOX" pitlane-step "$file" "$cmd")
 }
+
+# A step in the box has to be stopped IN the box: stopping the docker client — which is all a timeout,
+# the memory cap or a signal to the run reaches — leaves what it started running there, and a killed
+# install would keep writing into the worktree. Three fixed scripts do it; the command and every path
+# reach them as arguments, never as script text.
+#
+# WT_BOX_STEP_BOX runs in the box (POSIX sh; $1 = a file of its own in the box, $2 = the command). It
+# starts the command in a process group of its own — `setsid`, where the image has it; without it only
+# the command's own process can be stopped, not what that started — writes the group's id to $1, and
+# removes $1 once the command ends, passing on its exit status. The command reaches one shell.
+#
+# WT_BOX_STEP_STOP runs in the box too ($1 = that file, $2 = a signal name) and signals the group the
+# file names. Nothing to do once the file is gone, so it is safe to run when the step has ended. A
+# group is named `kill -TERM -<id>` first: dash takes `-s TERM -<id>` for an option and busybox refuses
+# `--`.
+#
+# WT_BOX_STEP_HOST runs on the host (bash; $1 = container, $2 = the file, $3 = WT_BOX_STEP_STOP, the
+# rest = the docker command). On TERM, INT or HUP it stops the step in the box, gives it 5 seconds to
+# end, then kills it, and exits 128 + the signal; `timeout` reports its own 124 regardless. A client that
+# ended by a signal it could not trap (the cap's SIGKILL) has the step stopped in the box as well. The
+# traps are set before the client starts, so no signal falls between the two.
+#
+# WT_BOX_STEP_DIR exists for the tests: the directory of the file in the box, /tmp by default.
+# shellcheck disable=SC2016  # these are scripts, expanded where they run
+WT_BOX_STEP_BOX='f=$1
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c "$2" &
+else
+  sh -c "$2" &
+fi
+printf "%s\n" "$!" >"$f"
+wait "$!"
+rc=$?
+rm -f "$f"
+exit "$rc"'
+# shellcheck disable=SC2016
+WT_BOX_STEP_STOP='p=$(cat "$1" 2>/dev/null) || exit 0
+case $p in "" | *[!0-9]*) exit 0 ;; esac
+kill -"$2" -"$p" 2>/dev/null || kill -s "$2" -- "-$p" 2>/dev/null || kill -"$2" "$p" 2>/dev/null
+exit 0'
+# shellcheck disable=SC2016
+WT_BOX_STEP_HOST='box=$1 file=$2 stopper=$3 client=""
+shift 3
+stop_in_box() {  # $1 = signal name
+  docker exec "$box" sh -c "$stopper" sh "$file" "$1" </dev/null >/dev/null 2>&1
+}
+stop() {  # $1 = exit status
+  trap "" TERM INT HUP
+  stop_in_box TERM
+  i=0
+  while [ -n "$client" ] && kill -0 "$client" 2>/dev/null && [ "$i" -lt 25 ]; do
+    sleep 0.2 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  if [ -n "$client" ] && kill -0 "$client" 2>/dev/null; then
+    stop_in_box KILL
+    kill -KILL "$client" 2>/dev/null
+  fi
+  [ -z "$client" ] || wait "$client" 2>/dev/null
+  exit "$1"
+}
+trap "stop 143" TERM
+trap "stop 130" INT
+trap "stop 129" HUP
+"$@" &
+client=$!
+wait "$client"
+rc=$?
+[ "$rc" -le 128 ] || stop_in_box TERM
+exit "$rc"'
 
 # ---------------------------------------------------------------------------
 # The resource guard — a setup step must never take the desktop down with it
