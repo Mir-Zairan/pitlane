@@ -3057,10 +3057,13 @@ if [ "$(id -u)" != 0 ]; then
   # The git dir cannot take it (read-only here; on another device below): moved aside beside the
   # dir instead, as before, and the next run's sweep finds it there.
   relink LOCKV1
+  # A run removes the leftovers dir when it is empty and makes it again, writable; the file keeps it.
+  mkdir -p "$ADMIN" && : > "$ADMIN/keep"
   chmod 555 "$DWT/vendor/locked" "$ADMIN"
   printf 'LOCKV3\n' > "$DWT/composer.lock"
   out=$(wt_bootstrap_deps "$DREPO" "$DWT" "$FAR" 2>&1)
   chmod 755 "$ADMIN"
+  rm -f "$ADMIN/keep"
   contains 'relink: with the git dir read-only the copy is moved aside beside the dir' \
     "vendor: could not remove the linked copy moved aside to $DWT/.vendor.pitlane-removed." "$out"
   eq '...nothing went into the git dir' '' "$(ls -A "$ADMIN")"
@@ -3072,6 +3075,7 @@ if [ "$(id -u)" != 0 ]; then
   eq '...and installs' "done|absent" "$(wt_state_status "$DWT" vendor)|$(present "$DWT/$leftover")"
 
   # A git dir on another device: never `mv`ed into, which would copy the whole tree.
+  mkdir -p "$ADMIN"  # the run above removed it, empty; the engine makes it before it compares
   FAKESTAT=$TMP/fakestat-bin
   mkdir -p "$FAKESTAT"
   # shellcheck disable=SC2016  # the fake's own script, expanded when it runs
