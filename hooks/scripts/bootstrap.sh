@@ -7,11 +7,11 @@
 # way that is easy to get fatally wrong:
 #
 #   SessionStart    Fires for launch-time `claude -w`. stdout is INJECTED INTO THE MODEL'S
-#                   CONTEXT, so nothing goes there but the status line and the approved agent
-#                   note. Creation was native, so `.worktreeinclude`
-#                   has ALREADY been honoured and must not be redone; only the profile's copy[]
-#                   is this hook's business. The session measurably blocks until this
-#                   returns, which is what makes a synchronous bootstrap safe.
+#                   CONTEXT, so nothing goes there but the status line, the line saying how to
+#                   run commands in the box, and the approved agent note. Creation was native, so
+#                   `.worktreeinclude` has ALREADY been honoured and must not be redone; only the
+#                   profile's copy[] is this hook's business. The session measurably blocks until
+#                   this returns, which is what makes a synchronous bootstrap safe.
 #   WorktreeCreate  Fires for the mid-session EnterWorktree tool and for subagents with
 #                   isolation:"worktree" — never for launch-time `claude -w`, because plugin hooks
 #                   join the registry after the worktree already exists. stdout IS the
@@ -262,10 +262,11 @@ wt_serve_cli() {  # $1 = --serve or --serve-stop
 # background` only while that run is alive, and `held back` when the approval says no, as at start-up.
 #
 # One profile load and no other interpreter; a session outside .claude/worktrees/ spawns nothing, and
-# a worktree with no usable profile prints nothing. The caller silences stderr, which would otherwise
-# repeat on every compaction what start-up already said once.
+# a worktree with no usable profile prints nothing. The line saying the commands run in the box is
+# printed again too, which costs a profile with a box the one `compose ps` probe. The caller silences
+# stderr, which would otherwise repeat on every compaction what start-up already said once.
 wt_status_after_reset() {  # $1 = the session's directory
-  local worktree root how=''
+  local worktree root how='' box_cli
   wt_linked_worktree_at "${1-}" || return 0
   worktree=$WT_LINKED_WORKTREE root=$WT_LINKED_ROOT
   WT_NAME=$(wt_name_from_path "$worktree")
@@ -292,6 +293,10 @@ wt_status_after_reset() {  # $1 = the session's directory
     fi
   fi
   WT_STATE_READ_ONLY=1 wt_bootstrap_status_line "$worktree" start "$how" ''
+  # By its path: whether this session's environment has PITLANE_BOX is not known here.
+  if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$worktree" "$WT_BOX_PROBE_SECONDS"; then
+    wt_box_context_line "bash '$box_cli'"
+  fi
   if wt_agent_note_is_approved; then
     wt_agent_note_block "${WT_SLUG-}" "$([ -z "$WT_PENDING" ] || printf incomplete)"
   fi
@@ -776,9 +781,15 @@ case $event in
       wt_bootstrap_status_line "$worktree" finish "$([ "${WT_APPROVAL:-}" = no ] && echo approval)"
       exit 0
     fi
-    # The session's own environment gets WORKTREE_PORT and WORKTREE_URL (ADR-021) — from the start-up hook
-    # only, since Claude Code reads CLAUDE_ENV_FILE once, when this hook exits.
-    wt_session_env_export "${CLAUDE_ENV_FILE:-}"
+    # The session's own environment gets WORKTREE_PORT and WORKTREE_URL (ADR-021), and PITLANE_BOX when
+    # its commands run in the box — from the start-up hook only, since Claude Code reads
+    # CLAUDE_ENV_FILE once, when this hook exits. The steps above may not have probed the box: the
+    # probe gets what is left of the budget.
+    box_cli=''
+    if wt_session_uses_box "$worktree" "$(wt_budget_left "${WT_BOOTSTRAP_DEADLINE:-}")"; then
+      box_cli=$(wt_box_cli_path) || box_cli=''
+    fi
+    wt_session_env_export "${CLAUDE_ENV_FILE:-}" "$box_cli"
     how=''
     if [ -n "$pending" ]; then
       if [ "${WT_APPROVAL:-}" = no ]; then
@@ -796,6 +807,12 @@ case $event in
     # Gathered rather than printed, so that a message for the developer can go with it (below).
     context=$(
       wt_bootstrap_status_line "$worktree" start "$how" "${WT_BOOTSTRAP_DEADLINE:-}"
+      if [ "$WT_BOX_CLI_EXPORTED" = 1 ]; then
+        # shellcheck disable=SC2016  # the session's shell expands it
+        wt_box_context_line 'bash "$PITLANE_BOX"'
+      elif [ -n "$box_cli" ]; then
+        wt_box_context_line "bash '$box_cli'"
+      fi
       # After the status line, which says nothing of it: the note is the repository's text, not
       # Pitlane's. The approval is the one the bootstrap above decided for this worktree.
       if wt_agent_note_is_approved; then

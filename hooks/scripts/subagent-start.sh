@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # SubagentStart entrypoint: tells a subagent which worktree it runs in, that worktree's own app
-# port and URL, and the profile's approved agent note.
+# port and URL, how to run its commands when they run in the box, and the profile's approved agent
+# note.
 #
 # Measured (ADR-024): a subagent with isolation "worktree" gets a worktree from WorktreeCreate, but no
 # SessionStart fires for it, WorktreeCreate gets no CLAUDE_ENV_FILE, and the subagent INHERITS the
@@ -43,12 +44,13 @@ wt_subagent_json_escape() {  # $1 = text, $2 = lines or empty
   wt_json_text "$@"
 }
 
-# The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told; and
-# the profile's agent note, in WT_SUBAGENT_AGENT_NOTE, when the subagent works in a worktree whose
-# profile carries one approved for it — empty otherwise, so a held note is never shown.
+# The one line for the subagent, in WT_SUBAGENT_NOTE, or empty when it has nothing to be told; the
+# line saying its commands run in the box, in WT_SUBAGENT_BOX, when they do; and the profile's agent
+# note, in WT_SUBAGENT_AGENT_NOTE, when the subagent works in a worktree whose profile carries one
+# approved for it — empty otherwise, so a held note is never shown.
 wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the parent session started in
-  local here=${1-} parent=${2-} name url='' inherited='' parent_name='' slug
-  WT_SUBAGENT_NOTE='' WT_SUBAGENT_AGENT_NOTE=''
+  local here=${1-} parent=${2-} name url='' inherited='' parent_name='' slug box_cli
+  WT_SUBAGENT_NOTE='' WT_SUBAGENT_AGENT_NOTE='' WT_SUBAGENT_BOX=''
   # What the parent session exported (wt_session_env_export): a port, if it started in a Pitlane
   # worktree that has one. Read from the hook's own environment too, should a release pass it on.
   if [ -n "${WORKTREE_PORT:-}${WORKTREE_URL:-}" ]; then
@@ -65,17 +67,23 @@ wt_subagent_note() {  # $1 = the subagent's directory, $2 = the directory the pa
     # common worktree, with neither, starts no interpreter. The note's approval is decided for this
     # worktree, as the start-up hook decides it — what the parent session was shown says nothing
     # about the files here.
-    if [ -n "$WT_SA_PORT" ] || wt_profile_may_carry_agent_note "$WT_SA_WORKTREE" "$WT_SA_ROOT"; then
+    if [ -n "$WT_SA_PORT" ] || wt_profile_may_carry_agent_note "$WT_SA_WORKTREE" "$WT_SA_ROOT" \
+       || wt_profile_may_spell "$WT_SA_WORKTREE" "$WT_SA_ROOT" box; then
       wt_load_profile_for "$WT_SA_WORKTREE" "$WT_SA_ROOT" 2>/dev/null
-      if wt_profile_has_agent_note; then
+      if wt_profile_has_agent_note || [ "${PROFILE_HAS_BOX:-0}" = 1 ]; then
         wt_approval_check "$WT_SA_WORKTREE" 2>/dev/null
-        if wt_agent_note_is_approved; then
-          # The slug the runtime named this worktree's state after, as start-up uses it; with no
-          # runtime record, the slugified name start-up would use.
-          slug=$(wt_runtime_state_get "$WT_SA_WORKTREE" slug 2>/dev/null) || slug=''
-          [ -n "$slug" ] || slug=$(wt_slugify "$name") || slug=''
-          WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block "$slug")
-        fi
+      fi
+      if wt_agent_note_is_approved; then
+        # The slug the runtime named this worktree's state after, as start-up uses it; with no
+        # runtime record, the slugified name start-up would use.
+        slug=$(wt_runtime_state_get "$WT_SA_WORKTREE" slug 2>/dev/null) || slug=''
+        [ -n "$slug" ] || slug=$(wt_slugify "$name") || slug=''
+        WT_SUBAGENT_AGENT_NOTE=$(wt_agent_note_block "$slug")
+      fi
+      # By its path, not PITLANE_BOX: the subagent inherits the parent session's environment, which
+      # has it only when the parent's own worktree runs in the box. Within the hook's 30 seconds.
+      if box_cli=$(wt_box_cli_path) && wt_session_uses_box "$WT_SA_WORKTREE" 15 2>/dev/null; then
+        WT_SUBAGENT_BOX=$(wt_box_context_line "bash '$box_cli'")
       fi
     fi
     if [ -n "$WT_SA_PORT" ]; then
@@ -105,9 +113,12 @@ main() {
   wt_has_json || return 0
   here=$(wt_read_field cwd) || here=$PWD
   wt_subagent_note "$here" "${CLAUDE_PROJECT_DIR:-}"
-  [ -n "$WT_SUBAGENT_NOTE$WT_SUBAGENT_AGENT_NOTE" ] || return 0
-  # The Pitlane line first, then the note on lines of its own, as at start-up.
+  [ -n "$WT_SUBAGENT_NOTE$WT_SUBAGENT_BOX$WT_SUBAGENT_AGENT_NOTE" ] || return 0
+  # The Pitlane lines first, then the note on lines of its own, as at start-up.
   context=$(wt_subagent_json_escape "$WT_SUBAGENT_NOTE")
+  if [ -n "$WT_SUBAGENT_BOX" ]; then
+    context+=${context:+\\n}$(wt_subagent_json_escape "$WT_SUBAGENT_BOX")
+  fi
   if [ -n "$WT_SUBAGENT_AGENT_NOTE" ]; then
     context+=${context:+\\n}$(wt_subagent_json_escape "$WT_SUBAGENT_AGENT_NOTE" lines)
   fi

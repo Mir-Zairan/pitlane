@@ -1159,14 +1159,19 @@ wt_box_database_argv() {  # $1 = command, $2 = directory; sets WT_CMD_ARGV
 # names a throwaway container the docker command runs, and stopping the step stops that container —
 # `docker stop` gives it the same 5 seconds — then removes it.
 #
+# Both sides start the command in the background, where a shell gives it /dev/null for stdin; each
+# hands it its own stdin through fd 3 instead, so what is piped into box.sh reaches the command.
+#
 # WT_BOX_STEP_DIR exists for the tests: the directory of the file in the box, /tmp by default.
 # shellcheck disable=SC2016  # these are scripts, expanded where they run
 WT_BOX_STEP_BOX='f=$1
-if command -v setsid >/dev/null 2>&1; then
-  setsid sh -c "$2" &
-else
-  sh -c "$2" &
-fi
+{
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c "$2" <&3 3<&- &
+  else
+    sh -c "$2" <&3 3<&- &
+  fi
+} 3<&0
 printf "%s\n" "$!" >"$f"
 wait "$!"
 rc=$?
@@ -1207,12 +1212,50 @@ stop() {  # $1 = exit status
 trap "stop 143" TERM
 trap "stop 130" INT
 trap "stop 129" HUP
-"$@" &
+{ "$@" <&3 3<&- & } 3<&0
 client=$!
 wait "$client"
 rc=$?
 [ "$rc" -le 128 ] || stop_in_box TERM
 exit "$rc"'
+
+# The absolute path of box.sh, the CLI beside this library that runs a session's own commands in the
+# box. Fails when it could not be one wt_session_env_export single-quotes into CLAUDE_ENV_FILE: not
+# absolute, or holding anything but letters, digits, spaces and `/ . _ + @ , : = ~ -`.
+wt_box_cli_path() {
+  local LC_ALL=C dir=${BASH_SOURCE[0]%/*} path
+  [ "$dir" != "${BASH_SOURCE[0]}" ] || dir=.
+  path=$(cd "$dir" 2>/dev/null && pwd -P)/box.sh || return 1
+  case $path in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case $path in
+    *[!A-Za-z0-9/._+@,:=~\ -]*) return 1 ;;
+  esac
+  printf '%s' "$path"
+}
+
+# True when the session in worktree $1 runs its commands in the box, through box.sh: the box is
+# selected, and the profile is not held back, which box.sh would refuse. The probe, when this process
+# has not made it yet, takes at most $2 seconds, so it fits what the caller has left.
+wt_session_uses_box() {  # $1 = worktree, $2 = seconds the probe may take
+  local secs=${2-}
+  [ "${PROFILE_HAS_BOX:-0}" = 1 ] && [ "${WT_APPROVAL:-}" != no ] || return 1
+  wt_is_posint "$secs" || return 1
+  [ "$secs" -le "$WT_BOX_PROBE_SECONDS" ] || secs=$WT_BOX_PROBE_SECONDS
+  WT_BOX_PROBE_SECONDS=$secs wt_toolchain_is_box "$1"
+}
+
+# The line that tells the model this worktree's commands run in the box, and how; $1 is the shell
+# text that invokes box.sh. Pitlane's own words: the service is a name the validator held to a
+# compose name.
+wt_box_context_line() {  # $1 = how box.sh is invoked
+  local databases=''
+  [ "${PROFILE_HAS_RUNTIME:-0}" != 1 ] || databases=", against this worktree's own databases"
+  printf 'Pitlane: this worktree runs its tools in the Docker box, compose service %s — run the project'"'"'s commands (tests, console, package tools) as %s <command> [args…], not directly; it runs them in the box, in the current folder of this worktree%s.\n' \
+    "$PROFILE_BOX_SERVICE" "$1" "$databases"
+}
 
 # ---------------------------------------------------------------------------
 # The resource guard — a setup step must never take the desktop down with it
@@ -5093,10 +5136,15 @@ wt_worktree_guard() {  # $1 = directory
 #
 # NOT A GATE, and it must never become one: it says "no note" only where loading would find none too,
 # so skipping on it hides nothing the approval would have let through, and a yes still goes through
-# the full load, the validation and wt_approval_check. A key written with a \u escape decodes to
-# agentNote, so any \u in the file counts as a yes.
+# the full load, the validation and wt_approval_check.
 wt_profile_may_carry_agent_note() {  # $1 = worktree, $2 = main checkout
-  local LC_ALL=C file=${1%/}/.claude/worktree-profile.json chunk n=0
+  wt_profile_may_spell "$1" "$2" agentNote
+}
+
+# The same test for any key $3, which SubagentStart makes for `box` too. A key written with a \u
+# escape decodes to the key, so any \u in the file counts as a yes.
+wt_profile_may_spell() {  # $1 = worktree, $2 = main checkout, $3 = key
+  local LC_ALL=C file=${1%/}/.claude/worktree-profile.json key=${3-} chunk n=0
   [ -f "$file" ] || file=${2%/}/.claude/worktree-profile.json
   [ -f "$file" ] && [ -r "$file" ] || return 1
   # NUL-delimited, so a profile is one read, and a NUL byte cannot cut the rest of the file off. At
@@ -5106,7 +5154,7 @@ wt_profile_may_carry_agent_note() {  # $1 = worktree, $2 = main checkout
     n=$((n + 1))
     [ "$n" -eq 1 ] && [ "${#chunk}" -le "$WT_PROFILE_MAX_BYTES" ] || return 0
     case $chunk in
-      *'"agentNote"'* | *'\u'*) return 0 ;;
+      *"\"$key\""* | *'\u'*) return 0 ;;
     esac
   done <"$file"
   return 1
@@ -8036,33 +8084,49 @@ EOF
 }
 
 # Append this worktree's port and URL to the file Claude Code names in CLAUDE_ENV_FILE, as `export`
-# lines, so the session's own commands see them in their environment (ADR-021). SessionStart only,
-# and only before the hook exits: Claude Code reads the file once, when the hook returns, so a
-# background run's write never arrives. A missing, unwritable or non-regular target only warns.
+# lines, so the session's own commands see them in their environment (ADR-021); and, when the box is
+# selected, PITLANE_BOX, the path of box.sh, which runs a command in it. SessionStart only, and only
+# before the hook exits: Claude Code reads the file once, when the hook returns, so a background
+# run's write never arrives. A missing, unwritable or non-regular target only warns.
 #
-# Only the two fixed names WORKTREE_PORT and WORKTREE_URL, never runtime.port.var: the file is
-# sourced before every Bash call, approved profile or not, so a profile-chosen name (BASH_ENV, PATH,
-# NODE_OPTIONS) would run a branch's code unapproved; and the repo's own port var in the process
+# Only the three fixed names WORKTREE_PORT, WORKTREE_URL and PITLANE_BOX, never runtime.port.var: the
+# file is sourced before every Bash call, approved profile or not, so a profile-chosen name (BASH_ENV,
+# PATH, NODE_OPTIONS) would run a branch's code unapproved; and the repo's own port var in the process
 # environment would override its env files, which dotenv loaders do not override. The values are
-# constrained by construction (digits; a URL wt_is_safe_url passed, which holds no quote), and
-# single-quoted anyway.
-wt_session_env_export() {  # $1 = the file CLAUDE_ENV_FILE names (empty: do nothing)
-  local f=${1-} lines=''
+# constrained by construction (digits; a URL wt_is_safe_url passed; the plugin's own path, which
+# wt_box_cli_path passed), none holding a quote, and single-quoted anyway.
+# WT_BOX_CLI_EXPORTED says whether PITLANE_BOX was written, so the context can name it.
+# shellcheck disable=SC2034  # read by bootstrap.sh
+WT_BOX_CLI_EXPORTED=0
+wt_session_env_export() {  # $1 = the file CLAUDE_ENV_FILE names (empty: do nothing), $2 = box.sh's path or empty
+  local f=${1-} box=${2-} lines='' names='' boxed=0
+  WT_BOX_CLI_EXPORTED=0
   [ -n "$f" ] || return 0
   if [ -n "${WT_RUNTIME_PORT:-}" ] && wt_is_posint "$WT_RUNTIME_PORT"; then
     lines+="export WORKTREE_PORT='$WT_RUNTIME_PORT'$WT_NL"
+    names+=', WORKTREE_PORT'
   fi
   if [ -n "${WT_RUNTIME_URL:-}" ] && wt_is_safe_url "$WT_RUNTIME_URL"; then
     lines+="export WORKTREE_URL='$WT_RUNTIME_URL'$WT_NL"
+    names+=', WORKTREE_URL'
+  fi
+  if [ -n "$box" ] && [ "$box" = "$(wt_box_cli_path)" ]; then
+    lines+="export PITLANE_BOX='$box'$WT_NL"
+    names+=', PITLANE_BOX'
+    boxed=1
   fi
   [ -n "$lines" ] || return 0
+  names=${names#, }
   if [ -d "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
-    wt_log "runtime: CLAUDE_ENV_FILE ($f) is not a regular file — the session's environment does not get the port or the URL"
+    wt_log "runtime: CLAUDE_ENV_FILE ($f) is not a regular file — the session's environment does not get $names"
     return 0
   fi
   # Braced so a failed open is silenced too: `>>f 2>/dev/null` lets bash report the open first.
   if ! { printf '%s' "$lines" >>"$f"; } 2>/dev/null; then
-    wt_log "runtime: could not append to CLAUDE_ENV_FILE ($f) — the session's environment does not get the port or the URL"
+    wt_log "runtime: could not append to CLAUDE_ENV_FILE ($f) — the session's environment does not get $names"
+    return 0
   fi
+  # shellcheck disable=SC2034
+  WT_BOX_CLI_EXPORTED=$boxed
   return 0
 }

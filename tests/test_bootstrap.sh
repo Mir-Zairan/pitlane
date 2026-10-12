@@ -3194,6 +3194,7 @@ eq '...and --serve-stop runs runtime.stop for it' "Pitlane: stopped the server a
 
 # Served in the box: a short-lived container of the box's service, with the worktree's port published.
 # The fake `docker` records each call; `compose … ps -q` answers with $SBXD/id (empty: not running);
+# `exec` runs its command here, in the caller's directory, in a session of its own as in the box;
 # `compose … run` starts its entrypoint and command here, in the worktree, in a session of its own as
 # a container's process would be, so a signal to the client does not reach it; `stop` and `rm -f`
 # signal that session by its --name, and an inspect of `.State.Status` finds it while it runs.
@@ -3226,6 +3227,18 @@ case \$1 in
         exit
         ;;
     esac
+    ;;
+  exec)
+    shift
+    while :; do
+      case \$1 in
+        -i) shift ;;
+        -u | -w | -e) shift 2 ;;
+        *) break ;;
+      esac
+    done
+    shift
+    exec setsid "\$@"
     ;;
   stop) p=\$(cat "$SBXD/run-\$4.pid" 2>/dev/null) && kill -TERM -- "-\$p" 2>/dev/null ;;
   rm) p=\$(cat "$SBXD/run-\$3.pid" 2>/dev/null) && kill -KILL -- "-\$p" 2>/dev/null ;;
@@ -3366,6 +3379,149 @@ eq '...docker never called' '' "$(cat "$SBXD/docker.log")"
 eq '...and the record has its seven fields, no container' '8 ' "$(serve_container "$WBX")"
 BXTOOLCHAIN=shell box_serve --serve-stop
 contains '...stopped by its pid' "Pitlane: stopped the server at $BXURL (pid" "$SV_OUT"
+
+# ---------------------------------------------------------------------------
+# box.sh: the session's own commands, run in the box as a step is
+# ---------------------------------------------------------------------------
+BOXCLI=$(cd "${HOOK%/*}" && pwd -P)/box.sh
+mkdir -p "$SBXD/steps" "$WBX/sub dir"
+printf 'c0ffee12\n' >"$SBXD/id"
+box_cli() {  # $1 = directory, then the arguments; stdin is the caller's. Sets BX_OUT and BX_RC, stderr to $TMP/err
+  local dir=$1
+  shift
+  : >"$SBXD/docker.log"
+  BX_OUT=$(cd "$dir" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=${BXTOOLCHAIN-box} WT_BOX_STEP_DIR=$SBXD/steps \
+    bash "$BOXCLI" "$@" 2>"$TMP/err")
+  BX_RC=$?
+}
+box_profile_set() {  # $1 = a python statement on the boxed worktree's profile, d
+  python3 -c 'import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+exec(sys.argv[2])
+json.dump(d, open(p, "w"), indent=2)' "$WBX/.claude/worktree-profile.json" "$1"
+}
+eq 'box.sh: (fixture) it is executable' yes "$([ -x "$BOXCLI" ] && echo yes || echo no)"
+
+# shellcheck disable=SC2016  # the $HOME is the argument, kept literal
+box_cli "$WBX/sub dir" printf '[%s]\n' 'a b' "it's" '$HOME' '"q"' '*' '' </dev/null
+eq 'box.sh: each argument reaches the command as one, evaluated once' \
+  "[a b]${NL_}[it's]${NL_}[\$HOME]${NL_}[\"q\"]${NL_}[*]${NL_}[]" "$BX_OUT"
+eq '...exit 0' 0 "$BX_RC"
+eq '...nothing on stderr' '' "$(cat "$TMP/err")"
+BXLOG=$(cat "$SBXD/docker.log")
+contains '...through docker exec, attached, as the developer, in the current folder'"'"'s path in the box' \
+  "CALL${NL_}exec${NL_}-i${NL_}-u${NL_}$(id -u):$(id -g)${NL_}-w${NL_}/srv/app/.claude/worktrees/boxed/sub dir${NL_}-e${NL_}HOME=/tmp${NL_}" "$BXLOG"
+lacks '...with no tty' "${NL_}-t${NL_}" "$BXLOG"
+contains '...clearing runtime.env.vars'"'"' names, as for a step, then the step'"'"'s box side' \
+  "${NL_}c0ffee12${NL_}env${NL_}-u${NL_}DATABASE_NAME${NL_}-u${NL_}TEST_DATABASE_NAME${NL_}-u${NL_}CI_DATABASE_NAME${NL_}sh${NL_}-c${NL_}" "$BXLOG"
+contains '...passing the worktree'"'"'s variables by name' "${NL_}-e${NL_}WT_SLUG${NL_}" "$BXLOG"
+box_cli "$WBX" sh -c 'exit 7' </dev/null
+eq 'box.sh: the command'"'"'s exit status is box.sh'"'"'s' 7 "$BX_RC"
+eq '...and its file in the box is gone' '' "$(ls -A "$SBXD/steps")"
+BX_OUT=$(printf 'from the pipe\n' | (cd "$WBX" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box WT_BOX_STEP_DIR=$SBXD/steps \
+  bash "$BOXCLI" sed 's/^/got: /' 2>"$TMP/err"))
+eq 'box.sh: stdin reaches the command' 'got: from the pipe' "$BX_OUT"
+
+# A stopped box.sh stops the command in the box, not only the docker client.
+rm -f "$WBX/inner.pid"
+# shellcheck disable=SC2016  # $$ is the in-box shell's
+( cd "$WBX" && PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box WT_BOX_STEP_DIR=$SBXD/steps \
+  exec bash "$BOXCLI" sh -c 'echo $$ >inner.pid; exec sleep 30' ) </dev/null >/dev/null 2>&1 &
+BXBG=$!
+for _ in $(seq 1 50); do [ -s "$WBX/inner.pid" ] && [ -n "$(ls -A "$SBXD/steps")" ] && break; sleep 0.1; done
+BXINNER=$(cat "$WBX/inner.pid" 2>/dev/null)
+ne 'box.sh: (fixture) the command started in the box' '' "$BXINNER"
+kill -TERM "$BXBG"
+wait "$BXBG"
+eq 'box.sh: TERM ends it with 143' 143 $?
+eq '...having stopped the command in the box' gone "$(kill -0 "$BXINNER" 2>/dev/null && echo running || echo gone)"
+rm -f "$WBX/inner.pid"
+
+# Refusals: one line on stderr, nothing on stdout, 125 — never the command run elsewhere.
+bx_refused() {  # $1 = label, $2 = the line expected on stderr
+  eq "$1" "$2" "$(cat "$TMP/err")"
+  eq '...nothing on stdout' '' "$BX_OUT"
+  eq '...exit 125' 125 "$BX_RC"
+  lacks '...and nothing ran in the box' "${NL_}exec${NL_}" "$NL_$(cat "$SBXD/docker.log")"
+}
+box_cli "$WBX" </dev/null
+bx_refused 'box.sh: no command is refused' 'Pitlane: not run — give the command to run in the box: box.sh <command> [args…].'
+box_cli "$SBX" printf x </dev/null
+bx_refused 'box.sh: from the main checkout it is refused' \
+  'Pitlane: not run — run box.sh from inside a worktree under .claude/worktrees/ — this is not one.'
+: >"$SBXD/id"
+box_cli "$WBX" printf x </dev/null
+# shellcheck disable=SC2016  # the backquotes are the line's own
+bx_refused 'box.sh: a box that is not running is refused, with how to start it' \
+  "Pitlane: not run — the box, compose service app, is not running — start it with \`docker compose --project-directory $SBX up -d app\`, then run this again."
+printf 'c0ffee12\n' >"$SBXD/id"
+BXTOOLCHAIN=shell box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: PITLANE_TOOLCHAIN=shell is refused, saying to run it directly' \
+  "Pitlane: not run — PITLANE_TOOLCHAIN=shell keeps the profile's commands out of the box — run the command directly."
+BXTOOLCHAIN='' box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: a profile with no shell uses the box only when asked to' \
+  "Pitlane: not run — the profile names no toolchain shell, so its box is used only with PITLANE_TOOLCHAIN=box — run the command directly."
+box_profile_set 'd["shell"] = "env"'
+BXTOOLCHAIN='' box_cli "$WBX" printf x </dev/null
+bx_refused 'box.sh: the toolchain installed here, it is refused, saying to run it directly' \
+  "Pitlane: not run — the profile's toolchain, env, is installed here, so the box is not used — run the command directly."
+git -C "$WBX" checkout -q -- .claude/worktree-profile.json
+(unset PITLANE_TRUST_PROFILES; box_cli "$WBX" printf x </dev/null
+ bx_refused 'box.sh: an unapproved profile is refused, pointing to /pitlane-finish' \
+   "Pitlane: not run — this worktree's profile is not approved in its current form, so nothing runs in its box; run /pitlane-finish to review it."
+ printf '%s %s\n' "$pass" "$fail" >"$TMP/bx-counts")
+read -r pass fail <"$TMP/bx-counts"
+
+# SessionStart: PITLANE_BOX and the line saying how to use it, only when the box is selected.
+bx_start() {  # $1 = PITLANE_TOOLCHAIN; prints the context, the env file in $TMP/bx-env
+  : >"$TMP/bx-env"
+  ctx "$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=$1 CLAUDE_ENV_FILE=$TMP/bx-env start_hook "$WBX")"
+}
+out=$(bx_start box)
+eq 'box SessionStart: CLAUDE_ENV_FILE gets PITLANE_BOX, the path of box.sh, beside the port and URL' \
+  "export WORKTREE_PORT='$BXPORT'${NL_}export WORKTREE_URL='$BXURL'${NL_}export PITLANE_BOX='$BOXCLI'" "$(cat "$TMP/bx-env")"
+eq '...which the session'"'"'s shell reads back' "$BOXCLI" "$(env -i bash -c ". '$TMP/bx-env'; printf '%s' \"\$PITLANE_BOX\"")"
+# shellcheck disable=SC2016  # the session's shell expands it
+contains '...and the session is told to run its commands through it' \
+  'Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project'"'"'s commands (tests, console, package tools) as bash "$PITLANE_BOX" <command> [args…], not directly; it runs them in the box, in the current folder of this worktree, against this worktree'"'"'s own databases.' "$out"
+eq '...on a line of its own after the status line' 2 "$(printf '%s\n' "$out" | grep -c .)"
+for tc in shell host; do
+  out=$(bx_start "$tc")
+  lacks "box SessionStart: PITLANE_TOOLCHAIN=$tc exports no PITLANE_BOX" PITLANE_BOX "$(cat "$TMP/bx-env")"
+  lacks '...and says nothing of the box' 'Docker box' "$out"
+done
+: >"$SBXD/id"
+out=$(bx_start box)
+lacks 'box SessionStart: a box that is not running exports no PITLANE_BOX' PITLANE_BOX "$(cat "$TMP/bx-env")"
+lacks '...and says nothing of using it' 'Docker box' "$out"
+printf 'c0ffee12\n' >"$SBXD/id"
+out=$( (unset PITLANE_TRUST_PROFILES; bx_start box) )
+lacks 'box SessionStart: an unapproved profile exports no PITLANE_BOX' PITLANE_BOX "$(cat "$TMP/bx-env")"
+lacks '...and says nothing of the box, which box.sh would refuse' 'Docker box' "$out"
+out=$(ctx "$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box start_hook "$WBX")")
+contains 'box SessionStart: without CLAUDE_ENV_FILE the line names box.sh by its path' "as bash '$BOXCLI' <command>" "$out"
+out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box reset_hook "$WBX" compact)
+contains 'box SessionStart: a compaction prints the line again, by its path' "as bash '$BOXCLI' <command>" "$out"
+out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=shell reset_hook "$WBX" compact)
+lacks '...and not when the box is not selected' 'Docker box' "$out"
+# Nothing the profile names reaches the file: box.env's names are compose's, never the session's.
+box_profile_set 'd["box"]["env"] = {"PITLANE_BOX": "/tmp/elsewhere.sh", "BASH_ENV": "/tmp/elsewhere.sh"}; d["box"]["clearEnv"] = ["PITLANE_BOX"]'
+bx_start box >/dev/null
+eq 'box SessionStart: a profile naming PITLANE_BOX or BASH_ENV changes nothing in CLAUDE_ENV_FILE' \
+  "export WORKTREE_PORT='$BXPORT'${NL_}export WORKTREE_URL='$BXURL'${NL_}export PITLANE_BOX='$BOXCLI'" "$(cat "$TMP/bx-env")"
+git -C "$WBX" checkout -q -- .claude/worktree-profile.json
+
+# A subagent working in the boxed worktree is told the same, by the path: it inherits PITLANE_BOX only
+# from a parent session whose own worktree runs in the box.
+out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box subagent_hook "$WBX" "" | sa_context)
+contains 'box subagent: told to run its commands through box.sh, by its path' \
+  "Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project's commands (tests, console, package tools) as bash '$BOXCLI' <command> [args…]" "$out"
+contains '...after its port line' "Pitlane: this worktree is boxed; its app port is $BXPORT" "$(printf '%s\n' "$out" | head -n 1)"
+eq '...two lines in all' 2 "$(printf '%s\n' "$out" | grep -c .)"
+out=$(PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=shell subagent_hook "$WBX" "" | sa_context)
+lacks 'box subagent: not when the box is not selected' 'Docker box' "$out"
+out=$( (unset PITLANE_TRUST_PROFILES; PATH=$SBXD/bin:$PATH PITLANE_TOOLCHAIN=box subagent_hook "$WBX" "" | sa_context) )
+lacks '...nor when the profile is not approved' 'Docker box' "$out"
 
 
 # ---------------------------------------------------------------------------

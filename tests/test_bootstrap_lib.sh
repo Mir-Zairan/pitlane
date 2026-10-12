@@ -694,6 +694,22 @@ eq '...and its file in the box is gone once it ends' '' "$(ls -A "$TMP/box/steps
 wt_run_in_shell 'printf "x\n" >> "$PWD/evalcount"' "$BOXWT" 10 >/dev/null 2>&1
 eq 'box: the command reaches exactly one shell, so it is evaluated once' 1 "$(wc -l <"$BOXWT/evalcount" | tr -d ' ')"
 rm -f "$BOXWT/evalcount"
+# Both sides start the command in the background, where a shell would hand it /dev/null.
+box_fresh
+wt_toolchain_is_box "$BOXWT" 2>/dev/null
+wt_box_exec_argv 'cat; echo "rc=$?"' "$BOXWT"
+eq 'box: the caller'"'"'s stdin reaches the command through both wrappers' "piped${NL_}rc=0" \
+  "$(printf 'piped\n' | (cd "$BOXWT" && exec "${WT_CMD_ARGV[@]}") 2>/dev/null)"
+eq '...and a step given /dev/null reads nothing' 'rc=0' \
+  "$( (cd "$BOXWT" && exec "${WT_CMD_ARGV[@]}") </dev/null 2>/dev/null)"
+# The line the model is told: Pitlane's words, the service the validator held to a compose name.
+# shellcheck disable=SC2016  # the session's shell expands $PITLANE_BOX
+eq 'box: the context line names the service and how box.sh is invoked' \
+  'Pitlane: this worktree runs its tools in the Docker box, compose service app — run the project'"'"'s commands (tests, console, package tools) as bash "$PITLANE_BOX" <command> [args…], not directly; it runs them in the box, in the current folder of this worktree.' \
+  "$(PROFILE_HAS_RUNTIME=0 wt_box_context_line 'bash "$PITLANE_BOX"')"
+contains '...and, with a runtime, that it runs against this worktree'"'"'s databases' \
+  "in the current folder of this worktree, against this worktree's own databases." \
+  "$(PROFILE_HAS_RUNTIME=1 wt_box_context_line x)"
 if command -v timeout >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   box_fresh
   rm -f "$BOXWT/inner.pid"
@@ -6901,6 +6917,41 @@ eq 'session env: a port that is not a number is not exported (the url still is)'
 : >"$CEF"
 WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF"
 eq 'session env: nothing to export writes nothing' '' "$(cat "$CEF")"
+# PITLANE_BOX: the path of box.sh beside the engine, and only that — whatever a caller passes.
+BOXCLI_=$(cd "$HERE" && pwd -P)/box.sh
+eq 'session env: box.sh is the CLI beside the engine' "$BOXCLI_" "$(wt_box_cli_path)"
+: >"$CEF"
+WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF" "$BOXCLI_"
+eq 'session env: the box selected, PITLANE_BOX is exported as the path of box.sh' \
+  "export PITLANE_BOX='$BOXCLI_'" "$(cat "$CEF")"
+eq '...which a shell reads back as the path' "$BOXCLI_" "$(env -i bash -c ". '$CEF'; printf '%s' \"\$PITLANE_BOX\"")"
+eq '...and the context is told it was' 1 "$WT_BOX_CLI_EXPORTED"
+: >"$CEF"
+wt_session_env_export "$CEF" "$BOXCLI_"
+eq 'session env: beside the port and the URL' \
+  "export WORKTREE_PORT='4123'${NL_}export WORKTREE_URL='http://localhost:4123'${NL_}export PITLANE_BOX='$BOXCLI_'" "$(cat "$CEF")"
+for bad in "/tmp/evil.sh" "$BOXCLI_'; touch pwned; '" "$BOXCLI_${NL_}export BASH_ENV=x"; do
+  : >"$CEF"
+  WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF" "$bad"
+  eq "session env: a path that is not box.sh's own is never exported ($(printf '%q' "$bad"))" '' "$(cat "$CEF")"
+  eq '...and the context is not told it was' 0 "$WT_BOX_CLI_EXPORTED"
+done
+: >"$CEF"
+WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$CEF" ''
+eq 'session env: the box not selected, no PITLANE_BOX' '' "$(cat "$CEF")"
+out=$(WT_RUNTIME_PORT='' WT_RUNTIME_URL='' wt_session_env_export "$TMP/no-such-dir/env.sh" "$BOXCLI_" 2>&1
+      printf ' exported=%s' "$WT_BOX_CLI_EXPORTED")
+contains 'session env: an unwritable target names PITLANE_BOX as not set' 'does not get PITLANE_BOX' "$out"
+contains '...and the context is not told it was' 'exported=0' "$out"
+# A plugin installed under a path a single quote could break out of has no PITLANE_BOX at all.
+mkdir -p "$TMP/it's here"
+cp "$HERE/lib.sh" "$HERE/bootstrap-lib.sh" "$TMP/it's here/"
+# shellcheck disable=SC2016  # expanded by the fresh bash, which has none of this file's functions
+eq 'session env: box.sh under a path with a quote is refused' 1 \
+  "$(bash -c '. "$1/lib.sh"; . "$1/bootstrap-lib.sh"; wt_box_cli_path' _ "$TMP/it's here" >/dev/null 2>&1; echo $?)"
+eq '...where the same engine under a plain path is not' "$(cd "$TMP" && pwd -P)/plain/box.sh" \
+  "$(mkdir -p "$TMP/plain"; cp "$HERE/lib.sh" "$HERE/bootstrap-lib.sh" "$TMP/plain/"
+     bash -c '. "$1/lib.sh"; . "$1/bootstrap-lib.sh"; wt_box_cli_path' _ "$(cd "$TMP" && pwd -P)/plain" 2>/dev/null)"
 # shellcheck disable=SC2034  # read by the sourced engine.
 PROFILE_RT_PORTVAR='' WT_RUNTIME_PORT='' WT_RUNTIME_URL=''
 
