@@ -317,8 +317,9 @@
     "            runtime.env.vars' names.",
     "  serve     The command the box serves the app with; placeholders as runtime.serve.",
     "Every problem here is fatal, and a refused name or path is not quoted back: each field reaches a",
-    "docker command line or the review before the profile is approved. Editing the box edits the",
-    "profile, so a profile that was approved has to be approved again."
+    "docker command line or the review before the profile is approved. A box is commands — compose",
+    "runs what its files name, and `serve` runs in it — so a profile with a box needs approval even when",
+    "it has no install or seed, and editing the box edits the profile, so it is approved again."
   ],
 
   "_comment_timeouts": [

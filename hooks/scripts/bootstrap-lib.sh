@@ -410,12 +410,15 @@ wt_approval_still() {  # $1 = run directory
 
 # True when the loaded profile names anything that would be executed: an install or verify
 # command, a seed or a teardown script, a serve or stop command, an artifact's build (which every
-# artifact has: the validator requires it). `shell` alone runs nothing — it only
-# wraps those. A profile that runs nothing (config copies, hardlinks, ports, env overrides, a URL)
-# needs no approval.
+# artifact has: the validator requires it), or a box. `shell` alone runs nothing — it only
+# wraps those. A box is not a wrapper of the same kind: with nothing else in the profile, Pitlane still
+# runs compose on the files it names — which choose the images, mounts and commands of containers
+# started as the developer — and its serve command, so the box itself is commands. A profile that
+# runs nothing (config copies, hardlinks, ports, env overrides, a URL) needs no approval.
 wt_profile_runs_commands() {
   local rec body dir lock strategy install verify _cksum _copy
   [ "${PROFILE_PRESENT:-0}" = 1 ] || return 1
+  [ "${PROFILE_HAS_BOX:-0}" = 1 ] && return 0
   if [ "${PROFILE_HAS_RUNTIME:-0}" = 1 ] && { [ -n "${PROFILE_RT_SEED:-}" ] || [ -n "${PROFILE_RT_TEARDOWN:-}" ] \
     || [ -n "${PROFILE_RT_SERVE:-}" ] || [ -n "${PROFILE_RT_STOP:-}" ]; }; then
     return 0

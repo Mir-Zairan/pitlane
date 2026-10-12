@@ -6239,6 +6239,28 @@ contains 'box review: a control character in the box is shown as ?' '  box serve
 lacks '...no escape reaches the screen' $'\033' "$out"
 eq 'box approval: held, approved once recorded, held again once only the box changes, approved again once it is back' \
   'no yes no yes' "$(cat "$TMP/box-approval")"
+# A box is commands even with nothing else: Pitlane runs compose with the files it names, and its serve
+# command, in the box. So a profile whose only command-bearing part is the box is held until approved.
+BOXO=$TMP/box-only-repo
+mkdir -p "$BOXO/.claude"
+git -C "$BOXO" init -q -b main
+( unset PITLANE_TRUST_PROFILES
+  for only_box in '{"service":"app","mount":"/srv/app"}' '{"service":"app","mount":"/srv/app","serve":"bin/serve"}'; do
+    printf '%s' '{"schemaVersion":1,"box":'"$only_box"'}' >"$BOXO/.claude/worktree-profile.json"
+    wt_load_profile "$BOXO" 2>/dev/null
+    wt_profile_runs_commands && printf 'runs ' || printf 'runs-nothing '
+    wt_profile_needs_approval && printf 'needs ' || printf 'needs-nothing '
+    wt_approval_check "$BOXO" 2>/dev/null
+    printf '%s ' "$WT_APPROVAL"
+    wt_approval_record "$WT_APPROVAL_FP" "$BOXO"
+    wt_approval_check "$BOXO" 2>/dev/null
+    printf '%s|' "$WT_APPROVAL"
+  done
+  printf '%s' '{"schemaVersion":1}' >"$BOXO/.claude/worktree-profile.json"
+  wt_load_profile "$BOXO" 2>/dev/null
+  wt_profile_needs_approval && printf 'needs' || printf 'needs-nothing' ) >"$TMP/box-only"
+eq 'box approval: a box alone runs commands, needs approval and is held until approved, with or without serve' \
+  'runs needs no yes|runs needs no yes|needs-nothing' "$(cat "$TMP/box-only")"
 
 # --- the approval record: a fingerprint matches only itself, compared as a string -----------------
 # Two different digests of the form 0e<digits> are both the number 0 to awk; an approval of one must
