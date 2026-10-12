@@ -5744,7 +5744,7 @@ rmdir "$BADMIN/gitdir"
 mv "$BADMIN/gitdir.away" "$BADMIN/gitdir"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
-# --- wt_port_in_use is ADVISORY, and is tested for itself ---
+# --- wt_port_in_use, tested for itself ---
 wt_port_in_use ''    ; eq 'port_in_use rejects an empty port'       1 $?
 wt_port_in_use abc   ; eq 'port_in_use rejects a non-numeric port'  1 $?
 wt_port_in_use 0     ; eq 'port_in_use rejects zero'                1 $?
@@ -5772,8 +5772,14 @@ PYL
 fi
 
 # --- wt_runtime_claim_port ---
+# Forget every record of PA's allocation, the ledger's included: a state file removed alone leaves
+# the ledger entry a re-entered worktree would claim its old port from.
+unclaim_pa() {
+  rm -f "$(wt_state_path "$PA")"
+  rm -rf "$PREPO/.git/worktree-ledger"
+}
 # Determinism first: it is what a bookmarked URL depends on.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_first=$WT_PORT
 in_range_b 'a claimed port is inside the span' 4100 200 "$p_first"
 eq 'the derived port is what a bare derivation gives' "$(wt_derive_port alpha_slug 4100 200)" \
@@ -5796,7 +5802,7 @@ eq 'the ports lock is released, not leaked' 0 \
 # sees nothing. The order is asserted deterministically by shadowing the release so it notes
 # whether the record was already on disk when it ran — a concurrency test for this would be
 # inherently flaky, and flaky is how an ordering guarantee quietly stops being checked.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 rm -f "$TMP/lock-order"
 (
   # SC2329: invoked indirectly — it shadows the real release for this subshell.
@@ -5839,14 +5845,14 @@ in_range_b 'a recorded port outside the port space is re-derived' 4100 200 "$WT_
 
 # PROBING FORWARD past a live sibling, pinned by pointing the sibling at exactly the port this slug
 # derives to, so the collision is certain rather than incidental.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 want=$(wt_derive_port alpha_slug 4100 200)
 wt_runtime_state_set "$PB" beta_slug "$want" derived .e ours none ''
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_probe=$WT_PORT
 ne 'a port claimed by a live sibling is stepped over' "$want" "$p_probe"
 in_range_b 'and the replacement is still inside the span' 4100 200 "$p_probe"
 eq 'and it is reported as probed, so teardown knows it was not derived' 'probed' "$WT_PORT_SOURCE"
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 contains 'and it says which port it stepped over' 'is taken by another worktree' \
   "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)"
 
@@ -5860,7 +5866,7 @@ c2=$(wt_port_candidates alpha_slug 4100 200 | sed -n 2p)
 c3=$(wt_port_candidates alpha_slug 4100 200 | sed -n 3p)
 wt_runtime_state_set "$PB" beta_slug  "$c1" derived .e ours none ''
 wt_runtime_state_set "$PG" gamma_slug "$c2" derived .e ours none ''
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 wt_runtime_siblings "$PREPO" "$PA"
 eq 'both siblings appear in one enumeration' 2 \
   "$(printf '%s' "$WT_SIBLINGS" | tr -cd "$RS_" | wc -c | tr -d ' ')"
@@ -5874,7 +5880,7 @@ git -C "$PREPO" worktree remove --force "$PG" 2>/dev/null
 # could ever match is a different live worktree whose name slugifies the same. Stepping the port
 # forward is right; it is the DATABASE the two would still share, which wt_runtime_handoff warns
 # about separately because no port move can fix it.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 wt_runtime_state_set "$PB" alpha_slug "$want" derived .e ours none ''
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200
 ne 'a live sibling on the same slug is stepped over like any other' "$want" "$WT_PORT"
@@ -5882,28 +5888,28 @@ wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
 # A span of 1 with the single port already claimed: every candidate is taken, so it keeps the
 # derived value and says so. It must not hang, loop, or print nothing.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 wt_runtime_state_set "$PB" beta_slug 4100 derived .e ours none ''
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 1 2>/dev/null
 eq 'a fully-claimed span keeps the derived port rather than failing' 4100 "$WT_PORT"
 eq 'and reports it as derived, since nothing was successfully probed' 'derived' "$WT_PORT_SOURCE"
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 contains 'and warns that it may fail to bind' 'may fail to bind' \
   "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 1 2>&1 >/dev/null)"
 # A ZERO-PADDED base on that same path. wt_is_posint accepts "04100" and bash reads a leading zero
 # as OCTAL, so a message computing base+span without the 10# prefix is a fatal arithmetic error —
 # on the one path that is already reporting a problem, which is the worst place to add a second one.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 contains 'the fully-claimed message survives a zero-padded base' 'may fail to bind' \
   "$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 04100 1 2>&1 >/dev/null)"
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 04100 1 2>/dev/null
 eq 'and a zero-padded base still derives a decimal port' 4100 "$WT_PORT"
 wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
 
 # An unusable port configuration yields nothing at all rather than a wrong number. The validator
 # only WARNS about these, so the engine is what actually has to refuse.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 for bad in '0 200' '4100 0' 'x 200' '4100 x' '80 10' '65000 1000'; do
   # SC2086: the split is the POINT — each entry is a base/span pair to be separated.
   # shellcheck disable=SC2086
@@ -5917,7 +5923,7 @@ done
 
 # WITHOUT flock, allocation must still happen — stock macOS has no flock(1), and refusing to
 # allocate there would be worse than allocating unserialised.
-rm -f "$(wt_state_path "$PA")"
+unclaim_pa
 NOFLOCK=$TMP/noflock; mkdir -p "$NOFLOCK"
 for c in git date mktemp cksum tr cat sed find mv rm mkdir printf timeout python3; do
   cp="$(command -v "$c" 2>/dev/null)" && ln -sf "$cp" "$NOFLOCK/$c"
@@ -5940,7 +5946,7 @@ noflock_stderr() {
   PATH=$NOFLOCK
   # shellcheck disable=SC2034
   WT_FLOCK_WARNED=''
-  rm -f "$(wt_state_path "$PA")"
+  unclaim_pa
   # SC2069: the order captures stderr ONLY, which is what this assertion reads. Deliberate.
   # shellcheck disable=SC2069
   wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null
@@ -5948,26 +5954,120 @@ noflock_stderr() {
 lacks 'and the message does not claim a competing worktree that does not exist' \
   'another worktree is allocating' "$(noflock_stderr)"
 
-# --- the foreign-listener warning is ADVISORY ---
-# Shadowing the probe rather than binding a socket: what is under test is that the ANSWER does not
-# move the port, not the probe itself (which is asserted directly above).
+# --- a listener outside the repository moves a FIRST allocation only ---
+# A REAL listener on the port alpha_slug derives to: a second clone of the repository serving on it
+# is what this rule exists for, and the probe is part of what is under test.
+want=$(wt_derive_port alpha_slug 4100 200)
+listen_on() {  # $1 = port; starts a listener and sets LPID, or returns 1 when it cannot bind
+  rm -f "$TMP/lready"
+  python3 - "$1" "$TMP/lready" <<'PYL' &
+import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8)
+    open(sys.argv[2], "w").write("ok")
+except OSError:
+    open(sys.argv[2], "w").write("no")
+    sys.exit(0)
+time.sleep(60)
+PYL
+  LPID=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -s "$TMP/lready" ] && break; sleep 0.2; done
+  [ "$(cat "$TMP/lready" 2>/dev/null)" = ok ]
+}
+if ! command -v python3 >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+  printf 'NOTE: python3 or timeout missing — the busy-port allocation is not exercised\n'
+elif ! listen_on "$want"; then
+  printf 'NOTE: could not listen on %s — the busy-port allocation is not exercised\n' "$want"
+else
+  next=$(wt_port_candidates alpha_slug 4100 200 | sed -n 2p)
+  unclaim_pa
+  out=$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)
+  if wt_port_in_use "$next"; then
+    printf 'NOTE: port %s is in use on this machine — the replacement is not pinned\n' "$next"
+  else
+    eq 'a first allocation steps past a port something else listens on' "$next" \
+      "$(wt_runtime_state_get "$PA" port)"
+  fi
+  eq '...records it as probed' probed "$(wt_runtime_state_get "$PA" portsource)"
+  contains '...and says the port was busy' "port $want is busy" "$out"
+  contains '...and which it chose' "using $(wt_runtime_state_get "$PA" port) instead" "$out"
+  lacks '...without the leave-it-alone warning a recorded port gets' 'leaving the port as it is' "$out"
+
+  # A RECORDED PORT NEVER MOVES FOR A LISTENER: it is the URL the developer has.
+  wt_runtime_state_set "$PA" alpha_slug "$want" derived .e ours "done" SEEDCK
+  out=$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
+  eq 'a recorded port is kept although something listens on it' "$want" "$WT_PORT"
+  lacks '...and is not reported as busy' 'is busy' "$out"
+
+  # RE-ENTRY: the worktree is removed with no teardown and made again by the same name. git takes
+  # the state file with the admin directory; the ledger entry is what remembers the port.
+  git -C "$PREPO" worktree remove --force "$PA" 2>/dev/null
+  git -C "$PREPO" worktree add -q "$PA" wa 2>/dev/null
+  eq 'the re-entered worktree starts with no state record' 1 \
+    "$(wt_runtime_state_get "$PA" port >/dev/null 2>&1; echo $?)"
+  out=$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)
+  eq 're-entry keeps the port the ledger recorded, listener or not' "$want" \
+    "$(wt_runtime_state_get "$PA" port)"
+  contains '...warning about the listener' 'leaving the port as it is' "$out"
+  lacks '...rather than moving' 'is busy' "$out"
+  # A port moved for a listener at first allocation is the one a re-entry comes back to.
+  wt_runtime_state_set "$PA" alpha_slug "$next" probed .e ours none ''
+  rm -f "$(wt_state_path "$PA")"
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
+  eq 're-entry keeps a probed port rather than re-deriving' "$next" "$WT_PORT"
+  eq '...and its source' probed "$WT_PORT_SOURCE"
+
+  # NO PROBE, NO MOVE: without `timeout` the answer is "do not know", and the allocation is the
+  # sibling claims' alone, as before.
+  NOTIMEOUT=$TMP/notimeout; mkdir -p "$NOTIMEOUT"
+  for c in git date mktemp cksum tr cat sed find mv rm ln mkdir printf flock python3; do
+    cp="$(command -v "$c" 2>/dev/null)" && ln -sf "$cp" "$NOTIMEOUT/$c"
+  done
+  notimeout_claim() {
+    # SC2123: narrowing PATH is the point — no timeout(1) on it.
+    # shellcheck disable=SC2123
+    PATH=$NOTIMEOUT
+    # SC2069: the order captures stderr ONLY, which is what the assertions read.
+    # shellcheck disable=SC2069
+    wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null
+  }
+  unclaim_pa
+  out=$(notimeout_claim)
+  eq 'with no probe a first allocation keeps the derived port' "$want" \
+    "$(wt_runtime_state_get "$PA" port)"
+  lacks '...and says nothing about a busy port' 'is busy' "$out"
+
+  kill "$LPID" 2>/dev/null; wait "$LPID" 2>/dev/null
+fi
+
+# A ledger port a live sibling has claimed since is given up, and the message says so.
+unclaim_pa
+wt_runtime_state_set "$PA" alpha_slug 4150 derived .e ours none ''
 rm -f "$(wt_state_path "$PA")"
-wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200; p_clean=$WT_PORT
-rm -f "$(wt_state_path "$PA")"
-p_busy=$(
+wt_runtime_state_set "$PB" beta_slug 4150 derived .e ours none ''
+out=$(wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)
+ne 'a ledger port a live sibling now claims is not reused' 4150 "$(wt_runtime_state_get "$PA" port)"
+contains '...and the move is explained' 'which this worktree had before' "$out"
+wt_runtime_state_set "$PB" beta_slug 3900 derived .e ours none ''
+
+# THE PROBING IS CAPPED. With every port busy it stops after WT_PORT_BUSY_MAX probes and keeps the
+# port the sibling claims alone give — here the derived one — with a warning.
+unclaim_pa
+rm -f "$TMP/probes"
+out=$(
   # SC2329: invoked INDIRECTLY — it shadows the real probe for this subshell.
   # shellcheck disable=SC2329
-  wt_port_in_use() { return 0; }
-  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>/dev/null
-  printf '%s' "$WT_PORT"
+  wt_port_in_use() { printf 'x' >>"$TMP/probes"; return 0; }
+  wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null
 )
-eq 'a foreign listener does NOT move the port — it only warns' "$p_clean" "$p_busy"
-rm -f "$(wt_state_path "$PA")"
-contains 'and the warning says the port was left alone' 'leaving the port as it is' \
-  "$(# shellcheck disable=SC2329
-     wt_port_in_use() { return 0; }
-     wt_runtime_claim_port "$PREPO" "$PA" alpha_slug 4100 200 2>&1 >/dev/null)"
-rm -f "$(wt_state_path "$PA")"
+eq 'busy ports are probed at most WT_PORT_BUSY_MAX times' "$WT_PORT_BUSY_MAX" \
+  "$(wc -c <"$TMP/probes" | tr -d ' ')"
+eq '...then the derived port is kept' "$want" "$(wt_runtime_state_get "$PA" port)"
+eq '...as derived' derived "$(wt_runtime_state_get "$PA" portsource)"
+contains '...with a warning' 'may fail to bind' "$out"
+unclaim_pa
 
 # ---------------------------------------------------------------------------
 # Layer 3 — the env override file

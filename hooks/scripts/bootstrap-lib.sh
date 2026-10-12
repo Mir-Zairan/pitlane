@@ -2372,6 +2372,56 @@ wt_ledger_parse() {  # $1 = entry file
   [ "$have_wt" = 1 ] && [ "$have_rt" = 1 ]
 }
 
+# This worktree's admin id and ledger directory, as WT_LEDGER_ID and WT_LEDGER_DIR; returns 1 when
+# $1 is not a linked worktree, which has no admin id to key an entry on. Read off the state path for
+# the reasons wt_ledger_write gives.
+wt_ledger_locate() {  # $1 = worktree
+  local wt=${1%/} state admin common
+  WT_LEDGER_ID='' WT_LEDGER_DIR=''
+  wt_state_path "$wt" >/dev/null
+  state=${WT_STATE_PATH_IS-}
+  [ "${WT_STATE_PATH_FOR-}" = "$wt" ] && [ -n "$state" ] || return 1
+  admin=${state%/*}
+  [ "$admin" != "$wt/.claude" ] && [ -f "$admin/gitdir" ] || return 1
+  common=${admin%/*}
+  [ "${common##*/}" = worktrees ] && [ -n "${admin##*/}" ] || return 1
+  WT_LEDGER_ID=${admin##*/}
+  WT_LEDGER_DIR=${common%/*}/$WT_LEDGER_DIRNAME
+}
+
+# The port the ledger recorded for the worktree at $1 under the slug $2, as WT_LEDGER_PORT and
+# WT_LEDGER_PORTSOURCE; returns 1 when it recorded none. This is how a worktree removed without a
+# teardown that released its allocation, then made again by the same name, finds the port it had:
+# its state file went with the old admin directory, the ledger entry did not. Several entries can
+# match, one set aside per reuse of the id; the one still named after its own admin id wins, else
+# the most recent — wt_ledger_entry_for's rule.
+wt_ledger_recorded_port() {  # $1 = worktree, $2 = slug
+  local wt=${1%/} slug=${2-} file entry recorded_wt rslug rport rpsrc rest when best_when=-1
+  WT_LEDGER_PORT='' WT_LEDGER_PORTSOURCE=''
+  wt_ledger_locate "$wt" || return 1
+  [ -d "$WT_LEDGER_DIR" ] || return 1
+  wt_state_join "$wt"
+  recorded_wt=$WT_STATE_REC
+  for file in "$WT_LEDGER_DIR"/*; do
+    entry=${file##*/}
+    wt_ledger_is_entry_name "$entry" || continue
+    wt_ledger_parse "$file" || continue
+    [ "$WT_LEDGER_PATH" = "$recorded_wt" ] || continue
+    IFS=$WT_US read -r rslug rport rpsrc rest <<<"$WT_LEDGER_RT" || true
+    [ "$rslug" = "$slug" ] && [ -n "$rport" ] || continue
+    when=${rest##*"$WT_US"}
+    case $when in '' | *[!0-9]*) when=0 ;; esac
+    if [ "$entry" = "$WT_LEDGER_ADMIN" ]; then
+      WT_LEDGER_PORT=$rport WT_LEDGER_PORTSOURCE=$rpsrc
+      return 0
+    fi
+    if [ "$when" -gt "$best_when" ]; then
+      WT_LEDGER_PORT=$rport WT_LEDGER_PORTSOURCE=$rpsrc best_when=$when
+    fi
+  done
+  [ -n "$WT_LEDGER_PORT" ]
+}
+
 # Record this worktree's allocation in the ledger. $2 is the `rt` record exactly as it was written
 # to the state file, so the two can never disagree about what was allocated.
 #
@@ -2397,18 +2447,11 @@ wt_ledger_parse() {  # $1 = entry file
 # saw the later name; the entry still holds the first. The rt record has no name field, so a
 # teardown with no ledger entry derives the name from the path (wt_read_allocation).
 wt_ledger_write() {  # $1 = worktree, $2 = the rt record
-  local wt=${1%/} rtrec=${2-} state admin id common ledger entry kept tmp when n slug recorded_wt name
+  local wt=${1%/} rtrec=${2-} id ledger entry kept tmp when n slug recorded_wt name
 
-  wt_state_path "$wt" >/dev/null
-  state=${WT_STATE_PATH_IS-}
-  [ "${WT_STATE_PATH_FOR-}" = "$wt" ] && [ -n "$state" ] || return 0
-  admin=${state%/*}
-  [ "$admin" != "$wt/.claude" ] && [ -f "$admin/gitdir" ] || return 0
-  id=${admin##*/}
-  common=${admin%/*}
-  [ "${common##*/}" = worktrees ] && [ -n "$id" ] || return 0
-  common=${common%/*}
-  ledger=$common/$WT_LEDGER_DIRNAME
+  wt_ledger_locate "$wt" || return 0
+  id=$WT_LEDGER_ID
+  ledger=$WT_LEDGER_DIR
   entry=$ledger/$id
   if ! wt_ledger_is_entry_name "$id"; then
     wt_log "runtime: worktree id \"$id\" cannot name a ledger entry — /pitlane-tidy will not know about this worktree's allocation"
@@ -6874,10 +6917,11 @@ wt_runtime_siblings() {  # $1 = main checkout, $2 = this worktree (excluded)
 
 # True if something is already listening on 127.0.0.1:$1.
 #
-# ADVISORY ONLY — its answer never changes which port is allocated, it only decides whether to say
-# something. bash's own /dev/tcp is used rather than `ss`, `lsof` or `nc`, because it is a shell
-# feature rather than a binary that may not be installed; when it is unavailable the answer is
-# "do not know" and nothing is printed, since a warning is all this could ever produce.
+# Its answer moves only a FIRST allocation (wt_runtime_claim_port); for a port already recorded it
+# decides whether to warn, nothing more. bash's own /dev/tcp is used rather than `ss`, `lsof` or
+# `nc`, because it is a shell feature rather than a binary that may not be installed; when it is
+# unavailable the answer is "do not know", given as "no", which leaves the allocation to the
+# sibling claims alone.
 #
 # The host is the LITERAL 127.0.0.1 and the port has already been through wt_is_posint, so nothing
 # from a profile reaches the /dev/tcp path as anything but digits.
@@ -6891,6 +6935,17 @@ wt_port_in_use() {  # $1 = port
   # A subshell so a failed redirection cannot disturb the caller's descriptors.
   ( timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" ) >/dev/null 2>&1
 }
+
+# True if $1 is a port a socket can be bound to by a hook: digits, inside WT_PORT_MIN..WT_PORT_MAX.
+wt_port_is_usable() {  # $1 = port
+  wt_is_posint "${1-}" && [ "$((10#$1))" -ge "$WT_PORT_MIN" ] && [ "$((10#$1))" -le "$WT_PORT_MAX" ]
+}
+
+# How many busy ports a first allocation steps past before it stops probing and takes the port the
+# sibling claims alone would give, with a warning. The probes run under the allocation lock: one on
+# loopback answers in milliseconds, refused or accepted, so ten cost little, and only a filtered
+# port spends the probe's full second.
+WT_PORT_BUSY_MAX=10
 
 # Decide this worktree's port AND record the claim. Sets WT_PORT (empty when there is no usable
 # port configuration) and WT_PORT_SOURCE (`derived` or `probed`); returns 0 either way.
@@ -6911,12 +6966,21 @@ wt_port_in_use() {  # $1 = port
 #      sibling created in between could otherwise push this worktree off the port it has been using
 #      all week. It is still range-checked: a recorded value outside the port space is no more
 #      usable than a derived one would be.
-#   2. Otherwise derive from the slug, then step forward past ports live siblings have claimed.
-#   3. If every candidate is claimed, keep the derived one and warn.
+#   2. A worktree made again under a removed one's path, whose state file went with the old admin
+#      directory, tries the port the ledger recorded for it — unless a live sibling claimed it since.
+#   3. Otherwise derive from the slug, then step forward past ports live siblings have claimed and,
+#      on a FIRST allocation only, past ports something else is listening on.
+#   4. If every candidate is claimed, keep the derived one and warn.
+#
+# A LISTENER MOVES ONLY A FIRST ALLOCATION — one with no port recorded for this worktree and slug in
+# the state file or the ledger. Another clone of the repository, or any other program, can hold the
+# derived port, and a new worktree has no URL anyone has bookmarked yet. Once a port is recorded it
+# is the worktree's address, and a listener on it earns a warning, never a move.
 wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 = span
   local root=${1%/} worktree=${2%/} slug=${3-} base=${4-} span=${5-}
   local recslug recport recsource chosen derived source='derived' lockpath held=0
   local cand skip sslug sport oenvfile oenvstate oseed ocksum
+  local first=1 known='' knownsource='' fallback='' passed='' passedwhy='' busy=0
 
   # SC2034: the function's two results; wt_runtime_handoff reads them.
   # shellcheck disable=SC2034
@@ -6930,14 +6994,18 @@ wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 
   # The recorded port depends on nothing another worktree can change, so it is read before the lock.
   recslug=$(wt_runtime_state_get "$worktree" slug) || recslug=''
   recport=$(wt_runtime_state_get "$worktree" port) || recport=''
-  if [ -n "$recport" ] && [ "$recslug" = "$slug" ] && wt_is_posint "$recport" &&
-     [ "$((10#$recport))" -ge "$WT_PORT_MIN" ] && [ "$((10#$recport))" -le "$WT_PORT_MAX" ]; then
+  if [ "$recslug" = "$slug" ] && wt_port_is_usable "$recport"; then
     recsource=$(wt_runtime_state_get "$worktree" portsource) || recsource=derived
     # shellcheck disable=SC2034
     WT_PORT=$recport
     # shellcheck disable=SC2034
     WT_PORT_SOURCE=${recsource:-derived}
     return 0
+  fi
+  if wt_ledger_recorded_port "$worktree" "$slug" && wt_port_is_usable "$WT_LEDGER_PORT"; then
+    first=0
+    known=$((10#$WT_LEDGER_PORT))
+    knownsource=${WT_LEDGER_PORTSOURCE:-derived}
   fi
 
   lockpath=$(wt_lock_path "$root" _runtime-ports)
@@ -6969,19 +7037,44 @@ wt_runtime_claim_port() {  # $1 = root, $2 = worktree, $3 = slug, $4 = base, $5 
 $WT_SIBLINGS
 EOF
     fi
-    [ "$skip" = 1 ] && continue
+    if [ "$skip" = 1 ]; then
+      [ -n "$passed" ] || { passed=$cand; passedwhy=sibling; }
+      continue
+    fi
+    if [ "$first" = 1 ]; then
+      [ -n "$fallback" ] || fallback=$cand
+      [ "$busy" -lt "$WT_PORT_BUSY_MAX" ] || break
+      # Without the lock's descriptor, so a probe child that outlived its timeout cannot hold it.
+      if wt_port_in_use "$cand" 7>&-; then
+        busy=$((busy + 1))
+        [ -n "$passed" ] || { passed=$cand; passedwhy=busy; }
+        continue
+      fi
+    fi
     chosen=$cand
     break
   done <<EOF
+$known
 $(wt_port_candidates "$slug" "$base" "$span")
 EOF
 
-  if [ -z "$chosen" ]; then
+  if [ -z "$chosen" ] && [ -n "$fallback" ]; then
+    chosen=$fallback
+    wt_log "  runtime: the first $busy ports from $derived that no other worktree claims all have something listening on them — using $chosen anyway, which may fail to bind"
+  elif [ -z "$chosen" ]; then
     chosen=$derived
     wt_log "  runtime: every port in ${base}-$((10#$base + 10#$span - 1)) is claimed by another worktree — using $chosen anyway, which may fail to bind"
+  elif [ "$passedwhy" = busy ]; then
+    wt_log "  runtime: port $passed is busy — something that is not one of this repository's worktrees is listening on it — using $chosen instead, and keeping it"
+  elif [ -n "$passed" ] && [ "$passed" = "$known" ]; then
+    wt_log "  runtime: port $passed, which this worktree had before, is now taken by another worktree — using $chosen instead"
+  elif [ -n "$passed" ]; then
+    wt_log "  runtime: port $passed is taken by another worktree — using $chosen instead"
+  fi
+  if [ -n "$known" ] && [ "$chosen" = "$known" ]; then
+    source=$knownsource
   elif [ "$chosen" != "$derived" ]; then
     source=probed
-    wt_log "  runtime: port $derived is taken by another worktree — using $chosen instead"
   fi
 
   # THE CLAIM, written before the lock is released so the next holder can see it. The other rt
@@ -7002,11 +7095,10 @@ EOF
 
   [ "$held" -eq 1 ] && wt_lock_release 7
 
-  # Advisory only, and deliberately AFTER both the decision and the lock release: a foreign
-  # listener never moves the port, and the probe can take a second — which is a second no other
-  # worktree should spend waiting on this lock. Running it here also keeps the probe's child from
-  # inheriting the lock descriptor and holding the flock past the release.
-  if wt_port_in_use "$chosen"; then
+  # A port the decision did not probe — one the ledger recorded, or the derived port of a span every
+  # sibling has claimed — is not moved for a listener, only warned about, and a warning is not worth
+  # holding the lock for: it is probed here, after the release.
+  if { [ "$first" = 0 ] || [ -z "$fallback" ]; } && wt_port_in_use "$chosen"; then
     wt_log "  runtime: something is already listening on port $chosen that is not one of this repository's worktrees — leaving the port as it is; the app may fail to bind"
   fi
 
