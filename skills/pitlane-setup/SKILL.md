@@ -445,7 +445,10 @@ on this project works only in Docker. No is the default, and writes no `box`.
 When you write a `box` and no `shell`, tell the developer so: each Docker-only developer must set
 `PITLANE_TOOLCHAIN=box` in their own environment (their shell profile, say), or nothing runs in the box.
 
-On a yes, propose the block from the record and confirm **each field** with the developer:
+On a yes, propose the block from the record and confirm **each field** with the developer. Print the
+proposed block whole, as JSON, in your message before you ask about it: a question that says "as
+shown" about a block that is only in your reasoning asks the developer to approve something they
+never saw.
 
 - `service`, `mount` — the record's. `mount` is the literal path inside the container; when the
   record shows a `${…}` there, ask for the path it resolves to.
@@ -454,15 +457,26 @@ On a yes, propose the block from the record and confirm **each field** with the 
 - `database` — one of the record's candidates, or none. The seed and teardown run in that service's
   image, because an app image's database client may not match the server (MariaDB's `mysqldump`
   cannot copy a MySQL 8 database). With none, they run in the box like any step.
-- `clearEnv` — the record's candidates: names the service's `environment:` pins that the app's env
-  files set too. A pin beats the worktree's env file, so it would point the worktree at shared state.
-  Names already in `runtime.env.vars` are cleared anyway.
+- `clearEnv` — chosen from the record's candidates: names the service's `environment:` pins that the
+  app's env files set too. A pin beats every env file, so go through the candidates one by one:
+  - a name that selects the app's environment or mode (`APP_ENV`, `NODE_ENV`, `RAILS_ENV`,
+    `DJANGO_SETTINGS_MODULE` and the like) — **clear it**. Pinned, it beats the value the test runner
+    or a test env file sets, so the tests boot the development environment;
+  - a name that points at shared state (a database or other store) and that the worktree's env file
+    sets a value for that works inside the container too — clear it;
+  - a name whose pin is just the in-container address of a service — keep the pin;
+  - names already in `runtime.env.vars` are cleared anyway, so leave them out.
 - `env`, `envFiles` — for the record's required variables that nothing the developer has sets. **The
   `env` values are committed and shown in the review**, so a secret-bearing key gets only `""`, and
   its real value comes from the developer's environment or a gitignored file listed in `envFiles`.
+  Also list in `envFiles` every file the project's own commands load before calling `docker compose`
+  — a Makefile, justfile or script that sources one (`set -a; . ./file`) or passes `--env-file` —
+  so Pitlane's compose calls see what the developer's do. A listed file that does not exist is
+  skipped, and an `env` default never overrides a value the file sets.
 - `serve` — only when the box needs another command than `runtime.serve`; in the box it wins. Either
   way, the command run in the box must listen on `0.0.0.0:{port}`: a server on `127.0.0.1` inside the
-  container never answers on the published port. Show it whole, as for `runtime.serve`.
+  container never answers on the published port. Start it with `exec`, so the server itself gets the
+  stop signal rather than a shell. Show it whole, as for `runtime.serve`.
 
 The seed and teardown in the database image reach the server by its service name, passed as
 `WT_DB_HOST`. So the scripts take the host from it, then the box's own host variable, and only then
