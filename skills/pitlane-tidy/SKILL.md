@@ -71,7 +71,9 @@ Kinds you will see: `orphan-dir` (a worktree directory git no longer knows), `st
 registration of a worktree that is gone), `admin-leftover` (what Claude Code's removal of a worktree
 left of git's registration: only Pitlane's own logs, state and locks; one still recorded by a
 `runtime-leftover` goes when that is applied, and is not listed on its own), `runtime-leftover` (a
-runtime allocation nothing uses),
+runtime allocation nothing uses: one item even when the worktree was opened several times under the
+same name and each opening left a ledger entry; applying it runs the teardown once and forgets them
+all),
 `server-leftover` (an app server `/pitlane-serve` started in a worktree removed without its teardown,
 as a native `claude -w` removal does), `ledger-junk` (a broken or abandoned ledger entry, or a half-written serve record),
 `removed-dep-leftover` (a copy of a hardlinked dependency dir — `.vendor.pitlane-removed.<pid>.<n>`

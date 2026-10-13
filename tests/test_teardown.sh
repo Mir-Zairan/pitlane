@@ -1065,16 +1065,17 @@ eq 're-entry: tidy offers nothing for the live path' '' \
   "$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/')"
 lacks '...nor the husk its ledger entry still records' "$XR/.git/worktrees/gone"$'\t' "$report"
 
-# Removed again: both entries are leftovers now, and releasing them takes the husks with them.
+# Removed again: both entries record the one allocation, so tidy offers it once, and releasing it
+# forgets both and takes the husks with them.
 native_remove "$XR" gone gone1
 report=$(bash "$SCRIPTS/prune.sh" --repo "$XR" 2>/dev/null)
 ids=$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/ { print $1 }')
-eq 'released: tidy offers both entries' 2 "$(printf '%s\n' "$ids" | grep -c .)"
-eq '...each as a teardown' 'teardown teardown' \
+eq 'released: tidy offers one item for both entries' 1 "$(printf '%s\n' "$ids" | grep -c .)"
+eq '...as a teardown' 'teardown' \
   "$(printf '%s\n' "$report" | awk -F'\t' '$2 == "runtime-leftover" && $3 ~ /\/gone$/ { printf "%s%s", s, $5; s=" " }')"
 # shellcheck disable=SC2086  # the ids are one word each
 bash "$SCRIPTS/prune.sh" --repo "$XR" --apply $ids >"$TMP/apply-out" 2>&1
-eq 'released: both applied' '2' "$(grep -c '^applied' "$TMP/apply-out")"
+eq 'released: applied once' '1' "$(grep -c '^applied' "$TMP/apply-out")"
 eq '...the database is dropped' no "$(exists "$DB/gone")"
 eq '...both ledger entries are forgotten' 'no no' \
   "$(exists "$XR/.git/worktree-ledger/gone") $(exists "$XR/.git/worktree-ledger/gone1")"

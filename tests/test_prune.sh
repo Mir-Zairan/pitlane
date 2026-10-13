@@ -1293,6 +1293,104 @@ printf 'mine\n' >"$RH/.git/worktrees/late/notes.txt"
 prune "$RH" --apply "$lid"
 eq 'husk: one that changed since the report is not applied' 1 "$(cat "$TMP/rc")"
 eq '...and is kept' yes "$(exists "$RH/.git/worktrees/late/notes.txt")"
+
+# ---------------------------------------------------------------------------
+# A worktree opened again by the same name after Claude Code removed it
+# ---------------------------------------------------------------------------
+# The removal's husk keeps the admin id taken, so git gives the next opening a new one, and the
+# ledger gets an entry per opening for the same path and slug: one allocation, so one item.
+RE=$TMP/reopen-repo
+make_repo "$RE" "printf 'ran\\n' >>\"$LOGS/\$WT_SLUG.count\""
+REL=$RE/.git/worktree-ledger
+# What Claude Code's removal of worktree id $2 leaves: no checkout, and its admin dir with git's files
+# deleted and this plugin's kept.
+claude_remove() {  # $1 = repo, $2 = admin id
+  local admin=$1/.git/worktrees/$2
+  rm -rf "$(sed 's|/\.git$||' "$admin/gitdir")"
+  rm -rf "$admin/gitdir" "$admin/HEAD" "$admin/commondir" "$admin/index" "$admin/logs" "$admin/refs" \
+    "$admin/ORIG_HEAD"
+}
+runtime_rows() {  # $1 = path: the runtime-leftover lines for it
+  awk -F'\t' -v p="$1" '$2 == "runtime-leftover" && $3 == p' "$TMP/out"
+}
+W1=$(create "$RE" reopened)
+claude_remove "$RE" reopened
+W2=$(create "$RE" reopened)
+claude_remove "$RE" reopened1
+W3=$(create "$RE" reopened)
+eq 'reopened: every opening is the same worktree' "$W1 $W1" "$W2 $W3"
+eq 'reopened: each opening has its own ledger entry' 'yes yes yes' \
+  "$(exists "$REL/reopened") $(exists "$REL/reopened1") $(exists "$REL/reopened2")"
+prune "$RE"
+eq 'reopened: while it is live, none of its records is an item' '' "$(runtime_rows "$W1")"
+claude_remove "$RE" reopened2
+prune "$RE"
+eq 'reopened: once it is gone, its records are one item' 1 "$(runtime_rows "$W1" | wc -l | tr -d ' ')"
+sum=$(printf 'runtime-leftover\037ledger:reopened2' | cksum)
+eq '...keyed by the newest entry' "$(printf 'p%08x' "${sum%% *}")" \
+  "$(field runtime-leftover "$W1" 1)"
+eq '...to tear down' teardown "$(field runtime-leftover "$W1" 5)"
+contains '...naming the earlier entries released with it' 'ledger entries reopened reopened1' \
+  "$(field runtime-leftover "$W1" 6)"
+eq '...and the husks are not items of their own' '' \
+  "$(awk -F'\t' '$2 == "admin-leftover" && $3 ~ /reopened/' "$TMP/out")"
+prune "$RE" --apply "$(field runtime-leftover "$W1" 1)"
+eq 'reopened: apply exits 0' 0 "$(cat "$TMP/rc")"
+eq '...runs the teardown script once' ran "$(cat "$LOGS/reopened.count")"
+eq '...which released the database' no "$(exists "$DB/reopened")"
+eq '...forgets every entry' 'no no no' \
+  "$(exists "$REL/reopened") $(exists "$REL/reopened1") $(exists "$REL/reopened2")"
+eq '...and deletes every husk' 'no no no' "$(exists "$RE/.git/worktrees/reopened") \
+$(exists "$RE/.git/worktrees/reopened1") $(exists "$RE/.git/worktrees/reopened2")"
+prune "$RE"
+eq '...leaving nothing to list' '' "$(runtime_rows "$W1")"
+
+# The same path under another slug is another allocation (a branch that changed runtime.slug).
+X1=$(create "$RE" reslug)
+claude_remove "$RE" reslug
+US=$'\037'
+entry=$(cat "$REL/reslug"; printf x)
+entry=${entry%x}
+printf '%s' "${entry/rt${US}reslug${US}/rt${US}reslug-old${US}}" >"$REL/reslug"
+create "$RE" reslug >/dev/null
+claude_remove "$RE" reslug1
+prune "$RE"
+eq 'reslug: an entry under another slug stays its own item' 2 "$(runtime_rows "$X1" | wc -l | tr -d ' ')"
+contains '...one for each slug' 'slug=reslug-old' "$(runtime_rows "$X1")"
+
+# An earlier entry whose admin dir git still registers holds the whole allocation back.
+H1=$(create "$RE" reheld)
+claude_remove "$RE" reheld
+create "$RE" reheld >/dev/null
+claude_remove "$RE" reheld1
+printf '%s/.git\n' "$H1" >"$RE/.git/worktrees/reheld/gitdir"
+prune "$RE"
+eq 'reheld: one item still' 1 "$(runtime_rows "$H1" | wc -l | tr -d ' ')"
+eq '...refused' refuse "$(field runtime-leftover "$H1" 5)"
+contains '...naming the earlier admin dir' "$RE/.git/worktrees/reheld is still registered" \
+  "$(field runtime-leftover "$H1" 6)"
+prune "$RE" --apply "$(field runtime-leftover "$H1" 1)"
+eq '...and apply refuses it too' 1 "$(cat "$TMP/rc")"
+eq '...keeping both entries' 'yes yes' "$(exists "$REL/reheld") $(exists "$REL/reheld1")"
+eq '...and the database' yes "$(exists "$DB/reheld")"
+
+# An earlier entry set aside because git gave its admin id to a worktree elsewhere: that live
+# worktree says nothing about this allocation, so it holds back only that entry, not the rest.
+A1=$(create "$RE" reused)
+claude_remove "$RE" reused
+create "$RE" reused >/dev/null
+claude_remove "$RE" reused1
+mv "$REL/reused" "$REL/reused.1700000000"
+rm -rf "$RE/.git/worktrees/reused"
+git -C "$RE" worktree add -q --detach "$TMP/elsewhere/reused" 2>/dev/null
+eq 'reused: git gave the id to the worktree elsewhere' "$TMP/elsewhere/reused/.git" \
+  "$(cat "$RE/.git/worktrees/reused/gitdir")"
+prune "$RE"
+eq 'reused: the set-aside entry is an item of its own' 2 "$(runtime_rows "$A1" | wc -l | tr -d ' ')"
+eq '...and the newest entry can still be torn down' teardown \
+  "$(runtime_rows "$A1" | awk -F'\t' '$6 ~ /^ledger entry reused1:/ { print $5 }')"
+eq '...while the set-aside one is refused' refuse \
+  "$(runtime_rows "$A1" | awk -F'\t' '$6 !~ /^ledger entry reused1:/ { print $5 }')"
 }
 
 for BACKEND in jq python3; do

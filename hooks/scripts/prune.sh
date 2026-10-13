@@ -149,6 +149,9 @@ PRUNE_ID=() PRUNE_KIND=() PRUNE_PATH=() PRUNE_BYTES=() PRUNE_ACTION=() PRUNE_REA
 PRUNE_KEY=() PRUNE_MEASURE=()
 # Set only for a removed-dep-leftover: the checkout it lies in, and the profile's dir it was.
 PRUNE_OWNER=() PRUNE_DEP=()
+# Set only for a runtime-leftover keyed `ledger:<entry>`: the other ledger entries recording the same
+# allocation, joined by WT_US, released with it (wt_find_runtime_leftovers).
+PRUNE_ALSO=()
 
 wt_prune_item_id() {  # $1 = kind, $2 = key
   local sum
@@ -360,7 +363,7 @@ wt_prune_survey() {  # $1 = main checkout
 wt_prune_discover() {  # $1 = main checkout
   local finder
   PRUNE_ID=() PRUNE_KIND=() PRUNE_PATH=() PRUNE_BYTES=() PRUNE_ACTION=() PRUNE_REASON=()
-  PRUNE_KEY=() PRUNE_MEASURE=() PRUNE_OWNER=() PRUNE_DEP=()
+  PRUNE_KEY=() PRUNE_MEASURE=() PRUNE_OWNER=() PRUNE_DEP=() PRUNE_ALSO=()
   wt_prune_survey "$1" || return 1
   for finder in "${WT_PRUNE_FINDERS[@]}"; do
     "$finder"
@@ -583,25 +586,34 @@ wt_prune_alive_elsewhere() {  # $1 = recorded worktree path, $2 = admin id or em
   return 0
 }
 
-# Why the allocation a ledger entry records may still belong to a worktree in use, one reason per
-# line, or nothing: everything wt_prune_alive_elsewhere says, and whether git still registers the
-# entry's admin dir or lists its worktree as locked. A registered admin dir is left to its own
-# stale-admin item, whatever it points at — after `git worktree move` it points at the worktree's
-# new home, which the ledger does not know.
-wt_prune_list_allocation_holds() {  # $1 = recorded worktree path, $2 = admin id or empty
-  local wt=$1 id=${2-}
-  wt_prune_alive_elsewhere "$wt" "$id"
-  # Registered means git lists it: it has a `gitdir`. What Claude Code's removal leaves — this
-  # plugin's files, no `gitdir` (wt_admin_husk) — registers nothing, and goes once this is released.
-  if [ -n "$id" ] && { wt_admin_registered "$WT_PRUNE_COMMON/worktrees/$id" \
-    || [ -L "$WT_PRUNE_COMMON/worktrees/$id" ]; }; then
-    printf 'its admin dir %s is still registered — the worktree may have been moved or locked\n' \
-      "$WT_PRUNE_COMMON/worktrees/$id"
-  fi
-  if wt_prune_is_locked "$wt"; then
-    # shellcheck disable=SC2016  # the backticks are literal text
-    printf 'its worktree is locked with `git worktree lock`\n'
-  fi
+# Why the allocation ledger entries record may still belong to a worktree in use, one reason per
+# line, each once, or nothing: everything wt_prune_alive_elsewhere says, and whether git still
+# registers an entry's admin dir or lists its worktree as locked. A registered admin dir is left to
+# its own stale-admin item, whatever it points at — after `git worktree move` it points at the
+# worktree's new home, which the ledger does not know. $2... are the admin ids of every entry
+# recording the allocation; none for one recorded without.
+wt_prune_list_allocation_holds() {  # $1 = recorded worktree path, $@ = admin ids
+  local wt=$1 id
+  shift
+  {
+    wt_prune_alive_elsewhere "$wt" ''
+    for id in "$@"; do
+      [ -n "$id" ] || continue
+      wt_prune_alive_elsewhere "$wt" "$id"
+      # Registered means git lists it: it has a `gitdir`. What Claude Code's removal leaves — this
+      # plugin's files, no `gitdir` (wt_admin_husk) — registers nothing, and goes once this is
+      # released.
+      if wt_admin_registered "$WT_PRUNE_COMMON/worktrees/$id" \
+        || [ -L "$WT_PRUNE_COMMON/worktrees/$id" ]; then
+        printf 'its admin dir %s is still registered — the worktree may have been moved or locked\n' \
+          "$WT_PRUNE_COMMON/worktrees/$id"
+      fi
+    done
+    if wt_prune_is_locked "$wt"; then
+      # shellcheck disable=SC2016  # the backticks are literal text
+      printf 'its worktree is locked with `git worktree lock`\n'
+    fi
+  } | awk '!seen[$0]++'
   return 0
 }
 
@@ -798,26 +810,82 @@ wt_find_server_leftovers() {
   done
 }
 
+# ONE ITEM PER ALLOCATION, not per entry. A worktree opened again by the same name after Claude Code
+# removed it gets a new admin id — git does not reuse the id the removal left a husk under — and so a
+# new ledger entry recording the same path and slug: the same databases, recorded once per opening.
+# Those entries are one item, keyed by the newest (the one its last session wrote), and released
+# together: the teardown script runs once, then every entry is forgotten. Entries for one path under
+# different slugs are different allocations (a branch that changed runtime.slug), and stay apart. So
+# does an entry whose admin id git has since given to a worktree at another path (an entry set aside
+# as `<id>.<when>`, wt_ledger_write): that registration says nothing about this allocation, and must
+# not hold back the rest of it. Alone, it is judged as any entry is.
 wt_find_runtime_leftovers() {
-  local entry path admin slug rest holds why waits_on
-  while IFS=$WT_US read -r -d "$WT_RS" entry path admin _ slug rest; do
+  local entry path admin slug when i j n rep holds why waits_on also reason pointer
+  local -a e_entry=() e_path=() e_admin=() e_slug=() e_when=() e_apart=() grouped=() admins=()
+  local -a members=() others=()
+  while IFS=$WT_US read -r -d "$WT_RS" entry path admin _ slug _ _ _ _ _ _ when _; do
     wt_prune_is_live "$path" && continue
-    holds=$(wt_prune_list_allocation_holds "$path" "$admin")
+    n=${#e_entry[@]}
+    e_entry[n]=$entry e_path[n]=$path e_admin[n]=$admin e_slug[n]=$slug e_apart[n]=0
+    wt_is_posint "$when" || when=0
+    e_when[n]=$when
+    if [ -n "$admin" ] && wt_admin_registered "$WT_PRUNE_COMMON/worktrees/$admin" \
+      && pointer=$(wt_read_git_pointer "$WT_PRUNE_COMMON/worktrees/$admin/gitdir" \
+        "$WT_PRUNE_COMMON/worktrees/$admin") \
+      && [ "$(wt_physical_path "${pointer%/.git}")" != "$(wt_physical_path "$path")" ]; then
+      e_apart[n]=1
+    fi
+  done < <(wt_ledger_entries "$WT_PRUNE_ROOT" 2>/dev/null)
+
+  for i in ${e_entry[@]+"${!e_entry[@]}"}; do
+    [ -z "${grouped[i]-}" ] || continue
+    members=("$i")
+    if [ "${e_apart[i]}" = 0 ]; then
+      for j in "${!e_entry[@]}"; do
+        [ "$j" != "$i" ] && [ -z "${grouped[j]-}" ] && [ "${e_apart[j]}" = 0 ] \
+          && [ "${e_path[j]}" = "${e_path[i]}" ] && [ "${e_slug[j]}" = "${e_slug[i]}" ] \
+          && members[${#members[@]}]=$j
+      done
+    fi
+    # The newest entry is the item's; on a tie, one still named after its own admin id, as
+    # wt_ledger_choose prefers.
+    rep=$i admins=() others=() also=''
+    for j in "${members[@]}"; do
+      grouped[j]=1
+      [ -z "${e_admin[j]}" ] || admins[${#admins[@]}]=${e_admin[j]}
+      if [ "${e_when[j]}" -gt "${e_when[rep]}" ] || { [ "${e_when[j]}" = "${e_when[rep]}" ] \
+        && [ "${e_entry[j]}" = "${e_admin[j]}" ] && [ "${e_entry[rep]}" != "${e_admin[rep]}" ]; }; then
+        rep=$j
+      fi
+    done
+    for j in "${members[@]}"; do
+      [ "$j" != "$rep" ] || continue
+      others[${#others[@]}]=${e_entry[j]}
+      also=${also:+$also$WT_US}${e_entry[j]}
+    done
+    entry=${e_entry[rep]} path=${e_path[rep]} slug=${e_slug[rep]}
+
+    holds=$(wt_prune_list_allocation_holds "$path" ${admins[@]+"${admins[@]}"})
     if [ -n "$holds" ]; then
       why=$(wt_prune_join_reasons "$holds")
       # Orphans are keyed physically; the ledger recorded the path as the worktree saw it.
       waits_on=$(wt_prune_item_id orphan-dir "$(wt_physical_path "$path")")
       wt_prune_find_item "$waits_on" >/dev/null && why="$why — remove it first ($waits_on)"
-      if [ -n "$admin" ]; then
+      for admin in ${admins[@]+"${admins[@]}"}; do
         waits_on=$(wt_prune_item_id stale-admin "$WT_PRUNE_COMMON/worktrees/$admin")
         wt_prune_find_item "$waits_on" >/dev/null && why="$why — settle its admin dir first ($waits_on)"
-      fi
+      done
       wt_prune_add runtime-leftover "ledger:$entry" "$path" - refuse "$why" ''
+      PRUNE_ALSO[${#PRUNE_ID[@]} - 1]=$also
       continue
     fi
+    reason="ledger entry $entry: allocation slug=$slug of a worktree that no longer exists"
+    [ ${#others[@]} -eq 0 ] \
+      || reason="$reason, also recorded by earlier openings of it under the same name (ledger entries ${others[*]}), which are released with it"
     wt_prune_add runtime-leftover "ledger:$entry" "$path" - "$WT_PRUNE_TEARDOWN" \
-      "$(wt_prune_join_reasons "ledger entry $entry: allocation slug=$slug of a worktree that no longer exists"$'\n'"size unknown: a database or containers only the teardown script can see"$'\n'"${WT_PRUNE_TEARDOWN_WHY}")" ''
-  done < <(wt_ledger_entries "$WT_PRUNE_ROOT" 2>/dev/null)
+      "$(wt_prune_join_reasons "$reason"$'\n'"size unknown: a database or containers only the teardown script can see"$'\n'"${WT_PRUNE_TEARDOWN_WHY}")" ''
+    PRUNE_ALSO[${#PRUNE_ID[@]} - 1]=$also
+  done
 }
 
 wt_find_ledger_junk() {
@@ -1123,6 +1191,29 @@ wt_apply_runtime_leftover() {  # $1 = item index
   return "$rc"
 }
 
+# The other ledger entries item $1 releases with its own, as WT_PRUNE_ALSO_ENTRIES and their admin
+# ids as WT_PRUNE_ALSO_ADMINS: each one the report grouped with it that still records the same path
+# and slug as the item's entry. One gone since, or changed, is no longer this allocation's record.
+WT_PRUNE_ALSO_ENTRIES=() WT_PRUNE_ALSO_ADMINS=()
+wt_prune_also_entries() {  # $1 = item index
+  local key=${PRUNE_KEY[$1]} also=${PRUNE_ALSO[$1]-} entry path slug other admin
+  WT_PRUNE_ALSO_ENTRIES=() WT_PRUNE_ALSO_ADMINS=()
+  case $key in ledger:*) entry=${key#ledger:} ;; *) return 0 ;; esac
+  [ -n "$also" ] || return 0
+  path=$(wt_ledger_field "$WT_PRUNE_ROOT" "$entry" path 2>/dev/null) || return 0
+  slug=$(wt_ledger_field "$WT_PRUNE_ROOT" "$entry" slug 2>/dev/null) || return 0
+  while IFS= read -r -d "$WT_US" other; do
+    if [ "$(wt_ledger_field "$WT_PRUNE_ROOT" "$other" path 2>/dev/null)" != "$path" ] \
+      || [ "$(wt_ledger_field "$WT_PRUNE_ROOT" "$other" slug 2>/dev/null)" != "$slug" ] \
+      || ! admin=$(wt_ledger_field "$WT_PRUNE_ROOT" "$other" admin 2>/dev/null); then
+      continue
+    fi
+    WT_PRUNE_ALSO_ENTRIES[${#WT_PRUNE_ALSO_ENTRIES[@]}]=$other
+    WT_PRUNE_ALSO_ADMINS[${#WT_PRUNE_ALSO_ADMINS[@]}]=$admin
+  done < <(printf '%s%s' "$also" "$WT_US")
+  return 0
+}
+
 # Why the allocation of item $1 must not be released now, re-checked under its lock, or nothing.
 # The holder the lock waited on may have released it already, or the worktree come back.
 wt_prune_recheck_allocation() {  # $1 = item index
@@ -1142,7 +1233,9 @@ wt_prune_recheck_allocation() {  # $1 = item index
         printf 'its ledger entry %s is gone — another teardown or prune released it\n' "$entry"
         return 0
       fi
-      wt_prune_list_allocation_holds "$wt" "$admin"
+      wt_prune_also_entries "$1"
+      wt_prune_list_allocation_holds "$wt" "$admin" \
+        ${WT_PRUNE_ALSO_ADMINS[@]+"${WT_PRUNE_ALSO_ADMINS[@]}"}
       ;;
     state:*)
       state=${key#state:}
@@ -1161,10 +1254,14 @@ wt_prune_recheck_allocation() {  # $1 = item index
 }
 
 # Release the allocation of item $1 with its lock held: nothing is forgotten unless the teardown
-# script ran to `done`, or the action is `forget` and the allocation could be read.
+# script ran to `done`, or the action is `forget` and the allocation could be read. The other entries
+# recording it (wt_prune_also_entries) are forgotten after the item's own, under the item's lock only:
+# their worktrees are gone, so no teardown.sh releases them, and the prune lock keeps out another
+# sweep.
 wt_prune_release_allocation() {  # $1 = item index
   local key=${PRUNE_KEY[$1]} wt=${PRUNE_PATH[$1]} action=${PRUNE_ACTION[$1]} entry='' state='' why record
-  local admin='' husk=''
+  local admin='' husk='' other kept='' n=0
+  local -a admins=()
   case $key in
     ledger:*)
       entry=${key#ledger:}; record="the ledger entry $entry"
@@ -1206,12 +1303,22 @@ wt_prune_release_allocation() {  # $1 = item index
         ;;
     esac
   fi
+  wt_prune_also_entries "$1"
   if [ -n "$entry" ]; then
     wt_settle_ledger_entry "$WT_PRUNE_ROOT" "$entry" 1
     if [ "$WT_TD_LEDGER" != forgotten ]; then
       WT_PRUNE_DETAIL="could not forget $record"
       return 1
     fi
+    admins=("$admin")
+    for other in ${WT_PRUNE_ALSO_ENTRIES[@]+"${WT_PRUNE_ALSO_ENTRIES[@]}"}; do
+      if wt_ledger_forget "$WT_PRUNE_ROOT" "$other"; then
+        admins[${#admins[@]}]=${WT_PRUNE_ALSO_ADMINS[n]}
+      else
+        kept=${kept:+$kept, }$other
+      fi
+      n=$((n + 1))
+    done
   else
     # The state file's only remaining purpose was this record; the admin dir around it is its own
     # stale-admin item.
@@ -1220,12 +1327,20 @@ wt_prune_release_allocation() {  # $1 = item index
       return 1
     fi
   fi
-  # What Claude Code's removal left of the admin dir goes with the last record of it.
-  if [ -n "$admin" ] && wt_ledger_is_entry_name "$admin" \
-    && ! wt_ledger_entry_for "$WT_PRUNE_ROOT" '' "$admin" >/dev/null \
-    && wt_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin" \
-    && wt_remove_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin"; then
-    husk="; deleted what the removal left of its git admin dir"
+  # What Claude Code's removal left of each admin dir goes with the last record of it.
+  for admin in ${admins[@]+"${admins[@]}"}; do
+    if [ -n "$admin" ] && wt_ledger_is_entry_name "$admin" \
+      && ! wt_ledger_entry_for "$WT_PRUNE_ROOT" '' "$admin" >/dev/null \
+      && wt_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin" \
+      && wt_remove_admin_husk "$WT_PRUNE_COMMON/worktrees/$admin"; then
+      husk="; deleted what the removal left of its git admin dir"
+    fi
+  done
+  [ ${#WT_PRUNE_ALSO_ENTRIES[@]} -eq 0 ] || [ -n "$kept" ] \
+    || husk="; forgot the ${#WT_PRUNE_ALSO_ENTRIES[@]} earlier record(s) of it too$husk"
+  if [ -n "$kept" ]; then
+    WT_PRUNE_DETAIL="released (slug=$WT_TD_SLUG), but could not forget the earlier record(s) $kept of it — the next report lists them for the teardown script that already ran; forgetting them by hand is enough"
+    return 1
   fi
   case $action in
     teardown)
