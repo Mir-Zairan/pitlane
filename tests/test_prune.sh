@@ -26,6 +26,10 @@ PRUNE=$SCRIPTS/prune.sh
 SCRATCH=$(mktemp -d)
 SCRATCH=$(cd -P "$SCRATCH" && pwd -P)
 TMP=$SCRATCH
+# The fixtures are made by WorktreeCreate payloads with no `prompt_id`, which defer like `claude -w`'s
+# (ADR-032) — but they must be fully set up before the sweep is asked about them.
+PITLANE_BACKGROUND=off
+export PITLANE_BACKGROUND
 # Each suite allocates from its own band below the ephemeral range, at a per-run offset, so suites
 # running in parallel (or one suite twice) never derive the same ports.
 PORT_BASE=$((15000 + $$ % 25 * 200))

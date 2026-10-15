@@ -1562,6 +1562,123 @@ if command -v jq >/dev/null 2>&1; then
   eq 'finish: works with jq and no python3' 'Pitlane: this worktree is fully set up.' "$outJ"
 fi
 
+# `claude -w` creates its worktree through WorktreeCreate (Claude Code 2.1.300 on), with no
+# `prompt_id`, and shows nothing until the hook returns: it defers like a session start, and starts
+# the background run itself. A subagent's creation carries a `prompt_id` and stays synchronous.
+# Done synchronously, the fixture's install and seed take at least 4s (sleep 3, sleep 1).
+create_hook() {  # $1 = name, $2 = extra payload keys (may be empty)
+  ( cd "$BG" && printf '%s' "{\"hook_event_name\":\"WorktreeCreate\",\"name\":\"$1\",\"cwd\":\"$BG\"$2}" \
+    | PITLANE_BACKGROUND=on bash "$HOOK" 2>"$TMP/err" )
+}
+WCW=$BG/.claude/worktrees/cli-w
+t0=$SECONDS
+outW=$(create_hook cli-w ''); errW=$(cat "$TMP/err")
+eq 'claude -w: WorktreeCreate prints exactly the worktree path' "$WCW" "$outW"
+eq '...and returns before the install and seed could have run' yes \
+  "$([ $((SECONDS - t0)) -lt 4 ] && echo yes || echo no)"
+eq '...with the hardlink done' MAIN "$(cat "$WCW/vendor/autoload.php" 2>/dev/null)"
+ne '...and the port' '' "$(envval "$WCW" SERVER_PORT)"
+eq '...but not the install' no "$([ -e "$WCW/node_modules/m" ] && echo yes || echo no)"
+eq '...nor the seed' no "$([ -e "$WCW/seeded.txt" ] && echo yes || echo no)"
+contains '...which it hands to the background' 'finishing in the background: node_modules' "$errW"
+GDCW=$(git -C "$WCW" rev-parse --absolute-git-dir 2>/dev/null)
+pidW=$(tr -cd '0-9' < "$GDCW/worktree-bootstrap.pid" 2>/dev/null)
+eq '...starting the run itself, not leaving it to SessionStart' yes \
+  "$([ -n "$pidW" ] && kill -0 "$pidW" 2>/dev/null && echo yes || echo no)"
+
+# The SessionStart that follows starts no second run, tells the session the setup is in progress, and
+# does not send the run round again: nothing has changed since the creation started it.
+outS=$(PITLANE_BACKGROUND=on start_hook "$WCW")
+eq 'claude -w: the SessionStart after it starts no second run' "$pidW" \
+  "$(tr -cd '0-9' < "$GDCW/worktree-bootstrap.pid" 2>/dev/null)"
+contains '...tells the session it is in progress' 'still being set up in the background' "$outS"
+eq '...and asks for no second round' no "$([ -e "$GDCW/worktree-bootstrap.again" ] && echo yes || echo no)"
+outF=$( cd "$WCW" && bash "$HOOK" --finish 2>/dev/null )
+eq 'claude -w: the background run finishes the worktree' 'Pitlane: this worktree is fully set up.' "$outF"
+eq '...installed' ok "$(cat "$WCW/node_modules/m" 2>/dev/null)"
+eq '...and seeded' cli_w "$(cat "$WCW/seeded.txt" 2>/dev/null)"
+lacks '...in one round' 'going round once more' "$(cat "$GDCW/worktree-bootstrap.log" 2>/dev/null)"
+eq '...leaving no creation marker behind' no "$([ -e "$GDCW/worktree-bootstrap.fresh" ] && echo yes || echo no)"
+
+# Unapproved, the deferred creation starts nothing: a run would only meet the same held commands.
+WCU=$BG/.claude/worktrees/cli-unapproved
+outU=$( unset PITLANE_TRUST_PROFILES; create_hook cli-unapproved '' ); errU=$(cat "$TMP/err")
+eq 'claude -w, unapproved: still prints exactly the worktree path' "$WCU" "$outU"
+eq '...starts no background run' no \
+  "$([ -e "$(git -C "$WCU" rev-parse --absolute-git-dir)/worktree-bootstrap.pid" ] && echo yes || echo no)"
+lacks '...and does not say it is finishing' 'finishing in the background' "$errU"
+eq '...installing nothing' no "$([ -e "$WCU/node_modules/m" ] && echo yes || echo no)"
+
+# A SessionStart that defers takes the worktree's lock without waiting while a background run holds it:
+# a stand-in run and a holder of the lock, so the old 5s wait would be paid in full.
+WLK=$BG/.claude/worktrees/cli-lock
+git -C "$BG" worktree add -q "$WLK" -b worktree-cli-lock 2>/dev/null
+GDLK=$(git -C "$WLK" rev-parse --absolute-git-dir)
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 30' & standin=$!
+printf '%s\n' "$standin" > "$GDLK/worktree-bootstrap.pid"
+flock "$GDLK/worktree-bootstrap-state.lock" sleep 30 & holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  flock -n "$GDLK/worktree-bootstrap-state.lock" true 2>/dev/null || break
+  sleep 0.2
+done
+t0=$SECONDS
+outL=$(PITLANE_BACKGROUND=on start_hook "$WLK")
+eq 'lock: a deferring SessionStart does not wait for the lock a background run holds' yes \
+  "$([ $((SECONDS - t0)) -lt 5 ] && echo yes || echo no)"
+contains '...and says the setup is in progress' 'still being set up in the background' "$outL"
+kill "$standin" "$holder" 2>/dev/null; wait "$standin" "$holder" 2>/dev/null
+rm -f "$GDLK/worktree-bootstrap.pid" "$GDLK/worktree-bootstrap.again"
+
+WSA=$BG/.claude/worktrees/agent-sa1
+outA=$(create_hook agent-sa1 ',"prompt_id":"p-1"')
+eq 'subagent: WorktreeCreate prints exactly the worktree path' "$WSA" "$outA"
+eq '...installed before it returns' ok "$(cat "$WSA/node_modules/m" 2>/dev/null)"
+eq '...and seeded' agent_sa1 "$(cat "$WSA/seeded.txt" 2>/dev/null)"
+eq '...with no background run' no \
+  "$([ -e "$(git -C "$WSA" rev-parse --absolute-git-dir)/worktree-bootstrap.pid" ] && echo yes || echo no)"
+
+# Reopened synchronously while its background run still works: it waits for the run instead of
+# running the install and the seed beside it. A stand-in plays a run that ends after 6s.
+rm -rf "$WSA/node_modules" "$WSA/seeded.txt"
+GDSA=$(git -C "$WSA" rev-parse --absolute-git-dir)
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 6' & standin=$!
+printf '%s\n' "$standin" > "$GDSA/worktree-bootstrap.pid"
+outA=$(create_hook agent-sa1 ',"prompt_id":"p-2"'); errA=$(cat "$TMP/err")
+eq 'reopen: still prints exactly the worktree path' "$WSA" "$outA"
+contains '...after waiting for the running background setup' 'still running — waiting for it' "$errA"
+contains '...until it ended' 'the background setup finished after' "$errA"
+eq '...then does the rest itself' ok "$(cat "$WSA/node_modules/m" 2>/dev/null)"
+wait "$standin" 2>/dev/null; rm -f "$GDSA/worktree-bootstrap.pid"
+
+# ...and when the run outlasts the wait, it does only the cheap steps and leaves the rest to that run,
+# with the wait charged to the hook's own clock. A fake `sleep` advances a counter that a fake `date
+# +%s` adds, so the 285s bound runs out at once.
+rm -rf "$WSA/node_modules" "$WSA/seeded.txt"
+REALDATE=$(command -v date)
+mkdir -p "$TMP/fakeclock"; printf '0\n' > "$TMP/fakeclock/n"
+cat > "$TMP/fakeclock/sleep" <<EOF
+#!/bin/sh
+n=\$(cat "$TMP/fakeclock/n"); printf '%s\n' "\$((n + \${1%%.*}))" > "$TMP/fakeclock/n"
+EOF
+cat > "$TMP/fakeclock/date" <<EOF
+#!/bin/sh
+if [ "\$1" = +%s ]; then printf '%s\n' "\$((\$("$REALDATE" +%s) + \$(cat "$TMP/fakeclock/n")))"; else exec "$REALDATE" "\$@"; fi
+EOF
+chmod +x "$TMP/fakeclock/sleep" "$TMP/fakeclock/date"
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 60' & standin=$!
+printf '%s\n' "$standin" > "$GDSA/worktree-bootstrap.pid"
+outA=$(PATH=$TMP/fakeclock:$PATH create_hook agent-sa1 ',"prompt_id":"p-3"'); errA=$(cat "$TMP/err")
+eq 'reopen, outlasted: still prints exactly the worktree path' "$WSA" "$outA"
+contains '...gives up waiting' 'going on without it' "$errA"
+eq '...installs nothing beside the run' no "$([ -e "$WSA/node_modules/m" ] && echo yes || echo no)"
+eq '...nor seeds' no "$([ -e "$WSA/seeded.txt" ] && echo yes || echo no)"
+eq '...but asks the run to go round again' yes "$([ -e "$GDSA/worktree-bootstrap.again" ] && echo yes || echo no)"
+eq '...starting no run of its own' "$standin" "$(tr -cd '0-9' < "$GDSA/worktree-bootstrap.pid" 2>/dev/null)"
+finished=$(printf '%s\n' "$errA" | sed -n 's/.*bootstrap finished in \([0-9]*\)s.*/\1/p' | tail -1)
+eq '...with the wait counted against the hook' yes "$([ "${finished:-0}" -ge 284 ] && echo yes || echo no)"
+kill "$standin" 2>/dev/null; wait "$standin" 2>/dev/null
+rm -f "$GDSA/worktree-bootstrap.pid" "$GDSA/worktree-bootstrap.again"
+
 # A hardlink that must fall back to an install is just as slow, so it is deferred too.
 printf 'CHANGED\n' > "$WBG/composer.lock"
 outB=$(PITLANE_BACKGROUND=on start_hook "$WBG"); errB=$(cat "$TMP/err")

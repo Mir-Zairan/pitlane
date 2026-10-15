@@ -8087,5 +8087,29 @@ elapsed=$((SECONDS - t0))
 eq 'copy: 6000 selected paths are each matched to what git said of them' 6000 "$((out))"
 eq '...in under 4s' fast "$(fast "$elapsed")"
 
+# ---------------------------------------------------------------------------
+# wt_background_wait: bounded, and says when the bound ran out with the run still going
+# ---------------------------------------------------------------------------
+BWR=$TMP/bgwait
+git init -q "$BWR" && git -C "$BWR" -c user.email=t@example.com -c user.name=t commit -q --allow-empty -m init
+git -C "$BWR" worktree add -q "$BWR/.claude/worktrees/w" -b w 2>/dev/null
+BWW=$BWR/.claude/worktrees/w
+BWPID=$(git -C "$BWW" rev-parse --absolute-git-dir)/worktree-bootstrap.pid
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 30' & standin=$!
+printf '%s\n' "$standin" >"$BWPID"
+wt_background_wait "$BWW" 2 2>"$TMP/bgwait.err"
+eq 'background wait: a run outliving the bound is given up on' 1 "$WT_BG_WAIT_GAVE_UP"
+contains '...and says so' 'still running after 2s — going on without it' "$(cat "$TMP/bgwait.err")"
+eq '...and left running' yes "$(kill -0 "$standin" 2>/dev/null && echo yes || echo no)"
+kill "$standin" 2>/dev/null; wait "$standin" 2>/dev/null
+bash -c 'exec -a "bash bootstrap.sh --finish --background" sleep 1' & standin=$!
+printf '%s\n' "$standin" >"$BWPID"
+wt_background_wait "$BWW" 10 2>/dev/null
+eq 'background wait: a run ending within the bound is waited out' 0 "$WT_BG_WAIT_GAVE_UP"
+wait "$standin" 2>/dev/null
+WT_BG_WAIT_GAVE_UP=1
+wt_background_wait "$BWW" 10 2>/dev/null
+eq 'background wait: with no run at all, nothing is given up on' 0 "$WT_BG_WAIT_GAVE_UP"
+
 printf '%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]

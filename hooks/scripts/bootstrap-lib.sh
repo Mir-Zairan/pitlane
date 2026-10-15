@@ -5620,20 +5620,40 @@ wt_background_pid() {  # $1 = worktree
   printf '%s' "$pid"
 }
 
+# Marks a run a WorktreeCreate started (ADR-032), until the SessionStart behind it consumes it or the
+# run ends.
+wt_background_freshfile() {  # $1 = worktree
+  local p
+  p=$(wt_state_path "$1")
+  printf '%s/worktree-bootstrap.fresh' "${p%/*}"
+}
+
 # Start the background run, unless one is already going. Returns 1 when it could not be started,
 # and the caller falls back to the ordinary "not finished" notice.
-wt_background_start() {  # $1 = worktree
-  local wt=${1%/} log pidf
+#
+# A run already going is asked to go round again — EXCEPT by the first SessionStart after the
+# WorktreeCreate that started it ($2 = 1 there, leaving the fresh marker). That session is `claude -w`'s
+# own, moments later, with nothing changed: another round would only repeat the sequence, and re-run at
+# once a seed that had just failed, over the databases it left half-made.
+wt_background_start() {  # $1 = worktree, $2 = 1 when a WorktreeCreate starts it
+  local wt=${1%/} by_create=${2:-0} log pidf fresh
+  fresh=$(wt_background_freshfile "$wt")
   if wt_background_pid "$wt" >/dev/null; then
+    if [ "$by_create" != 1 ] && [ -e "$fresh" ]; then
+      rm -f "$fresh" 2>/dev/null
+      return 0
+    fi
     # The running one may be past the step this session needs: ask it to go round again.
     : >"$(wt_background_againfile "$wt")" 2>/dev/null || true
     return 0
   fi
+  rm -f "$fresh" 2>/dev/null
   log=$(wt_background_logfile "$wt")
   pidf=$(wt_background_pidfile "$wt")
   {
     printf '%s background setup of %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$wt"
   } >"$log" 2>/dev/null || return 1
+  [ "$by_create" != 1 ] || : >"$fresh" 2>/dev/null || true
   ( cd "$wt" 2>/dev/null || exit 0
     exec setsid bash "$WT_BOOTSTRAP_SCRIPT" --finish --background ) </dev/null >>"$log" 2>&1 &
   printf '%s\n' "$!" >"$pidf" 2>/dev/null || return 1
@@ -5644,6 +5664,7 @@ wt_background_start() {  # $1 = worktree
 # wrote can be its parent's), and clear the record on the way out, only if it is still its own.
 wt_background_claim() {  # $1 = worktree
   WT_BG_PIDFILE=$(wt_background_pidfile "$1")
+  WT_BG_FRESHFILE=$(wt_background_freshfile "$1")
   printf '%s\n' "$$" >"$WT_BG_PIDFILE" 2>/dev/null || true
   rm -f "$(wt_background_againfile "$1")" 2>/dev/null
   trap 'wt_background_release' EXIT
@@ -5651,17 +5672,26 @@ wt_background_claim() {  # $1 = worktree
 
 wt_background_release() {
   [ -n "${WT_BG_PIDFILE:-}" ] || return 0
-  [ "$(tr -cd '0-9' <"$WT_BG_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WT_BG_PIDFILE"
+  if [ "$(tr -cd '0-9' <"$WT_BG_PIDFILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$WT_BG_PIDFILE"
+    # Unconsumed when no SessionStart followed (a subagent taken for a session): it must not spare
+    # some later session's request for another round.
+    [ -z "${WT_BG_FRESHFILE:-}" ] || rm -f "$WT_BG_FRESHFILE"
+  fi
   return 0
 }
 
-# /pitlane-finish while a background run is going: wait for it, bounded, saying so once.
-wt_background_wait() {  # $1 = worktree
-  local wt=${1%/} pid limit=${WT_FINISH_LIMIT:-3600} waited=0
+# /pitlane-finish, or a WorktreeCreate reopening the worktree, while a background run is going: wait
+# for it, bounded, saying so once. WT_BG_WAIT_GAVE_UP=1 when the bound ran out with it still going.
+wt_background_wait() {  # $1 = worktree, $2 = most seconds to wait (default WT_FINISH_LIMIT)
+  local wt=${1%/} pid limit=${2:-${WT_FINISH_LIMIT:-3600}} waited=0
+  # shellcheck disable=SC2034  # this function's result, read by bootstrap.sh's WorktreeCreate branch.
+  WT_BG_WAIT_GAVE_UP=0
   pid=$(wt_background_pid "$wt") || return 0
   wt_log "the background setup (pid $pid) is still running — waiting for it; progress in $(wt_background_logfile "$wt")"
   while wt_background_pid "$wt" >/dev/null; do
-    [ "$waited" -lt "$limit" ] || { wt_log "still running after ${limit}s — going on without it"; return 0; }
+    # shellcheck disable=SC2034  # as above.
+    [ "$waited" -lt "$limit" ] || { WT_BG_WAIT_GAVE_UP=1; wt_log "still running after ${limit}s — going on without it"; return 0; }
     sleep 2
     waited=$((waited + 2))
   done

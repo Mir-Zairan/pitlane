@@ -407,9 +407,12 @@ wt_symlink_refuses() {  # $1 = main checkout, $2 = the worktree path about to be
 # is to exit 0 having warned, whatever happened here.
 wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own .worktreeinclude
   local root=${1%/} worktree=${2%/} own_include=${3:-0}
-  local started deadline hook_deadline budget reserve elapsed held=0
+  local started deadline hook_deadline budget reserve elapsed held=0 lock_wait
 
-  started=$(date +%s 2>/dev/null) || started=''
+  # From when the HOOK started, where it waited for a background run first (WorktreeCreate): the
+  # platform's timer was running through that wait too.
+  started=${WT_HOOK_STARTED:-}
+  [ -n "$started" ] || started=$(date +%s 2>/dev/null) || started=''
   deadline='' hook_deadline=''
   # Finishing from /pitlane-finish runs outside any hook, so the only limit is a generous one.
   if [ "${WT_FINISH:-}" = 1 ]; then
@@ -461,7 +464,12 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
   # accident, and enough to make `git worktree remove` refuse without --force, which teardown would
   # then have to work around.
   wt_prime_paths "$root" "$worktree"
-  wt_lock_acquire "$(wt_state_path "$worktree").lock" 5 8 && held=1
+  # Not waited for when a background run holds it and this run defers anyway: that is every
+  # `claude -w`, whose WorktreeCreate started the run moments before this SessionStart, and five
+  # seconds of a blank terminal would buy a lock this run has no slow work to do under.
+  lock_wait=5
+  [ "${WT_DEFER:-0}" = 1 ] && wt_background_pid "$worktree" >/dev/null && lock_wait=0
+  wt_lock_acquire "$(wt_state_path "$worktree").lock" "$lock_wait" 8 && held=1
 
   # A checkout that lost a large part of its tracked files — a removal interrupted half-way — is no
   # base to install, build or seed on: lockfiles, sources and `.gitignore` may be gone, and what
@@ -516,6 +524,10 @@ wt_bootstrap_worktree() {  # $1 = main checkout, $2 = worktree, $3 = 1 if we own
 case $event in
   WorktreeCreate)
     # stdout is the path. Every message below goes to stderr.
+    WT_HOOK_STARTED=$(date +%s 2>/dev/null) || WT_HOOK_STARTED=''
+    # Present on a WorktreeCreate made mid-conversation (a subagent), absent on `claude -w`'s
+    # (measured). Read here, not with the other fields: no other event pays an interpreter start for it.
+    prompt_id=$(wt_read_field prompt_id) || prompt_id=''
     root=$(wt_main_root "$here") || root=$(wt_repo_root "$here") || root=''
     if [ -z "$root" ]; then
       # No path we could print would be enterable, so say why and let Claude Code report
@@ -663,9 +675,45 @@ case $event in
     wt_load_profile_for "$worktree" "$root"
     wt_log "worktree=$worktree slug=$WT_SLUG profile=$([ "$PROFILE_PRESENT" = 1 ] && echo "$PROFILE_PATH" || echo none)"
 
+    # DEFERRED FOR `claude -w`, SYNCHRONOUS FOR A SUBAGENT (ADR-032). Since Claude Code 2.1.300,
+    # `claude -w` creates its worktree through this hook — 2.1.299 created it natively and fired only
+    # SessionStart (measured) — and shows nothing until the hook returns: on a real repository an
+    # install and a four-database seed made that minutes of a blank terminal, which developers
+    # interrupt, leaving half-made databases for the next attempt. A subagent's worktree is created
+    # mid-conversation and its payload carries a `prompt_id`; `claude -w`'s carries none (measured,
+    # interactive and -p). So without one, only the cheap steps run here, as at a session start.
+    #
+    # The background run is started HERE, not left to the SessionStart that follows: a caller taken
+    # for a session that is not one would otherwise get a worktree whose setup nothing ever finishes.
+    # Taken the other way, it is only the old wait. With a `prompt_id` nothing changes: a subagent
+    # starts work at once, and no SessionStart follows it.
+    WT_DEFER=0
+    if [ -z "$prompt_id" ] && wt_background_enabled; then
+      WT_DEFER=1
+    elif wt_background_pid "$worktree" >/dev/null; then
+      # A worktree reopened while its background run still works: running the sequence beside it
+      # races its seed (measured: it dropped the databases the run was importing into). Wait for it,
+      # within half the hook's window so the sequence keeps the rest; if it is still going, do only
+      # the cheap steps and leave the rest to it.
+      wt_background_wait "$worktree" $(((WT_HOOK_TIMEOUT - 30) / 2))
+      [ "${WT_BG_WAIT_GAVE_UP:-0}" = 0 ] || WT_DEFER=1
+    fi
+
     # own_include=1: registering this hook DISABLES native `.worktreeinclude` handling on this
     # path (measured), so the plugin owes the behaviour here.
     wt_bootstrap_worktree "$root" "$worktree" 1
+
+    # Started only where runs are enabled: a wait that gave up defers too, and must not start one
+    # behind PITLANE_BACKGROUND=off when the run it waited for ends meanwhile. Started as this
+    # creation's own (`1`), so the SessionStart right behind it does not send it round again.
+    if [ "$WT_DEFER" = 1 ] && [ -z "${WT_GUTTED:-}" ] && [ "${WT_APPROVAL:-}" != no ]; then
+      wt_bootstrap_pending "$worktree"
+      if [ -n "$WT_PENDING_ATTEMPTABLE" ] && wt_background_enabled && wt_background_start "$worktree" 1; then
+        wt_log "finishing in the background: $(printf '%s' "$WT_PENDING" | paste -sd, - | sed 's/,/, /g') — progress in $(wt_background_logfile "$worktree")"
+      elif [ -n "$WT_PENDING" ]; then
+        wt_log "not finished: $(printf '%s' "$WT_PENDING" | paste -sd, - | sed 's/,/, /g')"
+      fi
+    fi
 
     # The one line that must reach stdout, printed LAST so nothing above can interleave with it.
     printf '%s\n' "$worktree"
