@@ -7940,9 +7940,24 @@ eq 'outcome: a hand-off with no runtime removes a stale record' '' "$(rtrun_recs
 # ---------------------------------------------------------------------------
 # What a branch's profile and the files it names cost to read, at the bounds
 # ---------------------------------------------------------------------------
-# All of this runs at session start, before anyone has approved the profile. Timed with SECONDS (bash
-# 3.2 has no EPOCHREALTIME); each shape took from several seconds to hours before it was made linear.
-fast() { [ "$1" -lt 4 ] && echo fast || echo "${1}s"; }
+# All of this runs at session start, before anyone has approved the profile. Each shape took from
+# several seconds to hours before it was made linear, all of it CPU — so it is timed in CPU, not on
+# the wall clock, which on a busy machine counts every other process too and failed runs at a load of
+# 7. `times` (bash 3.2 has it; it has no EPOCHREALTIME) is run in this shell and read from a file: in
+# a command substitution's fork it would report only that fork's own nothing.
+fast() { [ "$1" -lt "${2:-4}" ] && echo fast || echo "${1}s"; }  # $1 = seconds, $2 = the bound (4)
+cpu_ms() {  # sets CPU_MS: what this shell and the children it has waited for have used, in ms
+  local u s t min sec frac
+  CPU_MS=0
+  times >"$TMP/cpu.times" 2>/dev/null || return 0
+  while read -r u s; do
+    for t in "$u" "$s"; do
+      min=${t%%m*} sec=${t#*m}; sec=${sec%s}
+      frac=${sec#*.}000; sec=${sec%%.*}
+      CPU_MS=$((CPU_MS + 10#$min * 60000 + 10#$sec * 1000 + 10#${frac:0:3}))
+    done
+  done <"$TMP/cpu.times"
+}
 BREPO=$TMP/bounds
 mkdir -p "$BREPO"
 git init -q "$BREPO"
@@ -7953,18 +7968,18 @@ git -C "$BREPO" worktree add -q "$BWT" -b worktree-bw 2>/dev/null
 # An env file over WT_ENV_FILE_MAX_BYTES is left alone, read no further than the bound: a megabyte of
 # short lines, which the plugin used to read whole, appending each line to all before it.
 yes a | head -c 1048576 >"$BWT/.big.env"
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 state=$(wt_runtime_env_state "$BWT" .big.env 2>"$TMP/bounds.err")
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 eq 'env file: one of 1 MiB is not managed' theirs "$state"
 contains '...and says why' ".big.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
 eq '...in under 4s' fast "$(fast "$elapsed")"
 # One line of 8 MiB with no newline at all is refused by its size, before a byte of it is read.
 head -c 8388608 /dev/zero | tr '\0' a >"$BWT/.line.env"
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 WT_ENV_BEFORE='left from before'
 wt_runtime_env_split "$BWT/.line.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 eq 'env file: one line of 8 MiB is refused' '1 0' "$rc ${#WT_ENV_BEFORE}"
 contains '...and says why' ".line.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
 eq '...in under 4s' fast "$(fast "$elapsed")"
@@ -7972,22 +7987,22 @@ eq '...and so is its state: not managed' theirs "$(wt_runtime_env_state "$BWT" .
 # Measured, not read: a sparse GiB of NUL bytes, which takes no disk, holds no newline, and costs
 # `read` seconds to get through — and which, read whole, comes out as one empty line.
 dd if=/dev/zero of="$BWT/.sparse.env" bs=1 count=0 seek=1073741824 2>/dev/null
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 wt_runtime_env_split "$BWT/.sparse.env" 2>"$TMP/bounds.err" && rc=0 || rc=$?
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 eq 'env file: a sparse GiB is refused by its size' 1 "$rc"
 contains '...and says why' ".sparse.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$(cat "$TMP/bounds.err")"
 eq '...without reading it: in under 4s' fast "$(fast "$elapsed")"
 rm -f "$BWT/.sparse.env"
 # The second guard: should the measurement understate it (the file grew after it), no read asks for
 # more than the budget has left, so the line is still never read whole.
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 out=$(
   # shellcheck disable=SC2329  # called by the engine, as `wc`.
   wc() { echo 10; }
   wt_runtime_env_split "$BWT/.line.env" 2>&1 && echo read || echo "refused ${#WT_ENV_BEFORE}"
 )
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 contains 'env file: a line past the bound is refused while it is read' 'refused 0' "$out"
 contains '...and says why' ".line.env is over $WT_ENV_FILE_MAX_BYTES bytes" "$out"
 eq '...in under 4s' fast "$(fast "$elapsed")"
@@ -8006,9 +8021,9 @@ contains '...and is not read' refused "$out"
   yes b | head -n 20000
   printf 'last-without-newline'
 } >"$BWT/.near.env"
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 wt_runtime_env_split "$BWT/.near.env"
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 eq 'env file: 60 KB of short lines is read' "1 $(yes a | head -n 10000 | cksum)" "$WT_ENV_HAS_BLOCK $(printf '%s' "$WT_ENV_BEFORE" | cksum)"
 eq '...the lines after its block too, the last given its newline' \
   "$( { yes b | head -n 20000; echo last-without-newline; } | cksum)" "$(printf '%s' "$WT_ENV_AFTER" | cksum)"
@@ -8053,7 +8068,9 @@ eq 'env file: a block past the bound is not written' absent "$(wt_runtime_env_st
 contains '...and says why' 'with the block it would be over' "$out"
 
 # The hand-off over 60 env files of 4 KB paths, twice: the second run looks each up in the list
-# the first recorded. Cutting both lists apart a field at a time cost minutes. Segments of 255 bytes,
+# the first recorded. Cutting both lists apart a field at a time cost minutes. Bounded at 20s, not 4:
+# measured, it costs 2s of CPU, and 4s with every core kept busy — too close to 4 to tell a regression
+# from a busy machine, and still far under the minutes a regression costs. Segments of 255 bytes,
 # the most a name may have: git's own check of a path 2000 directories deep costs more than this does.
 bounds_handoff() (  # a subshell, so the profile it fakes stays in it
   local apath files='' n=0
@@ -8063,29 +8080,31 @@ bounds_handoff() (  # a subshell, so the profile it fakes stays in it
   PROFILE_HAS_RUNTIME=1 PROFILE_RT_ENVFILES=$files PROFILE_RT_ENVFILE=${files%%:*} PROFILE_RAW=''
   WT_SLUG='' WT_NAME=bw
   wt_runtime_handoff "$BREPO" "$BWT" '' 2>/dev/null
-  t0=$SECONDS
+  cpu_ms; t0=$CPU_MS
   wt_runtime_handoff "$BREPO" "$BWT" '' 2>/dev/null
-  printf '%s %s' "$(fast $((SECONDS - t0)))" "$([ "$(wt_runtime_state_get "$BWT" envfile)" = "$files" ] && echo recorded)"
+  cpu_ms
+  printf '%s %s' "$(fast $(((CPU_MS - t0) / 1000)) 20)" "$([ "$(wt_runtime_state_get "$BWT" envfile)" = "$files" ] && echo recorded)"
 )
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 out=$(bounds_handoff)
-elapsed=$((SECONDS - t0))
-eq 'hand-off: 60 env files of 4 KB paths, the second time, in under 4s' 'fast recorded' "$out"
-eq '...and both times in under 8s' fast "$(fast $((elapsed / 2)))"
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
+eq 'hand-off: 60 env files of 4 KB paths, the second time, in under 20s' 'fast recorded' "$out"
+eq '...and both times in under 40s' fast "$(fast "$elapsed" 40)"
 
 # A large .worktreeinclude selection: 6000 gitignored files, each refused (a symlink), so the time is
-# the matching of candidates to git's answers, which compared every one with every other.
+# the matching of candidates to git's answers, which compared every one with every other. Bounded at
+# 20s as the hand-off is: measured, 2s of CPU, 5s with every core kept busy.
 mkdir -p "$BREPO/src" "$BREPO/l"
 (cd "$BREPO/src" && seq -f 'f%05g' 6000 | xargs touch)
 (cd "$BREPO/l" && seq -f '../src/f%05g' 6000 | xargs sh -c 'ln -s "$@" .' _)
 printf 'l/\n' >"$BREPO/.gitignore"
 printf 'l/\n' >"$BREPO/.worktreeinclude"
 rm -f "$BWT/.worktreeinclude"
-t0=$SECONDS
+cpu_ms; t0=$CPU_MS
 out=$(wt_copy_config "$BREPO" "$BWT" 1 2>&1 | grep -c 'it is a symlink')
-elapsed=$((SECONDS - t0))
+cpu_ms; elapsed=$(((CPU_MS - t0) / 1000))
 eq 'copy: 6000 selected paths are each matched to what git said of them' 6000 "$((out))"
-eq '...in under 4s' fast "$(fast "$elapsed")"
+eq '...in under 20s' fast "$(fast "$elapsed" 20)"
 
 # ---------------------------------------------------------------------------
 # wt_background_wait: bounded, and says when the bound ran out with the run still going

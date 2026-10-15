@@ -1317,10 +1317,16 @@ claude_remove() {  # $1 = repo, $2 = admin id
 runtime_rows() {  # $1 = path: the runtime-leftover lines for it
   awk -F'\t' -v p="$1" '$2 == "runtime-leftover" && $3 == p' "$TMP/out"
 }
+# Each opening in a later second than the one before, as real openings are: entries are ordered by
+# the second they were written in, and three openings fast enough to share one made "the newest"
+# whichever came first.
+next_second() { local s; s=$(date +%s); while [ "$(date +%s)" = "$s" ]; do sleep 0.1; done; }
 W1=$(create "$RE" reopened)
 claude_remove "$RE" reopened
+next_second
 W2=$(create "$RE" reopened)
 claude_remove "$RE" reopened1
+next_second
 W3=$(create "$RE" reopened)
 eq 'reopened: every opening is the same worktree' "$W1 $W1" "$W2 $W3"
 eq 'reopened: each opening has its own ledger entry' 'yes yes yes' \
